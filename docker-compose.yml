@@ -1,0 +1,59 @@
+# ==============================================================================
+# LOCAL DEVELOPMENT INFRASTRUCTURE ONLY
+# ==============================================================================
+# WARNING: These credentials are non-sensitive LOCAL DEVELOPMENT DEFAULTS only.
+# Never use default credentials in production deployments. Real production
+# configurations must supply external environment variables.
+# ==============================================================================
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: coindcx-quant-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local_root_dev_only}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-coindcx_quant}
+      MYSQL_USER: ${MYSQL_USER:-quant_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-local_dev_only}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "mysqladmin",
+          "ping",
+          "-h",
+          "localhost",
+          "-u",
+          "${MYSQL_USER:-quant_user}",
+          "-p${MYSQL_PASSWORD:-local_dev_only}"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: coindcx-quant-bot
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: ${PORT:-3000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: mysql://${MYSQL_USER:-quant_user}:${MYSQL_PASSWORD:-local_dev_only}@mysql:3306/${MYSQL_DATABASE:-coindcx_quant}
+    ports:
+      - "${PORT:-3000}:${PORT:-3000}"
+
+volumes:
+  mysql_data:
+    driver: local
