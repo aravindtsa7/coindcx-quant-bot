@@ -13,9 +13,10 @@
     "lint": "eslint \"src/**/*.ts\" \"tests/**/*.ts\"",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
-    "prisma:deploy": "prisma migrate deploy",
-    "coindcx:read-smoke": "tsx scripts/coindcx-read-smoke.ts"
+    "coindcx:read-smoke": "tsx scripts/coindcx-read-smoke.ts",
+    "coin-runtime:smoke": "tsx scripts/coin-runtime-smoke.ts"
   },
+
   "keywords": [
     "coindcx",
     "crypto",

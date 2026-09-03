@@ -14,7 +14,12 @@ export type AppErrorCode =
   | 'COINDCX_TIMEOUT'
   | 'COINDCX_RATE_LIMIT'
   | 'COINDCX_PROVIDER_ERROR'
-  | 'COINDCX_RESPONSE_VALIDATION_ERROR';
+  | 'COINDCX_RESPONSE_VALIDATION_ERROR'
+  | 'COIN_CONFIG_ERROR'
+  | 'COIN_DISCOVERY_ERROR'
+  | 'COIN_REGISTRATION_ERROR'
+  | 'COIN_LIFECYCLE_ERROR';
+
 
 export interface AppErrorPayload {
   code: AppErrorCode;
@@ -128,5 +133,29 @@ export class CoinDcxProviderError extends AppError {
 export class CoinDcxResponseValidationError extends AppError {
   constructor(message: string, details?: Record<string, unknown>) {
     super('COINDCX_RESPONSE_VALIDATION_ERROR', message, 502, details, true);
+  }
+}
+
+export class CoinConfigError extends AppError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super('COIN_CONFIG_ERROR', message, 400, details, true);
+  }
+}
+
+export class CoinDiscoveryError extends AppError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super('COIN_DISCOVERY_ERROR', message, 502, details, true);
+  }
+}
+
+export class CoinRegistrationError extends AppError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super('COIN_REGISTRATION_ERROR', message, 409, details, true);
+  }
+}
+
+export class CoinLifecycleError extends AppError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super('COIN_LIFECYCLE_ERROR', message, 400, details, true);
   }
 }

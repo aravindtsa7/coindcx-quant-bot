@@ -6,11 +6,12 @@ This document defines the frozen, sequential 26-phase development roadmap for th
 
 | Phase | Name | Description | Status |
 | :--- | :--- | :--- | :--- |
-| **Phase 0** | **Frozen Documentation** | Establish core architectural source of truth, scope boundaries, invariants, onboarding procedures, and strategy lifecycle. | **CURRENT** |
-| **Phase 1** | **Foundation** | Node.js + strict TypeScript setup, Express server, MySQL 8 + Prisma persistence, Zod configuration, decimal arithmetic, structured logging with secret redaction, health API, graceful shutdown, Vitest, Docker, and GitHub Actions CI. | **CURRENT** |
-| **Phase 2** | **CoinDCX Read Layer** | Read-only REST API client for CoinDCX: instrument metadata discovery, contract specifications, order book snapshots, historical trade queries, and rate-limit tracking. | **CURRENT** |
-| **Phase 3** | **Coin Runtime Layer** | Dynamic, isolated per-coin operational supervisor; coin configuration loading without hardcoded symbol logic. | Planned |
-| **Phase 4** | **Public/Private WebSockets** | Real-time WebSocket connection manager: public trade feeds, order book depth feeds, private user execution updates, automatic reconnection, and heartbeat management. | Planned |
+| **Phase 0** | **Frozen Documentation** | Establish core architectural source of truth, scope boundaries, invariants, onboarding procedures, and strategy lifecycle. | COMPLETE |
+| **Phase 1** | **Foundation** | Node.js + strict TypeScript setup, Express server, MySQL 8 + Prisma persistence, Zod configuration, decimal arithmetic, structured logging with secret redaction, health API, graceful shutdown, Vitest, Docker, and GitHub Actions CI. | COMPLETE |
+| **Phase 2** | **CoinDCX Read Layer** | Read-only REST API client for CoinDCX: instrument metadata discovery, contract specifications, order book snapshots, historical trade queries, and rate-limit tracking. | COMPLETE |
+| **Phase 3** | **Coin Runtime Layer** | Dynamic, isolated per-coin operational supervisor; coin configuration loading without hardcoded symbol logic. | COMPLETE |
+
+| **Phase 4** | **Public/Private WebSockets** | Real-time WebSocket connection manager: public trade feeds, order book depth feeds, private user execution updates, automatic reconnection, and heartbeat management. | CURRENT |
 | **Phase 5** | **Canonical 1m Market Data** | Tick-to-candle synthesis engine, gap detection, out-of-order tick handling, and immutable persistence of finalized 1-minute OHLCV candles to MySQL 8. | Planned |
 | **Phase 6** | **Generic Higher-Timeframe Engine** | Pure mathematical aggregation engine deriving 5m, 15m, 30m, 1h, 4h, and 1d candles exclusively from canonical 1m data. | Planned |
 | **Phase 7** | **Historical Dataset Engine** | Historical bulk data backfill utility, candle verification, gap-filling algorithms, and dataset export/import capabilities. | Planned |
