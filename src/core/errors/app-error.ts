@@ -8,7 +8,13 @@ export type AppErrorCode =
   | 'VALIDATION_ERROR'
   | 'DATABASE_ERROR'
   | 'NOT_FOUND_ERROR'
-  | 'INTERNAL_ERROR';
+  | 'INTERNAL_ERROR'
+  | 'COINDCX_CONFIG_ERROR'
+  | 'COINDCX_AUTH_ERROR'
+  | 'COINDCX_TIMEOUT'
+  | 'COINDCX_RATE_LIMIT'
+  | 'COINDCX_PROVIDER_ERROR'
+  | 'COINDCX_RESPONSE_VALIDATION_ERROR';
 
 export interface AppErrorPayload {
   code: AppErrorCode;
@@ -82,5 +88,45 @@ export class NotFoundError extends AppError {
 export class InternalError extends AppError {
   constructor(message: string, details?: Record<string, unknown>) {
     super('INTERNAL_ERROR', message, 500, details, false);
+  }
+}
+
+export class CoinDcxConfigError extends AppError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super('COINDCX_CONFIG_ERROR', message, 500, details, true);
+  }
+}
+
+export class CoinDcxAuthError extends AppError {
+  constructor(message: string, statusCode = 401, details?: Record<string, unknown>) {
+    super('COINDCX_AUTH_ERROR', message, statusCode, details, true);
+  }
+}
+
+export class CoinDcxTimeoutError extends AppError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super('COINDCX_TIMEOUT', message, 504, details, true);
+  }
+}
+
+export class CoinDcxRateLimitError extends AppError {
+  public readonly retryAfterMs?: number | undefined;
+
+  constructor(message: string, retryAfterMs?: number, details?: Record<string, unknown>) {
+    const errorDetails = retryAfterMs !== undefined ? { ...details, retryAfterMs } : details;
+    super('COINDCX_RATE_LIMIT', message, 429, errorDetails, true);
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+export class CoinDcxProviderError extends AppError {
+  constructor(message: string, statusCode = 502, details?: Record<string, unknown>) {
+    super('COINDCX_PROVIDER_ERROR', message, statusCode, details, true);
+  }
+}
+
+export class CoinDcxResponseValidationError extends AppError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super('COINDCX_RESPONSE_VALIDATION_ERROR', message, 502, details, true);
   }
 }

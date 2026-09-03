@@ -8,7 +8,7 @@ This document defines the frozen, sequential 26-phase development roadmap for th
 | :--- | :--- | :--- | :--- |
 | **Phase 0** | **Frozen Documentation** | Establish core architectural source of truth, scope boundaries, invariants, onboarding procedures, and strategy lifecycle. | **CURRENT** |
 | **Phase 1** | **Foundation** | Node.js + strict TypeScript setup, Express server, MySQL 8 + Prisma persistence, Zod configuration, decimal arithmetic, structured logging with secret redaction, health API, graceful shutdown, Vitest, Docker, and GitHub Actions CI. | **CURRENT** |
-| **Phase 2** | **CoinDCX Read Layer** | Read-only REST API client for CoinDCX: instrument metadata discovery, contract specifications, order book snapshots, historical trade queries, and rate-limit tracking. | Planned |
+| **Phase 2** | **CoinDCX Read Layer** | Read-only REST API client for CoinDCX: instrument metadata discovery, contract specifications, order book snapshots, historical trade queries, and rate-limit tracking. | **CURRENT** |
 | **Phase 3** | **Coin Runtime Layer** | Dynamic, isolated per-coin operational supervisor; coin configuration loading without hardcoded symbol logic. | Planned |
 | **Phase 4** | **Public/Private WebSockets** | Real-time WebSocket connection manager: public trade feeds, order book depth feeds, private user execution updates, automatic reconnection, and heartbeat management. | Planned |
 | **Phase 5** | **Canonical 1m Market Data** | Tick-to-candle synthesis engine, gap detection, out-of-order tick handling, and immutable persistence of finalized 1-minute OHLCV candles to MySQL 8. | Planned |

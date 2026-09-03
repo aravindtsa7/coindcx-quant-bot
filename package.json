@@ -13,7 +13,8 @@
     "lint": "eslint \"src/**/*.ts\" \"tests/**/*.ts\"",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
-    "prisma:deploy": "prisma migrate deploy"
+    "prisma:deploy": "prisma migrate deploy",
+    "coindcx:read-smoke": "tsx scripts/coindcx-read-smoke.ts"
   },
   "keywords": [
     "coindcx",
@@ -31,6 +32,7 @@
     "decimal.js": "^10.5.0",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "lossless-json": "^4.3.0",
     "pino": "^9.6.0",
     "zod": "^3.24.2"
   },

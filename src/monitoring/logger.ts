@@ -33,6 +33,10 @@ const SENSITIVE_KEY_SET = new Set([
   'passphrase',
   'privatekey',
   'private_key',
+  'x-auth-apikey',
+  'x-auth-signature',
+  'xauthapikey',
+  'xauthsignature',
 ]);
 
 /**
@@ -53,7 +57,12 @@ export function isSensitiveKey(key: string): boolean {
     normalized === 'password' ||
     normalized === 'token' ||
     normalized === 'secret' ||
-    normalized === 'privatekey'
+    normalized === 'privatekey' ||
+    normalized === 'xauthapikey' ||
+    normalized === 'xauthsignature' ||
+    normalized.includes('apikey') ||
+    normalized.includes('apisecret') ||
+    normalized.includes('signature')
   );
 }
 
