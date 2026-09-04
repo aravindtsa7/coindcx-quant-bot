@@ -18,7 +18,9 @@ export type AppErrorCode =
   | 'COIN_CONFIG_ERROR'
   | 'COIN_DISCOVERY_ERROR'
   | 'COIN_REGISTRATION_ERROR'
-  | 'COIN_LIFECYCLE_ERROR';
+  | 'COIN_LIFECYCLE_ERROR'
+  | 'COINDCX_SOCKET_ERROR'
+  | 'COINDCX_SOCKET_VALIDATION_ERROR';
 
 
 export interface AppErrorPayload {
@@ -157,5 +159,17 @@ export class CoinRegistrationError extends AppError {
 export class CoinLifecycleError extends AppError {
   constructor(message: string, details?: Record<string, unknown>) {
     super('COIN_LIFECYCLE_ERROR', message, 400, details, true);
+  }
+}
+
+export class CoinDcxSocketError extends AppError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super('COINDCX_SOCKET_ERROR', message, 502, details, true);
+  }
+}
+
+export class CoinDcxSocketValidationError extends AppError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super('COINDCX_SOCKET_VALIDATION_ERROR', message, 502, details, true);
   }
 }

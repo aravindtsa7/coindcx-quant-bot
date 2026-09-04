@@ -14,9 +14,9 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "coindcx:read-smoke": "tsx scripts/coindcx-read-smoke.ts",
-    "coin-runtime:smoke": "tsx scripts/coin-runtime-smoke.ts"
+    "coin-runtime:smoke": "tsx scripts/coin-runtime-smoke.ts",
+    "coindcx:ws-smoke": "tsx scripts/coindcx-ws-smoke.ts"
   },
-
   "keywords": [
     "coindcx",
     "crypto",
@@ -35,6 +35,7 @@
     "express": "^4.21.2",
     "lossless-json": "^4.3.0",
     "pino": "^9.6.0",
+    "socket.io-client": "2.4.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {
