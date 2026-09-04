@@ -152,4 +152,3 @@ describe('P4-F005: Public Smoke Bounded Observation Timer Cleanup', () => {
     expect(smokeScriptContent).toContain('finally {');
   });
 });
-

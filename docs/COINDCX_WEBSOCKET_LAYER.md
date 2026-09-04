@@ -153,4 +153,3 @@ The WebSocket layer is verified through automated unit tests and public live exc
 ### Live Exchange Public Smoke Test
 - Command: `npm run coindcx:ws-smoke`
 - Validated: Discovers BTC/ETH perpetuals, subscribes to `B-BTC_USDT_1m-futures` and `B-ETH_USDT_1m-futures`, connects to `wss://stream.coindcx.com`, receives real live candles, normalizes them with Decimal precision, checks health snapshot, and stops cleanly with zero leaks.
-

@@ -37,4 +37,3 @@ export function calculateBackoffWithJitter(
 
   return config.minDelayMs + jitterOffset;
 }
-

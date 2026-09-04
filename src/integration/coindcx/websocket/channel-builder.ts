@@ -68,4 +68,3 @@ export function matchesFuturesCandleChannel(
   const expectedChannel = `${expectedPair}_${interval}-futures`;
   return channelName === expectedChannel;
 }
-

@@ -22,4 +22,3 @@ declare module 'socket.io-client' {
   function io(uri?: string, opts?: ConnectOptions): Socket;
   export default io;
 }
-

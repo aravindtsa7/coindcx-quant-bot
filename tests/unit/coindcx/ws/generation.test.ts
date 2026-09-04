@@ -464,4 +464,3 @@ describe('CoinDCX WebSocket — Generation Isolation', () => {
     stream.stop();
   });
 });
-

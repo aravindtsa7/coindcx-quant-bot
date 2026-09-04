@@ -1,11 +1,11 @@
 # Phase 4 Public WebSocket Smoke Test Evidence
 
-**Date:** 2026-09-04  
-**Command:** `npm run coindcx:ws-smoke`  
-**Endpoint:** `wss://stream.coindcx.com`  
-**Authentication:** NONE (Public Only, `--auth` prohibited)  
-**Target Pairs:** BTC (`B-BTC_USDT`), ETH (`B-ETH_USDT`)  
-**Channel Pattern:** `B-BTC_USDT_1m-futures`, `B-ETH_USDT_1m-futures`  
+**Date:** 2026-09-04
+**Command:** `npm run coindcx:ws-smoke`
+**Endpoint:** `wss://stream.coindcx.com`
+**Authentication:** NONE (Public Only, `--auth` prohibited)
+**Target Pairs:** BTC (`B-BTC_USDT`), ETH (`B-ETH_USDT`)
+**Channel Pattern:** `B-BTC_USDT_1m-futures`, `B-ETH_USDT_1m-futures`
 
 ---
 
@@ -112,4 +112,3 @@ privateSocketStarted=false
 | Stream Cleanup | `connected=false`, `state=STOPPED` | `connected=false`, `state=STOPPED` | PASS |
 | Secret Safety | `credentialsUsed=false`, `privateSocketStarted=false` | `false`, `false` | PASS |
 | Process Exit Code | `0` | `0` | PASS |
-

@@ -196,4 +196,3 @@ describe('CoinDCX WebSocket — Private Auth Signer & Join', () => {
     pubStream.stop();
   });
 });
-
