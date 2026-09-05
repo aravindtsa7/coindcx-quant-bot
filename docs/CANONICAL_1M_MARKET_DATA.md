@@ -304,7 +304,7 @@ Sections 11–12 cover restart safety *within* a single pair state machine's own
 (initialization races, stale callbacks). A later audit found that engine-level async operations —
 physical persistence, stream dispatch, REST recovery, and `start()`/`stop()` bookkeeping itself — were
 not held to the same standard: each was fixed locally without a *shared* notion of run ownership, leaving
-gaps at the boundaries between them. Phase 5 remains **CURRENT**; this section documents the unified
+gaps at the boundaries between them. Phase 5 is **COMPLETE**; this section documents the unified
 lifecycle model that closes those gaps as one coherent design rather than five unrelated patches.
 
 ### The core principle

@@ -12,7 +12,7 @@ This document defines the frozen, sequential 26-phase development roadmap for th
 | **Phase 3** | **Coin Runtime Layer** | Dynamic, isolated per-coin operational supervisor; coin configuration loading without hardcoded symbol logic. | COMPLETE |
 
 | **Phase 4** | **Public/Private WebSockets** | Real-time WebSocket connection manager: public trade feeds, order book depth feeds, private user execution updates, automatic reconnection, and heartbeat management. | COMPLETE |
-| **Phase 5** | **Canonical 1m Market Data** | Transport 1m candle update -> canonical 1m finalization, successor-confirmed finality, gap detection, REST recovery barrier, and immutable persistence of finalized 1-minute OHLCV candles to MySQL 8. | CURRENT |
+| **Phase 5** | **Canonical 1m Market Data** | Transport 1m candle update -> canonical 1m finalization, successor-confirmed finality, gap detection, REST recovery barrier, and immutable persistence of finalized 1-minute OHLCV candles to MySQL 8. | COMPLETE |
 | **Phase 6** | **Generic Higher-Timeframe Engine** | Pure mathematical aggregation engine deriving 5m, 15m, 30m, 1h, 4h, and 1d candles exclusively from canonical 1m data. | Planned |
 | **Phase 7** | **Historical Dataset Engine** | Historical bulk data backfill utility, candle verification, gap-filling algorithms, and dataset export/import capabilities. | Planned |
 | **Phase 8** | **Indicator Engine** | Deterministic technical and quantitative analysis library (EMA, SMA, RSI, MACD, ATR, Bollinger Bands, Volume Profile) with strict decimal precision. | Planned |
