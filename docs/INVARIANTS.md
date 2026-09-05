@@ -1,6 +1,6 @@
 # Core System Invariants
 
-The following 20 invariants are non-negotiable architectural and operational laws governing the **CoinDCX Quant Futures Bot**. No feature, performance optimization, refactoring, or hotfix may violate these rules.
+The following 21 invariants are non-negotiable architectural and operational laws governing the **CoinDCX Quant Futures Bot**. No feature, performance optimization, refactoring, or hotfix may violate these rules.
 
 ---
 
@@ -65,3 +65,5 @@ Every production trade must be completely traceable from end to end:
 ### Invariant 20: Explicit Live Trading Activation
 Live trading capabilities must remain physically disabled until explicit, multi-phase verification is complete and later-phase activation approval is granted. Live order placement code paths must not exist in early foundations.
 
+### Invariant 21: Deterministic Historical Datasets & Zero Data Fabrication
+Historical 1-minute research datasets must be acquired exclusively from genuine CoinDCX Futures closed candlestick REST data, persisted directly to the single canonical `candles_1m` store under the exact same `CanonicalDecimal` and structural OHLC validation as live candles, and identified deterministically by SHA-256 content hashing of logical market truth. Missing intervals must be retrieved genuine from the exchange or marked incomplete; synthetic gap fabrication (interpolation, forward-filling, previous-close copying, zero-volume insertion, or silent minute skipping) is strictly prohibited. Historical backfill and import write operations must execute as offline tasks without concurrent live Phase 5 writers.

@@ -93,46 +93,58 @@ The **CoinDCX Quant Futures Bot** is built as a highly deterministic, modular Ty
 - Reads exclusively from local MySQL `candles_1m` via `Canonical1mRangeReader` with zero external exchange calls and zero higher-timeframe database tables.
 - Subordinate to Phase 5 host lifecycle: Phase 6 starts after Phase 5, unsubscribes and stops before Phase 5, and tracks engine-level run ownership to isolate stale async callbacks.
 
-### 2.6 Indicator Engine
+### 2.6 Historical Dataset Engine
+- Deterministic, reproducible acquisition, verification, manifest tracking, export, and import of canonical 1-minute historical datasets.
+- Reuses the existing read-only `CoinDcxFuturesCandleRestReader` against the public CoinDCX Futures candlestick REST endpoint (`resolution=1`, closed 1m candles only).
+- Enforces half-open interval contract `[fromInclusiveMs, toExclusiveMs)` aligned to exact UTC minutes, strictly excluding the forming/current minute.
+- Operates a resumable, chunked backfill engine without job-state database tables: derives progress directly from continuous canonical rows in `candles_1m`, fetches only genuine missing spans, and inserts via idempotent repository semantics.
+- Enforces a strict zero-fabrication policy: interpolation, forward-filling, previous-close copying, and zero-volume filling are categorically barred. Datasets with unrecoverable exchange gaps fail closed as incomplete.
+- Reuses existing immutable MySQL 8 `candles_1m` as the single canonical storage table (`source: 'REST_HISTORICAL'`) under identical `CanonicalDecimal` and structural OHLC validation. Conflict with existing rows fails closed (`CanonicalCandleConflictError`).
+- Designated as an offline maintenance/research operation: historical writes must not run concurrently with an active Phase 5 live canonical writer on the same bot/database.
+- Establishes deterministic SHA-256 dataset identity: `contentSha256` hashed over ordered canonical logical rows (market truth only, excluding transport metadata) and lowercase 64-character hex `datasetId` hashed over schema, venue, market, pair, range, and content hash.
+- Manages dataset manifests (`HistoricalDatasetManifest`) and streaming NDJSON export/import with streaming hash verification for low memory consumption across multi-year datasets.
+- Preserves Phase 6 batch/live parity: stores canonical 1m truth only; higher timeframes are derived dynamically via `aggregateExactBucket`.
+
+### 2.7 Indicator Engine
 - Deterministic, zero-side-effect computational library for technical and quantitative indicators (EMA, RSI, ATR, Bollinger Bands, etc.).
 - Operates exclusively on decimal-safe inputs and arrays of validated candles.
 
-### 2.7 Strategy Research Lab
+### 2.8 Strategy Research Lab
 - Unified framework hosting quantitative strategy definitions.
 - Defines a standardized interface: `onCandle(context): Signal[]`.
 - Strategies are completely decoupled from execution channels, exchange APIs, and account balances.
 
-### 2.8 Backtesting Engine
+### 2.9 Backtesting Engine
 - High-fidelity event-driven simulation environment.
 - Models maker/taker fee structures, funding payments, order queue latency, and slippage based on candle liquidity profiles.
 - Validates strategy performance across distinct historical market regimes.
 
-### 2.9 Risk & Leverage Engine
+### 2.10 Risk & Leverage Engine
 - The non-bypassable guardian standing between strategy signals and order execution.
 - Computes position sizing, margin utilization, liquidation distance, and leverage limits.
 - Evaluates circuit breakers: max account drawdown, single-trade risk, daily loss limits, and consecutive loss halts.
 
-### 2.10 Paper Trading & Shadow Mode
+### 2.11 Paper Trading & Shadow Mode
 - **Paper Trading:** Executes strategy signals in real-time against exchange WebSocket feeds with a virtual ledger.
 - **Shadow Mode:** Runs alongside live production accounts, submitting shadow orders in lockstep to benchmark fill probabilities, slippage, and queue delays.
 
-### 2.11 Execution Engine
+### 2.12 Execution Engine
 - State machine managing the lifecycle of an order: `INTENT_CREATED` → `SUBMITTED` → `ACKNOWLEDGED` → `PARTIALLY_FILLED` → `FILLED` / `CANCELLED` / `REJECTED`.
 - Handles intelligent order routing, post-only enforcement, and partial fill tracking.
 
-### 2.12 Reconciliation & Crash Recovery
+### 2.13 Reconciliation & Crash Recovery
 - Runs immediately on startup before any trading loops begin.
 - Fetches ground-truth exchange positions, open orders, and balances from CoinDCX.
 - Resolves inconsistencies between local database state and exchange state; cancels dangling orphan orders.
 
-### 2.13 News Risk Layer
+### 2.14 News Risk Layer
 - Asynchronous risk modifier ingesting macroeconomic event calendars and high-impact crypto news.
 - Dynamically reduces risk scores, throttles leverage, or commands temporary position closure ahead of volatility spikes.
 
-### 2.14 Monitoring & Logging Subsystem
+### 2.15 Monitoring & Logging Subsystem
 - Structured JSON logging powered by Pino with automatic sensitive field redaction.
 - Emits operational heartbeats, latency metrics, and error rates.
 
-### 2.15 Quant Dashboard (Later Phase)
+### 2.16 Quant Dashboard (Later Phase)
 - Planned visualization interface for equity curves, open positions, risk metrics, and strategy health.
 
