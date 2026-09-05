@@ -20,7 +20,11 @@ export type AppErrorCode =
   | 'COIN_REGISTRATION_ERROR'
   | 'COIN_LIFECYCLE_ERROR'
   | 'COINDCX_SOCKET_ERROR'
-  | 'COINDCX_SOCKET_VALIDATION_ERROR';
+  | 'COINDCX_SOCKET_VALIDATION_ERROR'
+  | 'CANONICAL_CANDLE_ERROR'
+  | 'CANONICAL_CANDLE_CONFLICT'
+  | 'CANONICAL_RECOVERY_ERROR'
+  | 'CANONICAL_VALIDATION_ERROR';
 
 
 export interface AppErrorPayload {
@@ -171,5 +175,29 @@ export class CoinDcxSocketError extends AppError {
 export class CoinDcxSocketValidationError extends AppError {
   constructor(message: string, details?: Record<string, unknown>) {
     super('COINDCX_SOCKET_VALIDATION_ERROR', message, 502, details, true);
+  }
+}
+
+export class CanonicalCandleError extends AppError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super('CANONICAL_CANDLE_ERROR', message, 500, details, true);
+  }
+}
+
+export class CanonicalCandleConflictError extends AppError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super('CANONICAL_CANDLE_CONFLICT', message, 409, details, true);
+  }
+}
+
+export class CanonicalRecoveryError extends AppError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super('CANONICAL_RECOVERY_ERROR', message, 502, details, true);
+  }
+}
+
+export class CanonicalValidationError extends AppError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super('CANONICAL_VALIDATION_ERROR', message, 400, details, true);
   }
 }

@@ -18,3 +18,25 @@ model SystemState {
   @@map("system_state")
 }
 
+/// Canonical finalized 1-minute OHLCV candles persisted immutably.
+model Candle1m {
+  id                  String   @id @default(uuid())
+  pair                String   @db.VarChar(64)
+  openTimeMs          BigInt   @map("open_time_ms")
+  closeTimeMs         BigInt   @map("close_time_ms")
+  open                Decimal  @db.Decimal(36, 18)
+  high                Decimal  @db.Decimal(36, 18)
+  low                 Decimal  @db.Decimal(36, 18)
+  close               Decimal  @db.Decimal(36, 18)
+  volume              Decimal  @db.Decimal(36, 18)
+  quoteVolume         Decimal? @map("quote_volume") @db.Decimal(36, 18)
+  source              String   @db.VarChar(32)
+  providerEventTimeMs BigInt?  @map("provider_event_time_ms")
+  generationId        Int?     @map("generation_id")
+  finalizedAt         DateTime @map("finalized_at")
+  createdAt           DateTime @default(now()) @map("created_at")
+
+  @@unique([pair, openTimeMs], map: "candles_1m_pair_open_time_ms_unique")
+  @@index([pair, openTimeMs], map: "candles_1m_pair_open_time_ms_idx")
+  @@map("candles_1m")
+}

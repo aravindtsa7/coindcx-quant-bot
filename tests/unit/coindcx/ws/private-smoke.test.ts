@@ -73,7 +73,7 @@ describe('CoinDCX WebSocket — Private Auth Smoke Test Contract & Safety Invari
 
   // 2. --auth => private smoke path becomes eligible
   it('2. --auth => private smoke path becomes eligible strictly via command-line argument', () => {
-    expect(smokeScriptContent).toContain("if (isAuth) {\n    await runPrivateWsSmoke();\n  } else {\n    await runPublicWsSmoke();\n  }");
+    expect(smokeScriptContent.replace(/\r\n/g, '\n')).toContain("if (isAuth) {\n    await runPrivateWsSmoke();\n  } else {\n    await runPublicWsSmoke();\n  }");
     // Strict invariant: no bypass via environment variables
     expect(smokeScriptContent).not.toContain('ENABLE_AUTHENTICATED_SMOKE');
     expect(smokeScriptContent).not.toContain('SAFE_TO_RUN_PRIVATE_WS_SMOKE');

@@ -48,7 +48,7 @@ describe('CoinDCX WebSocket — Public Candle Wire Validation', () => {
     expect(result.low.toString()).toBe('49800.00000001');
     expect(result.close.toString()).toBe('50250.55555555');
     expect(result.volume.toString()).toBe('123.456789');
-    expect(result.quoteVolume.toString()).toBe('6172839.45');
+    expect(result.quoteVolume?.toString()).toBe('6172839.45');
     expect(result.openTimeMs).toBe(1700000000000);
     expect(result.closeTimeMs).toBe(1700000059999);
     expect(result.providerEventTimeMs).toBe(1700000055000);
@@ -336,11 +336,32 @@ describe('CoinDCX WebSocket — Public Candle Wire Validation', () => {
     expect(payload.low.toString()).toBe('65400');
     expect(payload.close.toString()).toBe('65480.5');
     expect(payload.volume.toString()).toBe('10.55');
-    expect(payload.quoteVolume.toString()).toBe('690500.75');
+    expect(payload.quoteVolume?.toString()).toBe('690500.75');
     expect(payload.openTimeMs).toBe(1700000000000);
     expect(payload.closeTimeMs).toBe(1700000059999);
     expect(payload.isClosed).toBe(false);
 
     stream.stop();
+  });
+
+  it('47. missing quote_volume is normalized to null without fabricating zero', () => {
+    const raw = makeRawCandle({
+      data: [
+        {
+          open: '50000',
+          high: '50500',
+          low: '49800',
+          close: '50250',
+          volume: '100',
+          quote_volume: undefined,
+          open_time: 1700000000,
+          close_time: 1700000059.999,
+          pair: 'B-BTC_USDT',
+          duration: '1m',
+        },
+      ],
+    });
+    const result = validateAndNormalizeCandleEvent(raw, 'B-BTC_USDT');
+    expect(result.quoteVolume).toBeNull();
   });
 });

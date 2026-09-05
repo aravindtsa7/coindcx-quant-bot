@@ -174,7 +174,7 @@ export function validateAndNormalizeCandleEvent(
   const volume = parseFinancialDecimal(candle.volume, 'volume');
   const quoteVolume = candle.quote_volume !== undefined
     ? parseFinancialDecimal(candle.quote_volume, 'quote_volume')
-    : new Decimal(0);
+    : null;
 
   // Prices must be non-negative
   if (open.isNegative() || high.isNegative() || low.isNegative() || close.isNegative()) {
@@ -182,7 +182,7 @@ export function validateAndNormalizeCandleEvent(
   }
 
   // Volumes must be non-negative
-  if (volume.isNegative() || quoteVolume.isNegative()) {
+  if (volume.isNegative() || (quoteVolume !== null && quoteVolume.isNegative())) {
     throw new CoinDcxSocketValidationError('Candle volumes must be non-negative');
   }
 

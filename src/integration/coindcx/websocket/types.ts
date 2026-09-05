@@ -67,7 +67,7 @@ export interface PublicCandleUpdatePayload {
   readonly low: Decimal;
   readonly close: Decimal;
   readonly volume: Decimal;
-  readonly quoteVolume: Decimal;
+  readonly quoteVolume: Decimal | null;
   readonly openTimeMs: number;
   readonly closeTimeMs: number;
   readonly providerEventTimeMs: number;
