@@ -1,5 +1,5 @@
 import { CanonicalDecimal } from '../canonical-decimal';
-import { CanonicalCandle1m } from '../types';
+import { CanonicalCandle1m, isCanonicalCandleSource } from '../types';
 import { AggregationDecimal, DerivedAggregateDecimal } from './derived-aggregate-decimal';
 import { HigherTimeframeCandle } from './types';
 import { MINUTE_MS, assertMinuteAlignedOpenTimeMs, bucketEndExclusiveMs, bucketStartMs, durationMs } from './timeframe';
@@ -14,7 +14,7 @@ function assertCanonicalConstituent(candle: CanonicalCandle1m): void {
     throw new TypeError('Canonical constituent decimals are invalid');
   }
   if (candle.quoteVolume !== null && !(candle.quoteVolume instanceof CanonicalDecimal)) throw new TypeError('Invalid canonical quote volume');
-  if ((candle.source !== 'WS_FINALIZED' && candle.source !== 'REST_RECOVERY') || candle.high.lessThan(candle.low) || candle.high.lessThan(candle.open) || candle.high.lessThan(candle.close) || candle.low.greaterThan(candle.open) || candle.low.greaterThan(candle.close)) {
+  if (!isCanonicalCandleSource(candle.source) || candle.high.lessThan(candle.low) || candle.high.lessThan(candle.open) || candle.high.lessThan(candle.close) || candle.low.greaterThan(candle.open) || candle.low.greaterThan(candle.close)) {
     throw new TypeError('Invalid canonical constituent structure');
   }
 }

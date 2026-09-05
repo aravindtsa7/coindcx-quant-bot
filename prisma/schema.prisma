@@ -40,3 +40,25 @@ model Candle1m {
   @@index([pair, openTimeMs], map: "candles_1m_pair_open_time_ms_idx")
   @@map("candles_1m")
 }
+
+/// Immutable certification record for a complete canonical historical 1m range.
+model HistoricalDataset {
+  datasetId           String   @id @map("dataset_id") @db.VarChar(64)
+  schemaVersion       Int      @map("schema_version")
+  venue               String   @db.VarChar(32)
+  market              String   @db.VarChar(32)
+  resolutionMinutes   Int      @map("resolution_minutes")
+  pair                String   @db.VarChar(64)
+  fromInclusiveMs     BigInt   @map("from_inclusive_ms")
+  toExclusiveMs       BigInt   @map("to_exclusive_ms")
+  expectedCandleCount Int      @map("expected_candle_count")
+  actualCandleCount   Int      @map("actual_candle_count")
+  firstOpenTimeMs     BigInt   @map("first_open_time_ms")
+  lastOpenTimeMs      BigInt   @map("last_open_time_ms")
+  contentSha256       String   @map("content_sha256") @db.VarChar(64)
+  createdAt           DateTime @default(now()) @map("created_at")
+
+  @@unique([pair, fromInclusiveMs, toExclusiveMs], map: "historical_datasets_pair_range_unique")
+  @@index([pair], map: "historical_datasets_pair_idx")
+  @@map("historical_datasets")
+}

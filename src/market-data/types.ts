@@ -1,6 +1,13 @@
 import { CanonicalDecimal } from './canonical-decimal';
 
-export type CanonicalCandleSource = 'WS_FINALIZED' | 'REST_RECOVERY';
+export const CANONICAL_CANDLE_SOURCES = ['WS_FINALIZED', 'REST_RECOVERY', 'REST_HISTORICAL'] as const;
+
+export type CanonicalCandleSource = (typeof CANONICAL_CANDLE_SOURCES)[number];
+
+/** Runtime guard for strings read from untyped transports and persistence. */
+export function isCanonicalCandleSource(value: unknown): value is CanonicalCandleSource {
+  return typeof value === 'string' && (CANONICAL_CANDLE_SOURCES as readonly string[]).includes(value);
+}
 
 /**
  * Immutable canonical closed 1-minute candlestick domain model.

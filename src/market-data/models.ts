@@ -1,7 +1,7 @@
 import { Decimal } from '../core/decimal/decimal';
 import { CanonicalDecimal } from './canonical-decimal';
 import { CanonicalValidationError } from './errors';
-import { CanonicalCandle1m, CanonicalCandleSource } from './types';
+import { CanonicalCandle1m, CanonicalCandleSource, isCanonicalCandleSource } from './types';
 
 // Sane minimum timestamp boundary: 2020-01-01T00:00:00.000Z
 export const MIN_CANONICAL_OPEN_TIME_MS = 1577836800000;
@@ -95,7 +95,7 @@ export function createCanonicalCandle1m(params: CreateCanonicalCandleParams): Ca
     throw new CanonicalValidationError(`Structural OHLC violation: low (${low.value}) > close (${close.value})`);
   }
 
-  if (source !== 'WS_FINALIZED' && source !== 'REST_RECOVERY') {
+  if (!isCanonicalCandleSource(source)) {
     throw new CanonicalValidationError(`Invalid source: ${source}`);
   }
 

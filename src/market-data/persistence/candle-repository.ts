@@ -3,7 +3,7 @@ import { prisma as defaultPrisma } from '../../persistence/prisma';
 import { CanonicalDecimal } from '../canonical-decimal';
 import { CanonicalCandleConflictError, CanonicalCandleError } from '../errors';
 import { areCanonicalCandlesIdentical, createCanonicalCandle1m } from '../models';
-import { CanonicalCandle1m, CanonicalCandleSource } from '../types';
+import { CanonicalCandle1m, isCanonicalCandleSource } from '../types';
 import { Canonical1mRangeReader } from '../higher-timeframe/types';
 
 export type InsertCandleOutcome = 'INSERTED' | 'ALREADY_IDENTICAL';
@@ -139,6 +139,9 @@ export class PrismaCandle1mRepository implements Candle1mRepository, Canonical1m
     generationId: number | null;
     finalizedAt: Date;
   }): CanonicalCandle1m {
+    if (!isCanonicalCandleSource(row.source)) {
+      throw new CanonicalCandleError(`Persisted candle source '${row.source}' is not a valid CanonicalCandleSource`);
+    }
     return createCanonicalCandle1m({
       pair: row.pair,
       openTimeMs: Number(row.openTimeMs),
@@ -148,7 +151,7 @@ export class PrismaCandle1mRepository implements Candle1mRepository, Canonical1m
       close: CanonicalDecimal.from(row.close.toString()),
       volume: CanonicalDecimal.from(row.volume.toString()),
       quoteVolume: row.quoteVolume !== null ? CanonicalDecimal.from(row.quoteVolume.toString()) : null,
-      source: row.source as CanonicalCandleSource,
+      source: row.source,
       finalizedAtMs: row.finalizedAt.getTime(),
       providerEventTimeMs: row.providerEventTimeMs !== null ? Number(row.providerEventTimeMs) : null,
       generationId: row.generationId,
