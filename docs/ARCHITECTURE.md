@@ -81,11 +81,17 @@ The **CoinDCX Quant Futures Bot** is built as a highly deterministic, modular Ty
 ### 2.4 Canonical 1m Store
 - The definitive, immutable record of 1-minute OHLCV candles persisted to MySQL 8.
 - Serves as the single source of truth across backtesting, paper trading, shadow mode, and live execution.
-- Bars are finalized only after the 1-minute window has elapsed and all out-of-order ticks are settled.
+- Bars are finalized authoritatively by Phase 5 using successor-confirmed finality (requiring observation of a valid strictly later minute; wall-clock advance alone never finalizes a candle), gap detection with REST recovery barriers, and strict persist-before-publish guarantees.
 
 ### 2.5 Timeframe Aggregation
-- Pure mathematical aggregation engine that synthesizes higher timeframes (5m, 15m, 30m, 1h, 4h, 1d) strictly from canonical 1m candles.
-- Eliminates timeframe discrepancies between backtesting datasets and live operational feeds.
+- Pure mathematical aggregation engine that synthesizes generic higher timeframes (initial production-supported set: 2m, 3m, 4m, 5m, 10m, 15m, 30m, 1h, 4h, 1d) strictly from authoritative Phase 5 canonical closed 1m candles.
+- Core architecture is generic for safe integer durations (`Number.isSafeInteger(timeframeMinutes) && timeframeMinutes >= 2`, preserving Phase 5 canonical 1m exclusivity) with UTC Unix-anchored bucket boundaries and exact constituent completeness ($N$ contiguous 1m candles; zero data fabrication or forward-filling).
+- Enforces pair-scoped serialized execution across all operations (live processing, startup hydration, and resync) to eliminate race conditions and chronological inversion.
+- Controlled by an explicit pair operational state model (`INITIALIZING`, `READY`, `BLOCKED`, `RESYNCING`) gated strictly by Phase 5 eligibility (`state === 'HEALTHY'`, `truthFault === 'NONE'`, `recoveryRequired === false`).
+- Employs an isolated 64-bit calculation context and `DerivedAggregateDecimal` bounds (scale $\le 18$, integer $\le 30$, precision $\le 48$) to prevent precision truncation during multi-candle summation.
+- Guarantees deterministic live/batch parity: the identical pure aggregation primitive (`aggregateExactBucket`) is executed across live streaming, historical dataset processing, indicator warmup, and backtesting, ensuring byte-equivalent derived market data.
+- Reads exclusively from local MySQL `candles_1m` via `Canonical1mRangeReader` with zero external exchange calls and zero higher-timeframe database tables.
+- Subordinate to Phase 5 host lifecycle: Phase 6 starts after Phase 5, unsubscribes and stops before Phase 5, and tracks engine-level run ownership to isolate stale async callbacks.
 
 ### 2.6 Indicator Engine
 - Deterministic, zero-side-effect computational library for technical and quantitative indicators (EMA, RSI, ATR, Bollinger Bands, etc.).

@@ -23,7 +23,7 @@ Onboarding a new coin (such as SOL) must never require altering the core engine,
 The finalized 1-minute candle is the foundational source of truth for all quantitative analysis. All market data ingestion paths converge onto canonical 1m candles stored in MySQL.
 
 ### Invariant 7: Higher Timeframe Derivation
-All higher timeframes (5m, 15m, 30m, 1h, 4h, 1d) must be mathematically synthesized exclusively from canonical 1m candles. Exchange-provided higher-timeframe candles must not be used as authoritative data sources.
+All configured higher timeframes (including the initial production-supported set: 2m, 3m, 4m, 5m, 10m, 15m, 30m, 1h, 4h, 1d) must be mathematically synthesized exclusively from authoritative canonical 1m candles using exact constituent completeness without data fabrication. The core aggregation engine is strictly generic for safe integer durations (`timeframeMinutes: integer >= 2`, preserving canonical 1m exclusivity in Phase 5) and must not hardcode timeframe durations or coin symbols. All operations must be serialized per pair and strictly gated by upstream canonical health; derived aggregate sums must maintain exact decimal precision without silent truncation. Exchange-provided higher-timeframe candles must not be used as authoritative data sources.
 
 ### Invariant 8: Stale Data Protection
 Incomplete, missing, or stale market data must immediately inhibit new live trade entries. If the latency between the current timestamp and the latest finalized candle exceeds predefined safety thresholds, signal processing for that instrument must halt.
