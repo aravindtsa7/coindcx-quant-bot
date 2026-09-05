@@ -4,6 +4,7 @@ import { CanonicalDecimal } from '../canonical-decimal';
 import { CanonicalCandleConflictError, CanonicalCandleError } from '../errors';
 import { areCanonicalCandlesIdentical, createCanonicalCandle1m } from '../models';
 import { CanonicalCandle1m, CanonicalCandleSource } from '../types';
+import { Canonical1mRangeReader } from '../higher-timeframe/types';
 
 export type InsertCandleOutcome = 'INSERTED' | 'ALREADY_IDENTICAL';
 
@@ -27,7 +28,7 @@ export interface Candle1mRepository {
  *   - If existing row differs: CanonicalCandleConflictError (fail-closed, never overwrite).
  * - Persist-before-publish safety barrier.
  */
-export class PrismaCandle1mRepository implements Candle1mRepository {
+export class PrismaCandle1mRepository implements Candle1mRepository, Canonical1mRangeReader {
   readonly #prisma: PrismaClient;
 
   constructor(prismaClient: PrismaClient = defaultPrisma) {
@@ -74,6 +75,7 @@ export class PrismaCandle1mRepository implements Candle1mRepository {
   }
 
   public async getLatestCanonicalCandle(pair: string): Promise<CanonicalCandle1m | null> {
+    if (!pair || pair.trim() === '') throw new CanonicalCandleError('Pair is required for latest canonical read');
     const row = await this.#prisma.candle1m.findFirst({
       where: { pair },
       orderBy: { openTimeMs: 'desc' },
@@ -95,6 +97,31 @@ export class PrismaCandle1mRepository implements Candle1mRepository {
 
     if (!row) return null;
     return this.#mapRowToCanonicalCandle(row);
+  }
+
+  public async getRange(
+    pair: string,
+    fromInclusiveMs: number,
+    toInclusiveMs: number
+  ): Promise<readonly CanonicalCandle1m[]> {
+    if (!pair || pair.trim() === '') throw new CanonicalCandleError('Pair is required for canonical range read');
+    for (const value of [fromInclusiveMs, toInclusiveMs]) {
+      if (!Number.isSafeInteger(value) || value % 60_000 !== 0) {
+        throw new CanonicalCandleError(`Canonical range boundary must be safe UTC-minute aligned: ${value}`);
+      }
+    }
+    if (fromInclusiveMs > toInclusiveMs) throw new CanonicalCandleError('Canonical range start must not exceed end');
+    const rows = await this.#prisma.candle1m.findMany({
+      where: { pair, openTimeMs: { gte: BigInt(fromInclusiveMs), lte: BigInt(toInclusiveMs) } },
+      orderBy: { openTimeMs: 'asc' },
+    });
+    const candles = rows.map((row) => this.#mapRowToCanonicalCandle(row));
+    for (let index = 1; index < candles.length; index++) {
+      if (candles[index - 1]?.openTimeMs === candles[index]?.openTimeMs) {
+        throw new CanonicalCandleError(`Duplicate canonical range row for ${pair}`);
+      }
+    }
+    return candles;
   }
 
   #mapRowToCanonicalCandle(row: {

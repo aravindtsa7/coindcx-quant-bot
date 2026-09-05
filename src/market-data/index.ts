@@ -7,3 +7,4 @@ export * from './rest-candle-reader';
 export * from './persistence/candle-repository';
 export * from './pair-state';
 export * from './canonical-engine';
+export * from './higher-timeframe';
