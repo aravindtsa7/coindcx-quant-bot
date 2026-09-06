@@ -131,7 +131,7 @@ To guarantee bit-for-bit cryptographic binding without retaining multi-year data
 
 ```
                           PRODUCTION TWO-PASS PIPELINE
-                          
+
   [ Historical Source ]
            │
            ├─► PASS 1: FULL MANIFEST VERIFICATION
@@ -343,7 +343,7 @@ export interface BacktestIndicatorBinding<T = unknown> {
 
 ## 9. Higher-Timeframe Derivation Rule
 
-Phase 9 **never** implements OHLC candle aggregation logic. 
+Phase 9 **never** implements OHLC candle aggregation logic.
 
 For every higher-timeframe bar closing at timestamp $T$:
 ```typescript
