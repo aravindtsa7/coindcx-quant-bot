@@ -106,8 +106,20 @@ The **CoinDCX Quant Futures Bot** is built as a highly deterministic, modular Ty
 - Preserves Phase 6 batch/live parity: stores canonical 1m truth only; higher timeframes are derived dynamically via `aggregateExactBucket`.
 
 ### 2.7 Indicator Engine
-- Deterministic, zero-side-effect computational library for technical and quantitative indicators (EMA, RSI, ATR, Bollinger Bands, etc.).
-- Operates exclusively on decimal-safe inputs and arrays of validated candles.
+- Deterministic, zero-side-effect computational layer for technical and quantitative indicators (SMA, EMA, Wilder RMA, ATR, RSI, MACD, Bollinger Bands, DMI/ADX, SuperTrend, Donchian Channel, UTC-day VWAP, Volume SMA, Volume Ratio).
+- Consumes strictly closed, validated market data truth from Phase 5 `CanonicalCandle1m` (timeframe = 1m) and Phase 6 `HigherTimeframeCandle` via a normalized, read-only `IndicatorCandle` view; does not duplicate candle aggregation.
+- Operates within deterministic calculation segments defined by `bootstrapStartOpenTimeMs`; exact recursive indicator state parity across restarts requires replaying continuous closed candles from the identical bootstrap origin (claims that "recent warmup candles" reconstruct recursive state are strictly barred).
+- Executes within an isolated 128-digit Decimal calculation context (`IndicatorCalcDecimal`, `ROUND_HALF_UP`) with total prohibition of native floating-point math, providing deterministic headroom for Bollinger squared sums (up to 77 digits) and VWAP price-volume accumulations (up to 88 digits).
+- Strictly prevents internal state contamination: recursive indicator states retain full 128-digit precision and never feed rounded 18dp public outputs back into recursive state machines.
+- Enforces strict prefix determinism (zero lookahead): indicator output for candle $t$ depends strictly on candles $\le t$ within the calculation segment; future candles never alter past results; centered windows and retroactive repainting are barred.
+- Guarantees exact batch/incremental parity: batch computations feed the identical sequential state kernel as live incremental processing; batch results equal incremental results timestamp-by-timestamp across all supported indicators.
+- Employs deterministic warmup alignment: emits explicit `value: null` (never `0`, `NaN`, `Infinity`, or fake seeds) until mathematical warmup conditions are met.
+- Enforces runtime safety on UTC-day VWAP: requires `floor(openTimeMs / 86_400_000) === floor((closeTimeExclusiveMs - 1) / 86_400_000)`, failing closed on candles genuinely straddling UTC midnight without synthetic splitting or open-day attribution.
+- Enforces universal parameter boundary $1 \le period \le 100\,000$ (`MAX_INDICATOR_PERIOD`) and bounded memory guarantees ($O(period)$ for rolling indicators, $O(1)$ for recursive state machines).
+- Maintains complete state isolation per instrument pair, timeframe, indicator type, parameter set, and bootstrap origin with zero module-global mutable state; multi-timeframe strategies combine independent indicator instances.
+- Zero indicator database persistence: indicators are pure derived mathematical transformations; restart and recovery replay closed warmup candles from the segment origin.
+- Explicitly defers true Volume Profile pending canonical trade-level price-volume data; synthetic intrabar volume distribution heuristics across OHLCV candles are strictly prohibited.
+- Complete mathematical specifications, recurrence relations, precision budgets, and verification fixtures are frozen in `docs/INDICATOR_ENGINE.md`.
 
 ### 2.8 Strategy Research Lab
 - Unified framework hosting quantitative strategy definitions.
