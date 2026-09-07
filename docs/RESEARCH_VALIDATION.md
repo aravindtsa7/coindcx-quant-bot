@@ -24,7 +24,7 @@ Phase 12 answers one fundamental question:
 │                                                                                 │
 │   ┌─────────────────────────────────────────────────────────────────────────┐   │
 │   │ 1. Canonical Validation Plan & Cross-Fold Subject Identity              │   │
-│   │    - validationPlanId binds datasets, folds, holdout, policies, gates   │   │
+│   │    - validationPlanId binds pairBindings, folds, holdout, gates         │   │
 │   │    - validationSubjectId = SHA-256(pair, strategyId, version, paramHash)│   │
 │   │    - holdoutExposureDeclaration: UNSEEN_BY_OPERATOR | PREVIOUSLY_OBSERVED│   │
 │   └────────────────────────────────────┬────────────────────────────────────┘   │
@@ -150,12 +150,67 @@ Because Phase 11's completed-result cache (`MatrixCompletedResultCache`) returns
 3. **Collector Verification Invariant:** For every planned cell that returns `status: 'COMPLETED'` during a Phase 12 validation run, Phase 12 **MUST** verify that an authoritative, finalized `ValidationEvidenceCollector` exists for that cell. If `cell.status === 'COMPLETED'` but verified event evidence is missing or unfinalized, the evaluation fails closed immediately with `EVIDENCE_INTEGRITY_FAILURE`. No subject may receive a verdict of `PASSED` without genuine event evidence.
 4. **Future Persisted Evidence Cache:** Out of scope for V1. Any future evidence cache must be content-addressed and cryptographically bound to `runId`, `resultSha256`, and `eventLedgerSha256`.
 
+### 2.5 Matrix Construction from Canonical Pair Bindings & Runtime Resource Cross-Check
+To ensure bit-for-bit reproducible backtest execution and avoid missing parameter contracts, Phase 12 directly reuses Phase 11's production pair catalog structure:
+```typescript
+export interface MatrixPairCatalogEntry {
+  readonly pair: string;
+  readonly datasetBinding: MatrixPairDatasetBinding;
+  readonly fixedResearchQuantity: string;
+  readonly instrumentSpecSnapshotId: string;
+  readonly fundingScheduleBinding: {
+    readonly sourceId: string;
+    readonly contentSha256: string;
+    readonly fidelity: BacktestFundingFidelity;
+  };
+}
+```
+
+1. **Full Pair Execution Binding:** Phase 12 canonical plans store `readonly pairBindings: readonly MatrixPairCatalogEntry[]`. This binds dataset identity (`datasetId`, `datasetContentSha256`), nominal research quantity (`fixedResearchQuantity`), instrument specification snapshot (`instrumentSpecSnapshotId`), and funding schedule binding (`sourceId`, `contentSha256`, `fidelity`).
+2. **Phase 11 Matrix Plan Construction:** For every generated Phase 11 matrix execution (IS fold, OOS fold, BASELINE, cost-stress scenarios, and final holdout), the matrix plan input `StrategyCoinMatrixPlanInput.pairs` is passed directly and immutably from `validationPlan.pairBindings`:
+   - No reconstruction from caller-owned mutable data.
+   - `fixedResearchQuantity` remains invariant across all folds and stress scenarios.
+   - Instrument spec snapshot remains invariant across all folds and stress scenarios.
+   - Funding schedule binding remains invariant across all folds and stress scenarios.
+   - The only per-execution differences are `researchWindow` (temporal bounds for IS, OOS, or holdout), `costModel` (for explicit stress scenarios), matrix plan name, and execution-only options (`verificationPageMinutes`, `workerCount`).
+3. **Runtime Resource Cross-Check (`assertPairResourceIdentity`):** Before executing any matrix cell, Phase 12 cross-checks each canonical `pairBinding` against `dependencies.pairResources` (`MatrixPairExecutionResources[]`):
+   - For each pair in `pairBindings`, exactly one matching runtime resource must be present.
+   - Phase 12 invokes Phase 11's authoritative `assertPairResourceIdentity(pairBinding, resource)`, asserting bit-for-bit equality of `datasetId`, `datasetContentSha256`, `instrumentSpecSnapshotId`, funding `sourceId`, `contentSha256`, and `fidelity`.
+   - Missing, duplicate, foreign, or mismatched pair resources fail closed immediately with `RESOURCE_IDENTITY_MISMATCH` (or `VALIDATION_PLAN_INVALID` if detected at plan time).
+   - `fixedResearchQuantity` is NOT extracted from runtime resources because `MatrixPairExecutionResources` does not own that field; the canonical `pairBinding` owns `fixedResearchQuantity`.
+4. **Fixed Research Quantity Authority:** `fixedResearchQuantity` is validated exclusively via Phase 11 / Phase 10 adapter authority (`normalizeFixedResearchQuantity`). Phase 12 does NOT normalize it with a new formula, scale it per fold, risk-adjust it, equity-adjust it, or coin-normalize it. Phase 13 owns dynamic position sizing.
+5. **Funding & Instrument Lineage:** Every fold/stress/holdout evidence record traces directly to the Phase 11 matrix cell whose `runId` already cryptographically binds the genuine Phase 9 manifest and resources. Phase 12 never creates a separate instrument or funding identity formula.
+
 ---
 
 ## 3. Deterministic Validation Plan & Plan Identity (`validationPlanId`)
 
-### 3.1 Input-Side Immutability
+### 3.1 Input-Side Immutability & Safe Plan Construction
 All caller-provided configuration objects, candidate spaces, threshold sets, temporal boundaries, and operator attestations are defensively deep-copied and deep-frozen upon ingestion. Subsequent mutations to caller memory have zero effect on validation plan contents, execution, or identities.
+
+#### Public Plan Input vs. Finalized Plan Split:
+To prevent callers from injecting unverified Git identities or contradictory pair universes, Phase 12 enforces a strict construction split analogous to Phase 11:
+- **`ResearchValidationPlanInput` (Public Caller Input):** Accepts caller-controlled research parameters, strategy candidate spaces, `pairBindings`, temporal windows, walk-forward config, holdout config, metric policies, and approval thresholds. It **DOES NOT** accept `schemaVersion`, `sourceIdentity`, `validationPlanId`, or derived `pairUniverse`.
+- **`ResearchValidationPlan` (Finalized Canonical Plan):** Contains the immutable canonical plan, including `schemaVersion: 1`, authoritative `sourceIdentity.gitCommitHash`, derived `pairUniverse`, and full `pairBindings`.
+
+#### Plan Construction Flow:
+1. **Defensive Ingestion:** Deep-copies and freezes all caller inputs (`matrixDeepCopyFreeze`).
+2. **Pair Binding Normalization & Validation:**
+   - `pairBindings` must be non-empty.
+   - Pair names must be unique and valid string identifiers.
+   - `datasetBinding.pair === entry.pair`.
+   - Valid SHA-256 for dataset, instrument, and funding schedule content.
+   - Valid `fixedResearchQuantity` normalized via Phase 10 `normalizeFixedResearchQuantity`.
+   - Lexicographically sorted by `pair` ascending (`ascii(left.pair, right.pair)`).
+   - Any duplicate, format mismatch, or invalid identifier throws `VALIDATION_PLAN_INVALID`.
+3. **Derived Pair Universe:**
+   `pairUniverse` is canonically derived as the projection `pairBindings.map(b => b.pair)`. The public caller cannot supply an independent or conflicting `pairUniverse`.
+4. **Authoritative Git Source Verification:**
+   Captures clean Git commit hash ONCE using the existing Phase 11 `ProductionGitSourceVerifier` (`git rev-parse HEAD` and `git status --porcelain=v1 --untracked-files=all` must be empty). Public callers cannot inject fake or unverified `sourceIdentity`. (For testing, an internal verifier seam accepts `GitSourceVerifier`).
+5. **Finalized Plan Assembly:**
+   Constructs `ResearchValidationPlan` with `schemaVersion: 1`, verified `sourceIdentity.gitCommitHash`, derived `pairUniverse`, and normalized `pairBindings`.
+6. **Canonical Plan ID Computation:**
+   Computes `validationPlanId = sha256CanonicalJson(finalized canonical plan)`.
 
 ### 3.2 Canonical Validation Plan Schema (`ResearchValidationPlan`)
 ```typescript
@@ -231,20 +286,15 @@ export interface ValidationOverfittingConfig {
   readonly metric: 'DEFLATED_SHARPE_Z';
 }
 
-export interface ResearchValidationPlan {
-  readonly schemaVersion: 1;
+export interface ResearchValidationPlanInput {
   readonly planName: string;
   readonly validationPolicyVersion: 'P12_VALIDATION_POLICY_V1';
-  readonly sourceIdentity: {
-    readonly gitCommitHash: string;        // Full 40-hex or 64-hex commit OID
-  };
-  readonly pairUniverse: readonly string[]; // Sorted lexicographically
+  readonly pairBindings: readonly MatrixPairCatalogEntry[];
   readonly strategies: readonly {
     readonly strategyId: string;
     readonly strategyVersion: string;
     readonly candidateSpace: StrategyParameterCandidateSpace;
   }[];
-  readonly datasetBindings: readonly MatrixPairDatasetBinding[];
   readonly validationWindow: {
     readonly startMs: number;              // Safe integer, UTC day-aligned
     readonly endExclusiveMs: number;       // Safe integer, UTC day-aligned
@@ -259,6 +309,14 @@ export interface ResearchValidationPlan {
   readonly backtestBaseConfig: MatrixBacktestExecutionConfig;
   readonly parameterNeighborhoods?: readonly ParameterNeighborhoodMapping[];
 }
+
+export interface ResearchValidationPlan extends ResearchValidationPlanInput {
+  readonly schemaVersion: 1;
+  readonly sourceIdentity: {
+    readonly gitCommitHash: string;        // Full 40-hex or 64-hex commit OID
+  };
+  readonly pairUniverse: readonly string[]; // Derived canonical projection: pairBindings.map(b => b.pair)
+}
 ```
 
 ### 3.3 Deterministic Plan ID (`validationPlanId`)
@@ -269,8 +327,14 @@ $$\text{validationPlanId} = \text{SHA-256}\left(\text{CanonicalJson}(\text{Resea
 2. Safe integer day-aligned timestamps.
 3. Quantized canonical decimal strings for all financial thresholds and rates.
 4. Includes `holdout.exposureDeclaration` and all explicit thresholds.
-5. **Strictly Excluded:** Wall-clock timestamps (`Date.now()`), execution durations, CPU architecture, hostnames, PIDs, temporary paths, and worker concurrency counts.
-6. Any alteration to candidate spaces, date windows, walk-forward parameters, holdout boundaries, cost stress models, Monte Carlo settings, or approval thresholds generates a new, distinct `validationPlanId`.
+5. **Full Pair Execution Binding Coverage:** Binds the complete normalized `pairBindings` array. Changing ANY of:
+   - `fixedResearchQuantity`
+   - `instrumentSpecSnapshotId`
+   - funding `sourceId`, `contentSha256`, or `fidelity`
+   - `datasetId` or `datasetContentSha256`
+   deterministically alters `validationPlanId`. No pair execution input required by Phase 11 may remain an unbound runtime-only choice.
+6. **Strictly Excluded:** Wall-clock timestamps (`Date.now()`), execution durations, CPU architecture, hostnames, PIDs, temporary paths, and worker concurrency counts.
+7. Any alteration to candidate spaces, pair bindings, date windows, walk-forward parameters, holdout boundaries, cost stress models, Monte Carlo settings, or approval thresholds generates a new, distinct `validationPlanId`.
 
 ---
 
@@ -870,7 +934,7 @@ export interface ResearchValidationPlanResult {
 - Every fold, stress, and holdout Phase 11 matrix execution must bind and verify the **identical** expected commit.
 - Before dispatching each new matrix execution and after the final execution:
   The engine verifies clean repository state (`git status --porcelain=v1 --untracked-files=all` must be empty) and exact expected commit (`git rev-parse HEAD`).
-- Existing Phase 11 Git verification authority (`verifyCleanGitWorkingTree`) is reused; no separate unsafe shell-based verifier is created.
+- Existing Phase 11 Git verification authority (`ProductionGitSourceVerifier` / `GitSourceVerifier`) is reused; no separate unsafe shell-based verifier is created.
 - If source becomes dirty or HEAD changes during execution:
   - No subsequent validation execution starts.
   - The validation plan terminates `status: 'FAILED'`.
@@ -914,8 +978,8 @@ export type ValidationErrorCode =
 
 | Invariant ID | Name | Formal Specification |
 | :--- | :--- | :--- |
-| **P12-I01** | **Deterministic Validation Plan Identity** | `validationPlanId` derives via `sha256CanonicalJson(ResearchValidationPlan)` binding all datasets, windows, candidate spaces, walk-forward parameters, holdout boundaries, operator attestation, cost models, Monte Carlo policies, and approval thresholds. Environment and timing metadata are excluded. |
-| **P12-I02** | **Exact Phase 11 / Phase 9 Lineage** | Every validation evaluation executes through the genuine Phase 11 `executeCell` $\to$ Phase 9 `BacktestEngine` path. Research mocks or synthetic candle simulators are strictly prohibited. Every subject retains genuine cell, run, outcome, and ledger IDs. |
+| **P12-I01** | **Deterministic Validation Plan Identity** | `validationPlanId` derives via `sha256CanonicalJson(ResearchValidationPlan)` canonically binding full `pairBindings` (pair, datasetBinding, fixedResearchQuantity, instrumentSpecSnapshotId, and fundingScheduleBinding { sourceId, contentSha256, fidelity }), derived `pairUniverse`, windows, candidate spaces, walk-forward parameters, holdout boundaries, operator attestation, cost models, Monte Carlo policies, and approval thresholds. Environment and timing metadata are excluded. |
+| **P12-I02** | **Exact Phase 11 / Phase 9 Lineage** | Every validation evaluation executes through the genuine Phase 11 `executeCell` $\to$ Phase 9 `BacktestEngine` path using matrix plans constructed directly from `validationPlan.pairBindings` without mutating fixedResearchQuantity, instrument specs, or funding schedules across folds, stress runs, or holdout runs. Research mocks or synthetic candle simulators are strictly prohibited. Every subject retains genuine cell, run, outcome, and ledger IDs. |
 | **P12-I03** | **Independent Observed Event Ledger Hash** | The evidence collector must independently hash the complete observed event stream using `updateCanonicalEventHash`. The finalized `observedEventLedgerSha256` must strictly equal Phase 9's `outcome.eventLedgerSha256`; mismatch fails closed with `EVIDENCE_INTEGRITY_FAILURE`. |
 | **P12-I04** | **Zero Warmup Metric Contamination** | Observations prior to `evaluationFromInclusiveMs` are strictly quarantined and never enter daily return series, trade counts, PnL calculations, or validation metrics. |
 | **P12-I05** | **Deterministic UTC Daily Equity & Return Series** | At `analysisStartMs`, baseline equity $E_0$ is captured after same-timestamp flush; metrics observe $\text{analysisStartMs} < T \le \text{analysisEndExclusiveMs}$, including final candle close and funding. $N+1$ UTC boundaries produce exactly $N$ daily returns $R_d = \frac{E_d - E_{d-1}}{E_{d-1}}$. Missing boundaries fail closed. |
@@ -953,7 +1017,7 @@ export type ValidationErrorCode =
 ## 21. Architecture Questions & Closed Resolutions
 
 ### Q1: How exactly does Phase 12 obtain event/equity evidence without duplicating Phase 9 or Phase 11 execution?
-**Resolution:** Phase 11 exposes an execution-only `eventSinkFactory` seam in `MatrixExecutionOptions`. When invoked by Phase 12, `executeCell` instantiates Phase 12's `ValidationEvidenceCollector` and passes it directly to `new BacktestEngine(config, sink)`. Phase 9 emits events directly into this sink during execution, achieving single-source execution without duplicating simulators or reconstructing candle PnL.
+**Resolution:** Phase 11 exposes an execution-only `eventSinkFactory` seam in `MatrixExecutionOptions`. Matrix plans are constructed directly from `validationPlan.pairBindings` (preserving canonical dataset, fixed research quantity, instrument spec, and funding schedule identity). When invoked by Phase 12, `executeCell` instantiates Phase 12's `ValidationEvidenceCollector` and passes it directly to `new BacktestEngine(config, sink)`. Phase 9 emits events directly into this sink during execution, achieving single-source execution without duplicating simulators or reconstructing candle PnL.
 
 ### Q2: How is an event evidence bundle cryptographically bound to `matrixCellId`, `runId`, `resultSha256`, and `eventLedgerSha256`?
 **Resolution:** The collector independently hashes every event in sequence using Phase 9's `updateCanonicalEventHash`. After `BacktestEngine.run()` returns, Phase 12 asserts that `observedEventLedgerSha256 === outcome.eventLedgerSha256`, that `outcome.runId === cell.expectedRunId`, and that `resultSha256 === sha256CanonicalJson(outcome without resultSha256)`. The collector packages `CanonicalValidationEvidence` containing all lineage and time-series data, computing `validationEvidenceSha256`. Any mismatch fails closed immediately.
@@ -974,7 +1038,7 @@ export type ValidationErrorCode =
 **Resolution:** The entire candidate parameter space is hashed directly into `validationPlanId`. Adding, removing, or modifying even a single candidate produces a new `validationPlanId`. Furthermore, human freshness is governed by plan-bound `holdoutExposureDeclaration`: declaring `PREVIOUSLY_OBSERVED` prevents satisfying fresh holdout gates.
 
 ### Q8: How are stress runs proven to be genuine new Phase 9 runs?
-**Resolution:** Phase 9 `costModel` is part of `BacktestRunManifest`. Updating the cost model alters the manifest canonical JSON, generating a brand-new Phase 9 `runId` ($\text{runId} = \text{sha256CanonicalJson}(\text{manifest})$). Executing the engine produces real fills, different accounting balances, a new `resultSha256`, and a new `eventLedgerSha256`. Synthetic cost deduction cannot produce these cryptographic proofs.
+**Resolution:** Phase 9 `costModel` is part of `BacktestRunManifest`. Stress matrix plans reuse `validationPlan.pairBindings` without altering execution quantities or market resources, updating only the `costModel`. Updating the cost model alters the manifest canonical JSON, generating a brand-new Phase 9 `runId` ($\text{runId} = \text{sha256CanonicalJson}(\text{manifest})$). Executing the engine produces real fills, different accounting balances, a new `resultSha256`, and a new `eventLedgerSha256`. Synthetic cost deduction cannot produce these cryptographic proofs.
 
 ### Q9: What deterministic algorithm and seed produce Monte Carlo permutations?
 **Resolution:** Seed derived via HMAC-SHA256 over plan, subject, fold, scenario, and policy IDs. Generates pseudorandom 32-bit words via SHA-256 counter mode. Employs unbiased rejection sampling to eliminate modulo bias, driving a Fisher-Yates shuffle of daily net returns to calculate permuted path drawdown distributions without `Math.random`. Path simulated equity is evaluated with high-water-mark tracking, and adverse drawdown is selected at configured `plan.monteCarlo.adversePercentile` via exact integer rank.
@@ -986,10 +1050,10 @@ export type ValidationErrorCode =
 **Resolution:** Phase 12 results contain no rank fields, no composite scores, no winner flags, and no capital allocation weights. Results are sorted strictly by `validationSubjectId` ascending. Each subject receives an independent binary gate evaluation (`PASSED`, `FAILED`, `INSUFFICIENT_EVIDENCE`). Phase 15 is explicitly designated as the sole ranking authority.
 
 ### Q12: How can the same candidate be identified across folds when fold-specific `strategyInstanceId` changes?
-**Resolution:** Defined as `ResearchValidationSubject` with $\text{validationSubjectId} = \text{sha256CanonicalJson}(\{ \text{pair}, \text{strategyId}, \text{strategyVersion}, \text{parameterHash} \})$, which is invariant across folds. Fold-specific `strategyInstanceId`, `matrixCellId`, and `runId` values are recorded as execution lineage under that invariant subject.
+**Resolution:** Defined as `ResearchValidationSubject` with $\text{validationSubjectId} = \text{sha256CanonicalJson}(\{ \text{pair}, \text{strategyId}, \text{strategyVersion}, \text{parameterHash} \})$, which is invariant across folds. Variations in pair execution bindings (such as datasets, quantities, or funding schedules) change `validationPlanId` and run lineage rather than the cross-fold subject identity. Fold-specific `strategyInstanceId`, `matrixCellId`, and `runId` values are recorded as execution lineage under that invariant subject.
 
 ### Q13: What is canonical and hashed versus telemetry-only?
-**Resolution:** Canonical (hashed in `validationResultSha256`): `validationPlanId`, overall status, summary counts, `totalFolds`, `unusedTailMs`, `freshnessBasis`, and per-subject digests sorted by `validationSubjectId` ascending. Telemetry-only (excluded): start/end timestamps, wall-clock duration (`durationMs`), worker concurrency count, process ID, hostname, memory usage, and console output.
+**Resolution:** Canonical (hashed in `validationPlanId` and `validationResultSha256`): `validationPlanId` (which binds `pairBindings`, derived `pairUniverse`, windows, candidate spaces, walk-forward, holdout, cost models, and thresholds), overall status, summary counts, `totalFolds`, `unusedTailMs`, `freshnessBasis`, and per-subject digests sorted by `validationSubjectId` ascending. Telemetry-only (excluded): start/end timestamps, wall-clock duration (`durationMs`), worker concurrency count, process ID, hostname, memory usage, and console output.
 
 ### Q14: What happens if Phase 11 cache has a completed result but Phase 12 lacks event evidence?
 **Resolution:** Phase 12 dependencies structurally omit the cache property, preventing Phase 11 from returning cached results. In addition, Phase 12 asserts that every cell reporting `COMPLETED` has an authentic finalized collector; missing evidence fails closed with `EVIDENCE_INTEGRITY_FAILURE`.
