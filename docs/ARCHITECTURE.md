@@ -152,32 +152,51 @@ The **CoinDCX Quant Futures Bot** is built as a highly deterministic, modular Ty
 - Auditable cryptographic lineage: deterministic JSON serialization with recursive key sorting at every nesting depth, newline-framed event ledger hashing (`eventLedgerSha256`), and comprehensive result hashing (`resultSha256`).
 - Preserves strategy boundaries: pure Phase 10 strategies emit abstract signals through standardized interfaces; Phase 9 executes orders through research orchestration adapters without backtest-specific state leakage or live side effects.
 
-### 2.10 Risk & Leverage Engine
+### 2.10 Strategy × Coin Matrix Research Engine (Phase 11)
+- Authoritative research orchestration engine systematically exploring multi-coin, multi-strategy, multi-parameter quantitative hypothesis spaces.
+- Enforces the deterministic research pipeline:
+  $$\text{Phase 7 Dataset} \longrightarrow \text{Phase 8 Indicators} \longrightarrow \text{Phase 10 Strategy} \longrightarrow \text{Phase 9 Deterministic Backtest} \longrightarrow \text{Phase 11 Matrix Orchestration} \longrightarrow \text{Raw Research Matrix Evidence} \longrightarrow \text{Phase 12 Validation}$$
+- **Predeclared Finite Candidate Space:** Evaluates strictly finite parameter grids and candidate lists. No adaptive mutation, Bayesian optimization, genetic algorithms, or future-result-driven candidate generation.
+- **Input-Side Defensive Immutability:** Defensively deep-copies and deep-freezes all caller-supplied parameter arrays, candidate space maps, and configuration objects upon ingestion, guaranteeing that post-construction caller mutations cannot alter plan contents, `matrixPlanId`, cell definitions, or execution results.
+- **Phase 10 Validation Authority:** Reuses Phase 10 `StrategyDefinition.normalizeParameters` as the sole parameter validation authority. Zero duplicated parameter validator code; invalid parameter combinations fail closed immediately before backtest execution.
+- **Explicit Duplicate Rejection:** Canonical parameter normalization converts numeric equivalents (e.g. `"2.0"` $\to$ `"2"`); logical collisions fail closed with structured duplicate parameter errors rather than silently producing duplicate cells.
+- **Cryptographic Dataset & Window Binding:** Every pair explicitly binds to an immutable Phase 7 `datasetId` and `contentSha256` covering both indicator warmup (`bootstrapFromInclusiveMs`) and the active research window (`evaluationFromInclusiveMs` to `evaluationToExclusiveMs`); auto-picked datasets or coverage gaps fail closed.
+- **Versioned Indicator Bootstrap Policy:** Binds frozen `bootstrapPolicyId` (`P11_INDICATOR_BOOTSTRAP_V1` supporting EMA, ATR, RSI with exact $3 \times period$ lookback); any unsupported indicator type (SMA, MACD, Bollinger, SuperTrend) fails closed immediately before plan finalization or execution without heuristic guessing. Computes common bootstrap alignment across all required timeframes, deterministically generating the authoritative Phase 10 `indicatorBootstrapIdentity` and `strategyInstanceId`.
+- **Verified Clean Git Source Identity:** Enforces full commit OID auto-capture (`git rev-parse HEAD`) and strict working-tree cleanliness (`git status --porcelain=v1 --untracked-files=all` must be empty). Dirty working trees, staged changes, untracked non-ignored files, missing Git metadata, or prebuilt plan commit mismatches fail closed; source state invariance is validated at execution boundaries.
+- **Authoritative Phase 9 Manifest & RunId Path:** Directly invokes the real Phase 9 `normalizeBacktestInputs` and `sha256CanonicalJson` to construct the authoritative `BacktestRunManifest` and `runId`, ensuring zero duplicated serializer/hashing formulas and complete sensitivity propagation across all behavior-altering inputs.
+- **Absolute Phase 9 Parity:** Every matrix cell executes through the genuine Phase 9 `BacktestEngine` and Phase 10 `StrategyKernel` via `StrategyBacktestParticipantAdapter`. Specialized, simplified, or "fast" research mocks are strictly prohibited.
+- **Cryptographic Plan & Cell Lineage:** Produces deterministic SHA-256 `matrixPlanId` over normalized canonical plan bytes, `matrixCellId` over canonical cell identity payload, and expected Phase 9 `runId` binding `fixedResearchQuantity`.
+- **Canonical Cell Ordering & Concurrency Determinism:** Cells are ordered by `pair` $\to$ `strategyId` $\to$ `strategyVersion` $\to$ `parameterHash` $\to$ `strategyInstanceId` $\to$ `expectedRunId`. Multi-worker parallel execution yields bit-for-bit identical ordered results and `matrixResultSha256` independent of completion timing.
+- **Fail-Closed Audit Accounting:** Failed cells never silently disappear. If any cell fails, the matrix reports `PARTIAL` or `FAILED`, preserving all planned cell records in the evidence ledger.
+- **Strict Anti-Scope & Zero Production Mutation:** Phase 11 produces raw, read-only research evidence. It never selects winners, computes statistical rankings, or promotes strategies to paper/live trading. Cross-coin raw PnL is not directly comparable without downstream capital normalization.
+- Complete specifications and verification contracts are frozen in `docs/STRATEGY_COIN_MATRIX.md`.
+
+### 2.11 Risk & Leverage Engine
 - The non-bypassable guardian standing between strategy signals and order execution.
 - Computes position sizing, margin utilization, liquidation distance, and leverage limits.
 - Evaluates circuit breakers: max account drawdown, single-trade risk, daily loss limits, and consecutive loss halts.
 
-### 2.11 Paper Trading & Shadow Mode
+### 2.12 Paper Trading & Shadow Mode
 - **Paper Trading:** Executes strategy signals in real-time against exchange WebSocket feeds with a virtual ledger.
 - **Shadow Mode:** Runs alongside live production accounts, submitting shadow orders in lockstep to benchmark fill probabilities, slippage, and queue delays.
 
-### 2.12 Execution Engine
+### 2.13 Execution Engine
 - State machine managing the lifecycle of an order: `INTENT_CREATED` → `SUBMITTED` → `ACKNOWLEDGED` → `PARTIALLY_FILLED` → `FILLED` / `CANCELLED` / `REJECTED`.
 - Handles intelligent order routing, post-only enforcement, and partial fill tracking.
 
-### 2.13 Reconciliation & Crash Recovery
+### 2.14 Reconciliation & Crash Recovery
 - Runs immediately on startup before any trading loops begin.
 - Fetches ground-truth exchange positions, open orders, and balances from CoinDCX.
 - Resolves inconsistencies between local database state and exchange state; cancels dangling orphan orders.
 
-### 2.14 News Risk Layer
+### 2.15 News Risk Layer
 - Asynchronous risk modifier ingesting macroeconomic event calendars and high-impact crypto news.
 - Dynamically reduces risk scores, throttles leverage, or commands temporary position closure ahead of volatility spikes.
 
-### 2.15 Monitoring & Logging Subsystem
+### 2.16 Monitoring & Logging Subsystem
 - Structured JSON logging powered by Pino with automatic sensitive field redaction.
 - Emits operational heartbeats, latency metrics, and error rates.
 
-### 2.16 Quant Dashboard (Later Phase)
+### 2.17 Quant Dashboard (Later Phase)
 - Planned visualization interface for equity curves, open positions, risk metrics, and strategy health.
 
