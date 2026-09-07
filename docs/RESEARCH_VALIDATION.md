@@ -184,6 +184,7 @@ export interface ValidationMetricPolicyConfig {
   readonly annualizationFactor: 365;       // Constant 365 for 24/7/365 crypto
   readonly minDailyObservations: number;   // Explicit safe integer threshold (e.g. 30)
   readonly minClosedTrades: number;        // Explicit safe integer threshold (e.g. 10)
+  readonly sharpeDegradationDenominatorFloor: string; // Canonical decimal string > "0", e.g. "0.10"
 }
 
 export interface ValidationApprovalThresholds {
@@ -207,7 +208,7 @@ export interface ValidationApprovalThresholds {
 export interface ValidationCostStressConfig {
   readonly policyId: 'P12_COST_STRESS_V1';
   readonly scenarios: readonly {
-    readonly scenarioId: string;
+    readonly scenarioId: string;           // Non-empty, unique stable identifier within the plan
     readonly costModel: {
       readonly makerFeeRate: string;
       readonly takerFeeRate: string;
@@ -220,8 +221,8 @@ export interface ValidationCostStressConfig {
 
 export interface ValidationMonteCarloConfig {
   readonly policyId: 'P12_MONTE_CARLO_PERMUTATION_V1';
-  readonly simulationCount: number;        // Safe integer, e.g. 1000
-  readonly adversePercentile: number;      // Safe integer 1-99, e.g. 95
+  readonly simulationCount: number;        // Safe integer >= 1, e.g. 1000
+  readonly adversePercentile: number;      // Safe integer 1 <= adversePercentile <= 99, e.g. 95
   readonly seedDerivationPolicy: 'HMAC_SHA256_V1';
 }
 
@@ -373,9 +374,16 @@ $$\text{holdoutEndExclusiveMs} > \text{holdoutStartMs}$$
   ```typescript
   holdoutExposureDeclaration: 'UNSEEN_BY_OPERATOR' | 'PREVIOUSLY_OBSERVED'
   ```
-- **Procedural Freshness Gate:**
-  - If `exposureDeclaration === 'PREVIOUSLY_OBSERVED'`: The holdout window is evaluated and reported for audit lineage, but it **MUST NOT** satisfy the fresh holdout approval gate (`GATE-13`). If `thresholds.requireFreshHoldout === true`, the candidate's verdict becomes `INSUFFICIENT_EVIDENCE` (unless a definitive metric failure makes it `FAILED` via verdict precedence).
-  - If `exposureDeclaration === 'UNSEEN_BY_OPERATOR'`: The holdout may satisfy `GATE-13`, and the final validation result explicitly records `freshnessBasis: 'OPERATOR_ATTESTATION_V1'`.
+- **Holdout Approval Gate Composition (GATE-13):**
+  GATE-13 evaluates final holdout performance across three explicit subgates:
+  1. **Holdout Sharpe Subgate (Always Active):**
+     $$\text{holdoutSharpe} \ge \text{thresholds.minHoldoutSharpe}$$
+  2. **Holdout Positive Return Subgate (Conditional):**
+     - If `thresholds.requireHoldoutPositiveReturn === true`: Requires $\text{holdoutTotalNetReturn} > 0$.
+     - If `thresholds.requireHoldoutPositiveReturn === false`: The positive-return requirement is `DISABLED` and does not affect the gate.
+  3. **Holdout Freshness Subgate (Conditional):**
+     - If `thresholds.requireFreshHoldout === true`: Requires `holdout.exposureDeclaration === 'UNSEEN_BY_OPERATOR'`. If `holdout.exposureDeclaration === 'PREVIOUSLY_OBSERVED'`, the freshness requirement is `UNAVAILABLE`, making GATE-13 `UNAVAILABLE` and contributing `INSUFFICIENT_EVIDENCE` to the subject verdict (unless another measurable gate definitively fails).
+     - If `thresholds.requireFreshHoldout === false`: Declaring `PREVIOUSLY_OBSERVED` does NOT prevent GATE-13 from passing, but the canonical validation result explicitly discloses the attestation (`freshnessBasis: 'OPERATOR_ATTESTATION_V1'`).
 - **Holdout Execution Sequencing:** All walk-forward IS/OOS executions and cost stress runs must complete before final holdout execution begins. No intermediate feedback loop may mutate candidate definitions before holdout evaluation.
 
 ---
@@ -529,6 +537,7 @@ export type MetricUndefinedReason =
   | 'ZERO_BASELINE_EQUITY'
   | 'NON_POSITIVE_BASELINE_EQUITY'
   | 'NON_POSITIVE_PRIOR_EQUITY'
+  | 'NON_POSITIVE_SIMULATED_EQUITY'
   | 'DSR_ESTIMATOR_VARIANCE_INVALID'
   | 'ZERO_DSR_ESTIMATOR_DEVIATION';
 
@@ -611,10 +620,37 @@ Given daily returns $R_1, \dots, R_N$:
 For every frozen validation subject across all $K$ walk-forward folds:
 1. **Per-Fold Metrics:** Compute IS and OOS metrics independently per fold.
 2. **Aggregate OOS Return Series:** Formed by concatenating non-overlapping OOS daily net returns in chronological order. Because windows are non-overlapping, no date is duplicated.
-3. **OOS Fold Pass Ratio:**
-   $$\text{PassRatio}_{\text{OOS}} = \frac{\sum_{k=0}^{K-1} \mathbb{I}(\text{Fold } k \text{ OOS satisfies approval gates})}{K}$$
-4. **IS $\to$ OOS Degradation:**
-   $$\text{Degradation}_{\text{Sharpe}} = \frac{\text{Sharpe}_{\text{IS}} - \text{Sharpe}_{\text{OOS}}}{\max(|\text{Sharpe}_{\text{IS}}|, \epsilon)}$$
+3. **OOS Fold Pass Ratio (`P12_OOS_FOLD_LOCAL_GATES_V1`):**
+   Freeze exactly which gates are FOLD-LOCAL.
+   For each OOS fold $k \in \{0, \dots, K-1\}$, evaluate strictly the seven fold-local gates:
+   - `MIN_OOS_TRADES` (fold-local form of GATE-01)
+   - `MIN_DAILY_OBSERVATIONS` (fold-local form of GATE-02)
+   - `MIN_OOS_SHARPE` (fold-local form of GATE-03)
+   - `MIN_OOS_SORTINO` (fold-local form of GATE-04)
+   - `MAX_OOS_DRAWDOWN` (fold-local form of GATE-05)
+   - `MIN_PROFIT_FACTOR` (fold-local form of GATE-06)
+   - `MIN_EXPECTANCY` (fold-local form of GATE-07)
+   A fold is marked `PASS` if and only if all seven fold-local gates are assessable and satisfied (`status === 'PASS'`).
+   If any required fold-local gate is unavailable (`status === 'UNAVAILABLE'`), the fold verdict is `INSUFFICIENT_EVIDENCE` and it is NOT counted as a passing fold.
+   Cross-fold and plan-level gates are strictly excluded from fold pass definition:
+   - GATE-08 (`MIN_OOS_FOLD_PASS_RATIO` itself)
+   - GATE-09 (`MAX_IS_TO_OOS_DEGRADATION`)
+   - GATE-10 (`COST_STRESS_SURVIVAL`)
+   - GATE-11 (`MONTE_CARLO_ADVERSE_DRAWDOWN`)
+   - GATE-12 (`DEFLATED_SHARPE_Z`)
+   - GATE-13 (`FINAL_HOLDOUT_GATE`)
+   Then:
+   $$\text{oosFoldPassRatio} = \frac{\text{numberOfPassingOosFolds}}{K}$$
+   evaluated using deterministic 128-digit Decimal arithmetic.
+4. **IS $\to$ OOS Sharpe Degradation:**
+   Degradation is computed strictly per fold without concatenating overlapping IS periods:
+   $$\text{degradation}_k = \frac{\text{Sharpe}_{\text{IS},k} - \text{Sharpe}_{\text{OOS},k}}{\max(|\text{Sharpe}_{\text{IS},k}|, \text{metricPolicy.sharpeDegradationDenominatorFloor})}$$
+   where $\text{metricPolicy.sharpeDegradationDenominatorFloor}$ is an explicit plan-bound canonical decimal string strictly $> 0$ (no hidden source-code epsilon).
+   For GATE-09, the canonical subject statistic is:
+   $$\text{maxIsToOosSharpeDegradationObserved} = \max_{k=0\dots K-1} (\text{degradation}_k)$$
+   GATE-09 passes iff:
+   $$\text{maxIsToOosSharpeDegradationObserved} \le \text{thresholds.maxIsToOosSharpeDegradation}$$
+   If any required IS or OOS fold Sharpe is `UNDEFINED` or `INSUFFICIENT_DATA`, GATE-09 is `UNAVAILABLE` and contributes `INSUFFICIENT_EVIDENCE` (unless another measurable gate definitively fails). No aggregate overlapping-IS return concatenation is permitted.
 5. **OOS Metric Dispersion:** Sample standard deviation of OOS Sharpe across folds.
 
 ---
@@ -622,9 +658,13 @@ For every frozen validation subject across all $K$ walk-forward folds:
 ## 11. Real Phase 9 Cost Stress Testing (`P12_COST_STRESS_V1`)
 
 - **Prohibition of Synthetic Deductions:** Subtracting hypothetical fees from baseline PnL in memory is barred.
-- **Genuine Phase 9 Reruns:** Each cost scenario (`MODERATE_STRESS`, `SEVERE_STRESS`) binds its exact cost model into a genuine `MatrixBacktestExecutionConfig`.
+- **Genuine Phase 9 Reruns:** Each configured cost scenario binds its exact cost model into a genuine `MatrixBacktestExecutionConfig`. Scenario IDs must be non-empty stable identifiers unique within the plan (e.g. `MODERATE_STRESS`, `SEVERE_STRESS`). Scenario identity always binds the exact `costModel`, not name alone.
 - **Unique Run Lineage:** Phase 9 `normalizeBacktestInputs` derives a distinct `expectedRunId` for each scenario. Execution yields authentic fills, genuine fee assessments, distinct `resultSha256`, and distinct `eventLedgerSha256`.
-- **Gate Evaluation:** Scenario `MODERATE_STRESS` must yield $\text{totalNetReturn} > 0$. Stress returns are evaluated in isolation and **never contaminate** the baseline OOS return series or DSR trial family.
+- **Gate Evaluation Semantics (GATE-10):**
+  - If `thresholds.requireCostStressSurvival === false`: GATE-10 is `DISABLED` and has no effect on subject verdict.
+  - If `thresholds.requireCostStressSurvival === true`: The plan **MUST** contain exactly one scenario with `scenarioId = 'MODERATE_STRESS'`; otherwise the plan fails validation with `VALIDATION_PLAN_INVALID`. GATE-10 evaluates that exact genuine Phase 9 rerun:
+    $$\text{totalNetReturn}_{\text{MODERATE\_STRESS}} > 0$$
+  - Additional configured scenarios (such as `SEVERE_STRESS`) may be executed and retained in canonical evidence bundles for audit and research inspection, but they do not form V1 approval gates unless a future version explicitly adds a threshold. Stress returns are evaluated in isolation and **never contaminate** baseline OOS return series or DSR trial families.
 
 ---
 
@@ -633,9 +673,29 @@ For every frozen validation subject across all $K$ walk-forward folds:
 - **Objective:** Path-risk evaluation (sequence luck), NOT profit forecasting.
 - **Input:** Cost-inclusive daily net returns array $[R_1, \dots, R_N]$ from aggregate OOS.
 - **Canonical Seed Derivation:**
-  $$\text{Seed}_0 = \text{HMAC-SHA256}(\text{key}=\text{validationPlanId}, \text{msg}=\text{subjectId} \mathbin{\Vert} \text{foldId} \mathbin{\Vert} \text{scenarioId} \mathbin{\Vert} \text{policyId})$$
-- **Algorithm:** Counter-mode SHA-256 stream with unbiased rejection sampling driving an in-place Fisher-Yates shuffle. Zero `Math.random`.
-- **Adverse Drawdown Gate:** 95th percentile simulated max drawdown $\le \text{thresholds.maxMonteCarloAdverseDrawdownPercent}$.
+  $$\text{seed}_0 = \text{HMAC-SHA256}\left(\text{key}=\text{UTF8}(\text{validationPlanId}), \text{message}=\text{UTF8}(\text{canonicalJson}(\{ \text{validationSubjectId}, \text{validationFoldId}: \text{'AGGREGATE\_OOS'}, \text{scenarioId}: \text{'BASELINE'}, \text{policyId}: \text{'P12\_MONTE\_CARLO\_PERMUTATION\_V1'} \}))\right)$$
+  The raw 32-byte HMAC digest is used as `seed0`.
+- **Deterministic Counter PRNG Stream:**
+  $$\text{block}(\text{counter}) = \text{SHA-256}(\text{seed}_0 \mathbin{\Vert} \text{UINT64\_BE}(\text{counter}))$$
+  `counter` starts at 0 and increments by 1 per generated 32-byte block. Each block is consumed as eight unsigned 32-bit big-endian words in byte order. Zero runtime RNG and zero `Math.random`.
+- **Unbiased Rejection-Sampled Fisher-Yates Shuffle:**
+  One continuous deterministic PRNG stream is consumed per subject across all simulations executed in ascending order: $\text{simulationIndex} = 0 \dots \text{simulationCount} - 1$. Each simulation begins from a fresh copy of the original aggregate OOS return array. For $i = N - 1$ down to 1:
+  $$\text{range} = i + 1, \quad \text{limit} = \lfloor 2^{32} / \text{range} \rfloor \times \text{range}$$
+  Draw $\text{uint32 } x$ from the stream until $x < \text{limit}$, then set $j = x \pmod{\text{range}}$ and swap $\text{array}[i]$ with $\text{array}[j]$. (Safe integer arithmetic is permitted for index/random-word logic).
+- **Simulated Equity Path Construction:**
+  For each permutation:
+  $$\text{simulatedEquity}_0 = 1$$
+  $$\text{simulatedEquity}_d = \text{simulatedEquity}_{d-1} \times (1 + \text{permutedReturn}_d)$$
+  evaluated using deterministic 128-digit Decimal arithmetic.
+  If any $1 + \text{permutedReturn}_d \le 0$, the Monte Carlo metric for that subject terminates as `UNDEFINED` with reason `NON_POSITIVE_SIMULATED_EQUITY` (zero `NaN`, zero `Infinity`).
+  Max drawdown percent is computed from the simulated equity path using peak high-water-mark tracking:
+  $$\text{peak}_d = \max(\text{peak}_{d-1}, \text{simulatedEquity}_d), \quad \text{drawdown}_d = \frac{\text{peak}_d - \text{simulatedEquity}_d}{\text{peak}_d}, \quad \text{maxDrawdownPercent} = \max_d(\text{drawdown}_d) \times 100$$
+- **Configured Adverse Percentile Selection (GATE-11):**
+  After collecting `simulationCount` max-drawdown percentages, the array is sorted ascending numerically using Decimal comparison. For configured percentile $p = \text{plan.monteCarlo.adversePercentile}$ ($1 \le p \le 99$):
+  $$\text{nearestRank} = \left\lceil \frac{p \times \text{simulationCount}}{100} \right\rceil = \left\lfloor \frac{p \times \text{simulationCount} + 99}{100} \right\rfloor, \quad \text{selectedIndex} = \text{nearestRank} - 1$$
+  Calculated using exact integer arithmetic without floating point.
+  $$\text{monteCarloAdverseDrawdownPercent} = \text{sortedDrawdowns}[\text{selectedIndex}]$$
+  GATE-11 passes iff $\text{monteCarloAdverseDrawdownPercent} \le \text{thresholds.maxMonteCarloAdverseDrawdownPercent}$. No hardcoded 95th percentile in production policy.
 
 ---
 
@@ -692,8 +752,32 @@ Requires: $N \ge \text{metricPolicy.minDailyObservations}$ and $N \ge 2$.
 
 ## 15. Research Validation Policy & Approval Gates
 
-### 15.1 Deterministic Policy Schema (`ResearchValidationPolicy`)
+### 15.1 Deterministic Policy Schema & Gate Status Model
 All approval criteria are declared explicitly in `ResearchValidationPolicy`:
+
+```typescript
+export type ValidationGateStatus =
+  | 'PASS'
+  | 'FAIL'
+  | 'UNAVAILABLE'
+  | 'DISABLED';
+
+export interface ValidationGateEvaluation {
+  readonly gateId: string;
+  readonly gateName: string;
+  readonly status: ValidationGateStatus;
+  readonly observedValue: string | number | null;
+  readonly thresholdValue: string | number | boolean | null;
+  readonly reason?: string;
+}
+```
+
+#### Gate Status Semantics:
+- **`PASS`:** Metric/condition is assessable and satisfies the threshold.
+- **`FAIL`:** Metric/condition is assessable and violates the threshold.
+- **`UNAVAILABLE`:** Metric/condition cannot be evaluated due to `INSUFFICIENT_DATA`, `UNDEFINED` metric value, unverified holdout, missing event evidence, or execution failure.
+- **`DISABLED`:** Gate is explicitly deactivated by plan configuration (e.g., `requireCostStressSurvival === false`, `requireHoldoutPositiveReturn === false`, or `requireFreshHoldout === false`).
+- **Verdict Effect:** `DISABLED` gates have no effect on subject verdict. `UNAVAILABLE` gates contribute `INSUFFICIENT_EVIDENCE` unless another required gate `FAIL`s. `FAIL` takes precedence over all other outcomes.
 
 | Gate ID | Approval Gate Name | Required Condition | Failure Classification |
 | :--- | :--- | :--- | :--- |
@@ -704,20 +788,20 @@ All approval criteria are declared explicitly in `ResearchValidationPolicy`:
 | **GATE-05** | `MAX_OOS_DRAWDOWN` | $\text{MaxDD}\%_{\text{OOS}} \le \text{thresholds.maxOosDrawdownPercent}$ | Risk threshold breach |
 | **GATE-06** | `MIN_PROFIT_FACTOR` | $\text{PF}_{\text{net,daily}} \ge \text{thresholds.minNetDailyProfitFactor}$ | Profitability failure |
 | **GATE-07** | `MIN_EXPECTANCY` | $\text{Expectancy}_{\text{net,daily}} \ge \text{thresholds.minNetDailyExpectancy}$ | Profitability failure |
-| **GATE-08** | `MIN_OOS_FOLD_PASS_RATIO` | $\text{PassRatio}_{\text{OOS}} \ge \text{thresholds.minOosFoldPassRatio}$ | Temporal instability |
-| **GATE-09** | `MAX_IS_TO_OOS_DEGRADATION` | $\text{Degradation}_{\text{Sharpe}} \le \text{thresholds.maxIsToOosSharpeDegradation}$ | Overfitting failure |
-| **GATE-10** | `COST_STRESS_SURVIVAL` | $\text{totalNetReturn}_{\text{MODERATE\_STRESS}} > 0$ | Execution cost fragility |
-| **GATE-11** | `MONTE_CARLO_ADVERSE_DRAWDOWN` | $\text{MaxDD}\%_{\text{MC}(95)} \le \text{thresholds.maxMonteCarloAdverseDrawdownPercent}$ | Path-risk vulnerability |
+| **GATE-08** | `MIN_OOS_FOLD_PASS_RATIO` | $\text{oosFoldPassRatio} \ge \text{thresholds.minOosFoldPassRatio}$ | Temporal instability |
+| **GATE-09** | `MAX_IS_TO_OOS_DEGRADATION` | $\text{maxIsToOosSharpeDegradationObserved} \le \text{thresholds.maxIsToOosSharpeDegradation}$ | Overfitting failure |
+| **GATE-10** | `COST_STRESS_SURVIVAL` | If $\text{requireCostStressSurvival} === \text{true}$: $\text{totalNetReturn}_{\text{MODERATE\_STRESS}} > 0$; else `DISABLED` | Execution cost fragility |
+| **GATE-11** | `MONTE_CARLO_ADVERSE_DRAWDOWN` | $\text{monteCarloAdverseDrawdownPercent} \le \text{thresholds.maxMonteCarloAdverseDrawdownPercent}$ (at configured `adversePercentile`) | Path-risk vulnerability |
 | **GATE-12** | `DEFLATED_SHARPE_Z` | $\text{deflatedSharpeZ} \ge \text{thresholds.minDeflatedSharpeZ}$ | Multiple-testing data mining |
-| **GATE-13** | `FINAL_HOLDOUT_GATE` | $\text{totalNetReturn}_{\text{Holdout}} > 0 \land \text{Sharpe}_{\text{Holdout}} \ge \text{thresholds.minHoldoutSharpe}$ | Final temporal verification |
+| **GATE-13** | `FINAL_HOLDOUT_GATE` | $\text{holdoutSharpe} \ge \text{thresholds.minHoldoutSharpe} \land (\neg \text{requireHoldoutPositiveReturn} \lor \text{holdoutTotalNetReturn} > 0) \land (\neg \text{requireFreshHoldout} \lor \text{exposureDeclaration} === \text{'UNSEEN\_BY\_OPERATOR'})$ | Final temporal verification |
 
 ### 15.2 Exact Verdict Precedence Architecture
 For every successfully orchestrated subject:
-1. **Precedence 1 (Definitive Policy Failure):** If ANY required policy gate evaluates to a genuine measurable value and definitively violates its threshold, verdict is:
+1. **Precedence 1 (Definitive Policy Failure):** If ANY required policy gate evaluates to `FAIL` (assessable and definitively violates its threshold), verdict is:
    $$\text{verdict} = \mathbf{FAILED}$$
-2. **Precedence 2 (Evidence / Procedural Insufficiency):** Else, if ANY required policy gate cannot be assessed due to `INSUFFICIENT_DATA`, `UNDEFINED` metric, missing fresh holdout (`PREVIOUSLY_OBSERVED` when fresh holdout required), per-fold backtest execution failure, or missing verified event evidence:
+2. **Precedence 2 (Evidence / Procedural Insufficiency):** Else, if ANY required policy gate evaluates to `UNAVAILABLE` (due to `INSUFFICIENT_DATA`, `UNDEFINED` metric, missing fresh holdout when `requireFreshHoldout === true`, per-fold backtest execution failure, or missing verified event evidence):
    $$\text{verdict} = \mathbf{INSUFFICIENT\_EVIDENCE}$$
-3. **Precedence 3 (Unanimous Approval):** If and only if EVERY required policy gate is assessable and evaluates to `passed: true`:
+3. **Precedence 3 (Unanimous Approval):** If and only if EVERY required policy gate evaluates to `PASS` (or is `DISABLED`):
    $$\text{verdict} = \mathbf{PASSED}$$
 
 *Principle:* Definitive statistical failure takes precedence over missing data; operational failure must never be masked as strategy failure.
@@ -727,10 +811,27 @@ For every successfully orchestrated subject:
 ## 16. Canonical Validation Result & Result ID (`validationResultSha256`)
 
 ```typescript
+export type ValidationPlanStatus = 'COMPLETED' | 'PARTIAL' | 'FAILED';
+
+export interface StrategyValidationRecord {
+  readonly validationSubjectId: string;
+  readonly pair: string;
+  readonly strategyId: string;
+  readonly strategyVersion: string;
+  readonly parameterHash: string;
+  readonly verdict: 'PASSED' | 'FAILED' | 'INSUFFICIENT_EVIDENCE';
+  readonly foldResults: readonly ValidationFoldResult[];
+  readonly aggregateOosMetrics: Record<string, ValidationMetric>;
+  readonly gateEvaluations: readonly ValidationGateEvaluation[];
+  readonly costStressEvaluations?: readonly ValidationCostStressEvaluation[];
+  readonly monteCarloResult?: ValidationMonteCarloResult;
+  readonly holdoutEvaluation?: ValidationHoldoutEvaluation;
+}
+
 export interface ResearchValidationPlanResult {
   readonly validationPlanId: string;
   readonly planName: string;
-  readonly status: 'COMPLETED' | 'PARTIAL' | 'FAILED';
+  readonly status: ValidationPlanStatus;
   readonly totalSubjects: number;
   readonly passedSubjects: number;
   readonly failedSubjects: number;
@@ -742,6 +843,38 @@ export interface ResearchValidationPlanResult {
   readonly validationResultSha256: string;
 }
 ```
+
+### 16.1 Deterministic Plan-Level Status Rules
+- **`COMPLETED`**:
+  - Source identity remained valid for the entire validation orchestration.
+  - Every authoritative validation subject in the plan has exactly one terminal `StrategyValidationRecord`.
+  - Each subject record has one research verdict: `PASSED`, `FAILED`, or `INSUFFICIENT_EVIDENCE`.
+  - A subject receiving verdict `FAILED` or `INSUFFICIENT_EVIDENCE` does **NOT** make plan status `FAILED`; `COMPLETED` indicates the research plan executed fully and produced complete evidence.
+- **`PARTIAL`**:
+  - Source identity remains valid.
+  - At least one authoritative validation subject has a terminal `StrategyValidationRecord`.
+  - One or more subjects cannot produce a complete canonical terminal validation record due to a bounded non-source orchestration failure (e.g. per-subject dataset read error or unexpected worker fault).
+  - No subject may silently disappear; missing or aborted subjects are explicitly disclosed in the evidence ledger.
+- **`FAILED`**:
+  - Source identity / clean Git invariant becomes invalid mid-orchestration (untracked files, modified working tree, or commit mismatch).
+  OR
+  - Matrix-wide evidence, concurrency, or cryptographic integrity invariant fails (`EVIDENCE_INTEGRITY_FAILURE`, hash mismatch).
+  OR
+  - Zero subjects obtain valid terminal records after execution begins.
+- **Pre-Execution Plan Validation Failure:**
+  - If a plan is invalid prior to execution (e.g. invalid candidate space, dataset coverage gap, or `requireCostStressSurvival === true` without exactly one `MODERATE_STRESS` scenario):
+    The engine throws `VALIDATION_PLAN_INVALID` and does **NOT** fabricate a `ResearchValidationPlanResult`.
+
+### 16.2 Validation-Wide Source TOCTOU Semantics
+- `validationPlan.sourceIdentity.gitCommitHash` is captured once at plan construction.
+- Every fold, stress, and holdout Phase 11 matrix execution must bind and verify the **identical** expected commit.
+- Before dispatching each new matrix execution and after the final execution:
+  The engine verifies clean repository state (`git status --porcelain=v1 --untracked-files=all` must be empty) and exact expected commit (`git rev-parse HEAD`).
+- Existing Phase 11 Git verification authority (`verifyCleanGitWorkingTree`) is reused; no separate unsafe shell-based verifier is created.
+- If source becomes dirty or HEAD changes during execution:
+  - No subsequent validation execution starts.
+  - The validation plan terminates `status: 'FAILED'`.
+  - No result may be emitted as `COMPLETED` or `PARTIAL`.
 
 $$\text{validationResultSha256} = \text{SHA-256}\left(\text{CanonicalJson}(\text{ValidationResultSummaryPayload})\right)$$
 
@@ -787,13 +920,13 @@ export type ValidationErrorCode =
 | **P12-I04** | **Zero Warmup Metric Contamination** | Observations prior to `evaluationFromInclusiveMs` are strictly quarantined and never enter daily return series, trade counts, PnL calculations, or validation metrics. |
 | **P12-I05** | **Deterministic UTC Daily Equity & Return Series** | At `analysisStartMs`, baseline equity $E_0$ is captured after same-timestamp flush; metrics observe $\text{analysisStartMs} < T \le \text{analysisEndExclusiveMs}$, including final candle close and funding. $N+1$ UTC boundaries produce exactly $N$ daily returns $R_d = \frac{E_d - E_{d-1}}{E_{d-1}}$. Missing boundaries fail closed. |
 | **P12-I06** | **Minute-Close Drawdown & Exact Risk Semantics** | Max drawdown evaluates across the minute-close cost-inclusive equity path plus same-timestamp funding settlement. Sharpe uses daily excess returns with $N-1$ variance and $\sqrt{365}$ annualization. Sortino uses plan-bound `annualSortinoTargetRate`. All financial math uses 128-digit Decimal. |
-| **P12-I07** | **Zero-Denominator & Insufficient-Data Semantics** | No metric calculation may emit `NaN`, `Infinity`, or silent fallback numbers. A metric must terminate in a discriminated union (`VALUE`, `UNDEFINED`, or `INSUFFICIENT_DATA`) with explicit reason codes. |
+| **P12-I07** | **Zero-Denominator & Insufficient-Data Semantics** | No metric calculation may emit `NaN`, `Infinity`, or silent fallback numbers. A metric must terminate in a discriminated union (`VALUE`, `UNDEFINED`, or `INSUFFICIENT_DATA`) with explicit reason codes (including `NON_POSITIVE_SIMULATED_EQUITY`). |
 | **P12-I08** | **Chronological Walk-Forward & Tail Disclosure** | Walk-forward steps chronologically forward with $\text{stepDays} === \text{testDays}$ producing $K$ complete non-overlapping folds. Any trailing span before holdout is disclosed as `unusedTailMs` and excluded from folds; partial folds are barred. |
 | **P12-I09** | **Holdout Plan Binding & Operator Attestation** | Plan identity binds holdout boundaries preventing cross-plan relabeling, but does not prove human non-exposure. Freshness is governed by plan-bound `holdoutExposureDeclaration` (`UNSEEN_BY_OPERATOR` vs `PREVIOUSLY_OBSERVED`); `PREVIOUSLY_OBSERVED` cannot satisfy fresh holdout requirements. |
-| **P12-I10** | **Real Cost-Stress Reruns (No Synthetic Adjustments)** | Cost stress scenarios must re-execute the genuine Phase 9 engine under identity-bound stressed cost models producing real Phase 9 run IDs and fills. Post-processing baseline PnL via synthetic fee subtraction is barred. |
-| **P12-I11** | **Deterministic Monte Carlo Permutations** | Daily return permutation uses an unbiased Fisher-Yates shuffle driven by counter-mode CSPRNG seeded via HMAC-SHA256 from plan, subject, fold, and policy IDs. `Math.random` is prohibited. Path-risk evaluation only. |
+| **P12-I10** | **Real Cost-Stress Reruns (No Synthetic Adjustments)** | Cost stress scenarios must re-execute the genuine Phase 9 engine under identity-bound stressed cost models producing real Phase 9 run IDs and fills. If `requireCostStressSurvival === true`, exactly one `MODERATE_STRESS` scenario is required. Post-processing baseline PnL via synthetic fee subtraction is barred. |
+| **P12-I11** | **Deterministic Monte Carlo Permutations** | Daily return permutation uses an unbiased Fisher-Yates shuffle driven by counter-mode CSPRNG seeded via HMAC-SHA256 from plan, subject, fold, and policy IDs. Evaluates simulated equity path $E_d = E_{d-1}(1+R_d)$; non-positive simulated equity terminates `UNDEFINED` (`NON_POSITIVE_SIMULATED_EQUITY`). Evaluates configured `adversePercentile` via exact integer rank. `Math.random` is prohibited. Path-risk evaluation only. |
 | **P12-I12** | **Explicit Overfitting Control (Deflated Sharpe Z)** | The engine must compute `deflatedSharpeZ` over aggregate OOS daily returns for the trial family of size $M$, evaluating $SR_0 = 0$ for $M === 1$ outside logarithms, and penalizing return skewness and kurtosis. Positive PnL alone is insufficient. |
-| **P12-I13** | **Concurrency & Worker-Count Invariance** | Validation results must be sorted strictly by canonical `validationSubjectId` ascending before hashing. Executing with 1 worker vs $N$ parallel workers yields bit-for-bit identical `validationResultSha256` and output JSON. |
+| **P12-I13** | **Concurrency & Worker-Count Invariance** | Validation results must be sorted strictly by canonical `validationSubjectId` ascending before hashing. Executing with 1 worker vs $N$ parallel workers yields bit-for-bit identical `validationResultSha256` and output JSON. Subject `FAILED` does not make plan status `FAILED`. |
 | **P12-I14** | **Deep Input & Result Immutability** | All plan inputs, threshold structures, evidence arrays, and output records must be defensively deep-copied and deep-frozen upon creation. |
 | **P12-I15** | **Strict Prohibition of Ranking & Winner Selection** | Phase 12 must never compute candidate rankings, leaderboards, composite sorting scores, or designate a "winning" strategy. Phase 15 owns ranking. Phase 12 emits only binary gate verdicts (`PASSED`, `FAILED`, `INSUFFICIENT_EVIDENCE`). |
 | **P12-I16** | **Structural Fresh Execution & Fail-Closed Evidence** | Phase 12 dependencies strictly omit completed-result cache. For every cell reporting `COMPLETED`, genuine independently verified event evidence must be present; missing evidence fails closed with `EVIDENCE_INTEGRITY_FAILURE`. |
@@ -811,7 +944,7 @@ export type ValidationErrorCode =
 | **H5** | **Holdout Freshness** | Plan binds holdout boundaries; operator attests `exposureDeclaration` (`UNSEEN_BY_OPERATOR` vs `PREVIOUSLY_OBSERVED`). No false cryptographic human-freshness claims. | **CLOSED** |
 | **H6** | **DSR Domain** | Evaluated on aggregate OOS daily returns in per-day Sharpe units. Raw Pearson kurtosis ($= 3$ for normal). $M=1$ branch sets $SR_0 = 0$ outside logarithms. | **CLOSED** |
 | **H7** | **Trial Family $M$** | $M$ is the count of distinct `parameterHash` candidates in the $(\text{pair}, \text{strategyId}, \text{strategyVersion})$ family within the plan. Excludes folds, stress runs, and MC. | **CLOSED** |
-| **H8** | **Monte Carlo Reproducibility** | HMAC-SHA256 seed + SHA-256 counter PRNG + rejection-sampled Fisher-Yates shuffle. 100% deterministic, zero `Math.random`. | **CLOSED** |
+| **H8** | **Monte Carlo Reproducibility** | HMAC-SHA256 seed + SHA-256 counter PRNG + rejection-sampled Fisher-Yates shuffle. 100% deterministic, zero `Math.random`. Exact integer percentile rank over configured `adversePercentile`. | **CLOSED** |
 | **H9** | **Threshold Identity** | All thresholds (`minDailyObservations`, `minOosClosedTrades`, `minDeflatedSharpeZ`, etc.) are explicit plan-bound fields hashed into `validationPlanId`. | **CLOSED** |
 | **H10** | **Ranking Boundary** | Results sorted strictly by `validationSubjectId` ascending. Zero rank fields, composite scores, or leaderboards. Phase 15 owns ranking. | **CLOSED** |
 
@@ -832,7 +965,7 @@ export type ValidationErrorCode =
 **Resolution:** Cost-inclusive UTC daily net returns $R_d = \frac{E_d - E_{d-1}}{E_{d-1}}$ evaluated in 128-digit Decimal arithmetic, reflecting realized PnL, unrealized mark adjustments, maker/taker fees, spread attribution, slippage attribution, and funding debits/credits across the $N$ days.
 
 ### Q5: What are the exact zero-denominator and insufficient-sample semantics?
-**Resolution:** Modeled as a discriminated union: `VALUE`, `UNDEFINED`, or `INSUFFICIENT_DATA`. Insufficient daily observations ($N < \text{metricPolicy.minDailyObservations}$) or trades emit `INSUFFICIENT_DATA` with `{ count, required }`. Zero sample variance, zero downside deviation, zero losing trades, or non-positive baseline equity emit `UNDEFINED` with typed reason codes. `NaN` and `Infinity` are strictly barred.
+**Resolution:** Modeled as a discriminated union: `VALUE`, `UNDEFINED`, or `INSUFFICIENT_DATA`. Insufficient daily observations ($N < \text{metricPolicy.minDailyObservations}$) or trades emit `INSUFFICIENT_DATA` with `{ count, required }`. Zero sample variance, zero downside deviation, zero losing trades, non-positive baseline equity, or non-positive simulated equity emit `UNDEFINED` with typed reason codes. `NaN` and `Infinity` are strictly barred.
 
 ### Q6: What exact chronology prevents train/OOS/holdout leakage?
 **Resolution:** Safe-integer UTC midnight boundaries ($t \pmod{86\,400\,000} === 0$). Walk-forward steps forward with $\text{stepDays} === \text{testDays}$ producing $K$ complete, non-overlapping OOS windows ($K = \max\{j \mid \text{OOS\_end}(j-1) \le \text{holdoutStartMs}\}$). Any trailing gap is disclosed as `unusedTailMs`. Final holdout is strictly in the future ($\text{holdoutStartMs} \ge \text{OOS\_end}(K-1)$). Indicator warmup is quarantined before the evaluation window.
@@ -844,7 +977,7 @@ export type ValidationErrorCode =
 **Resolution:** Phase 9 `costModel` is part of `BacktestRunManifest`. Updating the cost model alters the manifest canonical JSON, generating a brand-new Phase 9 `runId` ($\text{runId} = \text{sha256CanonicalJson}(\text{manifest})$). Executing the engine produces real fills, different accounting balances, a new `resultSha256`, and a new `eventLedgerSha256`. Synthetic cost deduction cannot produce these cryptographic proofs.
 
 ### Q9: What deterministic algorithm and seed produce Monte Carlo permutations?
-**Resolution:** Seed derived via HMAC-SHA256 over plan, subject, fold, scenario, and policy IDs. Generates pseudorandom 32-bit words via SHA-256 counter mode. Employs unbiased rejection sampling to eliminate modulo bias, driving a Fisher-Yates shuffle of daily net returns to calculate permuted path drawdown distributions without `Math.random`.
+**Resolution:** Seed derived via HMAC-SHA256 over plan, subject, fold, scenario, and policy IDs. Generates pseudorandom 32-bit words via SHA-256 counter mode. Employs unbiased rejection sampling to eliminate modulo bias, driving a Fisher-Yates shuffle of daily net returns to calculate permuted path drawdown distributions without `Math.random`. Path simulated equity is evaluated with high-water-mark tracking, and adverse drawdown is selected at configured `plan.monteCarlo.adversePercentile` via exact integer rank.
 
 ### Q10: What exact V1 overfitting method is used, with mathematical definition?
 **Resolution:** Deflated Sharpe Z-Score (`P12_DEFLATED_SHARPE_Z_V1`). Evaluated on aggregate OOS daily returns in per-day units: $\text{deflatedSharpeZ} = \frac{\widehat{SR} - SR_0}{\sigma_{\widehat{SR}}}$. For candidate family size $M === 1$, $SR_0 = 0$ outside logarithms. For $M > 1$, $SR_0 = \sqrt{2 \ln M} \times \sigma_{\{SR\}} \left( 1 - \frac{\gamma + \ln(\ln M)}{2 \ln M} \right)$. Estimator variance $\sigma_{\widehat{SR}}^2 = \frac{1 - \text{skewness} \cdot \widehat{SR} + \frac{\text{kurtosis} - 1}{4} \widehat{SR}^2}{N - 1}$ incorporates sample skewness and Pearson kurtosis. Gated against plan-bound `minDeflatedSharpeZ`.
