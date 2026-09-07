@@ -568,6 +568,9 @@ Before any cell's `expectedRunId` is finalized and again prior to executing Phas
    - In addition, Phase 9 `normalizeBacktestInputs` strictly re-verifies chronological event ordering within `(bootstrapFromInclusiveMs, replayToExclusiveMs]` and confirms that `computeBacktestFundingScheduleContentSha256(events) === planPair.fundingScheduleBinding.contentSha256`.
 5. **Fail-Closed on Mismatch:** Any discrepancy between provided execution resources and frozen plan bindings fails closed immediately with `RESOURCE_IDENTITY_MISMATCH` or `DATASET_IDENTITY_MISMATCH`. No mismatched resource may silently proceed.
 
+### 8.5 Authoritative Finalized Cell-Set Reconstruction
+Before cache lookup or worker dispatch, execution independently rebuilds the complete canonical Cartesian cell expansion from the frozen plan, the verified stored `sourceIdentity.gitCommitHash`, the real Strategy Registry, and validated runtime resources. Initial plan finalization and serialized-plan verification invoke the same internal deterministic derivation routine. The supplied cells must exactly match the authoritative count and full canonical cell structure in sequence; omission, addition, duplication, resequencing, or a self-consistent rehashed out-of-plan candidate fails closed with `MATRIX_PLAN_INTEGRITY_MISMATCH`. Execution never repairs or mutates a mismatched artifact.
+
 ### 8.5 Explicit Distinction: Dataset Source vs. Git Source
 Phase 11 strictly differentiates between two fundamentally distinct source identity concepts:
 1. **Git Executable Source Identity:**
@@ -890,6 +893,7 @@ export type MatrixErrorCode =
   | 'STRATEGY_PARAM_VALIDATION_FAILED'
   | 'CELL_EXECUTION_FAILED'
   | 'RUN_ID_MISMATCH'
+  | 'MATRIX_PLAN_INTEGRITY_MISMATCH'
   | 'CONCURRENCY_INTEGRITY_VIOLATION'
   | 'CACHE_INTEGRITY_FAILURE'
   | 'MATRIX_SOURCE_STATE_UNAVAILABLE'
@@ -1014,3 +1018,4 @@ Implementation of Phase 11 must provide exhaustive test suites proving complianc
 | **P11-I13** | Genuine Phase 9 + Phase 10 execution, runtime resource validation & execution source integrity | Verify cell execution calls genuine `BacktestEngine` and `StrategyKernel` via `StrategyBacktestParticipantAdapter`. Assert runtime resource identity mismatch (`datasetManifest`, `instrumentSpec`, `fundingSchedule`) fails closed before execution. Verify clean source state is asserted before first cell, throughout execution, and before declaring `COMPLETED`. If source tree is dirtied mid-run, execution fails closed, all pending cells fail, and matrix status is `FAILED`. |
 | **P11-I14** | Input-side defensive immutability & result immutability | Construct plan/cells using caller-owned mutable input objects/arrays; mutate caller inputs aggressively post-construction; assert frozen plan, `matrixPlanId`, cell list, `matrixCellIds`, parameter hashes, `strategyInstanceIds`, and `runIds` are completely unchanged. Assert emitted plan/cell/result objects are deeply frozen against external mutation. |
 | **P11-I15** | Phase 9 completed-result cache integrity | Accept genuine completed `BacktestRunResult` from cache when `runId` matches `cell.expectedRunId`, `matrixCellId` matches `cell.matrixCellId`, and `sha256CanonicalJson(outcome without resultSha256) === outcome.resultSha256`. Assert modifying any hashed Phase 9 outcome field invalidates cache check and forces fresh execution. Assert that hashing full outcome including `resultSha256` is explicitly NOT the validation algorithm. Assert that failed outcomes (`status: 'FAILED'`) are never reusable as Phase 11 v1 cache hits. Corrupt cache entries fail closed and never produce `COMPLETED` evidence. |
+| **P11-I16** | Authoritative finalized cell-set reconstruction | Execute an untouched planner artifact successfully. Before any dataset read, cache lookup, or worker dispatch, reject omitted, extra, duplicate-plus-omission, foreign substituted, fully rehashed out-of-plan, same-count wrong-candidate, and fewer-than-authoritative supplied cell sets. Assert every public execution entry point routes through the shared authoritative derivation barrier. |

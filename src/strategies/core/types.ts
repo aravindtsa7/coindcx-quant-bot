@@ -74,10 +74,17 @@ export interface StrategyKernelConfig<TParameters> {
   readonly indicatorBootstrapIdentity: readonly StrategyIndicatorBootstrapIdentityEntry[];
 }
 
+export interface StrategyConstructionDescription<TParameters extends Readonly<Record<string, unknown>> = Readonly<Record<string, unknown>>> {
+  readonly normalizedParameters: TParameters;
+  readonly triggerTimeframeMinutes: number;
+  readonly indicatorRequirements: readonly StrategyIndicatorRequirement[];
+}
+
 export interface StrategyDefinition<TParameters extends Readonly<Record<string, unknown>> = Readonly<Record<string, unknown>>> {
   readonly strategyId: string;
   readonly strategyVersion: string;
   normalizeParameters(parameters: unknown): TParameters;
+  describeConstruction(parameters: unknown): StrategyConstructionDescription<TParameters>;
   createKernel(config: StrategyKernelConfig<unknown>): StrategyKernel;
 }
 

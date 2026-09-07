@@ -3,7 +3,8 @@ import { toStrategyCalc } from '../core/decimal';
 import { StrategyError } from '../core/errors';
 import { BaseStrategyKernel, type StrategyOutcome } from '../core/kernel';
 import { freezeNormalizedParameters, requireExactObject, strategyPeriod, strategyPriceSource, strategyTimeframe } from '../core/parameters';
-import type { StrategyDefinition, StrategyEvaluationSnapshot, StrategyIndicatorBootstrapIdentityEntry, StrategyKernel } from '../core/types';
+import { deepCopyFreeze } from '../core/immutable';
+import type { StrategyConstructionDescription, StrategyDefinition, StrategyEvaluationSnapshot, StrategyIndicatorBootstrapIdentityEntry, StrategyIndicatorRequirement, StrategyKernel } from '../core/types';
 
 export type EmaTrendParameters = Readonly<{
   timeframeMinutes: number;
@@ -26,13 +27,18 @@ export function normalizeEmaTrendParameters(raw: unknown): EmaTrendParameters {
   return freezeNormalizedParameters(parameters) as EmaTrendParameters;
 }
 
+function describe(parameters: EmaTrendParameters): StrategyConstructionDescription<EmaTrendParameters> {
+  const indicatorRequirements: readonly StrategyIndicatorRequirement[] = [
+    { alias: 'ema.fast', indicatorType: 'EMA', timeframeMinutes: parameters.timeframeMinutes, parameters: { period: parameters.fastPeriod }, priceSource: parameters.priceSource },
+    { alias: 'ema.slow', indicatorType: 'EMA', timeframeMinutes: parameters.timeframeMinutes, parameters: { period: parameters.slowPeriod }, priceSource: parameters.priceSource },
+  ];
+  return deepCopyFreeze({ normalizedParameters: parameters, triggerTimeframeMinutes: parameters.timeframeMinutes, indicatorRequirements });
+}
+
 export class EmaTrendKernel extends BaseStrategyKernel {
   public constructor(pair: string, parameters: EmaTrendParameters, bootstrap: readonly StrategyIndicatorBootstrapIdentityEntry[]) {
-    const requirements = [
-      { alias: 'ema.fast', indicatorType: 'EMA' as const, timeframeMinutes: parameters.timeframeMinutes, parameters: { period: parameters.fastPeriod }, priceSource: parameters.priceSource },
-      { alias: 'ema.slow', indicatorType: 'EMA' as const, timeframeMinutes: parameters.timeframeMinutes, parameters: { period: parameters.slowPeriod }, priceSource: parameters.priceSource },
-    ];
-    super({ pair, strategyId: 'EMA_TREND', strategyVersion: '1.0.0', normalizedParameters: parameters, indicatorBootstrapIdentity: bootstrap, triggerTimeframeMinutes: parameters.timeframeMinutes, indicatorRequirements: requirements });
+    const description = describe(parameters);
+    super({ pair, strategyId: 'EMA_TREND', strategyVersion: '1.0.0', normalizedParameters: description.normalizedParameters, indicatorBootstrapIdentity: bootstrap, triggerTimeframeMinutes: description.triggerTimeframeMinutes, indicatorRequirements: description.indicatorRequirements });
   }
   protected evaluateValidated(_snapshot: StrategyEvaluationSnapshot, points: ReadonlyMap<string, IndicatorPoint<unknown>>): StrategyOutcome {
     const fast = this.indicatorValue(points, 'ema.fast');
@@ -49,6 +55,9 @@ export const emaTrendV1Definition: StrategyDefinition<EmaTrendParameters> = Obje
   strategyId: 'EMA_TREND',
   strategyVersion: '1.0.0',
   normalizeParameters: normalizeEmaTrendParameters,
+  describeConstruction(parameters: unknown): StrategyConstructionDescription<EmaTrendParameters> {
+    return describe(normalizeEmaTrendParameters(parameters));
+  },
   createKernel(config: { readonly pair: string; readonly parameters: unknown; readonly indicatorBootstrapIdentity: readonly StrategyIndicatorBootstrapIdentityEntry[] }): StrategyKernel {
     return new EmaTrendKernel(config.pair, normalizeEmaTrendParameters(config.parameters), config.indicatorBootstrapIdentity);
   },

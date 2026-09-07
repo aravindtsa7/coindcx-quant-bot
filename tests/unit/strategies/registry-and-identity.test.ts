@@ -35,6 +35,7 @@ describe('Phase 10 registry and canonical identity', () => {
     const extra: StrategyDefinition = Object.freeze({
       strategyId: 'EXTRA', strategyVersion: '1.0.0',
       normalizeParameters: () => Object.freeze({}),
+      describeConstruction: () => Object.freeze({ normalizedParameters: Object.freeze({}), triggerTimeframeMinutes: 1, indicatorRequirements: Object.freeze([]) }),
       createKernel: () => { throw new Error('not used'); },
     });
     const registry = new StrategyRegistry();

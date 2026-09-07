@@ -2,8 +2,9 @@ import type { IndicatorPoint, PriceSource } from '../../indicators/types';
 import { toStrategyCalc } from '../core/decimal';
 import { StrategyError } from '../core/errors';
 import { BaseStrategyKernel, type StrategyOutcome } from '../core/kernel';
+import { deepCopyFreeze } from '../core/immutable';
 import { freezeNormalizedParameters, requireExactObject, sortedDistinctTimeframes, strategyPeriod, strategyPriceSource } from '../core/parameters';
-import type { StrategyDefinition, StrategyEvaluationSnapshot, StrategyIndicatorBootstrapIdentityEntry, StrategyIndicatorRequirement, StrategyKernel } from '../core/types';
+import type { StrategyConstructionDescription, StrategyDefinition, StrategyEvaluationSnapshot, StrategyIndicatorBootstrapIdentityEntry, StrategyIndicatorRequirement, StrategyKernel } from '../core/types';
 
 export type MultiTimeframeTrendParameters = Readonly<{
   timeframes: readonly number[];
@@ -33,13 +34,18 @@ function requirements(parameters: MultiTimeframeTrendParameters): readonly Strat
   ]);
 }
 
+function describe(parameters: MultiTimeframeTrendParameters): StrategyConstructionDescription<MultiTimeframeTrendParameters> {
+  const triggerTimeframeMinutes = parameters.timeframes[0];
+  if (triggerTimeframeMinutes === undefined) throw new StrategyError('INVALID_STRATEGY_PARAMETER', 'Multi-Timeframe Trend requires a trigger timeframe');
+  return deepCopyFreeze({ normalizedParameters: parameters, triggerTimeframeMinutes, indicatorRequirements: requirements(parameters) });
+}
+
 export class MultiTimeframeTrendKernel extends BaseStrategyKernel {
   readonly #timeframes: readonly number[];
   public constructor(pair: string, parameters: MultiTimeframeTrendParameters, bootstrap: readonly StrategyIndicatorBootstrapIdentityEntry[]) {
-    const triggerTimeframeMinutes = parameters.timeframes[0];
-    if (triggerTimeframeMinutes === undefined) throw new StrategyError('INVALID_STRATEGY_PARAMETER', 'Multi-Timeframe Trend requires a trigger timeframe');
-    super({ pair, strategyId: 'MULTI_TIMEFRAME_TREND', strategyVersion: '1.0.0', normalizedParameters: parameters,
-      indicatorBootstrapIdentity: bootstrap, triggerTimeframeMinutes, indicatorRequirements: requirements(parameters) });
+    const description = describe(parameters);
+    super({ pair, strategyId: 'MULTI_TIMEFRAME_TREND', strategyVersion: '1.0.0', normalizedParameters: description.normalizedParameters,
+      indicatorBootstrapIdentity: bootstrap, triggerTimeframeMinutes: description.triggerTimeframeMinutes, indicatorRequirements: description.indicatorRequirements });
     this.#timeframes = parameters.timeframes;
   }
   protected evaluateValidated(_snapshot: StrategyEvaluationSnapshot, points: ReadonlyMap<string, IndicatorPoint<unknown>>): StrategyOutcome {
@@ -59,6 +65,9 @@ export class MultiTimeframeTrendKernel extends BaseStrategyKernel {
 
 export const multiTimeframeTrendV1Definition: StrategyDefinition<MultiTimeframeTrendParameters> = Object.freeze({
   strategyId: 'MULTI_TIMEFRAME_TREND', strategyVersion: '1.0.0', normalizeParameters: normalizeMultiTimeframeTrendParameters,
+  describeConstruction(parameters: unknown): StrategyConstructionDescription<MultiTimeframeTrendParameters> {
+    return describe(normalizeMultiTimeframeTrendParameters(parameters));
+  },
   createKernel(config: { readonly pair: string; readonly parameters: unknown; readonly indicatorBootstrapIdentity: readonly StrategyIndicatorBootstrapIdentityEntry[] }): StrategyKernel {
     return new MultiTimeframeTrendKernel(config.pair, normalizeMultiTimeframeTrendParameters(config.parameters), config.indicatorBootstrapIdentity);
   },

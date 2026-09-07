@@ -2,8 +2,9 @@ import type { IndicatorPoint, PriceSource } from '../../indicators/types';
 import { StrategyCalcDecimal, toStrategyCalc } from '../core/decimal';
 import { StrategyError } from '../core/errors';
 import { BaseStrategyKernel, type StrategyOutcome } from '../core/kernel';
+import { deepCopyFreeze } from '../core/immutable';
 import { freezeNormalizedParameters, positiveDecimalParameter, requireExactObject, strategyPeriod, strategyPriceSource, strategyTimeframe } from '../core/parameters';
-import type { StrategyDefinition, StrategyEvaluationSnapshot, StrategyIndicatorBootstrapIdentityEntry, StrategyKernel } from '../core/types';
+import type { StrategyConstructionDescription, StrategyDefinition, StrategyEvaluationSnapshot, StrategyIndicatorBootstrapIdentityEntry, StrategyIndicatorRequirement, StrategyKernel } from '../core/types';
 
 export type RsiMomentumParameters = Readonly<{
   timeframeMinutes: number;
@@ -29,13 +30,21 @@ export function normalizeRsiMomentumParameters(raw: unknown): RsiMomentumParamet
   }) as RsiMomentumParameters;
 }
 
+function describe(parameters: RsiMomentumParameters): StrategyConstructionDescription<RsiMomentumParameters> {
+  const indicatorRequirements: readonly StrategyIndicatorRequirement[] = [
+    { alias: 'rsi', indicatorType: 'RSI', timeframeMinutes: parameters.timeframeMinutes, parameters: { period: parameters.period }, priceSource: parameters.priceSource },
+  ];
+  return deepCopyFreeze({ normalizedParameters: parameters, triggerTimeframeMinutes: parameters.timeframeMinutes, indicatorRequirements });
+}
+
 export class RsiMomentumKernel extends BaseStrategyKernel {
   readonly #longThreshold: InstanceType<typeof StrategyCalcDecimal>;
   readonly #shortThreshold: InstanceType<typeof StrategyCalcDecimal>;
   public constructor(pair: string, parameters: RsiMomentumParameters, bootstrap: readonly StrategyIndicatorBootstrapIdentityEntry[]) {
-    super({ pair, strategyId: 'RSI_MOMENTUM', strategyVersion: '1.0.0', normalizedParameters: parameters, indicatorBootstrapIdentity: bootstrap,
-      triggerTimeframeMinutes: parameters.timeframeMinutes,
-      indicatorRequirements: [{ alias: 'rsi', indicatorType: 'RSI', timeframeMinutes: parameters.timeframeMinutes, parameters: { period: parameters.period }, priceSource: parameters.priceSource }],
+    const description = describe(parameters);
+    super({ pair, strategyId: 'RSI_MOMENTUM', strategyVersion: '1.0.0', normalizedParameters: description.normalizedParameters, indicatorBootstrapIdentity: bootstrap,
+      triggerTimeframeMinutes: description.triggerTimeframeMinutes,
+      indicatorRequirements: description.indicatorRequirements,
     });
     this.#longThreshold = new StrategyCalcDecimal(parameters.longThreshold);
     this.#shortThreshold = new StrategyCalcDecimal(parameters.shortThreshold);
@@ -53,6 +62,9 @@ export class RsiMomentumKernel extends BaseStrategyKernel {
 
 export const rsiMomentumV1Definition: StrategyDefinition<RsiMomentumParameters> = Object.freeze({
   strategyId: 'RSI_MOMENTUM', strategyVersion: '1.0.0', normalizeParameters: normalizeRsiMomentumParameters,
+  describeConstruction(parameters: unknown): StrategyConstructionDescription<RsiMomentumParameters> {
+    return describe(normalizeRsiMomentumParameters(parameters));
+  },
   createKernel(config: { readonly pair: string; readonly parameters: unknown; readonly indicatorBootstrapIdentity: readonly StrategyIndicatorBootstrapIdentityEntry[] }): StrategyKernel {
     return new RsiMomentumKernel(config.pair, normalizeRsiMomentumParameters(config.parameters), config.indicatorBootstrapIdentity);
   },

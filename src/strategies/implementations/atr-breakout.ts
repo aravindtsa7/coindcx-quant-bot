@@ -2,8 +2,9 @@ import type { IndicatorPoint } from '../../indicators/types';
 import { StrategyCalcDecimal, toStrategyCalc, type StrategyCalc } from '../core/decimal';
 import { StrategyError } from '../core/errors';
 import { BaseStrategyKernel, type StrategyOutcome } from '../core/kernel';
+import { deepCopyFreeze } from '../core/immutable';
 import { freezeNormalizedParameters, positiveDecimalParameter, requireExactObject, strategyPeriod, strategyTimeframe } from '../core/parameters';
-import type { StrategyDefinition, StrategyEvaluationSnapshot, StrategyIndicatorBootstrapIdentityEntry, StrategyKernel } from '../core/types';
+import type { StrategyConstructionDescription, StrategyDefinition, StrategyEvaluationSnapshot, StrategyIndicatorBootstrapIdentityEntry, StrategyIndicatorRequirement, StrategyKernel } from '../core/types';
 
 export type AtrBreakoutParameters = Readonly<{
   timeframeMinutes: number;
@@ -20,19 +21,27 @@ export function normalizeAtrBreakoutParameters(raw: unknown): AtrBreakoutParamet
   }) as AtrBreakoutParameters;
 }
 
+function describe(parameters: AtrBreakoutParameters): StrategyConstructionDescription<AtrBreakoutParameters> {
+  const indicatorRequirements: readonly StrategyIndicatorRequirement[] = [
+    { alias: 'atr', indicatorType: 'ATR', timeframeMinutes: parameters.timeframeMinutes, parameters: { period: parameters.atrPeriod } },
+  ];
+  return deepCopyFreeze({ normalizedParameters: parameters, triggerTimeframeMinutes: parameters.timeframeMinutes, indicatorRequirements });
+}
+
 export class AtrBreakoutKernel extends BaseStrategyKernel {
   readonly #multiplier: StrategyCalc;
   #previousReadyClose: StrategyCalc | null = null;
   #previousReadyAtr: StrategyCalc | null = null;
   public constructor(pair: string, parameters: AtrBreakoutParameters, bootstrap: readonly StrategyIndicatorBootstrapIdentityEntry[]) {
+    const description = describe(parameters);
     super({
       pair,
       strategyId: 'ATR_BREAKOUT',
       strategyVersion: '1.0.0',
-      normalizedParameters: parameters,
+      normalizedParameters: description.normalizedParameters,
       indicatorBootstrapIdentity: bootstrap,
-      triggerTimeframeMinutes: parameters.timeframeMinutes,
-      indicatorRequirements: [{ alias: 'atr', indicatorType: 'ATR', timeframeMinutes: parameters.timeframeMinutes, parameters: { period: parameters.atrPeriod } }],
+      triggerTimeframeMinutes: description.triggerTimeframeMinutes,
+      indicatorRequirements: description.indicatorRequirements,
     });
     this.#multiplier = new StrategyCalcDecimal(parameters.breakoutMultiplier);
   }
@@ -61,6 +70,9 @@ export class AtrBreakoutKernel extends BaseStrategyKernel {
 
 export const atrBreakoutV1Definition: StrategyDefinition<AtrBreakoutParameters> = Object.freeze({
   strategyId: 'ATR_BREAKOUT', strategyVersion: '1.0.0', normalizeParameters: normalizeAtrBreakoutParameters,
+  describeConstruction(parameters: unknown): StrategyConstructionDescription<AtrBreakoutParameters> {
+    return describe(normalizeAtrBreakoutParameters(parameters));
+  },
   createKernel(config: { readonly pair: string; readonly parameters: unknown; readonly indicatorBootstrapIdentity: readonly StrategyIndicatorBootstrapIdentityEntry[] }): StrategyKernel {
     return new AtrBreakoutKernel(config.pair, normalizeAtrBreakoutParameters(config.parameters), config.indicatorBootstrapIdentity);
   },
