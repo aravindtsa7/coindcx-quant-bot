@@ -90,6 +90,7 @@ async function executeCell(
   pair: MatrixPairCatalogEntry,
   resource: MatrixPairExecutionResources,
   verificationPageMinutes: number | undefined,
+  eventSinkFactory: MatrixExecutionOptions['eventSinkFactory'],
 ): Promise<StrategyCoinMatrixCellResult> {
   try {
     assertPairResourceIdentity(pair, resource);
@@ -128,7 +129,7 @@ async function executeCell(
       fixedResearchQuantity: cell.fixedResearchQuantity,
       decisionSink: new InMemoryStrategyDecisionSink(),
     });
-    const engine = new BacktestEngine({
+    const engineConfig = {
       datasetManifest: resource.datasetManifest,
       datasetSource: resource.datasetSource,
       bootstrapFromInclusiveMs: cell.timeRange.bootstrapFromInclusiveMs,
@@ -147,7 +148,9 @@ async function executeCell(
       maxOpenOrders: finalized.plan.backtestConfig.maxOpenOrders,
       engineSemanticVersion: finalized.plan.backtestConfig.engineSemanticVersion,
       ...(verificationPageMinutes === undefined ? {} : { verificationPageMinutes }),
-    });
+    };
+    const sink = eventSinkFactory?.(cell);
+    const engine = sink === undefined ? new BacktestEngine(engineConfig) : new BacktestEngine(engineConfig, sink);
     if (engine.runId !== cell.expectedRunId) return failure(cell, 'RUN_ID_MISMATCH', 'Phase 9 engine runId differs from expectedRunId');
     const outcome = await engine.run();
     if (outcome.runId !== cell.expectedRunId) return failure(cell, 'RUN_ID_MISMATCH', 'Phase 9 outcome runId differs from expectedRunId', outcome);
@@ -160,13 +163,17 @@ async function executeCell(
   }
 }
 
-function validateOptions(options: MatrixExecutionOptions): { readonly workerCount: number; readonly verificationPageMinutes?: number } {
+function validateOptions(options: MatrixExecutionOptions): Required<Pick<MatrixExecutionOptions, 'workerCount'>> & Pick<MatrixExecutionOptions, 'verificationPageMinutes' | 'eventSinkFactory'> {
   const workerCount = options.workerCount ?? 1;
   if (!Number.isSafeInteger(workerCount) || workerCount < 1) throw new StrategyCoinMatrixError('INVALID_BACKTEST_CONFIG', 'workerCount must be a positive safe integer');
   if (options.verificationPageMinutes !== undefined && (!Number.isSafeInteger(options.verificationPageMinutes) || options.verificationPageMinutes < 1)) {
     throw new StrategyCoinMatrixError('INVALID_BACKTEST_CONFIG', 'verificationPageMinutes must be a positive safe integer');
   }
-  return options.verificationPageMinutes === undefined ? { workerCount } : { workerCount, verificationPageMinutes: options.verificationPageMinutes };
+  return {
+    workerCount,
+    ...(options.verificationPageMinutes === undefined ? {} : { verificationPageMinutes: options.verificationPageMinutes }),
+    ...(options.eventSinkFactory === undefined ? {} : { eventSinkFactory: options.eventSinkFactory }),
+  };
 }
 
 function finalizeResult(
@@ -242,7 +249,7 @@ export async function executeWithGitSourceVerifier(
       const resource = maps.resources.get(cell.pair);
       results[cell.cellSequence - 1] = pair === undefined || resource === undefined
         ? failure(cell, 'RESOURCE_IDENTITY_MISMATCH', 'Planned pair execution resources are unavailable')
-        : await executeCell(immutableFinalized, cell, dependencies, pair, resource, normalizedOptions.verificationPageMinutes);
+        : await executeCell(immutableFinalized, cell, dependencies, pair, resource, normalizedOptions.verificationPageMinutes, normalizedOptions.eventSinkFactory);
     }));
   }
   if (!sourceInvalid) {

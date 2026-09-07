@@ -6,6 +6,7 @@ import type {
   BacktestFundingSchedule,
   BacktestInstrumentSpec,
   BacktestRunResult,
+  BacktestEventSink,
 } from '../../backtest/types';
 import type { StrategyRegistry } from '../../strategies/core/registry';
 import type { MatrixErrorCode } from './errors';
@@ -172,4 +173,5 @@ export interface MatrixExecutionDependencies extends MatrixPlanningDependencies 
 export interface MatrixExecutionOptions {
   readonly workerCount?: number;
   readonly verificationPageMinutes?: number;
+  readonly eventSinkFactory?: (cell: StrategyCoinMatrixCell) => BacktestEventSink;
 }

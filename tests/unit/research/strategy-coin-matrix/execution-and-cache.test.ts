@@ -3,6 +3,7 @@ import {
   BacktestDecimal,
   canonicalJson,
   sha256CanonicalJson,
+  type BacktestEvent,
   type BacktestDatasetSource,
 } from '../../../../src/backtest';
 import type { CanonicalCandle1m } from '../../../../src/market-data/types';
@@ -188,5 +189,32 @@ describe('Phase 11 production execution and cache evidence', () => {
     }, {}, new ControlledGitVerifier());
     expect(retried.status).toBe('COMPLETED');
     expect(retrySource.reads).toBeGreaterThan(0);
+  });
+
+  it('keeps identities invariant while the execution-only sink observes fresh events and fails closed', async () => {
+    const pairResource = resources('BTC-INR');
+    const fixture = await finalized([pairResource], false);
+    const baseline = await executeWithGitSourceVerifier(fixture.plan, { registry: fixture.definitions, pairResources: [pairResource] }, {}, new ControlledGitVerifier());
+    const events: BacktestEvent[] = [];
+    const observed = await executeWithGitSourceVerifier(fixture.plan, { registry: fixture.definitions, pairResources: [pairResource] }, {
+      eventSinkFactory: (cell) => ({ write: (event) => { expect(cell.matrixCellId).toBe(fixture.plan.cells[0]?.matrixCellId); events.push(event); } }),
+    }, new ControlledGitVerifier());
+    expect(events.length).toBeGreaterThan(0);
+    expect(events.at(-1)?.type).toBe('RUN_COMPLETED');
+    expect(observed).toEqual(baseline);
+
+    const failed = await executeWithGitSourceVerifier(fixture.plan, { registry: fixture.definitions, pairResources: [pairResource] }, {
+      eventSinkFactory: () => ({ write: () => { throw new Error('controlled sink failure'); } }),
+    }, new ControlledGitVerifier());
+    expect(failed.cellResults[0]).toMatchObject({ status: 'FAILED', failure: { code: 'CELL_EXECUTION_FAILED' } });
+
+    let factoryCalls = 0;
+    const completed = baseline.cellResults[0];
+    if (completed?.status !== 'COMPLETED') throw new Error('expected completed result');
+    const cached = await executeWithGitSourceVerifier(fixture.plan, { registry: fixture.definitions, pairResources: [pairResource], cache: new InMemoryMatrixCompletedResultCache([completed]) }, {
+      eventSinkFactory: () => { factoryCalls += 1; return { write: () => undefined }; },
+    }, new ControlledGitVerifier());
+    expect(cached.status).toBe('COMPLETED');
+    expect(factoryCalls).toBe(0);
   });
 });
