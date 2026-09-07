@@ -48,10 +48,13 @@ Phase 11 answers one fundamental question:
 │                 RAW RESEARCH EVIDENCE LEDGER & RESULT MODEL                     │
 │                                                                                 │
 │   - Immutable StrategyCoinMatrixCellResult with authoritative Phase 9 runId     │
+│   - Discriminated terminal results: COMPLETED (real BacktestRunResult) | FAILED   │
+│   - Pre-engine failures record MatrixCellFailure with outcome: null             │
 │   - Source check: Verify clean HEAD prior to declaring matrix COMPLETED         │
 │   - Fail-closed matrix completion: Failed cells NEVER silently vanish           │
-│   - Discrete execution status: PLANNED, RUNNING, COMPLETED, PARTIAL, FAILED     │
-│   - Read-only research evidence ledger: Zero production state mutation          │
+│   - Discrete execution states: PLANNED, RUNNING; terminal: COMPLETED, FAILED    │
+│   - Overall matrix status: COMPLETED, PARTIAL, FAILED                           │
+│   - Zero wall-clock durations or timestamps in canonical research evidence      │
 │   - Anti-Scope: NO winner selection, NO ranking, NO automatic promotion         │
 └────────────────────────────────────────┬────────────────────────────────────────┘
                                          │ Raw Research Evidence (Read-Only)
@@ -288,26 +291,95 @@ Prohibitions:
 - Skipping fee calculation, slippage attribution, or funding settlement: **STRICTLY PROHIBITED**.
 - All-in-memory shortcuts that bypass Phase 9's two-pass dataset verification contract: **STRICTLY PROHIBITED**.
 
-### 6.2 Authoritative Phase 9 Manifest & RunId Construction Path (P11-SPEC-02)
+### 6.2 Matrix Backtest Execution Configuration Contract (`MatrixBacktestExecutionConfig`)
+Phase 11 v1 matrix-level deterministic backtest configuration binds the common Phase 9 run inputs that are shared across matrix cells within a plan:
+
+```typescript
+export interface MatrixBacktestExecutionConfig {
+  readonly initialEquity: string;
+
+  readonly costModel: {
+    readonly makerFeeRate: string;
+    readonly takerFeeRate: string;
+    readonly halfSpreadBps: string;
+    readonly marketSlippageBps: string;
+    readonly stopSlippageBps: string;
+  };
+
+  readonly intrabarAmbiguityPolicy: 'ADVERSE_FIRST';
+  readonly maxOpenOrders: number;
+  readonly engineSemanticVersion: string;
+}
+```
+
+#### Deterministic Rules & Bounds:
+1. **Decimal Canonical Normalization:** All decimal fields (`initialEquity`, `makerFeeRate`, `takerFeeRate`, `halfSpreadBps`, `marketSlippageBps`, `stopSlippageBps`) are validated and normalized using the actual Phase 9 canonical decimal normalization path (`BacktestDecimal`, `toBacktestCalcDecimal`). Native JS floating-point arithmetic is strictly prohibited.
+2. **Positive Equity:** `initialEquity` must be a positive decimal string ($> 0$, e.g. `"100000.00"`).
+3. **Cost Model Bounds:** Cost rates must be non-negative ($\ge 0$). As enforced by Phase 9, half spread plus market slippage rate and half spread plus stop slippage rate must each be strictly less than one ($< 1$).
+4. **Order Concurrency Limits:** `maxOpenOrders` must be a safe integer between 1 and 100 inclusive (default: 20, ceiling: 100).
+5. **Engine Semantic Version:** `engineSemanticVersion` is explicitly bound (default: `'9.0.0'`).
+6. **Intrabar Ambiguity:** Fixed to `'ADVERSE_FIRST'`.
+7. **No Implicit Sizing:** No implicit strategy or risk sizing parameters are embedded in the backtest configuration.
+8. **Plan Identity Binding:** `MatrixBacktestExecutionConfig` is a direct property of `StrategyCoinMatrixPlan` and is hashed directly into `matrixPlanId`.
+9. **Exclusion of Pair-Specific Funding:** Funding schedules are pair-specific and are explicitly **excluded** from `MatrixBacktestExecutionConfig`. Each pair binds its own funding schedule in `MatrixPairCatalogEntry`.
+
+### 6.3 `verificationPageMinutes` Non-Identity Specification
+Phase 9 `normalizeBacktestInputs` supports `verificationPageMinutes` for memory-bounded dataset verification chunking, but `verificationPageMinutes` is **NOT** part of `BacktestRunManifest` or Phase 9 `runId`.
+
+For Phase 11 v1:
+- `verificationPageMinutes` is **NOT** part of deterministic research identity:
+  - It is **NOT** part of `matrixPlanId`.
+  - It is **NOT** part of `matrixCellId`.
+  - It is **NOT** part of `matrixResultSha256`.
+- The engine uses the Phase 9 default (1440 minutes, 24 hours) unless an execution-only runtime option is explicitly passed to the worker.
+- If exposed as runtime worker tuning, changing `verificationPageMinutes` must **never** alter canonical research results, cell outcomes, or cryptographic identities.
+- Phase 11 specifications and code must never falsely claim that Phase 9 `runId` binds `verificationPageMinutes`.
+
+### 6.4 `configuredTimeframes` Derivation Rule
+For each cell, the `configuredTimeframes` array passed to Phase 9 `normalizeBacktestInputs` must be derived deterministically from the actual Phase 10 strategy kernel indicator requirements:
+1. **Extraction:** Collect the `timeframeMinutes` from all declared `indicatorRequirements` of the strategy kernel.
+2. **Filter Higher Timeframes Only ($> 1$):**
+   $$\text{configuredTimeframes} = \{ TF \in \text{kernelRequirements} \mid TF > 1 \}$$
+   - **Critical Rule:** 1m is **NEVER** included in `configuredTimeframes`. Phase 9 treats canonical 1m as the base candle stream and `configuredTimeframes` strictly as derived higher timeframes.
+3. **Sort Ascending:** Sort the resulting distinct timeframe values numerically ascending (e.g. `[5, 15, 60]`).
+4. **Bucket Alignment Verification:** Phase 9 `normalizeBacktestInputs` re-verifies that `bootstrapFromInclusiveMs` is strictly aligned to the bucket start of every configured higher timeframe:
+   $$\text{bucketStartMs}(\text{bootstrapFromInclusiveMs}, TF) === \text{bootstrapFromInclusiveMs} \quad \forall TF \in \text{configuredTimeframes}$$
+
+### 6.5 Authoritative Phase 9 Manifest & RunId Construction Path (P11-SPEC-02)
 Phase 11 **MUST NOT** implement a duplicate canonical JSON serializer, a parallel manifest serializer, or a custom `runId` hashing function.
 - Phase 11 directly imports and invokes the actual Phase 9 production manifest builder:
   ```typescript
   import { normalizeBacktestInputs } from '../backtest/manifest';
   import { sha256CanonicalJson } from '../backtest/canonical-json';
   ```
-- For every cell, the expected Phase 9 execution parameters are passed to `normalizeBacktestInputs(...)`, which returns:
-  $$\{ \text{manifest}: \text{BacktestRunManifest}, \text{runId}: \text{string}, \dots \}$$
-- The returned `runId` is the **authoritative `expectedRunId`** assigned to `cell.expectedRunId`.
-- When the cell executes via `BacktestEngine.run()`, the resulting `cellResult.runId` must strictly equal `cell.expectedRunId`. A mismatch fails closed immediately (`RUN_ID_MISMATCH`).
+- To construct a finalized cell:
+  1. Instantiate the actual Phase 10 kernel for the strategy candidate (`definition.createKernel(...)`).
+  2. Build the actual Phase 10 participant adapter identity:
+     ```typescript
+     const participant = buildStrategyBacktestParticipantIdentity({
+       kernel,
+       fixedResearchQuantity: pairCatalogEntry.fixedResearchQuantity,
+       gitCommitHash: plan.sourceIdentity.gitCommitHash,
+     });
+     ```
+  3. Derive `configuredTimeframes` per Section 6.4.
+  4. Collect actual runtime pair resources (`datasetManifest`, `instrumentSpec`, `costModel`, `fundingSchedule`).
+  5. Invoke actual Phase 9 `normalizeBacktestInputs(...)`, which returns:
+     $$\{ \text{manifest}: \text{BacktestRunManifest}, \text{runId}: \text{string}, \dots \}$$
+  6. The returned `runId` is the **authoritative `expectedRunId`** assigned to `cell.expectedRunId`.
+  7. For evidence verification only, assert:
+     $$\text{cell.expectedRunId} === \text{sha256CanonicalJson}(\text{normalized.manifest})$$
+     using the actual Phase 9 `sha256CanonicalJson`.
+  8. When the cell executes via `BacktestEngine.run()`, the resulting `cellResult.runId` must strictly equal `cell.expectedRunId`. A mismatch fails closed immediately (`RUN_ID_MISMATCH`).
 
-### 6.3 RunId Sensitivity & Identity Propagation
+### 6.6 RunId Sensitivity & Identity Propagation
 Phase 9 `runId` is sensitive to every behavior-altering backtest input. Altering any of the following parameters must deterministically produce a different `expectedRunId` and `matrixCellId`:
 1. `datasetId` or `datasetContentSha256`
 2. `bootstrapFromInclusiveMs`, `evaluationFromInclusiveMs`, `evaluationToExclusiveMs`, `replayToExclusiveMs`
-3. `configuredTimeframes`
-4. `instrumentSpecSnapshotId`
+3. `configuredTimeframes` (derived from strategy indicator requirements)
+4. `instrumentSpecSnapshotId` (re-verified by Phase 9)
 5. `costModel` (maker fee, taker fee, spread bps, slippage bps)
-6. `fundingSchedule` (sourceId, contentSha256, fidelity)
+6. `fundingSchedule` (`sourceId`, `contentSha256`, `fidelity`)
 7. `intrabarAmbiguityPolicy` (`ADVERSE_FIRST`)
 8. `maxOpenOrders`
 9. `engineSemanticVersion`
@@ -317,7 +389,7 @@ Phase 9 `runId` is sensitive to every behavior-altering backtest input. Altering
 
 Phase 11 enforces that all sensitivity changes propagate directly through the Phase 9 production code path.
 
-### 6.4 Fixed Research Quantity Binding
+### 6.7 Fixed Research Quantity Binding
 Phase 10 adapter requires `fixedResearchQuantity`.
 In Phase 11:
 - `fixedResearchQuantity` must be explicitly declared per pair in the matrix plan (e.g., `0.01` for `BTC-INR`, `0.1` for `ETH-INR`).
@@ -327,7 +399,7 @@ In Phase 11:
   - **DOES** alter Phase 9's `participant.parameterHash` and Phase 9 `runId`.
 - Phase 11 matrix cell identity cryptographically binds Phase 9 `runId`, ensuring complete lineage transparency.
 
-### 6.5 Cross-Coin Comparison Safety Warning
+### 6.8 Cross-Coin Comparison Safety Warning
 > [!WARNING]
 > Raw net PnL from a `BTC-INR` cell and an `ETH-INR` cell is **NOT directly comparable** in Phase 11.
 > Because `fixedResearchQuantity` represents different nominal capital exposures across different asset prices and contract multipliers, a strategy showing +₹50,000 on BTC and +₹30,000 on ETH cannot be declared "better on BTC" without capital-weighted, margin-normalized risk evaluation. Phase 11 records raw reproducible evidence; Phase 12 and Phase 15 perform statistical and ranking normalization.
@@ -386,6 +458,20 @@ For Phase 11 v1, if authoritative Git source metadata cannot be verified (e.g. s
 - The engine **FAILS CLOSED** with `MATRIX_SOURCE_STATE_UNAVAILABLE`.
 - Fallbacks to environment variables, manual strings, package versions, timestamps, hostnames, or process IDs are **strictly prohibited**.
 
+### 7.6 Testability Seam vs. Production Contract
+To ensure rigorous unit and integration testing without weakening production integrity:
+1. **Public Production Contract:** Production entry points (`runStrategyCoinMatrix`, `planStrategyCoinMatrix`, etc.) MUST always invoke the real Git source verifier querying local repository state directly (`git rev-parse HEAD`, `git status --porcelain=v1 --untracked-files=all`). Callers cannot supply an arbitrary `gitCommitHash` to bypass repository verification.
+2. **Internal Dependency Seam:** Implementation may define an internal source inspection abstraction (e.g. `GitSourceVerifier`) that defaults to the real Git process executor. An internal seam may be injected strictly within internal unit tests.
+3. **Public API Seam Protection:** The internal test seam **MUST NOT** be exported from the public Phase 11 barrel (`src/matrix/index.ts`) or public API.
+4. **Isolated Temporary Git Repositories:** Unit tests for Git source verification should construct isolated temporary Git repositories (`fs.mkdtemp`, `git init`, `git commit`) so that working-tree dirtiness during ongoing active development in the main workspace does not force weakening the production clean-tree rule.
+5. **Mandatory Test Cases:** Real Git integration test suites must explicitly cover:
+   - Clean temporary repository (succeeds)
+   - Tracked modified file (fails closed with `MATRIX_SOURCE_DIRTY`)
+   - Staged uncommitted file (fails closed with `MATRIX_SOURCE_DIRTY`)
+   - Untracked non-ignored file (fails closed with `MATRIX_SOURCE_DIRTY`)
+   - Different commit HEAD OID (fails closed with `MATRIX_SOURCE_COMMIT_MISMATCH`)
+6. **Controlled Mid-Run Invalidation:** Orchestration tests may use the internal seam to simulate repository state becoming dirty mid-run, verifying that all pending cells fail and the matrix terminates with status `FAILED`.
+
 ---
 
 ## 8. Canonical Matrix Plan Contract & Plan ID
@@ -403,6 +489,8 @@ To ensure that caller-owned mutable objects or arrays cannot alter a matrix plan
 
 ### 8.2 Canonical Plan Interface (`StrategyCoinMatrixPlan`)
 ```typescript
+import type { BacktestFundingFidelity } from '../backtest/types';
+
 export interface MatrixStrategyCatalogEntry {
   readonly strategyId: string;
   readonly strategyVersion: string;
@@ -414,6 +502,11 @@ export interface MatrixPairCatalogEntry {
   readonly datasetBinding: MatrixPairDatasetBinding;
   readonly fixedResearchQuantity: string;
   readonly instrumentSpecSnapshotId: string;
+  readonly fundingScheduleBinding: {
+    readonly sourceId: string;
+    readonly contentSha256: string;
+    readonly fidelity: BacktestFundingFidelity;
+  };
 }
 
 export interface StrategyCoinMatrixPlan {
@@ -433,19 +526,74 @@ export interface StrategyCoinMatrixPlan {
 }
 ```
 
-### 8.3 Deterministic Matrix Plan ID (`matrixPlanId`)
+### 8.3 Plan-Build & Execution Runtime Resources Contract (`MatrixPairExecutionResources`)
+To maintain clean separation between the canonical research specification and concrete runtime environment objects:
+- **Canonical Plan (Artifact A):** Stores authoritative cryptographic identities and configuration hashes (`datasetId`, `datasetContentSha256`, `instrumentSpecSnapshotId`, `fundingScheduleBinding`, `gitCommitHash`).
+- **Runtime Execution Resources (Artifact B):** The concrete in-memory or filesystem resources required by Phase 9 `BacktestEngine` and `normalizeBacktestInputs` to execute backtest runs.
+
+Phase 11 binds execution resources via the pair resource contract using real Phase 7/9 types:
+```typescript
+import type { HistoricalDatasetManifest } from '../market-data/historical';
+import type {
+  BacktestDatasetSource,
+  BacktestFundingSchedule,
+  BacktestInstrumentSpec,
+} from '../backtest/types';
+
+export interface MatrixPairExecutionResources {
+  readonly pair: string;
+  readonly datasetManifest: HistoricalDatasetManifest;
+  readonly datasetSource: BacktestDatasetSource;
+  readonly instrumentSpec: BacktestInstrumentSpec;
+  readonly fundingSchedule: BacktestFundingSchedule;
+}
+```
+
+### 8.4 Resource Identity Verification Rules
+Before any cell's `expectedRunId` is finalized and again prior to executing Phase 9 `BacktestEngine`, the matrix engine validates resource identity equality:
+1. **Dataset Pair Match:**
+   $$\text{datasetManifest.pair} === \text{planPair.pair}$$
+2. **Dataset Identity Match:**
+   $$\text{datasetManifest.datasetId} === \text{planPair.datasetBinding.datasetId}$$
+   $$\text{datasetManifest.contentSha256} === \text{planPair.datasetBinding.datasetContentSha256}$$
+3. **Instrument Spec Match:**
+   $$\text{instrumentSpec.pair} === \text{planPair.pair}$$
+   $$\text{instrumentSpec.instrumentSpecSnapshotId} === \text{planPair.instrumentSpecSnapshotId}$$
+   - In addition, Phase 9 `normalizeBacktestInputs` recomputes and verifies the instrument snapshot:
+     $$\text{computeBacktestInstrumentSpecSnapshotId}(\text{normalizedInstrument}) === \text{planPair.instrumentSpecSnapshotId}$$
+4. **Funding Schedule Match:**
+   $$\text{fundingSchedule.sourceId} === \text{planPair.fundingScheduleBinding.sourceId}$$
+   $$\text{fundingSchedule.contentSha256} === \text{planPair.fundingScheduleBinding.contentSha256}$$
+   $$\text{fundingSchedule.fidelity} === \text{planPair.fundingScheduleBinding.fidelity}$$
+   - In addition, Phase 9 `normalizeBacktestInputs` strictly re-verifies chronological event ordering within `(bootstrapFromInclusiveMs, replayToExclusiveMs]` and confirms that `computeBacktestFundingScheduleContentSha256(events) === planPair.fundingScheduleBinding.contentSha256`.
+5. **Fail-Closed on Mismatch:** Any discrepancy between provided execution resources and frozen plan bindings fails closed immediately with `RESOURCE_IDENTITY_MISMATCH` or `DATASET_IDENTITY_MISMATCH`. No mismatched resource may silently proceed.
+
+### 8.5 Explicit Distinction: Dataset Source vs. Git Source
+Phase 11 strictly differentiates between two fundamentally distinct source identity concepts:
+1. **Git Executable Source Identity:**
+   - Property: `plan.sourceIdentity.gitCommitHash`
+   - Purpose: Cryptographic identity of the code repository executing the research.
+   - Destination: Passed into Phase 10 adapter and Phase 9 manifest as `participant.gitCommitHash`.
+2. **Historical Dataset Source Identity:**
+   - Property: `datasetSource.sourceIdentity` (from `MatrixPairExecutionResources.datasetSource`)
+   - Purpose: Identifier of the historical market data storage mechanism (e.g. `'LOCAL_FS'`, `'MEMORY'`, `'S3'`).
+   - Destination: Passed into Phase 9 `normalizeBacktestInputs({ sourceIdentity: datasetSource.sourceIdentity, ... })`.
+
+**Critical Boundary:** These two fields are never conflated. A dataset source string must **NEVER** be assigned to `participant.gitCommitHash`.
+
+### 8.6 Deterministic Matrix Plan ID (`matrixPlanId`)
 $$\text{matrixPlanId} = \text{SHA-256}\left(\text{CanonicalJson}(\text{StrategyCoinMatrixPlan})\right)$$
 
 **Canonicalization Rules:**
 1. UTF-8 encoding without BOM.
 2. Object keys sorted lexicographically (ASCII byte order) recursively at all depths.
-3. `pairs` array sorted strictly ascending by `pair` name.
+3. `pairs` array sorted strictly ascending by `pair` name, with each entry binding `datasetBinding`, `fixedResearchQuantity`, `instrumentSpecSnapshotId`, and `fundingScheduleBinding`.
 4. `strategies` array sorted strictly ascending by `strategyId`, then `strategyVersion`.
 5. Candidate dimensions within each strategy sorted lexicographically by dimension key, and dimension values sorted per Section 3.3.
-6. Decimals serialized as canonical normalized strings (`"0.01"`, `"1.5"`).
+6. `backtestConfig` serialized with normalized decimal strings (`"100000.00"`, `"0.0002"`, `"0.0005"`, `"1.5"`, `"2.0"`).
 7. Zero wall-clock timestamps (`Date.now()`), zero runtime durations, zero hostnames, and zero process IDs in the hash payload.
 
-Any change to the pair catalog, dataset hash, analysis window, strategy candidate spaces, execution parameters, bootstrap policy ID, or repository git commit alters `matrixPlanId`.
+Any change to the pair catalog, dataset hash, analysis window, strategy candidate spaces, execution parameters, funding schedule binding, bootstrap policy ID, or repository git commit alters `matrixPlanId`.
 
 ---
 
@@ -521,19 +669,41 @@ This sequence is completely decoupled from execution completion order or worker 
 
 ## 10. Result Model & Matrix Execution Lifecycle
 
-### 10.1 Cell Execution Lifecycle
-Each research cell progresses through explicit, deterministic lifecycle states:
+### 10.1 Transient Execution Lifecycle vs. Terminal Result Model
+Each research cell progresses through explicit transient lifecycle states during execution:
 
 ```
 [ PLANNED ] ──► [ RUNNING ] ──► [ COMPLETED ] (Valid Phase 9 BacktestRunResult)
                      │
-                     └──► [ FAILED ] (Structured Error, Coverage Gap, or Engine Failure)
+                     └──► [ FAILED ] (Matrix-level error or Phase 9 BacktestFailedRunResult)
 ```
 
 ```typescript
-export type MatrixCellStatus = 'PLANNED' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+export type MatrixCellExecutionState =
+  | 'PLANNED'
+  | 'RUNNING'
+  | 'COMPLETED'
+  | 'FAILED';
+```
 
-export interface StrategyCoinMatrixCellResult {
+However, the canonical **final matrix result** contains **only terminal cell results** (`COMPLETED` or `FAILED`).
+
+### 10.2 Final Cell Result Discriminated Union
+Phase 11 v1 defines an authoritative discriminated union for terminal cell results:
+
+```typescript
+import type {
+  BacktestRunResult,
+  BacktestFailedRunResult,
+} from '../backtest/types';
+
+export interface MatrixCellFailure {
+  readonly code: MatrixErrorCode;
+  readonly message: string;
+  readonly details?: Readonly<Record<string, unknown>>;
+}
+
+export interface MatrixCellResultBase {
   readonly matrixCellId: string;
   readonly cellSequence: number;
   readonly pair: string;
@@ -542,18 +712,62 @@ export interface StrategyCoinMatrixCellResult {
   readonly parameterHash: string;
   readonly strategyInstanceId: string;
   readonly datasetId: string;
-  readonly runId: string;
-  readonly status: MatrixCellStatus;
-  readonly outcome: BacktestRunOutcome;
-  readonly executionMetrics?: {
-    readonly durationMs: number;
-  };
+  readonly expectedRunId: string;
 }
+
+export interface MatrixCellCompletedResult extends MatrixCellResultBase {
+  readonly status: 'COMPLETED';
+  readonly runId: string;
+  readonly outcome: BacktestRunResult;
+  readonly failure: null;
+}
+
+export interface MatrixCellFailedResult extends MatrixCellResultBase {
+  readonly status: 'FAILED';
+  readonly runId: string | null;
+  readonly outcome: BacktestFailedRunResult | null;
+  readonly failure: MatrixCellFailure;
+}
+
+export type StrategyCoinMatrixCellResult =
+  | MatrixCellCompletedResult
+  | MatrixCellFailedResult;
 ```
 
-### 10.2 Overall Matrix Plan Status
+#### Invariants on `COMPLETED` Cell Result:
+- `status === 'COMPLETED'`
+- `runId === expectedRunId`
+- `outcome.runId === expectedRunId`
+- `outcome.terminalStatus === 'COMPLETED'`
+- `outcome.isValid === true`
+- `failure === null`
+
+#### Invariants on `FAILED` Cell Result & Pre-Engine vs. Engine Failure:
+- `status === 'FAILED'`
+- `failure` is a non-null, structured `MatrixCellFailure`.
+- **Pre-Engine Failure (Engine Never Ran):** If cell execution fails before `BacktestEngine.run()` starts (e.g., strategy instantiation failure, parameter validation failure, runtime resource mismatch, dataset coverage gap, or cache integrity rejection):
+  - `outcome = null` (strictly null; no fabricated `BacktestRunOutcome` is ever constructed).
+  - `runId = null` (unless an authoritative `expectedRunId` was already computed before failure).
+  - `failure.code` is the genuine `MatrixErrorCode`.
+- **Phase 9 Failed Run (Engine Ran & Failed):** If `BacktestEngine.run()` completes with a failed run (`outcome.terminalStatus === 'FAILED'`):
+  - `outcome` preserves the genuine `BacktestFailedRunResult`.
+  - `outcome.errorCode` preserves the genuine Phase 9 `BacktestErrorCode`.
+  - Phase 11 **MUST NOT** rewrite or suppress the Phase 9 error as a fake matrix-only outcome.
+  - `failure` wraps the failure with `code: 'CELL_EXECUTION_FAILED'` and descriptive diagnostic message.
+
+### 10.3 Planning-Time Structural Failure vs. Execution-Time Failure
+Phase 11 enforces a strict boundary between planning errors and execution failures:
+1. **Planning-Time Structural Failures:**
+   - Any condition that prevents the construction of a valid, immutable canonical matrix plan or valid cell definitions—such as invalid candidate dimensions, duplicate normalized candidate parameters, unsupported indicator bootstrap policies, invalid Git repository state, or invalid backtest configurations—**FAILS PLAN FINALIZATION IMMEDIATELY**.
+   - These structural failures throw `StrategyCoinMatrixError`.
+   - The engine **NEVER** fabricates a `StrategyCoinMatrixPlanResult` for a plan that never achieved valid status.
+2. **Execution-Time Cell Failures:**
+   - Once a valid, immutable plan has been constructed, any subsequent failure during execution (runtime dataset read error, engine simulation failure, resource mismatch discovered at execution time, or unexpected adapter exception) produces a terminal `FAILED` cell result.
+   - **No cell disappears:** `cellResults.length` must strictly equal the planned cell count ($N$).
+
+### 10.4 Overall Matrix Plan Status
 ```typescript
-export type MatrixPlanStatus = 'PLANNED' | 'RUNNING' | 'COMPLETED' | 'PARTIAL' | 'FAILED';
+export type MatrixPlanStatus = 'COMPLETED' | 'PARTIAL' | 'FAILED';
 
 export interface StrategyCoinMatrixPlanResult {
   readonly matrixPlanId: string;
@@ -567,25 +781,62 @@ export interface StrategyCoinMatrixPlanResult {
 }
 ```
 
-### 10.3 The Fail-Closed Non-Disappearing Cell Invariant (Critical Audit Law)
-> **Core Architectural Law:** A failed, rejected, or missing cell MUST NEVER silently disappear from the matrix result. If any cell fails, the overall matrix status MUST NOT report `COMPLETED` (it must report `PARTIAL` or `FAILED`).
+#### Final Status Transitions:
+1. **`COMPLETED`:** All $N$ planned cells finished with `status: 'COMPLETED'` AND the final Git source verification check passes cleanly.
+2. **`PARTIAL`:** Under a still-valid verified Git source identity, at least one cell is `COMPLETED` and at least one cell is `FAILED`.
+3. **`FAILED`:**
+   - Zero cells completed; OR
+   - Matrix-wide source integrity fails at any point during execution or finalization.
 
-- If $N$ cells were planned, `cellResults.length` **MUST ALWAYS equal $N$**.
-- If cell #4 encounters a dataset gap or backtest engine failure:
-  - Its status is recorded as `FAILED`.
-  - Its structured error code and diagnostic trace are recorded in `outcome`.
-  - The matrix overall status becomes `PARTIAL` (if some completed) or `FAILED` (if zero completed).
-- Dropping failed cells to report a false 100% completion rate is strictly barred.
+#### Mid-Run Git Source Invalidation Rule:
+If the local repository HEAD changes or the working tree becomes dirty mid-run:
+- The matrix **MUST NOT** report `COMPLETED` or ordinary `PARTIAL` research success.
+- Overall matrix status becomes **`FAILED`**.
+- Every planned cell that has not yet completed is terminalized as **`FAILED`** with `failure.code = 'MATRIX_SOURCE_DIRTY'` or `'MATRIX_SOURCE_COMMIT_MISMATCH'`.
+- Already-completed cell evidence may remain recorded for audit traceability, but the overall matrix artifact is marked `FAILED` and is invalid for research conclusions.
+- `cellResults.length` still strictly equals $N$.
 
-### 10.4 Result Cryptographic Hash (`matrixResultSha256`)
+### 10.5 Elimination of Wall-Clock Durations from Canonical Results
+To preserve bit-for-bit reproducible research evidence across different hardware, CPUs, and execution environments:
+- **Zero Durations:** `durationMs`, elapsed runtime, wall-clock start/end timestamps, hostnames, and process IDs are **STRICTLY EXCLUDED** from canonical:
+  - `StrategyCoinMatrixCellResult`
+  - `StrategyCoinMatrixPlanResult`
+  - `matrixResultSha256` payload
+- If runtime performance telemetry is desired for operational monitoring, it must reside in an external, non-canonical telemetry channel and must **never** affect research identities or canonical JSON hashes.
+- For Phase 11 v1, runtime telemetry is omitted from canonical evidence artifacts.
+
+### 10.6 Result Cryptographic Hash (`matrixResultSha256`)
 $$\text{matrixResultSha256} = \text{SHA-256}\left(\text{CanonicalJson}(\text{MatrixResultSummaryPayload})\right)$$
 
-The payload covers:
-- `matrixPlanId`
-- `status`
-- `totalCells`, `completedCells`, `failedCells`
-- Array of canonical cell result digests: `[ { matrixCellId, runId, status, resultSha256: outcome.resultSha256 ?? null } ]` sorted strictly by `cellSequence`.
-- Excludes execution duration, timestamps, and host information.
+The summary payload covers only canonical terminal research evidence:
+1. `matrixPlanId`: The frozen 64-hex plan identity.
+2. `status`: The final `MatrixPlanStatus` (`'COMPLETED'`, `'PARTIAL'`, or `'FAILED'`).
+3. `totalCells`, `completedCells`, `failedCells`: Exact non-negative integer counts.
+4. `cellDigests`: Array of per-cell digest records sorted strictly by `cellSequence` ($1, 2, \dots, N$):
+   - **For `COMPLETED` Cells:**
+     ```json
+     {
+       "expectedRunId": "<64-hex>",
+       "matrixCellId": "<64-hex>",
+       "resultSha256": "<64-hex>",
+       "runId": "<64-hex>",
+       "status": "COMPLETED"
+     }
+     ```
+   - **For `FAILED` Cells:**
+     ```json
+     {
+       "expectedRunId": "<64-hex>",
+       "failureCode": "CELL_EXECUTION_FAILED",
+       "matrixCellId": "<64-hex>",
+       "phase9ErrorCode": "DATASET_RANGE_INVALID",
+       "runId": "<64-hex-or-null>",
+       "status": "FAILED"
+     }
+     ```
+     *(If the cell failed before engine execution, `phase9ErrorCode` is `null` and `runId` is `null`).*
+5. Excludes all duration, execution time, and worker process metadata.
+6. Bit-for-bit identical whether executed with 1 worker or $N$ parallel workers.
 
 ---
 
@@ -599,13 +850,27 @@ Phase 11 supports parallel worker execution (e.g., worker pools, cluster nodes):
 - Running a plan with 1 worker vs. 8 workers vs. 64 workers yields **bit-for-bit identical `matrixResultSha256` and identical JSON result output**.
 
 ### 11.2 Strict Resume & Cache Boundary
-To accelerate research iteration, Phase 11 may inspect existing cell result archives:
-1. **Verification Before Reuse:** A cached cell result cannot be trusted based on `matrixCellId` alone.
-2. **Mandatory Integrity Validation:** The cache layer must verify:
-   $$\text{cachedResult.runId} === \text{cell.expectedRunId}$$
-   $$\text{SHA-256}(\text{CanonicalJson}(\text{cachedResult.outcome})) === \text{cachedResult.outcome.resultSha256}$$
-3. If any checksum, git commit, or parameter mismatch occurs, the cache is invalidated and the cell re-executes.
-4. Mismatched or corrupted cache entries fail closed.
+To accelerate research iteration across long backtest spans, Phase 11 may inspect existing cell result archives:
+1. **Verification Before Reuse:** A cached cell result cannot be trusted based on `matrixCellId` or filename alone.
+2. **Reusability Restriction (COMPLETED Only):** Phase 11 v1 cache reuse is permitted **ONLY** for genuine successful `BacktestRunResult` outcomes. A failed outcome (`status: 'FAILED'`, `outcome.terminalStatus === 'FAILED'`) is **NEVER** reusable as a cache hit and must re-evaluate on fresh execution.
+3. **Mandatory Cache Integrity Validation Algorithm:**
+   A cached cell result is accepted if and only if all of the following conditions hold:
+   - `cachedResult.status === 'COMPLETED'`
+   - `cachedResult.outcome !== null`
+   - `cachedResult.outcome.terminalStatus === 'COMPLETED'`
+   - `cachedResult.outcome.isValid === true`
+   - `cachedResult.runId === cell.expectedRunId`
+   - `cachedResult.outcome.runId === cell.expectedRunId`
+   - `cachedResult.matrixCellId === cell.matrixCellId`
+   - **Correct Phase 9 Result Hash Verification:**
+     Because Phase 9 computes `resultSha256` over `BacktestResultHashPayload` *prior* to attaching the `resultSha256` field to `BacktestRunResult`, the cache validator must extract the hash payload and verify:
+     ```typescript
+     const { resultSha256, ...phase9HashPayload } = cachedResult.outcome;
+     sha256CanonicalJson(phase9HashPayload) === resultSha256;
+     ```
+   - **Explicit Non-Algorithm:** Hashing the full `cachedResult.outcome` object including `resultSha256` is **EXPLICITLY NOT** the validation algorithm (as the self-referential hash would never match).
+4. **Tamper Invalidation:** Mutating any field in `phase9HashPayload` (e.g. `finalEquity`, `netPnl`, `totalFills`, `eventLedgerSha256`) invalidates the cache check.
+5. **Fail-Closed on Corruption:** Mismatched, corrupt, or unverified cache entries fail closed: the cache entry is rejected/invalidated, forcing fresh cell execution. If fresh execution subsequently fails, standard `FAILED` cell result semantics apply. A corrupt cache can never fabricate `COMPLETED` evidence.
 
 ---
 
@@ -630,7 +895,10 @@ export type MatrixErrorCode =
   | 'MATRIX_SOURCE_STATE_UNAVAILABLE'
   | 'MATRIX_SOURCE_DIRTY'
   | 'MATRIX_SOURCE_COMMIT_MISMATCH'
-  | 'MATRIX_UNSUPPORTED_INDICATOR_BOOTSTRAP_POLICY';
+  | 'MATRIX_UNSUPPORTED_INDICATOR_BOOTSTRAP_POLICY'
+  | 'RESOURCE_IDENTITY_MISMATCH'
+  | 'INVALID_BACKTEST_CONFIG'
+  | 'FUNDING_SCHEDULE_INVALID';
 
 export class StrategyCoinMatrixError extends Error {
   public constructor(
@@ -716,6 +984,12 @@ Cell 003: BTC-INR × ATR_BREAKOUT 1.0.0 × { atrPeriod: 20, breakoutMultiplier: 
 | **P11-H15** | Can dataset binding silently resolve to "latest"? | **NO.** Exact `datasetId` and `contentSha256` must be explicitly declared in the plan. | **CLOSED** |
 | **P11-H16** | Can altered `fixedResearchQuantity` retain the same Phase 9 runId? | **NO.** Adapter configuration binds `participant.parameterHash`, changing Phase 9 `runId` deterministically. | **CLOSED** |
 | **P11-H17** | Can matrix results mutate production configurations? | **NO.** Matrix results are immutable read-only records. Production configurations remain unaffected. | **CLOSED** |
+| **P11-H18** | Can `MatrixBacktestExecutionConfig` be omitted or left unstandardized? | **NO.** `MatrixBacktestExecutionConfig` is explicitly frozen with canonical decimal bounds (`initialEquity`, `costModel`, `intrabarAmbiguityPolicy: 'ADVERSE_FIRST'`, `maxOpenOrders`, `engineSemanticVersion`), bound in `StrategyCoinMatrixPlan` and hashed into `matrixPlanId`. Pair-specific funding schedules are cleanly segregated into pair catalog entries. | **CLOSED** |
+| **P11-H19** | Can pair-specific funding schedules or concrete execution resources mismatch plan identities? | **NO.** `MatrixPairCatalogEntry` binds `fundingScheduleBinding` (`sourceId`, `contentSha256`, `fidelity`). `MatrixPairExecutionResources` are validated against plan bindings before cell finalization and execution; any mismatch fails closed (`RESOURCE_IDENTITY_MISMATCH`). | **CLOSED** |
+| **P11-H20** | Can a cell failure fabricate a fake `BacktestRunOutcome` or can pre-engine failure use an invalid union variant? | **NO.** Discriminated union enforces `MatrixCellCompletedResult` (`outcome: BacktestRunResult`, `failure: null`) vs `MatrixCellFailedResult` (`failure: MatrixCellFailure`). Pre-engine failures record `outcome: null` and `runId: null`, strictly forbidding fabricated Phase 9 outcomes. | **CLOSED** |
+| **P11-H21** | Can cache validation hash the full outcome including `resultSha256` or reuse failed backtests? | **NO.** Validation extracts `{ resultSha256, ...phase9HashPayload }` and verifies `sha256CanonicalJson(phase9HashPayload) === resultSha256`. Full-outcome self-hashing is prohibited. Failed outcomes are never reusable cache hits. | **CLOSED** |
+| **P11-H22** | Can wall-clock duration or worker timing jitter affect canonical research evidence? | **NO.** All durations (`durationMs`), `Date.now()`, `performance.now()`, and process metadata are strictly removed from `StrategyCoinMatrixCellResult`, `StrategyCoinMatrixPlanResult`, and `matrixResultSha256`. | **CLOSED** |
+| **P11-H23** | Can production entry points bypass real Git source verification using test seams? | **NO.** Public production entry points strictly require the real Git source verifier. Internal test seam is not exported from the public barrel. Tests run against isolated temporary Git repositories. | **CLOSED** |
 
 ---
 
@@ -730,12 +1004,13 @@ Implementation of Phase 11 must provide exhaustive test suites proving complianc
 | **P11-I03** | Dataset, window & versioned bootstrap policy binding | Provide dataset missing required warmup or analysis window $\implies$ fails closed with `DATASET_COVERAGE_GAP`. Prove EMA, ATR, RSI are accepted by `P11_INDICATOR_BOOTSTRAP_V1` and yield deterministic bootstrap origins. |
 | **P11-I04** | Deterministic `matrixPlanId` & verified Git source binding | Construct two identical plans with different key orders $\implies$ identical `matrixPlanId`. Prove full commit OID is auto-captured; dirty tracked file, staged file, or untracked non-ignored file fails closed (`MATRIX_SOURCE_DIRTY`); commit mismatch on prebuilt plan fails closed (`MATRIX_SOURCE_COMMIT_MISMATCH`); different clean commit OID produces different `matrixPlanId`. |
 | **P11-I05** | Deterministic cell expansion & ordering | Generate cells from multi-coin multi-strategy grid; assert cells strictly follow canonical total ordering (`pair` $\to$ `strategyId` $\to$ `version` $\to$ `paramHash` $\to$ `strategyInstanceId` $\to$ `expectedRunId`). |
-| **P11-I06** | Authoritative Phase 9 `runId` construction path & sensitivity | Expected `runId` is computed by calling actual Phase 9 `normalizeBacktestInputs` and `sha256CanonicalJson` (zero parallel hash code); assert executed `cellResult.runId` exactly equals `cell.expectedRunId`. Prove sensitivity: independently varying dataset manifest, strategy participant identity, `fixedResearchQuantity`, `gitCommitHash`, or backtest execution config changes Phase 9 `runId`. |
+| **P11-I06** | Authoritative Phase 9 `runId` construction path & sensitivity | Bind exact `MatrixBacktestExecutionConfig` and real pair resource identities (`MatrixPairCatalogEntry`, `fundingScheduleBinding`). Derive `configuredTimeframes` from real Phase 10 kernel indicator requirements (distinct $TF > 1$, sorted ascending, 1 excluded). Invoke actual Phase 9 `normalizeBacktestInputs` and `sha256CanonicalJson` (zero parallel hash code); assert executed `cellResult.runId` exactly equals `cell.expectedRunId` and `cell.expectedRunId === sha256CanonicalJson(normalized.manifest)`. Prove sensitivity: independently varying dataset manifest, strategy participant identity, `fixedResearchQuantity`, `gitCommitHash`, pair funding schedule, or backtest execution config changes Phase 9 `runId`. |
 | **P11-I07** | BTC + ETH × 4 strategies generic matrix | Execute a multi-cell test across BTC and ETH with all 4 Phase 10 strategies without any coin-specific code paths. |
 | **P11-I08** | Invalid / duplicate candidate & unsupported bootstrap policy fail-closed | Provide duplicate candidates (e.g. `"2.0"` and `"2.00"`) $\implies$ throws `DUPLICATE_PARAMETER_CANDIDATE`. Pass strategy requiring SMA, MACD, Bollinger, or SuperTrend $\implies$ fails closed before plan finalization or execution with `MATRIX_UNSUPPORTED_INDICATOR_BOOTSTRAP_POLICY`. Prove policy version increment changes `matrixPlanId`. |
-| **P11-I09** | Failed cell cannot disappear / partial semantics | Simulate one cell failing during backtest; assert matrix contains all planned cells, status is `PARTIAL`, and `isValid` is handled accurately without cell loss. |
-| **P11-I10** | Concurrency invariance | Execute identical 16-cell plan with 1 worker vs. 4 workers; assert `cellResults` sequence and `matrixResultSha256` are identical. |
+| **P11-I09** | Discriminated cell results, non-disappearing cells & partial/failure semantics | Final cell result is a strict discriminated union (`MatrixCellCompletedResult` vs `MatrixCellFailedResult`). For pre-engine failures (validation, coverage gap, resource mismatch), assert `status: 'FAILED'`, `outcome: null`, `runId: null` (or null outcome), and non-null `failure: MatrixCellFailure`, with zero fabricated `BacktestRunOutcome`. For Phase 9 engine failures, assert `outcome: BacktestFailedRunResult` preserves genuine `BacktestErrorCode`. Assert failed cells never disappear (`cellResults.length === plannedCells`). If at least 1 cell completes and 1 fails under valid source, matrix status is `PARTIAL`. If 0 cells complete, status is `FAILED`. If source changes mid-run, status is `FAILED` and pending cells become `FAILED` with `MATRIX_SOURCE_DIRTY` / `MATRIX_SOURCE_COMMIT_MISMATCH`. |
+| **P11-I10** | Concurrency invariance & zero duration in canonical results | Execute identical 16-cell plan with 1 worker vs. 4 workers; assert `cellResults` sequence, `matrixResultSha256`, and canonical result JSON are bit-for-bit identical independent of worker completion timing. Assert zero wall-clock duration (`durationMs`), timestamps, or process metadata exist in canonical cell results, plan results, or `matrixResultSha256` payload. |
 | **P11-I11** | No-lookahead / predeclared space | Assert candidate grid generation completes before any backtest execution begins; zero feedback loops from results to candidates. |
 | **P11-I12** | Fixed research quantity propagation | Execute identical strategy parameters with two different `fixedResearchQuantity` values; assert pure strategy `parameterHash` is unchanged while Phase 9 `runId` and `matrixCellId` differ. |
-| **P11-I13** | Genuine Phase 9 + Phase 10 execution & execution source integrity | Verify cell execution calls genuine `BacktestEngine` and `StrategyKernel`. Verify clean source state is asserted before first cell and before declaring `COMPLETED`. If source tree is dirtied mid-run, execution fails closed and never reports `COMPLETED`. |
+| **P11-I13** | Genuine Phase 9 + Phase 10 execution, runtime resource validation & execution source integrity | Verify cell execution calls genuine `BacktestEngine` and `StrategyKernel` via `StrategyBacktestParticipantAdapter`. Assert runtime resource identity mismatch (`datasetManifest`, `instrumentSpec`, `fundingSchedule`) fails closed before execution. Verify clean source state is asserted before first cell, throughout execution, and before declaring `COMPLETED`. If source tree is dirtied mid-run, execution fails closed, all pending cells fail, and matrix status is `FAILED`. |
 | **P11-I14** | Input-side defensive immutability & result immutability | Construct plan/cells using caller-owned mutable input objects/arrays; mutate caller inputs aggressively post-construction; assert frozen plan, `matrixPlanId`, cell list, `matrixCellIds`, parameter hashes, `strategyInstanceIds`, and `runIds` are completely unchanged. Assert emitted plan/cell/result objects are deeply frozen against external mutation. |
+| **P11-I15** | Phase 9 completed-result cache integrity | Accept genuine completed `BacktestRunResult` from cache when `runId` matches `cell.expectedRunId`, `matrixCellId` matches `cell.matrixCellId`, and `sha256CanonicalJson(outcome without resultSha256) === outcome.resultSha256`. Assert modifying any hashed Phase 9 outcome field invalidates cache check and forces fresh execution. Assert that hashing full outcome including `resultSha256` is explicitly NOT the validation algorithm. Assert that failed outcomes (`status: 'FAILED'`) are never reusable as Phase 11 v1 cache hits. Corrupt cache entries fail closed and never produce `COMPLETED` evidence. |
