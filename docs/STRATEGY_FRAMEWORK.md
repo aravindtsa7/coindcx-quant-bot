@@ -837,15 +837,21 @@ To ensure that changing `fixedResearchQuantity` alters the Phase 9 backtest run 
 $$\text{Same Strategy Parameters} + \text{Different fixedResearchQuantity} \implies \begin{cases} \text{SAME pure strategy parameterHash} \\ \text{SAME strategyInstanceId} \\ \text{DIFFERENT Phase 9 participant.parameterHash} \\ \text{DIFFERENT Phase 9 runId} \end{cases}$$
 
 ### 15.3 Open-Order Safety & Fail-Closed Invariant
-- If `context.openOrders.length > 0`:
-  The adapter records `dispatchStatus: 'ADAPTER_REJECTED'` and throws `STRATEGY_BACKTEST_ADAPTER_BUSY` ("Cannot reconcile strategy target exposure while active open orders exist").
-  It fails closed rather than stacking duplicate exposure-changing orders.
+- Active / pending / open-order safety has precedence over target reconciliation for every successfully audited decision status: `WARMING`, `READY` / `LONG`, `READY` / `SHORT`, and `READY` / `FLAT`.
+- The exact adapter order is:
+  1. `strategy.evaluate()` produces a `StrategyDecision`.
+  2. `StrategyDecisionSink.writeDecision()` succeeds.
+  3. The adapter inspects `context.openOrders`.
+  4. If any unresolved active order exists, the adapter records `dispatchStatus: 'ADAPTER_REJECTED'` where the dispatch audit facility remains available, throws `STRATEGY_BACKTEST_ADAPTER_BUSY` ("Cannot reconcile strategy target exposure while active open orders exist"), and returns no action.
+  5. Only when no active order exists does the adapter map `WARMING` to `WARMING_NO_ACTION` or reconcile a `READY` target exposure.
+- The decision therefore remains durably/auditably written before an active-order rejection. The adapter fails closed rather than stacking duplicate exposure-changing orders.
 
 ### 15.4 Target Exposure to Phase 9 Market Order Mapping
 
 | Target Exposure | Current Simulated Position | Action / Order Intent Generated | Dispatch Status |
 | :--- | :--- | :--- | :--- |
-| **`WARMING`** | Any | **No orders submitted** (`submitOrders: []`). | `WARMING_NO_ACTION` |
+| **`WARMING`** | Any, with **no active unresolved order** | **No orders submitted** (`submitOrders: []`). | `WARMING_NO_ACTION` |
+| **`WARMING`** | Any, with an **active unresolved order** | **No action returned**; fail closed with `STRATEGY_BACKTEST_ADAPTER_BUSY`. | `ADAPTER_REJECTED` |
 | **`FLAT`** | `FLAT` | **No orders submitted**. | `READY_NO_ACTION` |
 | **`FLAT`** | `LONG` ($Q$) | `SELL`, `quantity = Q`, `reduceOnly = true`, `type = MARKET` | `ACTION_BATCH_RETURNED` |
 | **`FLAT`** | `SHORT` ($Q$) | `BUY`, `quantity = Q`, `reduceOnly = true`, `type = MARKET` | `ACTION_BATCH_RETURNED` |
@@ -915,7 +921,8 @@ Implementation of Phase 10 must provide exhaustive test suites proving complianc
 - MTF duplicate timeframes `[5, 15, 5]` fail validation (`INVALID_STRATEGY_PARAMETER`).
 
 ### G. Mandatory Decision Audit Sink (P10-SPEC-05)
-- `WARMING` decision is written to sink before returning $\implies$ dispatch record is `WARMING_NO_ACTION`.
+- `WARMING` decision with no active unresolved order is written to sink before returning $\implies$ dispatch record is `WARMING_NO_ACTION`.
+- `WARMING` decision with an active unresolved order is written to sink before the busy check $\implies$ dispatch record is `ADAPTER_REJECTED`, the adapter throws `STRATEGY_BACKTEST_ADAPTER_BUSY`, and no action is returned.
 - `READY` decision with matching side written to sink $\implies$ dispatch record is `READY_NO_ACTION`.
 - `READY` decision with order written to sink before orders returned $\implies$ dispatch record contains `actionBatchSha256`.
 - If `decisionSink.writeDecision()` throws $\implies$ adapter fails closed, zero orders submitted.
@@ -943,8 +950,8 @@ Implementation of Phase 10 must provide exhaustive test suites proving complianc
 | **P10-I07** | Can RSI thresholds accept inverted bounds? | **NO.** Validation requires $0 < \text{shortThreshold} < \text{longThreshold} < 100$ on canonical decimal values. | **CLOSED** |
 | **P10-I08** | Can MTF bootstrap origin change without altering strategy identity? | **NO.** `strategyInstanceId` binds authoritative `indicatorBootstrapIdentity` for every configured timeframe. | **CLOSED** |
 | **P10-I09** | Can backtest strategy implementation differ from live strategy logic? | **NO.** Backtest and live execution use the exact same `StrategyKernel` class. Only external adapters differ. | **CLOSED** |
-| **P10-I10** | Can WARMING decision trigger order submission or position closure? | **NO.** WARMING has `targetExposure: null` and emits zero orders (`WARMING_NO_ACTION`). | **CLOSED** |
-| **P10-I11** | Can active open orders exist during backtest adapter reconciliation? | **NO.** Adapter fails closed immediately with `STRATEGY_BACKTEST_ADAPTER_BUSY`. | **CLOSED** |
+| **P10-I10** | Can WARMING decision trigger order submission or position closure? | **NO.** WARMING has `targetExposure: null`; with no active order it emits zero orders (`WARMING_NO_ACTION`), while an active unresolved order takes precedence and fails closed with zero action. | **CLOSED** |
+| **P10-I11** | Can active open orders exist during backtest adapter reconciliation? | **NO.** After the decision is written, the adapter rejects any decision status with `ADAPTER_REJECTED` and fails closed with `STRATEGY_BACKTEST_ADAPTER_BUSY` before reconciliation. | **CLOSED** |
 | **P10-I12** | Can future market data alter strategy decisions at timestamp $T$? | **NO.** Strict no-lookahead poison test verifies decisions through $T$ are identical. | **CLOSED** |
 | **P10-I13** | Can a generated decision vanish before audit? | **NO.** `StrategyDecisionSink.writeDecision` is mandatory before adapter reconciliation. | **CLOSED** |
 | **P10-I14** | Can fixed research quantity alter backtest run without altering Phase 9 run identity? | **NO.** `fixedResearchQuantity` binds Phase 9 `participant.parameterHash` and `runId`. | **CLOSED** |
