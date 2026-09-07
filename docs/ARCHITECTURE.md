@@ -121,10 +121,21 @@ The **CoinDCX Quant Futures Bot** is built as a highly deterministic, modular Ty
 - Explicitly defers true Volume Profile pending canonical trade-level price-volume data; synthetic intrabar volume distribution heuristics across OHLCV candles are strictly prohibited.
 - Complete mathematical specifications, recurrence relations, precision budgets, and verification fixtures are frozen in `docs/INDICATOR_ENGINE.md`.
 
-### 2.8 Strategy Research Lab
-- Unified framework hosting quantitative strategy definitions.
-- Defines a standardized interface: `onCandle(context): Signal[]`.
-- Strategies are completely decoupled from execution channels, exchange APIs, and account balances.
+### 2.8 Strategy Framework (Phase 10)
+- Environment-neutral, deterministic quantitative strategy architecture where the **identical pure strategy kernel** executes across historical backtesting, paper trading, shadow evaluation, and live production trading without environment-specific branches.
+- Enforces strict unidirectional dependency, fail-closed input validation, and auditable dispatch:
+  $$\text{Closed Market Truth} \longrightarrow \text{Phase 8 Indicator Kernels} \longrightarrow \text{Sanitized StrategyEvaluationSnapshot} \longrightarrow \text{Pure Strategy Kernel} \longrightarrow \text{StrategyDecision} \longrightarrow \text{StrategyDecisionSink} \longrightarrow \text{Environment Adapter} \longrightarrow \text{Dispatch Audit} \longrightarrow \text{Downstream Actions}$$
+- **Zero Account / Order Awareness in Strategy Core:** The pure strategy core (`src/strategies/core/**`) is strictly prohibited from importing backtest engines, exchange clients, order APIs, risk engines, account equity, cash balances, exchange positions, or active orders.
+- **Pre-Strategy Input Validation Contract:** Enforces strict structural checks (alias presence, pair match, timeframe match, closed timestamps, trigger freshness, and HTF same-timestamp freshness) and null-regression detection before warmup/ready handling. Malformed or missing indicator truth fails closed and never silently becomes warmup or flat.
+- **Mandatory Decision Audit Sink:** Every actual trigger evaluation writes an immutable `StrategyDecision` to `StrategyDecisionSink` before any environment adapter reconciliation occurs. If the sink fails, the adapter fails closed with zero order output.
+- **Environment Adapters Sanitize & Reconcile:** Adapters (e.g. `StrategyBacktestParticipantAdapter`) sanitize incoming runtime context (explicitly stripping account, position, and open-order fields) into an immutable `StrategyEvaluationSnapshot`, call `kernel.evaluate(snapshot)`, record a `StrategyDecisionDispatchRecord`, and reconcile abstract target exposures with environment-specific execution mechanisms.
+- **Discriminated Non-Actionable Warmup:** Legitimate indicator warmup emits `status: 'WARMING'` with `targetExposure = null`; converting warmup into `FLAT` or generating exit orders during warmup is strictly prohibited, preventing accidental position liquidation during bootstrap.
+- **Abstract Target Exposure:** Pure strategies emit desired market direction (`LONG`, `SHORT`, `FLAT`), never concrete orders (`BUY`, `SELL`), order types (`MARKET`, `LIMIT`), quantities, or leverage.
+- **Trigger-Timeframe Scheduling:** Strategies evaluate if and only if their configured `triggerTimeframeMinutes` candle closes at evaluation timestamp $T$; multi-timeframe strategies observe newly finalized higher-timeframe candles and indicators closing at $T$ in ascending order, or their latest prior closed values.
+- **Deterministic Identity & Canonical Normalization:** Exact decimal parameter canonicalization normalizes numeric-equivalent values (`"2"`, `"2.0"`, `"002.000"` $\to$ `"2"`) before SHA-256 `parameterHash` computation; analytical run segments bind authoritative per-timeframe `indicatorBootstrapIdentity` entries into `strategyInstanceId`; and adapter-only `fixedResearchQuantity` binds Phase 9 participant and run identity without leaking into strategy parameter hash.
+- **Isolated Decimal Arithmetic:** Threshold and breakout math evaluates within an isolated 128-digit Decimal context (`StrategyCalcDecimal`, `ROUND_HALF_UP`) with native floating-point math strictly prohibited.
+- **First 4 Parameterized Strategies:** Core implementations for EMA Trend V1 (`EMA_TREND`), ATR Breakout V1 (`ATR_BREAKOUT`), RSI Momentum V1 (`RSI_MOMENTUM`), and Multi-Timeframe Trend V1 (`MULTI_TIMEFRAME_TREND`).
+- Complete specifications and verification contracts are frozen in `docs/STRATEGY_FRAMEWORK.md`.
 
 ### 2.9 Backtesting Engine
 - High-performance, strictly deterministic offline event replay and simulation environment operating on verified Phase 7 canonical 1m datasets.
