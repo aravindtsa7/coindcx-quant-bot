@@ -61,7 +61,7 @@ export async function runPublicWsSmoke(): Promise<void> {
 
   // Initialize public futures stream
   console.log('\n[4/5] Initializing CoinDcxPublicFuturesStream (one shared public socket)...');
-  const stream = new CoinDcxPublicFuturesStream();
+  const stream = new CoinDcxPublicFuturesStream({ registry });
 
   let candleCount = 0;
   const candlesByPair = new Map<string, number>();

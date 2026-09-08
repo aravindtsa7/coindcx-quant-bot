@@ -113,6 +113,9 @@ export function determineEntryEligibility(
   if (instrument.exitOnly) {
     return 'EXIT_ONLY';
   }
+  if (instrument.exitOnly !== false) {
+    return 'RESTRICTION_UNKNOWN';
+  }
 
   if (instrument.marginCurrency !== 'INR') {
     return 'INVALID_INSTRUMENT_METADATA';

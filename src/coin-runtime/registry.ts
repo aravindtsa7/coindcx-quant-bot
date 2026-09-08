@@ -160,6 +160,33 @@ function createRuntimeSnapshot(record: InternalCoinRecord): CoinRuntime {
 export class CoinRegistry {
   readonly #byUnderlying = new Map<string, InternalCoinRecord>();
   readonly #byPair = new Map<string, InternalDiscoveredRecord>();
+  readonly #revisions = new Map<string, number>();
+  readonly #changeListeners = new Set<() => void>();
+
+  public beginDiscovery(underlying: string): number {
+    const key = canonicalizeUnderlying(underlying);
+    const revision = (this.#revisions.get(key) ?? 0) + 1;
+    this.#revisions.set(key, revision);
+    return revision;
+  }
+
+  public assertDiscoveryOwner(underlying: string, revision: number): void {
+    if (this.#revisions.get(canonicalizeUnderlying(underlying)) !== revision) {
+      throw new CoinRegistrationError('Coin discovery operation was superseded', { underlying, reason: 'SUPERSEDED' });
+    }
+  }
+
+  public subscribeChanges(listener: () => void): () => void {
+    this.#changeListeners.add(listener);
+    return () => { this.#changeListeners.delete(listener); };
+  }
+
+  #notifyChanged(underlying: string): void {
+    this.beginDiscovery(underlying); // Every lifecycle mutation revokes older async ownership.
+    for (const listener of [...this.#changeListeners]) {
+      try { listener(); } catch { logger.error('Coin registry change listener failed'); }
+    }
+  }
 
   /**
    * Registers a newly constructed CoinRuntime.
@@ -187,6 +214,7 @@ export class CoinRegistry {
         entryEligibility: 'CONFIG_DISABLED',
       };
       this.#byUnderlying.set(canonicalUnderlying, record);
+      this.#notifyChanged(canonicalUnderlying);
       logger.info(
         { underlying: canonicalUnderlying, lifecycle: 'DISABLED' },
         'Registered undiscovered disabled coin runtime'
@@ -215,6 +243,7 @@ export class CoinRegistry {
 
     this.#byUnderlying.set(canonicalUnderlying, record);
     this.#byPair.set(pair, record);
+    this.#notifyChanged(canonicalUnderlying);
 
     logger.info(
       {
@@ -267,6 +296,7 @@ export class CoinRegistry {
 
     this.#byUnderlying.set(canonicalUnderlying, record);
     this.#byPair.set(newPair, record);
+    this.#notifyChanged(canonicalUnderlying);
 
     logger.info(
       {
@@ -368,6 +398,10 @@ export class CoinRegistry {
     }
 
     const previousState = record.lifecycle;
+    if (previousState === 'DISABLED' && nextState === 'DISABLED') {
+      this.#notifyChanged(canonical);
+      return createRuntimeSnapshot(record);
+    }
     assertValidLifecycleTransition(
       previousState,
       nextState,
@@ -376,6 +410,7 @@ export class CoinRegistry {
     );
 
     record.lifecycle = nextState;
+    this.#notifyChanged(canonical);
 
     logger.info(
       {
@@ -403,5 +438,6 @@ export class CoinRegistry {
   public clear(): void {
     this.#byUnderlying.clear();
     this.#byPair.clear();
+    for (const underlying of this.#revisions.keys()) this.#notifyChanged(underlying);
   }
 }

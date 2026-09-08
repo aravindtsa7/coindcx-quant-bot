@@ -210,7 +210,7 @@ export function normalizeInstrument(wire: InstrumentWire): InrFuturesInstrument 
       wire.expiry_time !== undefined && wire.expiry_time !== null
         ? toSafeIntegerTimestamp(wire.expiry_time, 'expiry_time')
         : null,
-    exitOnly: wire.exit_only ?? false,
+    exitOnly: wire.exit_only ?? null,
     timeInForceOptions: Object.freeze([...(wire.time_in_force_options ?? [])]),
     supportedOrderTypes: Object.freeze([...(wire.order_types ?? [])]),
     dynamicPositionLeverageTiers: Object.freeze(dynamicPositionLeverageTiers),

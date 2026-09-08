@@ -226,8 +226,33 @@ export class CoinDcxTransport {
     const isHttps = fullUrl.protocol === 'https:';
     const requestModule = isHttps ? https : http;
 
-    return new Promise<HttpResponse<T>>((resolve, reject) => {
+    return new Promise<HttpResponse<T>>((resolveWire, rejectWire) => {
       let reqTimeout: NodeJS.Timeout | null = null;
+      let response: http.IncomingMessage | undefined;
+      let settled = false;
+      const timeoutError = () => new CoinDcxTimeoutError(
+        `CoinDCX request timed out after ${this.#timeoutMs}ms`,
+        { path, method, timeoutMs: this.#timeoutMs }
+      );
+      const clearDeadline = () => {
+        if (reqTimeout !== null) clearTimeout(reqTimeout);
+        reqTimeout = null;
+      };
+      const reject = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearDeadline();
+        rejectWire(error);
+        response?.destroy();
+        req.destroy();
+      };
+      const resolve = (value: HttpResponse<T>) => {
+        if (settled) return;
+        if (Date.now() - startTime >= this.#timeoutMs) { reject(timeoutError()); return; }
+        settled = true;
+        clearDeadline();
+        resolveWire(value);
+      };
 
       const req = requestModule.request(
         fullUrl,
@@ -236,19 +261,17 @@ export class CoinDcxTransport {
           headers,
         },
         (res) => {
-          if (reqTimeout) {
-            clearTimeout(reqTimeout);
-            reqTimeout = null;
-          }
+          response = res;
+          if (settled) { res.destroy(); return; }
 
           const statusCode = res.statusCode ?? 500;
           const chunks: Buffer[] = [];
           let receivedBytes = 0;
 
           res.on('data', (chunk: Buffer) => {
+            if (settled) return;
             receivedBytes += chunk.length;
             if (receivedBytes > this.#maxResponseBytes) {
-              res.destroy();
               reject(
                 new CoinDcxProviderError(
                   `CoinDCX response exceeded maximum size limit of ${this.#maxResponseBytes} bytes`,
@@ -262,6 +285,8 @@ export class CoinDcxTransport {
           });
 
           res.on('end', () => {
+            if (settled) return;
+            if (Date.now() - startTime >= this.#timeoutMs) { reject(timeoutError()); return; }
             const durationMs = Date.now() - startTime;
             const buffer = Buffer.concat(chunks);
             const rawBody = buffer.toString('utf8');
@@ -340,39 +365,38 @@ export class CoinDcxTransport {
           });
 
           res.on('error', (err) => {
-            if (reqTimeout) {
-              clearTimeout(reqTimeout);
-              reqTimeout = null;
-            }
             reject(
               new CoinDcxProviderError(`Socket error while receiving response: ${err.message}`, 502, {
                 path,
               })
             );
           });
+          res.once('aborted', () => reject(new CoinDcxProviderError('CoinDCX response was aborted', 502, { path })));
+          res.once('close', () => {
+            if (!settled) reject(new CoinDcxProviderError('CoinDCX response closed before completion', 502, { path }));
+            // This transport exclusively owns this response's body listeners.
+            res.removeAllListeners('data');
+            res.removeAllListeners('end');
+            res.removeAllListeners('error');
+            res.removeAllListeners('aborted');
+          });
         }
       );
 
       reqTimeout = setTimeout(() => {
-        req.destroy();
-        reject(
-          new CoinDcxTimeoutError(
-            `CoinDCX request timed out after ${this.#timeoutMs}ms`,
-            { path, method, timeoutMs: this.#timeoutMs }
-          )
-        );
-      }, this.#timeoutMs);
+        reject(timeoutError());
+      }, Math.max(0, this.#timeoutMs - (Date.now() - startTime)));
 
       req.on('error', (err) => {
-        if (reqTimeout) {
-          clearTimeout(reqTimeout);
-          reqTimeout = null;
-        }
         reject(
           new CoinDcxProviderError(`Network transport error connecting to CoinDCX: ${err.message}`, 502, {
             path,
           })
         );
+      });
+      req.once('close', () => {
+        if (!response && !settled) reject(new CoinDcxProviderError('CoinDCX request closed before response', 502, { path }));
+        req.removeAllListeners('error');
       });
 
       if (serializedPayload !== undefined) {

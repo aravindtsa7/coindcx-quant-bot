@@ -19,7 +19,7 @@ export function createSubscriptionIntent(
   }
 
   // Disabled coin produces no active subscription intent
-  if (!runtime.profile.enabled) {
+  if (!runtime.profile.enabled || runtime.lifecycle === 'DISABLED') {
     return null;
   }
 

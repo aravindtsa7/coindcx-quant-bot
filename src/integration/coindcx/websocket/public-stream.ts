@@ -1,5 +1,8 @@
+import { CoinDcxSocketError } from '../../../core/errors/app-error';
 import pino from 'pino';
 import { MarketDataSubscriptionIntent } from '../../../coin-runtime/types';
+import { CoinRegistry } from '../../../coin-runtime/registry';
+import { createSubscriptionIntents } from '../../../coin-runtime/subscription-intent';
 import { Clock, SystemClock } from '../clock';
 import { logger as rootLogger } from '../../../monitoring/logger';
 import { BackoffPolicyConfig, calculateBackoffWithJitter, DEFAULT_BACKOFF_CONFIG } from './backoff';
@@ -37,6 +40,8 @@ export const SystemStreamScheduler: StreamScheduler = {
 };
 
 export interface PublicStreamConfig {
+  /** Live lifecycle authority for runtime-managed subscriptions; overrides stale intent snapshots. */
+  registry?: CoinRegistry;
   endpoint?: string;
   socketFactory?: CoinDcxSocketFactory;
   clock?: Clock;
@@ -67,6 +72,8 @@ interface ReconnectToken {
  * - Zero mutation methods, zero order execution, zero strategy calls
  */
 export class CoinDcxPublicFuturesStream {
+  readonly #registry: CoinRegistry | undefined;
+  #registryUnsubscribe: (() => void) | null = null;
   readonly #endpoint: string;
   readonly #socketFactory: CoinDcxSocketFactory;
   readonly #clock: Clock;
@@ -86,6 +93,7 @@ export class CoinDcxPublicFuturesStream {
   #socket: CoinDcxSocket | null = null;
   #activeSocketListeners: Array<[string, SocketEventListener]> | null = null;
   #connectionAttempt: Promise<void> | null = null;
+  #cancelConnectionAttempt: (() => void) | null = null;
   #reconnectToken: ReconnectToken | null = null;
   #connectTimeoutTimer: number | NodeJS.Timeout | null = null;
   #pingTimer: number | NodeJS.Timeout | null = null;
@@ -117,6 +125,7 @@ export class CoinDcxPublicFuturesStream {
   readonly #subscribers = new Set<StreamEventListener>();
 
   constructor(config: PublicStreamConfig = {}) {
+    this.#registry = config.registry;
     this.#endpoint = config.endpoint ?? COINDCX_DEFAULT_SOCKET_ENDPOINT;
     this.#socketFactory = config.socketFactory ?? new ProductionCoinDcxSocketFactory();
     this.#clock = config.clock ?? new SystemClock();
@@ -165,6 +174,7 @@ export class CoinDcxPublicFuturesStream {
    * Joins new channels and leaves removed channels.
    */
   public syncSubscriptions(intents: readonly MarketDataSubscriptionIntent[]): void {
+    if (this.#registry) intents = createSubscriptionIntents(this.#registry.list());
     const newIntended = new Map<string, { pair: string; channel: string }>();
 
     for (const intent of intents) {
@@ -184,11 +194,16 @@ export class CoinDcxPublicFuturesStream {
     if (!this.connected || this.#socket === null) {
       return;
     }
+    const socket = this.#socket;
+    const generation = this.#generationId;
+    const ownsSocket = () => this.#socket === socket && generation === this.#generationId && !this.#isStopped;
 
     // Leave channels that are no longer intended
     for (const ch of previousChannels) {
       if (!newIntended.has(ch) && this.#activeSubscriptions.has(ch)) {
-        this.#socket.emit('leave', { channelName: ch });
+        if (!ownsSocket()) return;
+        socket.emit('leave', { channelName: ch });
+        if (!ownsSocket()) return;
         this.#activeSubscriptions.delete(ch);
       }
     }
@@ -196,7 +211,9 @@ export class CoinDcxPublicFuturesStream {
     // Join newly intended channels
     for (const [ch] of newIntended) {
       if (!this.#activeSubscriptions.has(ch)) {
-        this.#socket.emit('join', { channelName: ch });
+        if (!ownsSocket()) return;
+        socket.emit('join', { channelName: ch });
+        if (!ownsSocket()) return;
         this.#activeSubscriptions.add(ch);
       }
     }
@@ -205,13 +222,18 @@ export class CoinDcxPublicFuturesStream {
   /**
    * Starts the public futures stream.
    * Single-flight: concurrent start calls join the same connection attempt.
+   * Stop/disposal rejects an unfinished start with CoinDcxSocketError / SOCKET_CONNECT_CANCELLED.
    */
   public async start(intents?: readonly MarketDataSubscriptionIntent[]): Promise<void> {
     this.#isStopped = false;
     this.#cleanupReconnectTimer();
 
-    if (intents) {
-      this.syncSubscriptions(intents);
+    if (this.#registry && this.#registryUnsubscribe === null) {
+      this.#registryUnsubscribe = this.#registry.subscribeChanges(() => this.syncSubscriptions([]));
+    }
+
+    if (intents || this.#registry) {
+      this.syncSubscriptions(intents ?? []);
     }
 
     return this.#ensureConnected();
@@ -233,8 +255,12 @@ export class CoinDcxPublicFuturesStream {
       return Promise.resolve();
     }
 
+    const expectedGeneration = this.#generationId + 1;
     const attempt = this.#executeConnectGeneration();
-    this.#connectionAttempt = attempt;
+    // Synchronous callbacks can already have installed a replacement generation.
+    if (this.#generationId === expectedGeneration && !this.#isStopped && this.#cancelConnectionAttempt !== null) {
+      this.#connectionAttempt = attempt;
+    }
     attempt
       .finally(() => {
         if (this.#connectionAttempt === attempt) {
@@ -261,6 +287,17 @@ export class CoinDcxPublicFuturesStream {
 
     return new Promise<void>((resolve, reject) => {
       let resolved = false;
+      const finish = (error?: Error): void => {
+        if (resolved) return;
+        resolved = true;
+        if (this.#cancelConnectionAttempt === cancel) {
+          this.#cancelConnectionAttempt = null;
+          this.#connectionAttempt = null;
+        }
+        if (error) reject(error); else resolve();
+      };
+      const cancel = () => finish(new CoinDcxSocketError('SOCKET_CONNECT_CANCELLED', { reason: 'CANCELLED', generationId: currentGeneration }));
+      this.#cancelConnectionAttempt = cancel;
 
       // Bound connection timeout
       this.#connectTimeoutTimer = this.#scheduler.setTimeout(() => {
@@ -274,21 +311,19 @@ export class CoinDcxPublicFuturesStream {
           msg: 'Public socket connection timed out',
         });
 
+        finish(new CoinDcxSocketError('SOCKET_CONNECT_TIMEOUT'));
         this.#handleConnectionFailure(currentGeneration, new Error('SOCKET_CONNECT_TIMEOUT'));
-        if (!resolved) {
-          resolved = true;
-          this.#connectionAttempt = null;
-          reject(new Error('SOCKET_CONNECT_TIMEOUT'));
-        }
       }, this.#connectTimeoutMs);
 
       try {
         const socket = this.#socketFactory.createSocket(this.#endpoint);
+        if (currentGeneration !== this.#generationId || this.#isStopped) { socket.disconnect(); return; }
         this.#socket = socket;
+        const ownsSocket = () => currentGeneration === this.#generationId && !this.#isStopped && this.#socket === socket;
 
         // Register generation-pinned listeners with exact references
         const connectListener: SocketEventListener = () => {
-          if (currentGeneration !== this.#generationId || this.#isStopped) {
+          if (!ownsSocket()) {
             this.#staleGenerationDropCount++;
             return;
           }
@@ -323,6 +358,7 @@ export class CoinDcxPublicFuturesStream {
                 ),
               }),
             });
+            if (!ownsSocket()) return;
           }
 
           this.#dispatchEnvelope({
@@ -336,9 +372,11 @@ export class CoinDcxPublicFuturesStream {
             pair: null,
             payload: { generationId: currentGeneration },
           });
+          if (!ownsSocket()) return;
 
           // Re-subscribe intended channels
           this.#emitIntendedSubscriptions(socket);
+          if (!ownsSocket()) return;
 
           // Reset reconnect attempt count only after successful baseline established
           this.#reconnectAttempt = 0;
@@ -346,15 +384,11 @@ export class CoinDcxPublicFuturesStream {
           // Start ping task
           this.#startPingTask(currentGeneration, socket);
 
-          if (!resolved) {
-            resolved = true;
-            this.#connectionAttempt = null;
-            resolve();
-          }
+          finish();
         };
 
         const disconnectListener: SocketEventListener = (rawReason: unknown) => {
-          if (currentGeneration !== this.#generationId || this.#isStopped) {
+          if (!ownsSocket()) {
             this.#staleGenerationDropCount++;
             return;
           }
@@ -369,6 +403,7 @@ export class CoinDcxPublicFuturesStream {
             disconnectReasonCategory: category,
             msg: 'Public socket disconnected',
           });
+          if (!ownsSocket()) return;
 
           this.#dispatchEnvelope({
             source: 'COINDCX',
@@ -381,28 +416,24 @@ export class CoinDcxPublicFuturesStream {
             pair: null,
             payload: { reason: category, generationId: currentGeneration },
           });
+          if (!ownsSocket()) return;
 
           this.#scheduleReconnect(currentGeneration);
         };
 
         const connectErrorListener: SocketEventListener = () => {
-          if (currentGeneration !== this.#generationId || this.#isStopped) {
+          if (!ownsSocket()) {
             this.#staleGenerationDropCount++;
             return;
           }
 
           this.#cleanupConnectTimeout();
+          finish(new CoinDcxSocketError('SOCKET_CONNECT_FAILED'));
           this.#handleConnectionFailure(currentGeneration, new Error('SOCKET_CONNECT_FAILED'));
-
-          if (!resolved) {
-            resolved = true;
-            this.#connectionAttempt = null;
-            reject(new Error('SOCKET_CONNECT_FAILED'));
-          }
         };
 
         const errorListener: SocketEventListener = () => {
-          if (currentGeneration !== this.#generationId || this.#isStopped) {
+          if (!ownsSocket()) {
             this.#staleGenerationDropCount++;
             return;
           }
@@ -411,6 +442,7 @@ export class CoinDcxPublicFuturesStream {
         };
 
         const candlestickListener: SocketEventListener = (rawPayload: unknown) => {
+          if (!ownsSocket()) { this.#staleGenerationDropCount++; return; }
           this.#handleCandlestickMessage(currentGeneration, rawPayload);
         };
 
@@ -431,23 +463,25 @@ export class CoinDcxPublicFuturesStream {
         // Initiate connection
         socket.connect();
       } catch (err: unknown) {
+        if (currentGeneration !== this.#generationId || this.#isStopped) { finish(new CoinDcxSocketError('SOCKET_CONNECT_CANCELLED')); return; }
         this.#cleanupConnectTimeout();
+        finish(new CoinDcxSocketError('SOCKET_CONNECT_FAILED'));
         this.#handleConnectionFailure(currentGeneration, err);
-        if (!resolved) {
-          resolved = true;
-          this.#connectionAttempt = null;
-          reject(new Error('SOCKET_CONNECT_FAILED'));
-        }
       }
     });
   }
 
   #emitIntendedSubscriptions(socket: CoinDcxSocket): void {
+    const generation = this.#generationId;
+    const ownsSocket = () => !this.#isStopped && this.#generationId === generation && this.#socket === socket;
+    if (!ownsSocket()) return;
     this.#activeSubscriptions.clear();
     this.#state = this.#recoveryRequired ? 'RECOVERY_REQUIRED' : 'SUBSCRIBING';
 
     for (const [channelName] of this.#intendedChannels) {
+      if (!ownsSocket()) return;
       socket.emit('join', { channelName });
+      if (!ownsSocket()) return;
       this.#activeSubscriptions.add(channelName);
     }
 
@@ -589,10 +623,7 @@ export class CoinDcxPublicFuturesStream {
     this.#cleanupPing();
 
     this.#pingTimer = this.#scheduler.setInterval(() => {
-      if (generation !== this.#generationId || this.#isStopped) {
-        this.#cleanupPing();
-        return;
-      }
+      if (generation !== this.#generationId || this.#isStopped || this.#socket !== socket) return;
 
       if (socket.connected) {
         try {
@@ -605,7 +636,9 @@ export class CoinDcxPublicFuturesStream {
   }
 
   #dispatchEnvelope<T>(envelope: CoinDcxStreamEnvelope<T>): void {
-    for (const subscriber of this.#subscribers) {
+    const socket = this.#socket;
+    for (const subscriber of [...this.#subscribers]) {
+      if (this.#isStopped || envelope.generationId !== this.#generationId || socket !== this.#socket) return;
       try {
         subscriber(envelope as unknown as CoinDcxStreamEnvelope<unknown>);
       } catch {
@@ -642,9 +675,13 @@ export class CoinDcxPublicFuturesStream {
   }
 
   #cleanupOldSocket(): void {
+    const cancel = this.#cancelConnectionAttempt;
+    this.#cancelConnectionAttempt = null;
+    cancel?.();
     this.#cleanupConnectTimeout();
     this.#cleanupPing();
     this.#connectionAttempt = null;
+    this.#activeSubscriptions.clear();
 
     if (this.#socket !== null) {
       const oldSocket = this.#socket;
@@ -671,6 +708,8 @@ export class CoinDcxPublicFuturesStream {
    */
   public stop(): void {
     this.#isStopped = true;
+    this.#registryUnsubscribe?.();
+    this.#registryUnsubscribe = null;
     this.#generationId++; // Invalidate any running callbacks immediately
     this.#cleanupConnectTimeout();
     this.#cleanupReconnectTimer();

@@ -95,6 +95,7 @@ export class CoinRuntimeBootstrapService {
 
     for (const profile of validatedProfiles) {
       const canonicalUnderlying = canonicalizeUnderlying(profile.underlying);
+      const revision = this.#registry.beginDiscovery(canonicalUnderlying);
 
       try {
         if (!profile.enabled) {
@@ -134,6 +135,7 @@ export class CoinRuntimeBootstrapService {
           );
         }
 
+        this.#registry.assertDiscoveryOwner(canonicalUnderlying, revision);
         if (!discovered) {
           throw new CoinDiscoveryError(
             `No active INR perpetual futures instrument found for underlying '${canonicalUnderlying}'`,
@@ -256,6 +258,7 @@ export class CoinRuntimeBootstrapService {
       throw new CoinConfigError(safeMessage, { underlying: canonicalUnderlying, category });
     }
 
+    const revision = this.#registry.beginDiscovery(canonicalUnderlying);
     // Phase 2: Generic Discovery
     let discovered: InrFuturesInstrument | null = null;
     try {
@@ -270,12 +273,14 @@ export class CoinRuntimeBootstrapService {
         throw new Error('Instrument not found');
       }
     } catch {
+      this.#registry.assertDiscoveryOwner(canonicalUnderlying, revision);
       const category: CoinBootstrapFailureCategory = 'DISCOVERY_FAILED';
       const safeMessage = FAILURE_MESSAGES[category];
       this.#logger.error({ underlying: canonicalUnderlying, category }, safeMessage);
       throw new CoinDiscoveryError(safeMessage, { underlying: canonicalUnderlying, category });
     }
 
+    this.#registry.assertDiscoveryOwner(canonicalUnderlying, revision);
     // Phase 3: Mapping
     let instrument: InstrumentMetadata;
     try {
@@ -308,6 +313,7 @@ export class CoinRuntimeBootstrapService {
         entryEligibility,
       });
 
+      this.#registry.assertDiscoveryOwner(canonicalUnderlying, revision);
       return this.#registry.replaceOrRegisterDiscovered(runtime);
     } catch {
       const category: CoinBootstrapFailureCategory = 'REGISTRATION_FAILED';

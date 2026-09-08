@@ -460,6 +460,7 @@ describe('CoinDcxClient', () => {
               pair: 'B-BTC_USDT',
               side: 'buy',
               fee_amount: '0.25',
+              order_id: 'ord-xyz',
               timestamp: 1700000000000,
               margin_currency_short_name: 'INR',
             },

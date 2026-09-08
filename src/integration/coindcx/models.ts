@@ -47,7 +47,7 @@ export interface InrFuturesInstrument {
   readonly safetyPercentage: Decimal | null;
   readonly fundingFrequency: number | null;
   readonly expiryTimeMs: number | null;
-  readonly exitOnly: boolean;
+  readonly exitOnly: boolean | null;
   readonly timeInForceOptions: readonly string[];
   readonly supportedOrderTypes: readonly string[];
   readonly dynamicPositionLeverageTiers: readonly DynamicLeverageTier[];

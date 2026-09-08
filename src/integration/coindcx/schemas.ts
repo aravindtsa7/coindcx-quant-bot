@@ -155,7 +155,7 @@ export type ActiveInstrumentsResponse = z.infer<typeof ActiveInstrumentsResponse
 
 export const InstrumentWireSchema = z
   .object({
-    pair: z.string(),
+    pair: z.string().regex(/^B-[A-Z0-9]+_[A-Z0-9]+$/),
     status: z.string(),
     kind: z.string(),
     settlement: z.string().optional().nullable(),

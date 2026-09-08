@@ -68,6 +68,7 @@ export type CoinEntryEligibility =
   | 'DISABLED'
   | 'INSTRUMENT_INACTIVE'
   | 'EXIT_ONLY'
+  | 'RESTRICTION_UNKNOWN'
   | 'INVALID_INSTRUMENT_METADATA'
   | 'CONFIG_DISABLED'
   | 'UNDISCOVERED';
@@ -132,7 +133,7 @@ export interface InstrumentMetadata {
   readonly safetyPercentage: Decimal | null;
   readonly fundingFrequency: number | null;
   readonly expiryTimeMs: number | null;
-  readonly exitOnly: boolean;
+  readonly exitOnly: boolean | null;
   readonly timeInForceOptions: readonly string[];
   readonly supportedOrderTypes: readonly string[];
   readonly dynamicPositionLeverageTiers: readonly DynamicLeverageTier[];

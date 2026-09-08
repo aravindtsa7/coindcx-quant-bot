@@ -146,8 +146,8 @@ export class CoinDcxClient {
    * Fetches detailed specifications and trading constraints for a discovered pair in INR margin mode.
    */
   public async getInrFuturesInstrument(pair: string): Promise<InrFuturesInstrument> {
-    if (!pair || pair.trim() === '') {
-      throw new ValidationError('Pair must be a non-empty string');
+    if (typeof pair !== 'string' || !/^B-[A-Z0-9]+_[A-Z0-9]+$/.test(pair.trim())) {
+      throw new ValidationError('Pair must use canonical uppercase B-<BASE>_<QUOTE> format');
     }
 
     logger.debug({ pair }, 'Fetching INR Futures instrument specifications');
@@ -167,6 +167,9 @@ export class CoinDcxClient {
       );
     }
 
+    if (parsed.data.instrument.pair !== pair.trim()) {
+      throw new CoinDcxResponseValidationError('Instrument response pair does not match requested pair', { pair: pair.trim() });
+    }
     return normalizeInstrument(parsed.data.instrument);
   }
 
@@ -379,6 +382,11 @@ export class CoinDcxClient {
       });
     }
 
+    if (parsed.data.some(position =>
+      (validated.data.pairs && !validated.data.pairs.split(',').map(pair => pair.trim()).includes(position.pair)) ||
+      (validated.data.position_ids && !validated.data.position_ids.split(',').map(id => id.trim()).includes(position.id)))) {
+      throw new CoinDcxResponseValidationError('Position response identity is outside requested scope');
+    }
     return parsed.data.map(normalizePosition);
   }
 
@@ -522,6 +530,10 @@ export class CoinDcxClient {
       });
     }
 
+    if (parsed.data.some(trade => trade.pair !== validated.data.pair ||
+      (validated.data.orderId && trade.order_id !== validated.data.orderId))) {
+      throw new CoinDcxResponseValidationError('Trade response identity is outside requested scope');
+    }
     return parsed.data.map(normalizeTrade);
   }
 }
