@@ -30,6 +30,7 @@ export type EngineLifecycleState = 'STOPPED' | 'STARTING' | 'RUNNING' | 'STOPPIN
  */
 interface PairInitializationAttempt {
   readonly runId: number;
+  readonly streamRevision: number;
   readonly promise: Promise<PairCanonicalStateMachine>;
 }
 
@@ -133,6 +134,10 @@ export class CanonicalMarketDataEngine {
   // via a following start() or a direct initializePair() call) is unambiguously tagged as belonging to
   // a new run.
   #currentRunId = 1;
+  #streamGenerationId: number | null = null;
+  #streamRevision = 0;
+  #reconnectGenerationId: number | null = null;
+  readonly #pairInitializationRevisions = new Map<string, number>();
 
   constructor(config: CanonicalMarketDataEngineConfig = {}) {
     this.#repository = config.repository ?? new PrismaCandle1mRepository();
@@ -175,14 +180,17 @@ export class CanonicalMarketDataEngine {
     }
 
     const runId = this.#currentRunId;
+    const streamRevision = this.#streamRevision;
 
     const inFlight = this.#pairInitializations.get(pair);
-    if (inFlight && inFlight.runId === runId) {
+    if (inFlight && inFlight.runId === runId && inFlight.streamRevision === streamRevision) {
       return inFlight.promise;
     }
 
-    const promise = this.#createPairStateMachine(pair, runId);
-    this.#pairInitializations.set(pair, { runId, promise });
+    const pairRevision = (this.#pairInitializationRevisions.get(pair) ?? 0) + 1;
+    this.#pairInitializationRevisions.set(pair, pairRevision);
+    const promise = this.#createPairStateMachine(pair, runId, streamRevision, this.#streamGenerationId, pairRevision);
+    this.#pairInitializations.set(pair, { runId, streamRevision, promise });
 
     try {
       return await promise;
@@ -200,7 +208,9 @@ export class CanonicalMarketDataEngine {
    * Performs the actual DB read + construction + installation for one initializePair() attempt, bound
    * to the runId captured by its caller before any await. See initializePair() for the full contract.
    */
-  async #createPairStateMachine(pair: string, runId: number): Promise<PairCanonicalStateMachine> {
+  async #createPairStateMachine(pair: string, runId: number, streamRevision: number, generationId: number | null, pairRevision: number): Promise<PairCanonicalStateMachine> {
+    const ownsInitialization = (): boolean => runId === this.#currentRunId && streamRevision === this.#streamRevision &&
+      generationId === this.#streamGenerationId && pairRevision === this.#pairInitializationRevisions.get(pair);
     // SOL-P5-001/2B: wait for any prior-run (or same-run) in-flight PHYSICAL canonical write for this
     // pair to settle BEFORE establishing the durable baseline. Reading getLatestCanonicalCandle while a
     // predecessor's insert is still unresolved could observe a null/stale baseline and accept a later
@@ -210,7 +220,7 @@ export class CanonicalMarketDataEngine {
 
     // RESTART-INITIALIZATION-RACE: revalidate ownership after this (now two-part) async gap. A
     // superseded attempt must never construct/install a state machine of its own.
-    if (runId !== this.#currentRunId) {
+    if (!ownsInitialization()) {
       const currentInstance = this.#pairStates.get(pair);
       if (currentInstance) {
         return currentInstance;
@@ -224,7 +234,7 @@ export class CanonicalMarketDataEngine {
     const latestDbCandle = await this.#repository.getLatestCanonicalCandle(pair);
 
     // RESTART-INITIALIZATION-RACE: revalidate ownership immediately after this await too.
-    if (runId !== this.#currentRunId) {
+    if (!ownsInitialization()) {
       const currentInstance = this.#pairStates.get(pair);
       if (currentInstance) {
         // A newer run already installed its own instance for this pair while this attempt was stale;
@@ -280,6 +290,11 @@ export class CanonicalMarketDataEngine {
         logger.warn({ pair: stalePair }, 'Pair canonical stream became stale');
         this.#emitEvent('CANONICAL_1M_STALE', stalePair, { staleAtMs: this.#clock.nowMs() });
       },
+      onReconciliationCompleted: (completedPair, result) => {
+        if (runId === this.#currentRunId && this.#pairStates.get(completedPair) === stateMachine) {
+          this.#emitEvent('CANONICAL_1M_RECOVERY_COMPLETED', completedPair, { result });
+        }
+      },
       getPersistedCandle: async (p: string, openTimeMs: number) => {
         return this.#repository.getCandle(p, openTimeMs);
       },
@@ -318,7 +333,7 @@ export class CanonicalMarketDataEngine {
     // and here today, but this checkpoint is deliberately explicit and independent so that this
     // invariant — never install a superseded run's state machine — holds even if a future change adds
     // another await in between.
-    if (runId !== this.#currentRunId) {
+    if (!ownsInitialization()) {
       const currentInstance = this.#pairStates.get(pair);
       if (currentInstance) {
         return currentInstance;
@@ -329,6 +344,11 @@ export class CanonicalMarketDataEngine {
     }
 
     this.#pairStates.set(pair, stateMachine);
+    if (generationId !== null) stateMachine.setGeneration(generationId);
+    if (generationId !== null && this.#reconnectGenerationId === generationId) {
+      stateMachine.handleReconnectBarrier(generationId);
+      this.#reconcileReconnect(pair, stateMachine);
+    }
     return stateMachine;
   }
 
@@ -432,30 +452,35 @@ export class CanonicalMarketDataEngine {
       return;
     }
 
-    if (envelope.eventType === 'PUBLIC_STREAM_RECOVERY_REQUIRED') {
-      const payload = envelope.payload as PublicRecoveryRequiredPayload;
-      // Reconnect barrier: notify all pairs
+    const generationId = envelope.eventType === 'PUBLIC_STREAM_RECOVERY_REQUIRED'
+      ? (envelope.payload as PublicRecoveryRequiredPayload).newGeneration : envelope.generationId;
+    if (!Number.isSafeInteger(generationId) || generationId < 1 ||
+      (this.#streamGenerationId !== null && generationId < this.#streamGenerationId)) return;
+    const isNewGeneration = this.#streamGenerationId === null || generationId > this.#streamGenerationId;
+    const needsBarrier = envelope.eventType === 'PUBLIC_STREAM_RECOVERY_REQUIRED' || (isNewGeneration && this.#streamGenerationId !== null);
+    if (isNewGeneration) {
+      this.#streamGenerationId = generationId;
+      this.#streamRevision++;
+    }
+    if (needsBarrier && this.#reconnectGenerationId !== generationId) {
+      this.#reconnectGenerationId = generationId;
+      // Invalidate pending initialization even if this generation was first observed by CONNECTED.
+      if (!isNewGeneration) this.#streamRevision++;
       for (const [pair, pairState] of this.#pairStates.entries()) {
-        pairState.handleReconnectBarrier(payload.newGeneration);
+        pairState.handleReconnectBarrier(generationId);
         this.#emitEvent('CANONICAL_1M_RECOVERY_REQUIRED', pair, {
-          previousGeneration: payload.previousGeneration,
-          newGeneration: payload.newGeneration,
+          newGeneration: generationId,
         });
-
-        const latestTime = pairState.latestCanonicalOpenTimeMs;
-        if (latestTime !== null) {
-          const nowMs = this.#clock.nowMs();
-          const latestClosedMinuteMs = Math.floor(nowMs / 60_000) * 60_000 - 60_000;
-          if (latestTime + 60_000 <= latestClosedMinuteMs) {
-            const recoveryEpoch = pairState.recoveryEpoch;
-            this.executeRecovery(pair, latestTime + 60_000, latestClosedMinuteMs, recoveryEpoch).catch(() => {});
-          }
-        }
+        if (dispatchRunId !== this.#currentRunId) return;
+        this.#reconcileReconnect(pair, pairState);
       }
+    }
+    if (envelope.eventType === 'PUBLIC_STREAM_RECOVERY_REQUIRED') {
       return;
     }
 
     if (envelope.eventType === 'PUBLIC_CANDLE_UPDATE') {
+      const dispatchStreamRevision = this.#streamRevision;
       const candleEnvelope = envelope as CoinDcxStreamEnvelope<PublicCandleUpdatePayload>;
       const payload = candleEnvelope.payload;
       let stateMachine = this.#pairStates.get(payload.pair);
@@ -474,7 +499,7 @@ export class CanonicalMarketDataEngine {
       // SOL-P5-002: re-validate the ORIGINATING dispatch's run is still active — not merely
       // `!#isStopped`, which a stop()->start() cycle resets for the new run. A stop() may have landed
       // (with or without a subsequent restart) while this envelope was waiting on initializePair().
-      if (dispatchRunId !== this.#currentRunId) {
+      if (dispatchRunId !== this.#currentRunId || generationId !== this.#streamGenerationId || dispatchStreamRevision !== this.#streamRevision) {
         logger.debug({ pair: payload.pair }, 'Dropping envelope: dispatch run was superseded by a restart');
         return;
       }
@@ -486,6 +511,16 @@ export class CanonicalMarketDataEngine {
       }
 
       await stateMachine.handleStreamEnvelope(candleEnvelope);
+    }
+  }
+
+  #reconcileReconnect(pair: string, state: PairCanonicalStateMachine): void {
+    const fromMs = state.reconnectRecoveryFromMs;
+    const latestClosedMinuteMs = Math.floor(this.#clock.nowMs() / 60_000) * 60_000 - 60_000;
+    if (fromMs !== null && fromMs <= latestClosedMinuteMs) {
+      void this.executeRecovery(pair, fromMs, latestClosedMinuteMs, state.recoveryEpoch);
+    } else {
+      state.awaitReconnectHandoff(state.latestCanonicalOpenTimeMs === null ? 'NO_BASELINE' : 'NOTHING_MISSING');
     }
   }
 
@@ -606,6 +641,7 @@ export class CanonicalMarketDataEngine {
           toMs,
           recoveryEpoch: activeEpoch,
           recoveredCount: canonicalRecovered.length,
+          result: 'RECOVERED_RANGE',
         });
       }
     } catch (err: unknown) {
@@ -688,6 +724,9 @@ export class CanonicalMarketDataEngine {
     // RESTART-EPOCH-REUSE: this run is over. Anything created from here on (a following start(), or a
     // direct initializePair() call) belongs to a new run and must never be mistaken for this one.
     this.#currentRunId++;
+    this.#streamGenerationId = null;
+    this.#reconnectGenerationId = null;
+    this.#streamRevision++;
     // SOL-P5-005: explicitly drop the tracked start operation too. Its own runId mismatch already makes
     // it unreusable, but clearing it here is the explicit "stop() invalidates obsolete start ownership"
     // signal and avoids holding a reference to an operation object no future start() can ever reuse.

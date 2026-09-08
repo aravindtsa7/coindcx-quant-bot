@@ -448,12 +448,12 @@ describe('Phase 5 — Gap Detection, Generation Barrier & Recovery Protocol', ()
 
     // ETH continues normal steady stream
     await engine.handleStreamEnvelope(
-      createTestEnvelope('PUBLIC_CANDLE_UPDATE', createTestCandlePayload({ pair: PAIR_ETH, openTimeMs: MINUTE_0 }), { pair: PAIR_ETH })
+      createTestEnvelope('PUBLIC_CANDLE_UPDATE', createTestCandlePayload({ pair: PAIR_ETH, openTimeMs: MINUTE_3 }), { pair: PAIR_ETH })
     );
 
-    clock.setTime(MINUTE_3 + 35000);
+    clock.setTime(MINUTE_3 + 60000 + 35000);
     await engine.handleStreamEnvelope(
-      createTestEnvelope('PUBLIC_CANDLE_UPDATE', createTestCandlePayload({ pair: PAIR_ETH, openTimeMs: MINUTE_1 }), { pair: PAIR_ETH })
+      createTestEnvelope('PUBLIC_CANDLE_UPDATE', createTestCandlePayload({ pair: PAIR_ETH, openTimeMs: MINUTE_3 + 60000 }), { pair: PAIR_ETH })
     );
 
     scheduler.advanceTime(600);
@@ -462,9 +462,9 @@ describe('Phase 5 — Gap Detection, Generation Barrier & Recovery Protocol', ()
     // (matching the pattern used by every other test that checks repository state after a grace timer).
     await new Promise((r) => setTimeout(r, 10));
 
-    // ETH successfully finalized minute 0 and remains HEALTHY
+    // ETH successfully finalized its fresh minute 3 and remains HEALTHY.
     expect(engine.getPairHealth(PAIR_ETH)?.state).toBe('HEALTHY');
-    const ethCandle = await repo.getCandle(PAIR_ETH, MINUTE_0);
+    const ethCandle = await repo.getCandle(PAIR_ETH, MINUTE_3);
     expect(ethCandle).not.toBeNull();
     expect(ethCandle?.pair).toBe(PAIR_ETH);
 

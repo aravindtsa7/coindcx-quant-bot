@@ -214,7 +214,7 @@ describe('Phase 5 — Consolidated Production Corrections (Terra F1–F11)', () 
 
       const health = engine.getPairHealth(PAIR)!;
       expect(health.workingOpenTimeMs).toBeNull(); // Did not advance working candle
-      expect(health.duplicateCount).toBe(1);
+      expect(health.lateDropCount).toBe(1); // The persisted final supersedes earlier forming evidence.
 
       engine.stop();
     });
@@ -503,6 +503,8 @@ describe('Phase 5 — Consolidated Production Corrections (Terra F1–F11)', () 
         createTestEnvelope('PUBLIC_CANDLE_UPDATE', createTestCandlePayload({
           openTimeMs: MINUTE_0,
           close: new Decimal('55000'),
+          high: new Decimal('55000'),
+          providerEventTimeMs: MINUTE_1 + 1000,
         }))
       );
 

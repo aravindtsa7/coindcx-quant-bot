@@ -19,7 +19,13 @@ export interface WorkingCandleSnapshot {
 
 export type WorkingCandleUpdateResult =
   | { applied: true; reason: 'ACCEPTED' | 'IDEMPOTENT_DUPLICATE' }
-  | { applied: false; reason: 'SUPERSEDED' };
+  | { applied: false; reason: 'SUPERSEDED' | 'CONFLICT' };
+
+export function haveIdenticalCandleValues(a: Pick<WorkingCandleSnapshot, 'open' | 'high' | 'low' | 'close' | 'volume' | 'quoteVolume'>, b: Pick<WorkingCandleSnapshot, 'open' | 'high' | 'low' | 'close' | 'volume' | 'quoteVolume'>): boolean {
+  return a.open.equals(b.open) && a.high.equals(b.high) && a.low.equals(b.low) &&
+    a.close.equals(b.close) && a.volume.equals(b.volume) &&
+    (a.quoteVolume === null ? b.quoteVolume === null : b.quoteVolume !== null && a.quoteVolume.equals(b.quoteVolume));
+}
 
 /**
  * Manages working candle snapshots per pair.
@@ -28,7 +34,7 @@ export type WorkingCandleUpdateResult =
  * - Same-minute volume is NEVER summed across snapshots.
  * - Newer snapshots replace older working state deterministically.
  * - Primary ordering: providerEventTimeMs.
- * - Deterministic tie-breakers: Phase 4 sequence, then receivedAtMs.
+ * - Equal provider times with different values are unresolved conflicts.
  * - Older same-minute updates are safely dropped.
  * - Identical duplicate updates are idempotent no-ops.
  */
@@ -74,14 +80,10 @@ export class WorkingCandleManager {
       return { applied: true, reason: 'IDEMPOTENT_DUPLICATE' };
     }
 
-    // Deterministic ordering check: providerEventTimeMs -> sequence -> receivedAtMs
-    const isNewer =
-      snapshot.providerEventTimeMs > existing.providerEventTimeMs ||
-      (snapshot.providerEventTimeMs === existing.providerEventTimeMs &&
-        snapshot.sequence > existing.sequence) ||
-      (snapshot.providerEventTimeMs === existing.providerEventTimeMs &&
-        snapshot.sequence === existing.sequence &&
-        snapshot.receivedAtMs > existing.receivedAtMs);
+    if (snapshot.providerEventTimeMs === existing.providerEventTimeMs) {
+      return { applied: false, reason: 'CONFLICT' };
+    }
+    const isNewer = snapshot.providerEventTimeMs > existing.providerEventTimeMs;
 
     if (!isNewer) {
       return { applied: false, reason: 'SUPERSEDED' };
@@ -122,7 +124,6 @@ export class WorkingCandleManager {
 
   #isIdentical(a: WorkingCandleSnapshot, b: WorkingCandleSnapshot): boolean {
     if (a.providerEventTimeMs !== b.providerEventTimeMs) return false;
-    if (a.sequence !== b.sequence) return false;
     if (!a.open.equals(b.open)) return false;
     if (!a.high.equals(b.high)) return false;
     if (!a.low.equals(b.low)) return false;

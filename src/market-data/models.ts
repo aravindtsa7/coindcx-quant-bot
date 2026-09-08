@@ -99,7 +99,7 @@ export function createCanonicalCandle1m(params: CreateCanonicalCandleParams): Ca
     throw new CanonicalValidationError(`Invalid source: ${source}`);
   }
 
-  if (!Number.isSafeInteger(finalizedAtMs) || finalizedAtMs <= 0) {
+  if (!Number.isSafeInteger(finalizedAtMs) || finalizedAtMs < closeTimeExclusiveMs) {
     throw new CanonicalValidationError(`Invalid finalizedAtMs: ${finalizedAtMs}`);
   }
 
@@ -118,6 +118,13 @@ export function createCanonicalCandle1m(params: CreateCanonicalCandleParams): Ca
     providerEventTimeMs: providerEventTimeMs !== null && Number.isSafeInteger(providerEventTimeMs) ? providerEventTimeMs : null,
     generationId: generationId !== null && Number.isInteger(generationId) ? generationId : null,
   });
+}
+
+/** Unknown quote volume is not contradictory; two known final values still must agree. */
+export function areCanonicalCandlesCompatible(a: CanonicalCandle1m, b: CanonicalCandle1m): boolean {
+  return areCanonicalCandlesIdentical(
+    { ...a, quoteVolume: null }, { ...b, quoteVolume: null }
+  ) && (a.quoteVolume === null || b.quoteVolume === null || a.quoteVolume.equals(b.quoteVolume));
 }
 
 /**

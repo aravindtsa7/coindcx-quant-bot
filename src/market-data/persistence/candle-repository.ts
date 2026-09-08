@@ -2,7 +2,7 @@ import { Prisma, PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../persistence/prisma';
 import { CanonicalDecimal } from '../canonical-decimal';
 import { CanonicalCandleConflictError, CanonicalCandleError } from '../errors';
-import { areCanonicalCandlesIdentical, createCanonicalCandle1m } from '../models';
+import { areCanonicalCandlesCompatible, createCanonicalCandle1m } from '../models';
 import { CanonicalCandle1m, isCanonicalCandleSource } from '../types';
 import { Canonical1mRangeReader } from '../higher-timeframe/types';
 
@@ -59,7 +59,7 @@ export class PrismaCandle1mRepository implements Candle1mRepository, Canonical1m
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
         // Unique constraint violation: check whether existing row is identical or conflicting
         const existing = await this.getCandle(candle.pair, candle.openTimeMs);
-        if (existing && areCanonicalCandlesIdentical(existing, candle)) {
+        if (existing && areCanonicalCandlesCompatible(existing, candle)) {
           // Idempotent duplicate: safe no-op
           return { outcome: 'ALREADY_IDENTICAL' };
         }

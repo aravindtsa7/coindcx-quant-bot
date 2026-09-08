@@ -212,11 +212,11 @@ describe('Phase 5 — Successor-Confirmed Finality & Clock Safety', () => {
       defaultMeta
     );
 
-    // Incoming packet claims providerEventTime is 20_000ms into future (excess skew)
+    // Temporally consistent successor, but its provider timestamp exceeds local skew tolerance.
     await state.handleCandleUpdate(
       createTestCandlePayload({
         openTimeMs: MINUTE_1, // Purported successor
-        providerEventTimeMs: clock.nowMs() + 20000, // 20s ahead of local clock
+        providerEventTimeMs: MINUTE_1 + 10000, // 60s ahead of local clock
       }),
       { sequence: 2, receivedAtMs: clock.nowMs(), generationId: 1 }
     );

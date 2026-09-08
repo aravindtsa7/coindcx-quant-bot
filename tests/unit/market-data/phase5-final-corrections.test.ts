@@ -284,7 +284,8 @@ describe('Phase 5 — Final Architectural Correction', () => {
 
       const health = engine.getPairHealth(PAIR)!;
       expect(health.truthFault).toBe('NONE');
-      expect(health.state).toBe('HEALTHY');
+      expect(health.state).toBe('STALE'); // Reconciliation alone is not fresh live evidence.
+      expect(health.recoveryRequired).toBe(false);
 
       engine.stop();
     });
@@ -615,7 +616,7 @@ describe('Phase 5 — Final Architectural Correction', () => {
         )
       );
       expect(engine.getPairHealth(PAIR)?.bufferedLiveUpdateCount).toBe(1);
-      expect(engine.getPairHealth(PAIR)?.lateDropCount).toBe(1);
+      expect(engine.getPairHealth(PAIR)?.lateDropCount).toBe(0); // Engine discards stale generation before pair dispatch.
 
       // Complete recovery for the barrier-created epoch (no REST candles actually missing here).
       await pairState.applyRecoveredCandlesAndDrainBuffer([], 2);

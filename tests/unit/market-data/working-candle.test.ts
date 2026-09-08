@@ -58,7 +58,7 @@ describe('Phase 5 — Working Candle Semantics & Deterministic Tie-Breaking', ()
     expect(manager.getCurrent(PAIR)?.close.toString()).toBe('50100');
     expect(manager.getCurrent(PAIR)?.volume.toString()).toBe('2.5');
 
-    // Newer snapshot with equal providerEventTimeMs but higher sequence tie-breaker
+    // Local sequence cannot resolve conflicting equal-provider-time evidence.
     const tieBreakSequence = createTestWorkingSnapshot({
       pair: PAIR,
       openTimeMs: MINUTE_0,
@@ -69,11 +69,11 @@ describe('Phase 5 — Working Candle Semantics & Deterministic Tie-Breaking', ()
       volume: new Decimal('3.0'),
     });
     const tieResult = manager.update(tieBreakSequence);
-    expect(tieResult.applied).toBe(true);
-    expect(tieResult.reason).toBe('ACCEPTED');
-    expect(manager.getCurrent(PAIR)?.close.toString()).toBe('50150');
+    expect(tieResult.applied).toBe(false);
+    expect(tieResult.reason).toBe('CONFLICT');
+    expect(manager.getCurrent(PAIR)?.close.toString()).toBe('50100');
 
-    // Newer snapshot with equal providerEventTimeMs and equal sequence, but higher receivedAtMs
+    // A later local receipt cannot resolve conflicting equal-provider-time evidence either.
     const tieBreakReceivedAt = createTestWorkingSnapshot({
       pair: PAIR,
       openTimeMs: MINUTE_0,
@@ -84,9 +84,9 @@ describe('Phase 5 — Working Candle Semantics & Deterministic Tie-Breaking', ()
       volume: new Decimal('3.5'),
     });
     const tieRecResult = manager.update(tieBreakReceivedAt);
-    expect(tieRecResult.applied).toBe(true);
-    expect(tieRecResult.reason).toBe('ACCEPTED');
-    expect(manager.getCurrent(PAIR)?.close.toString()).toBe('50200');
+    expect(tieRecResult.applied).toBe(false);
+    expect(tieRecResult.reason).toBe('CONFLICT');
+    expect(manager.getCurrent(PAIR)?.close.toString()).toBe('50100');
   });
 
   it('3. same-minute volume is NOT summed', () => {

@@ -2,9 +2,13 @@ import http from 'node:http';
 import https from 'node:https';
 import { URL } from 'node:url';
 import { z } from 'zod';
+import { parse as parseLosslessJson } from 'lossless-json';
 import { Decimal } from '../core/decimal/decimal';
 import { Clock, SystemClock } from '../integration/coindcx/clock';
-import { parseFinancialDecimal } from '../integration/coindcx/websocket/schemas';
+import { toLosslessDecimal, toSafeIntegerTimestamp } from '../integration/coindcx/normalizers';
+import { WireNumericSchema } from '../integration/coindcx/schemas';
+import { CanonicalDecimal } from './canonical-decimal';
+import { MIN_CANONICAL_OPEN_TIME_MS } from './models';
 import { CanonicalRecoveryError } from './errors';
 
 export const DEFAULT_PUBLIC_MARKET_DATA_URL = 'https://public.coindcx.com';
@@ -36,12 +40,13 @@ export interface FuturesCandleRestReaderConfig {
 }
 
 const RawRestCandleItemSchema = z.object({
-  open: z.union([z.string(), z.number()]),
-  high: z.union([z.string(), z.number()]),
-  low: z.union([z.string(), z.number()]),
-  close: z.union([z.string(), z.number()]),
-  volume: z.union([z.string(), z.number()]),
-  time: z.number(),
+  open: WireNumericSchema,
+  high: WireNumericSchema,
+  low: WireNumericSchema,
+  close: WireNumericSchema,
+  volume: WireNumericSchema,
+  quote_volume: WireNumericSchema.nullable().optional(),
+  time: WireNumericSchema,
 });
 
 const RawRestCandlesResponseSchema = z.object({
@@ -81,7 +86,7 @@ export class CoinDcxFuturesCandleRestReader {
       throw new CanonicalRecoveryError('Pair is required for REST candle recovery');
     }
 
-    if (!Number.isInteger(fromMs) || !Number.isInteger(toMs) || fromMs > toMs) {
+    if (!Number.isSafeInteger(fromMs) || !Number.isSafeInteger(toMs) || fromMs > toMs) {
       throw new CanonicalRecoveryError(`Invalid time range: fromMs=${fromMs}, toMs=${toMs}`);
     }
 
@@ -102,7 +107,7 @@ export class CoinDcxFuturesCandleRestReader {
 
     let parsedJson: unknown;
     try {
-      parsedJson = JSON.parse(rawBody);
+      parsedJson = parseLosslessJson(rawBody);
     } catch {
       throw new CanonicalRecoveryError('Failed to parse REST candlestick JSON response');
     }
@@ -124,9 +129,10 @@ export class CoinDcxFuturesCandleRestReader {
 
     for (const item of data) {
       // Normalize timestamp to ms
-      const timeMs = item.time < 100_000_000_000 ? Math.floor(item.time * 1000) : Math.floor(item.time);
+      const timestamp = toSafeIntegerTimestamp(item.time, 'time');
+      const timeMs = timestamp < 100_000_000_000 ? timestamp * 1000 : timestamp;
 
-      if (timeMs % 60_000 !== 0) {
+      if (!Number.isSafeInteger(timeMs) || timeMs < MIN_CANONICAL_OPEN_TIME_MS || timeMs % 60_000 !== 0) {
         throw new CanonicalRecoveryError(`REST candle time must align to exact UTC minute: ${timeMs}`);
       }
 
@@ -140,14 +146,23 @@ export class CoinDcxFuturesCandleRestReader {
         continue;
       }
 
-      const open = parseFinancialDecimal(item.open, 'open');
-      const high = parseFinancialDecimal(item.high, 'high');
-      const low = parseFinancialDecimal(item.low, 'low');
-      const close = parseFinancialDecimal(item.close, 'close');
-      const volume = parseFinancialDecimal(item.volume, 'volume');
+      const exact = (value: unknown, field: string): Decimal => {
+        const decimal = toLosslessDecimal(value, field);
+        // Bound the exponent before any fixed-point expansion allocates a large string.
+        if (decimal.decimalPlaces() > 18 || decimal.abs().greaterThanOrEqualTo('1000000000000000000')) {
+          throw new CanonicalRecoveryError(`REST financial field ${field} exceeds canonical decimal bounds`);
+        }
+        return CanonicalDecimal.from(decimal).toDecimal();
+      };
+      const open = exact(item.open, 'open');
+      const high = exact(item.high, 'high');
+      const low = exact(item.low, 'low');
+      const close = exact(item.close, 'close');
+      const volume = exact(item.volume, 'volume');
+      const quoteVolume = item.quote_volume == null ? null : exact(item.quote_volume, 'quote_volume');
 
       // Price and volume non-negativity
-      if (open.isNegative() || high.isNegative() || low.isNegative() || close.isNegative() || volume.isNegative()) {
+      if (open.isNegative() || high.isNegative() || low.isNegative() || close.isNegative() || volume.isNegative() || quoteVolume?.isNegative()) {
         throw new CanonicalRecoveryError(`Negative price or volume encountered at time ${timeMs}`);
       }
 
@@ -170,7 +185,7 @@ export class CoinDcxFuturesCandleRestReader {
         low,
         close,
         volume,
-        quoteVolume: null, // Public REST candlesticks endpoint does not provide quote_volume
+        quoteVolume,
       };
 
       const existing = dedupeMap.get(timeMs);
@@ -181,13 +196,15 @@ export class CoinDcxFuturesCandleRestReader {
           existing.high.equals(record.high) &&
           existing.low.equals(record.low) &&
           existing.close.equals(record.close) &&
-          existing.volume.equals(record.volume);
+          existing.volume.equals(record.volume) &&
+          (existing.quoteVolume === null || record.quoteVolume === null || existing.quoteVolume.equals(record.quoteVolume));
 
         if (!isIdentical) {
           throw new CanonicalRecoveryError(
             `REST response contains conflicting duplicate records for minute ${timeMs}`
           );
         }
+        if (existing.quoteVolume === null && record.quoteVolume !== null) dedupeMap.set(timeMs, record);
         // Identical duplicate: no-op
       } else {
         dedupeMap.set(timeMs, record);

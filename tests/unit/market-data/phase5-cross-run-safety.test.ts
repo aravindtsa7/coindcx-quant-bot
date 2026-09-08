@@ -223,7 +223,7 @@ describe('Phase 5 — Cross-Run Safety Correction (Sol Audit)', () => {
     const after = runBPairState.getHealthSnapshot();
     expect(after.workingOpenTimeMs).toBeNull();
     expect(after.lastValidProviderEventTimeMs).toBeNull();
-    expect(after.state).toBe('HEALTHY');
+    expect(after.state).toBe('STALE');
     expect(after.truthFault).toBe('NONE');
     expect(after.gapCount).toBe(0);
 
@@ -475,7 +475,7 @@ describe('Phase 5 — Cross-Run Safety Correction (Sol Audit)', () => {
     expect(ethC.canonicalEpoch).toBe(1);
     expect(ethC.recoveryEpoch).toBe(1);
     expect(ethC.truthFault).toBe('NONE');
-    expect(ethC.state).toBe('HEALTHY');
+    expect(ethC.state).toBe('STALE');
     expect(ethC.latestCanonicalOpenTimeMs).toBeNull(); // run B's gap/recovery never actually completed
 
     // Run C then works normally atop BTC's inherited baseline (next expected minute is MINUTE_1).

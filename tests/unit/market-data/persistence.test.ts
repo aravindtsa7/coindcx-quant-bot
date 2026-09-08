@@ -47,7 +47,7 @@ describe('Phase 5 — Immutable Persistence & Persist-Before-Publish', () => {
     // Baseline is null; no pre-existing candles
     expect(engine.getPairHealth(PAIR)?.latestCanonicalOpenTimeMs).toBeNull();
     expect(engine.getPairHealth(PAIR)?.gapCount).toBe(0);
-    expect(engine.getPairHealth(PAIR)?.state).toBe('HEALTHY');
+    expect(engine.getPairHealth(PAIR)?.state).toBe('STALE');
 
     // First snapshot establishes baseline without triggering recovery back to epoch 0
     await engine.handleStreamEnvelope(
@@ -356,7 +356,7 @@ describe('Phase 5 — Immutable Persistence & Persist-Before-Publish', () => {
         'PUBLIC_CANDLE_UPDATE',
         createTestCandlePayload({
           openTimeMs: MINUTE_0,
-          providerEventTimeMs: MINUTE_0 + 40000,
+          providerEventTimeMs: MINUTE_1 + 1000, // Conflicting evidence after the minute closed.
           close: new Decimal('50090.0'),
         })
       )

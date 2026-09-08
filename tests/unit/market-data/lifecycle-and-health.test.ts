@@ -199,7 +199,7 @@ describe('Phase 5 — Health States, Lifecycle Cleanup & Architectural Boundarie
 
     for (const coin of futureCoins) {
       await engine.initializePair(coin);
-      expect(engine.getPairHealth(coin)?.state).toBe('HEALTHY');
+      expect(engine.getPairHealth(coin)?.state).toBe('STALE'); // No source evidence yet.
 
       clock.setTime(MINUTE_0 + 35000);
       await engine.handleStreamEnvelope(

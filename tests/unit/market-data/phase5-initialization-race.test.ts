@@ -101,7 +101,7 @@ describe('Phase 5 — RESTART-INITIALIZATION-RACE Correction', () => {
     expect(runBPairState.canonicalEpoch).toBe(1);
     expect(runBPairState.getHealthSnapshot().lastValidProviderEventTimeMs).toBeNull();
     expect(publishedEvents.filter((e) => e.eventType === 'CANONICAL_1M_CLOSED').length).toBe(0);
-    expect(scheduler.activeTimerCount).toBe(0); // no stale timers from run A's (non-)initialization
+    expect(scheduler.activeTimerCount).toBe(1); // Only run B's no-evidence freshness timer exists.
 
     // Run B then processes fresh, valid market data normally.
     clock.setTime(MINUTE_0 + 50_000);
@@ -222,7 +222,7 @@ describe('Phase 5 — RESTART-INITIALIZATION-RACE Correction', () => {
     expect(runCPairState.latestCanonicalOpenTimeMs).toBeNull();
     expect(runCPairState.canonicalEpoch).toBe(1);
     expect(publishedEvents.filter((e) => e.eventType === 'CANONICAL_1M_CLOSED').length).toBe(0);
-    expect(scheduler.activeTimerCount).toBe(0);
+    expect(scheduler.activeTimerCount).toBe(1); // Only run C's no-evidence freshness timer exists.
 
     engine.stop();
   });

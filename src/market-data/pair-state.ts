@@ -5,14 +5,16 @@ import {
   PublicCandleUpdatePayload,
 } from '../integration/coindcx/websocket/types';
 import { CanonicalDecimal } from './canonical-decimal';
-import { MIN_CANONICAL_OPEN_TIME_MS, createCanonicalCandle1m } from './models';
+import { MIN_CANONICAL_OPEN_TIME_MS, areCanonicalCandlesCompatible, createCanonicalCandle1m } from './models';
 import {
   CanonicalCandle1m,
   CanonicalHealthSnapshot,
   CanonicalHealthState,
   TruthFault,
 } from './types';
-import { WorkingCandleManager, WorkingCandleSnapshot, WorkingCandleUpdateResult } from './working-candle';
+import { WorkingCandleManager, WorkingCandleSnapshot, WorkingCandleUpdateResult, haveIdenticalCandleValues } from './working-candle';
+
+export type EmptyReconciliationResult = 'NO_BASELINE' | 'NOTHING_MISSING';
 
 export interface PairStateConfig {
   readonly pair: string;
@@ -35,6 +37,7 @@ export interface PairStateCallbacks {
   readonly onRequestRecovery: (pair: string, fromMs: number, toMs: number, recoveryEpoch?: number) => Promise<void>;
   readonly onConflictDetected: (pair: string, conflictMessage: string) => void;
   readonly onStaleDetected?: ((pair: string) => void) | undefined;
+  readonly onReconciliationCompleted?: ((pair: string, result: EmptyReconciliationResult) => void) | undefined;
   readonly getPersistedCandle: (pair: string, openTimeMs: number) => Promise<CanonicalCandle1m | null>;
 }
 
@@ -97,7 +100,7 @@ export interface CommitCandidate {
  * - F5: Fail-closed truth fault latch (truthFault). Normal packets cannot auto-heal truth faults. A
  *   RECOVERY_INCOMPLETE fault can only be cleared by a subsequent successful exact recovery for the
  *   active recovery epoch.
- * - F7: Strict quoteVolume participation in truth equality (null !== Decimal(0)).
+ * - F7: Unknown quote volume is preserved; differing known final values conflict.
  * - F9: Candle-time safety: safe integer, minute aligned, sane bounds, forward-skew and far-future rejection.
  * - F10: Recovery buffer stores full envelopes with exact metadata and duplicate coalescing.
  * - Freshness telemetry (lastValidProviderEventTimeMs/lastValidReceivedAtMs) mutates ONLY after a packet
@@ -127,7 +130,11 @@ export class PairCanonicalStateMachine {
   // await the unified queue's decision without ever bypassing it.
   readonly #commitSettledWaiters = new Map<number, Array<() => void>>();
 
-  #state: CanonicalHealthState = 'HEALTHY';
+  #state: CanonicalHealthState = 'STALE';
+  // Reconciliation ownership is not encoded in the diagnostic health enum.
+  #recoveryActive = false;
+  #reconnectRecoveryFromMs: number | null = null;
+  #emptyReconciliation: EmptyReconciliationResult | null = null;
   #truthFault: TruthFault = 'NONE';
   #canonicalEpoch = 1;
   #recoveryEpoch = 1;
@@ -153,6 +160,7 @@ export class PairCanonicalStateMachine {
     this.#maxRecoveryBuffer = config.maxRecoveryBuffer ?? 100;
     this.#staleThresholdMs = config.staleThresholdMs ?? 120_000;
     this.#callbacks = callbacks;
+    this.#scheduleStaleCheck();
   }
 
   public get pair(): string {
@@ -183,6 +191,13 @@ export class PairCanonicalStateMachine {
     return this.#recoveryEpoch;
   }
 
+  public get recoveryActive(): boolean { return this.#recoveryActive; }
+  public get reconnectRecoveryFromMs(): number | null { return this.#reconnectRecoveryFromMs; }
+
+  public awaitReconnectHandoff(result: EmptyReconciliationResult): void {
+    if (!this.#isStopped && this.#recoveryActive) this.#emptyReconciliation = result;
+  }
+
   public initializeLatestCanonical(openTimeMs: number | null): void {
     this.#latestCanonicalOpenTimeMs = openTimeMs;
     this.#continuityWatermarkMs = openTimeMs;
@@ -205,7 +220,7 @@ export class PairCanonicalStateMachine {
       gapCount: this.#gapCount,
       lateDropCount: this.#lateDropCount,
       duplicateCount: this.#duplicateCount,
-      recoveryRequired: this.#state === 'RECOVERING' || this.#truthFault !== 'NONE',
+      recoveryRequired: this.#recoveryActive || this.#truthFault !== 'NONE',
       bufferedLiveUpdateCount: this.#recoveryBuffer.length,
     });
   }
@@ -220,6 +235,8 @@ export class PairCanonicalStateMachine {
   public enterRecovery(): number {
     if (this.#isStopped) return this.#recoveryEpoch;
     this.#recoveryEpoch++;
+    this.#recoveryActive = true;
+    this.#emptyReconciliation = null;
     this.#state = 'RECOVERING';
     this.#clearAllPendingFinalizations();
     return this.#recoveryEpoch;
@@ -237,6 +254,7 @@ export class PairCanonicalStateMachine {
     if (recoveryEpoch !== this.#recoveryEpoch) return;
     if (this.#truthFault !== 'NONE') return;
     this.#truthFault = fault;
+    this.#recoveryActive = true;
     this.#state = 'RECOVERING';
   }
 
@@ -246,6 +264,12 @@ export class PairCanonicalStateMachine {
   public handleReconnectBarrier(newGeneration: number): void {
     if (this.#isStopped) return;
 
+    if (this.#currentGenerationId !== null && newGeneration < this.#currentGenerationId) return;
+    const unresolved = [this.#workingManager.getCurrentOpenTimeMs(this.#pair), ...this.#pendingFinalizations.keys(), this.#reconnectRecoveryFromMs].filter((t): t is number => t !== null);
+    this.#reconnectRecoveryFromMs = this.#latestCanonicalOpenTimeMs !== null
+      ? this.#latestCanonicalOpenTimeMs + 60_000
+      : unresolved.length ? Math.min(...unresolved) : null;
+
     this.#currentGenerationId = newGeneration;
     this.#canonicalEpoch++;
     this.#recoveryEpoch++;
@@ -253,6 +277,11 @@ export class PairCanonicalStateMachine {
 
     // Invalidate trust in pre-disconnect working candle
     this.#workingManager.clear(this.#pair);
+    this.#recoveryBuffer.length = 0;
+    this.#lastValidProviderEventTimeMs = null;
+    this.#lastValidReceivedAtMs = null;
+    this.#recoveryActive = true;
+    this.#emptyReconciliation = null;
 
     // Enter RECOVERING state
     this.#state = 'RECOVERING';
@@ -311,7 +340,9 @@ export class PairCanonicalStateMachine {
       return;
     }
 
-    if (!Number.isSafeInteger(providerEventTimeMs) || providerEventTimeMs <= 0) {
+    if (!Number.isSafeInteger(providerEventTimeMs) || providerEventTimeMs < openTimeMs ||
+      payload.duration !== '1m' || !Number.isSafeInteger(payload.closeTimeMs) ||
+      payload.closeTimeMs !== openTimeMs + 59_999) {
       this.#state = 'INVALID';
       this.#truthFault = 'TIME_INVALID';
       return;
@@ -333,7 +364,33 @@ export class PairCanonicalStateMachine {
     }
 
     // F10: Buffer live envelopes when RECOVERING with full metadata and same-minute coalescing
-    if (this.#state === 'RECOVERING') {
+    if (this.#recoveryActive) {
+      if (this.#emptyReconciliation !== null && this.#truthFault === 'NONE') {
+        // Empty REST ranges still need fresh evidence from the new generation to establish
+        // the forming bucket. A later first bucket expands the required recovery interval.
+        if (!this.#sourceIsFresh(providerEventTimeMs, nowMs)) {
+          this.#lateDropCount++;
+          return;
+        }
+        const fromMs = this.#reconnectRecoveryFromMs;
+        if (fromMs !== null && openTimeMs < fromMs) { this.#lateDropCount++; return; }
+        if (fromMs !== null && openTimeMs > fromMs) {
+          this.#emptyReconciliation = null;
+          this.#bufferEnvelope({ envelope, pair, openTimeMs, providerEventTimeMs, sequence, receivedAtMs, generationId });
+          await this.#callbacks.onRequestRecovery(this.#pair, fromMs, openTimeMs - 60_000, this.#recoveryEpoch);
+          return;
+        }
+        const result = this.#emptyReconciliation;
+        this.#emptyReconciliation = null;
+        this.#reconnectRecoveryFromMs = null;
+        this.#recoveryActive = false;
+        this.#state = 'STALE';
+        await this.handleStreamEnvelope(envelope);
+        if (!this.#isStopped && !this.#recoveryActive && this.#truthFault === 'NONE') {
+          this.#callbacks.onReconciliationCompleted?.(this.#pair, result);
+        }
+        return;
+      }
       this.#bufferEnvelope({
         envelope,
         pair,
@@ -474,12 +531,29 @@ export class PairCanonicalStateMachine {
    * progress. Never called for SUPERSEDED, duplicate, late-dropped, historical, or rejected packets.
    */
   #refreshFreshness(providerEventTimeMs: number, nowMs: number): void {
+    if (!this.#sourceIsFresh(providerEventTimeMs, nowMs)) {
+      if (!this.#recoveryActive && this.#truthFault === 'NONE') this.#state = 'STALE';
+      return;
+    }
     this.#lastValidProviderEventTimeMs = providerEventTimeMs;
     this.#lastValidReceivedAtMs = nowMs;
-    if (this.#state === 'STALE' || this.#state === 'DEGRADED') {
+    if (!this.#recoveryActive && this.#truthFault === 'NONE' && (this.#state === 'STALE' || this.#state === 'DEGRADED')) {
       this.#state = 'HEALTHY';
     }
     this.#scheduleStaleCheck();
+  }
+
+  #sourceIsFresh(sourceMs: number, nowMs: number): boolean {
+    // Skew tolerance permits working evidence, never proof of freshness from the future.
+    // Keep the existing expiry at age >= staleThresholdMs; timers cannot restore health.
+    return sourceMs <= nowMs && nowMs - sourceMs < this.#staleThresholdMs;
+  }
+
+  #latchEqualTimeConflict(): void {
+    this.#truthFault = 'CANONICAL_CONFLICT';
+    this.#state = 'INVALID';
+    this.#clearAllPendingFinalizations();
+    this.#callbacks.onConflictDetected(this.#pair, 'Conflicting snapshots have equal provider event timestamps');
   }
 
   #bufferEnvelope(item: BufferedEnvelope): void {
@@ -488,13 +562,11 @@ export class PairCanonicalStateMachine {
     if (existingIndex >= 0) {
       const existing = this.#recoveryBuffer[existingIndex];
       if (existing) {
-        // Deterministic comparison: providerEventTimeMs -> sequence -> receivedAtMs
-        const isNewer =
-          item.providerEventTimeMs > existing.providerEventTimeMs ||
-          (item.providerEventTimeMs === existing.providerEventTimeMs && item.sequence > existing.sequence) ||
-          (item.providerEventTimeMs === existing.providerEventTimeMs &&
-            item.sequence === existing.sequence &&
-            item.receivedAtMs > existing.receivedAtMs);
+        if (item.providerEventTimeMs === existing.providerEventTimeMs && !haveIdenticalCandleValues(item.envelope.payload, existing.envelope.payload)) {
+          this.#latchEqualTimeConflict();
+          return;
+        }
+        const isNewer = item.providerEventTimeMs > existing.providerEventTimeMs;
 
         if (isNewer) {
           // Replace in-place (does not increase buffer count)
@@ -537,6 +609,7 @@ export class PairCanonicalStateMachine {
 
     const res = this.#workingManager.update(snapshot);
     if (!res.applied) {
+      if (res.reason === 'CONFLICT') this.#latchEqualTimeConflict();
       this.#lateDropCount++;
     } else if (res.reason === 'IDEMPOTENT_DUPLICATE') {
       this.#duplicateCount++;
@@ -552,6 +625,7 @@ export class PairCanonicalStateMachine {
     eligibleOpenTimeMs: number,
     meta: { sequence: number; receivedAtMs: number; providerEventTimeMs: number }
   ): void {
+    if (this.#recoveryActive || this.#truthFault !== 'NONE' || meta.providerEventTimeMs < eligibleOpenTimeMs + 60_000) return;
     // Clear existing timer for THIS specific openTimeMs if already scheduled
     const existing = this.#pendingFinalizations.get(eligibleOpenTimeMs);
     if (existing) {
@@ -569,7 +643,7 @@ export class PairCanonicalStateMachine {
     const timerId = this.#scheduler.setTimeout(() => {
       if (this.#isStopped) return;
       this.#onFinalizationGraceElapsed(eligibleOpenTimeMs, currentEpochToken);
-    }, this.#finalizationGraceMs);
+    }, Math.max(this.#finalizationGraceMs, eligibleOpenTimeMs + 60_000 - this.#clock.nowMs()));
 
     const pending: PendingFinalization = {
       pair: this.#pair,
@@ -594,6 +668,13 @@ export class PairCanonicalStateMachine {
   #onFinalizationGraceElapsed(openTimeMs: number, token: EpochToken): void {
     const pending = this.#pendingFinalizations.get(openTimeMs);
     if (!pending) return;
+    if (this.#recoveryActive) return;
+    // Exchange successor evidence is mandatory; local time is only an additional guard
+    // against persisting an observation timestamp before the candle close during clock skew.
+    if (this.#clock.nowMs() < openTimeMs + 60_000) {
+      this.#scheduleFinalization(openTimeMs, pending);
+      return;
+    }
 
     // F3/F4: Revalidate epoch ownership before this minute is even eligible to commit
     if (!this.#isTokenValid(token, 'LIVE_FINALIZATION')) {
@@ -714,6 +795,7 @@ export class PairCanonicalStateMachine {
   async #commitOne(candidate: CommitCandidate): Promise<void> {
     const { openTimeMs, token, origin } = candidate;
     if (!this.#isTokenValid(token, origin)) return;
+    if (origin === 'LIVE_FINALIZATION' && this.#recoveryActive) return;
 
     // F5: Mirrors #drainCommitQueue's fault exemption — a REST_RECOVERY candidate may proceed despite
     // an active RECOVERY_INCOMPLETE fault (the one fault kind recovery is defined to be able to clear).
@@ -762,13 +844,7 @@ export class PairCanonicalStateMachine {
         this.#latestCanonicalOpenTimeMs = canonical.openTimeMs;
         this.#continuityWatermarkMs = canonical.openTimeMs;
       }
-      // F5: A successful commit for a REST_RECOVERY candidate is exactly what may clear a
-      // RECOVERY_INCOMPLETE fault. Ordinary live packets never reach here while a fault is active
-      // (#drainCommitQueue blocks LIVE_FINALIZATION candidates), so this can only ever be recovery
-      // resolving its own previously-latched fault for the active epoch.
-      if (this.#truthFault === 'RECOVERY_INCOMPLETE' && candidate.origin === 'REST_RECOVERY') {
-        this.#truthFault = 'NONE';
-      }
+      // Recovery clears its fault only after the entire verified batch has settled.
       // Clear any working-manager entry for this minute now that canonical truth is durable (covers
       // both a live working snapshot and a stale pre-gap working candle recovery just resolved).
       this.#workingManager.delete(this.#pair, openTimeMs);
@@ -808,13 +884,14 @@ export class PairCanonicalStateMachine {
    * durable, fail-closed fault instead of throwing past this method.
    */
   async #handleLatePostFinalizationUpdate(payload: PublicCandleUpdatePayload): Promise<void> {
+    const token: EpochToken = { canonicalEpoch: this.#canonicalEpoch, recoveryEpoch: this.#recoveryEpoch, generationId: this.#currentGenerationId };
     let existing: CanonicalCandle1m | null;
     try {
       existing = await this.#callbacks.getPersistedCandle(payload.pair, payload.openTimeMs);
     } catch (err: unknown) {
       // A stop() may have landed on THIS instance while the read was in flight; a genuinely superseded
       // instance need not (and must not) still be mutating its own state after being torn down.
-      if (this.#isStopped) return;
+      if (!this.#isTokenValid(token)) return;
       this.#truthFault = 'PERSISTENCE_FAILURE';
       this.#state = 'DEGRADED';
       this.#callbacks.onConflictDetected(
@@ -826,7 +903,7 @@ export class PairCanonicalStateMachine {
       return;
     }
 
-    if (this.#isStopped) return;
+    if (!this.#isTokenValid(token)) return;
 
     if (!existing) {
       this.#truthFault = 'CANONICAL_CONFLICT';
@@ -838,6 +915,13 @@ export class PairCanonicalStateMachine {
       return;
     }
 
+    // A forming observation predating closure is superseded by durable final truth.
+    // It is not a second authoritative assertion of the final OHLCV.
+    if (payload.providerEventTimeMs < existing.closeTimeExclusiveMs) {
+      this.#lateDropCount++;
+      return;
+    }
+
     try {
       const payloadOpen = CanonicalDecimal.from(payload.open);
       const payloadHigh = CanonicalDecimal.from(payload.high);
@@ -846,9 +930,9 @@ export class PairCanonicalStateMachine {
       const payloadVolume = CanonicalDecimal.from(payload.volume);
       const payloadQuoteVolume = CanonicalDecimal.fromNullable(payload.quoteVolume);
 
-      // F7: Full equality check including quoteVolume with null !== Decimal(0)
+      // Unknown quote volume is compatible; two known values must agree.
       const quoteEqual =
-        (existing.quoteVolume === null && payloadQuoteVolume === null) ||
+        existing.quoteVolume === null || payloadQuoteVolume === null ||
         (existing.quoteVolume !== null && payloadQuoteVolume !== null && existing.quoteVolume.equals(payloadQuoteVolume));
 
       const isMatch =
@@ -921,6 +1005,18 @@ export class PairCanonicalStateMachine {
     //    #drainCommitQueue's strictly-ascending-contiguous rule, not by this loop.
     const settleWaiters: Promise<void>[] = [];
     for (const candle of recoveredCandles) {
+      if (!this.#isTokenValid(token)) return;
+      if (candle.pair !== this.#pair) { this.#latchEqualTimeConflict(); return; }
+      if (this.#latestCanonicalOpenTimeMs !== null && candle.openTimeMs <= this.#latestCanonicalOpenTimeMs) {
+        const existing = await this.#callbacks.getPersistedCandle(this.#pair, candle.openTimeMs);
+        if (!this.#isTokenValid(token)) return;
+        if (!existing || !areCanonicalCandlesCompatible(existing, candle)) {
+          this.#truthFault = 'CANONICAL_CONFLICT'; this.#state = 'INVALID';
+          this.#callbacks.onConflictDetected(this.#pair, 'Recovered final candle conflicts with durable final truth');
+          return;
+        }
+        continue;
+      }
       settleWaiters.push(this.#awaitCommitSettled(candle.openTimeMs));
       this.#enqueueCommitCandidate({
         openTimeMs: candle.openTimeMs,
@@ -937,27 +1033,36 @@ export class PairCanonicalStateMachine {
     if (!this.#isTokenValid(token)) {
       return;
     }
+    if (this.#truthFault === 'RECOVERY_INCOMPLETE') this.#truthFault = 'NONE';
     if (this.#truthFault !== 'NONE') {
       return;
     }
 
-    // 2. Drain buffered live updates in deterministic chronological order
-    const buffered = [...this.#recoveryBuffer].sort((a, b) => {
-      if (a.openTimeMs !== b.openTimeMs) return a.openTimeMs - b.openTimeMs;
-      if (a.providerEventTimeMs !== b.providerEventTimeMs) return a.providerEventTimeMs - b.providerEventTimeMs;
-      if (a.sequence !== b.sequence) return a.sequence - b.sequence;
-      return a.receivedAtMs - b.receivedAtMs;
-    });
+    // Keep ownership while reconciling overlapping evidence, including packets buffered during
+    // a historical DB read. A fresh forming packet cannot bypass an unresolved final comparison.
+    while (this.#latestCanonicalOpenTimeMs !== null) {
+      const watermark = this.#latestCanonicalOpenTimeMs;
+      const overlapIndex = this.#recoveryBuffer.findIndex(item => item.openTimeMs <= watermark);
+      if (overlapIndex < 0) break;
+      const [item] = this.#recoveryBuffer.splice(overlapIndex, 1);
+      if (!item) break;
+      await this.#handleLatePostFinalizationUpdate(item.envelope.payload);
+      if (!this.#isTokenValid(token) || this.#truthFault !== 'NONE') return;
+    }
+
+    // One coalesced snapshot per minute remains. Ordering uses exchange minute identity only.
+    const buffered = [...this.#recoveryBuffer].sort((a, b) => a.openTimeMs - b.openTimeMs);
 
     this.#recoveryBuffer.length = 0;
 
-    // truthFault is guaranteed 'NONE' here (checked above; #commitOne already cleared a
-    // RECOVERY_INCOMPLETE fault per-candidate as this batch settled), so it is now safe to leave
-    // RECOVERING and resume normal live processing.
-    this.#state = 'HEALTHY';
+    // The verified batch and overlapping assertions are reconciled before live handoff.
+    this.#recoveryActive = false;
+    this.#reconnectRecoveryFromMs = null;
+    this.#emptyReconciliation = null;
+    this.#state = this.#lastValidProviderEventTimeMs !== null && this.#sourceIsFresh(this.#lastValidProviderEventTimeMs, this.#clock.nowMs()) ? 'HEALTHY' : 'STALE';
 
     for (const item of buffered) {
-      if (this.#isStopped) return;
+      if (!this.#isTokenValid(token)) return;
       // Stale generation entries dropped before drain (F10)
       if (this.#currentGenerationId !== null && item.generationId < this.#currentGenerationId) {
         this.#lateDropCount++;
@@ -968,7 +1073,9 @@ export class PairCanonicalStateMachine {
   }
 
   #scheduleStaleCheck(): void {
-    this.#scheduleStaleCheckWithDelay(this.#staleThresholdMs);
+    const sourceRemaining = this.#lastValidProviderEventTimeMs === null ? this.#staleThresholdMs
+      : this.#staleThresholdMs - (this.#clock.nowMs() - this.#lastValidProviderEventTimeMs);
+    this.#scheduleStaleCheckWithDelay(Math.max(1, Math.min(this.#staleThresholdMs, sourceRemaining)));
   }
 
   #scheduleStaleCheckWithDelay(delayMs: number): void {
@@ -983,10 +1090,12 @@ export class PairCanonicalStateMachine {
       if (this.#isStopped) return;
 
       const checkNow = this.#clock.nowMs();
-      const elapsed = this.#lastValidReceivedAtMs !== null ? checkNow - this.#lastValidReceivedAtMs : this.#staleThresholdMs;
+      const elapsed = this.#lastValidReceivedAtMs !== null && this.#lastValidProviderEventTimeMs !== null
+        ? Math.max(checkNow - this.#lastValidReceivedAtMs, checkNow - this.#lastValidProviderEventTimeMs)
+        : this.#staleThresholdMs;
 
       if (elapsed >= this.#staleThresholdMs) {
-        if (this.#truthFault === 'NONE' && this.#state === 'HEALTHY') {
+        if (!this.#recoveryActive && this.#truthFault === 'NONE' && this.#state === 'HEALTHY') {
           this.#state = 'STALE';
           this.#callbacks.onStaleDetected?.(this.#pair);
         }

@@ -34,7 +34,7 @@ describe('Phase 5 — Three-Blocker Correction', () => {
   // ===========================================================================================
   describe('FRESHNESS-SUPERSEDED-REFRESH', () => {
     it('a SUPERSEDED same-minute update does not refresh freshness and does not postpone the staleness deadline', async () => {
-      const clock = new FakeClock(MINUTE_0);
+      const clock = new FakeClock(MINUTE_0 + 5_000);
       const scheduler = new ManualScheduler();
       const state = new PairCanonicalStateMachine(
         { pair: PAIR, clock, scheduler, staleThresholdMs: 10_000 },
@@ -46,7 +46,7 @@ describe('Phase 5 — Three-Blocker Correction', () => {
         }
       );
 
-      // t=0: accepted current same-minute snapshot.
+      // Elapsed t=0: source time equals evaluation time, establishing a fresh baseline.
       await state.handleCandleUpdate(
         createTestCandlePayload({ openTimeMs: MINUTE_0, providerEventTimeMs: MINUTE_0 + 5_000, close: new Decimal('50000') }),
         { sequence: 5, receivedAtMs: MINUTE_0 + 5_000 }
@@ -57,10 +57,10 @@ describe('Phase 5 — Three-Blocker Correction', () => {
 
       // t=9s: an older/materially-different same-minute snapshot (lower providerEventTimeMs AND lower
       // sequence than what's already accepted) -> WorkingCandleManager reports SUPERSEDED.
-      clock.setTime(MINUTE_0 + 9_000);
+      clock.setTime(MINUTE_0 + 14_000);
       await state.handleCandleUpdate(
         createTestCandlePayload({ openTimeMs: MINUTE_0, providerEventTimeMs: MINUTE_0 + 1_000, close: new Decimal('49950') }),
-        { sequence: 1, receivedAtMs: MINUTE_0 + 9_000 }
+        { sequence: 1, receivedAtMs: MINUTE_0 + 14_000 }
       );
 
       const afterSuperseded = state.getHealthSnapshot();
@@ -70,7 +70,7 @@ describe('Phase 5 — Three-Blocker Correction', () => {
 
       // The deadline was armed from t=0 with a 10s threshold; it must still fire at ~t=10s, proving the
       // SUPERSEDED packet at t=9s did NOT postpone it (a postponed deadline would still read HEALTHY here).
-      clock.setTime(MINUTE_0 + 10_500);
+      clock.setTime(MINUTE_0 + 15_500);
       scheduler.advanceTime(10_500);
       expect(state.state).toBe('STALE');
 
@@ -397,7 +397,7 @@ describe('Phase 5 — Three-Blocker Correction', () => {
       expect(runBPairState.recoveryEpoch).toBe(1);
       expect(runBPairState.latestCanonicalOpenTimeMs).toBe(MINUTE_0);
       expect(runBPairState.getHealthSnapshot().lastValidProviderEventTimeMs).toBeNull();
-      expect(runBPairState.state).toBe('HEALTHY');
+      expect(runBPairState.state).toBe('STALE');
       expect(runBPairState.truthFault).toBe('NONE');
 
       const persistedMinute0 = await repo.getCandle(PAIR, MINUTE_0);
