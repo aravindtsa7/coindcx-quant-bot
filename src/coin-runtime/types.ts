@@ -163,6 +163,26 @@ export interface DiscoveredCoinRuntime {
   readonly instrument: InstrumentMetadata;
   readonly lifecycle: CoinLifecycleState;
   readonly entryEligibility: CoinEntryEligibility;
+  readonly dataReadiness?: CoinDataReadinessRecord;
+}
+
+/** Phase 3 completion evidence, issued by CoinRegistry.prepareDataReadiness.
+ * This scope covers metadata and owned data intent, not feed health, channel ACKs,
+ * historical backfill, or Phase 5/6 initialization (which Phase 3 does not own).
+ */
+export interface CoinDataReadinessProof {
+  readonly scope: 'PHASE3_METADATA_AND_DATA_INTENT';
+  readonly underlying: string;
+  readonly pair: string;
+  readonly lifecycleRevision: number;
+  readonly operationRevision: number;
+  readonly completedSteps: readonly ['INSTRUMENT_METADATA', 'ONE_MINUTE_DATA_INTENT'];
+  readonly subscriptionIntent: MarketDataSubscriptionIntent;
+}
+
+export interface CoinDataReadinessRecord {
+  readonly lifecycleRevision: number;
+  readonly evidence: CoinDataReadinessProof;
 }
 
 /**

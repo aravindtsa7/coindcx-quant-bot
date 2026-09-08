@@ -1,9 +1,14 @@
 import { Decimal } from '../core/decimal/decimal';
-import { CoinRegistrationError, NotFoundError } from '../core/errors/app-error';
+import { CoinLifecycleError, CoinRegistrationError, NotFoundError } from '../core/errors/app-error';
 import { logger } from '../monitoring/logger';
 import { assertValidLifecycleTransition } from './lifecycle';
+import { assertDataInitializationMetadata, DataReadinessInstrumentReader } from './data-readiness';
+import { determineEntryEligibility, mapInstrumentToMetadata } from './instrument-mapper';
+import { createSubscriptionIntent } from './subscription-intent';
 import {
   CoinLifecycleState,
+  CoinDataReadinessProof,
+  CoinDataReadinessRecord,
   CoinProfile,
   CoinRuntime,
   DiscoveredCoinRuntime,
@@ -117,6 +122,14 @@ interface InternalDiscoveredRecord {
   readonly instrument: InstrumentMetadata;
   lifecycle: CoinLifecycleState;
   readonly entryEligibility: DiscoveredCoinRuntime['entryEligibility'];
+  dataReadiness?: CoinDataReadinessRecord;
+}
+
+interface IssuedReadiness {
+  readonly record: InternalDiscoveredRecord;
+  readonly instrument: InstrumentMetadata;
+  promotedRecord?: InternalDiscoveredRecord;
+  promotedOperationRevision?: number;
 }
 
 type InternalCoinRecord = InternalDiscoveredRecord | InternalUndiscoveredDisabledRecord;
@@ -142,6 +155,7 @@ function createRuntimeSnapshot(record: InternalCoinRecord): CoinRuntime {
     instrument: clonedInstrument,
     lifecycle: record.lifecycle,
     entryEligibility: record.entryEligibility,
+    ...(record.dataReadiness ? { dataReadiness: record.dataReadiness } : {}),
   });
   return snapshot;
 }
@@ -161,6 +175,8 @@ export class CoinRegistry {
   readonly #byUnderlying = new Map<string, InternalCoinRecord>();
   readonly #byPair = new Map<string, InternalDiscoveredRecord>();
   readonly #revisions = new Map<string, number>();
+  readonly #lifecycleRevisions = new Map<string, number>();
+  readonly #readinessProofs = new WeakMap<CoinDataReadinessProof, IssuedReadiness>();
   readonly #changeListeners = new Set<() => void>();
 
   public beginDiscovery(underlying: string): number {
@@ -181,8 +197,15 @@ export class CoinRegistry {
     return () => { this.#changeListeners.delete(listener); };
   }
 
-  #notifyChanged(underlying: string): void {
+  #notifyChanged(underlying: string, readiness?: CoinDataReadinessProof): void {
     this.beginDiscovery(underlying); // Every lifecycle mutation revokes older async ownership.
+    const lifecycleRevision = (this.#lifecycleRevisions.get(underlying) ?? 0) + 1;
+    this.#lifecycleRevisions.set(underlying, lifecycleRevision);
+    const record = this.#byUnderlying.get(underlying);
+    if (record?.status === 'DISCOVERED') {
+      delete record.dataReadiness;
+      if (readiness) record.dataReadiness = Object.freeze({ lifecycleRevision, evidence: readiness });
+    }
     for (const listener of [...this.#changeListeners]) {
       try { listener(); } catch { logger.error('Coin registry change listener failed'); }
     }
@@ -193,6 +216,7 @@ export class CoinRegistry {
    * Atomic operation: rejects duplicate underlyings or duplicate pairs.
    */
   public register(runtime: CoinRuntime): void {
+    this.#assertInitialLifecycle(runtime);
     const canonicalUnderlying = canonicalizeUnderlying(runtime.profile.underlying);
 
     if (this.#byUnderlying.has(canonicalUnderlying)) {
@@ -261,6 +285,7 @@ export class CoinRegistry {
    * Ensures pair indexes remain strictly synchronized.
    */
   public replaceOrRegisterDiscovered(runtime: DiscoveredCoinRuntime): CoinRuntime {
+    this.#assertInitialLifecycle(runtime);
     const canonicalUnderlying = canonicalizeUnderlying(runtime.profile.underlying);
     const newPair = runtime.instrument.pair.trim();
 
@@ -389,6 +414,9 @@ export class CoinRegistry {
     underlying: string,
     nextState: CoinLifecycleState
   ): CoinRuntime {
+    if (nextState === 'DATA_READY') {
+      throw new CoinLifecycleError('DATA_READY requires a current registry-issued proof via promoteDataReady');
+    }
     const canonical = canonicalizeUnderlying(underlying);
     const record = this.#byUnderlying.get(canonical);
     if (!record) {
@@ -439,5 +467,74 @@ export class CoinRegistry {
     this.#byUnderlying.clear();
     this.#byPair.clear();
     for (const underlying of this.#revisions.keys()) this.#notifyChanged(underlying);
+  }
+
+  #assertInitialLifecycle(runtime: CoinRuntime): void {
+    if (runtime.lifecycle !== 'DISCOVERED' && runtime.lifecycle !== 'DISABLED') {
+      throw new CoinLifecycleError('Registration must start at DISCOVERED or DISABLED; readiness must be earned');
+    }
+  }
+
+  /** Executes Phase 3's mandatory initialization; only this path can issue an authentic proof. */
+  public async prepareDataReadiness(underlying: string, reader: DataReadinessInstrumentReader): Promise<CoinDataReadinessProof> {
+    const key = canonicalizeUnderlying(underlying);
+    const record = this.#byUnderlying.get(key);
+    if (!record || record.status !== 'DISCOVERED') throw new CoinLifecycleError('Readiness requires a discovered runtime');
+    assertValidLifecycleTransition(record.lifecycle, 'DATA_READY', key, record.profile.liveEnabled);
+    const operationRevision = this.beginDiscovery(key);
+    const lifecycleRevision = this.#lifecycleRevisions.get(key)!;
+    const ownsInitialization = () => this.#byUnderlying.get(key) === record &&
+      this.#revisions.get(key) === operationRevision && this.#lifecycleRevisions.get(key) === lifecycleRevision;
+    const assertOwner = () => {
+      if (!ownsInitialization()) throw new CoinLifecycleError('Data initialization was superseded', { underlying: key, reason: 'SUPERSEDED' });
+    };
+    try {
+      const discovered = await reader.getInrFuturesInstrument(record.instrument.pair);
+      assertOwner();
+      if (discovered.pair !== record.instrument.pair) throw new CoinLifecycleError('Readiness instrument pair does not match the registered pair');
+      const metadata = mapInstrumentToMetadata(discovered, key);
+      assertDataInitializationMetadata(record.profile, metadata);
+      const intent = createSubscriptionIntent({ ...createRuntimeSnapshot(record), instrument: metadata } as DiscoveredCoinRuntime);
+      if (!intent || !intent.requiresOneMinuteCandles || intent.pair !== record.instrument.pair) {
+        throw new CoinLifecycleError('Mandatory one-minute data intent was not established');
+      }
+      assertOwner();
+      const proof: CoinDataReadinessProof = Object.freeze({
+        scope: 'PHASE3_METADATA_AND_DATA_INTENT', underlying: key, pair: metadata.pair,
+        lifecycleRevision, operationRevision,
+        completedSteps: Object.freeze(['INSTRUMENT_METADATA', 'ONE_MINUTE_DATA_INTENT'] as const),
+        subscriptionIntent: intent,
+      });
+      this.#readinessProofs.set(proof, { record, instrument: deepCloneInstrument(metadata)! });
+      return proof;
+    } catch {
+      assertOwner();
+      throw new CoinLifecycleError('Mandatory data initialization failed', { underlying: key, pair: record.instrument.pair, reason: 'INITIALIZATION_FAILED' });
+    }
+  }
+
+  /** Sole DATA_READY promotion authority. Structural lookalikes and proofs from other registries fail. */
+  public promoteDataReady(underlying: string, proof: CoinDataReadinessProof): CoinRuntime {
+    const key = canonicalizeUnderlying(underlying);
+    const issued = proof && this.#readinessProofs.get(proof);
+    const record = this.#byUnderlying.get(key);
+    if (!issued || !record || record.status !== 'DISCOVERED' || proof.underlying !== key || proof.pair !== record.instrument.pair) {
+      throw new CoinLifecycleError('Missing or mismatched registry-issued readiness proof');
+    }
+    if (record === issued.promotedRecord && record.lifecycle === 'DATA_READY' && record.dataReadiness?.evidence === proof &&
+      this.#revisions.get(key) === issued.promotedOperationRevision) return createRuntimeSnapshot(record);
+    if (record !== issued.record || this.#revisions.get(key) !== proof.operationRevision ||
+      this.#lifecycleRevisions.get(key) !== proof.lifecycleRevision) {
+      throw new CoinLifecycleError('Readiness proof was superseded', { underlying: key, reason: 'SUPERSEDED' });
+    }
+    assertValidLifecycleTransition(record.lifecycle, 'DATA_READY', key, record.profile.liveEnabled);
+    const promoted: InternalDiscoveredRecord = { ...record, lifecycle: 'DATA_READY', instrument: issued.instrument,
+      entryEligibility: determineEntryEligibility(record.profile, issued.instrument) };
+    this.#byUnderlying.set(key, promoted);
+    this.#byPair.set(proof.pair, promoted);
+    issued.promotedRecord = promoted;
+    issued.promotedOperationRevision = this.#revisions.get(key)! + 1;
+    this.#notifyChanged(key, proof);
+    return this.getByUnderlying(key); // A synchronous lifecycle subscriber may already have disabled it.
   }
 }
