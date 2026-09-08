@@ -1,5 +1,6 @@
 import type { CanonicalCandle1m } from '../market-data/types';
 import { createCanonicalCandle1m } from '../market-data/models';
+import { canonicalFixedPointIdentity } from '../market-data/fixed-point-identity';
 import type { HigherTimeframeCandle } from '../market-data/higher-timeframe/types';
 import { aggregateExactBucket } from '../market-data/higher-timeframe/aggregate-exact-bucket';
 import { bucketEndExclusiveMs } from '../market-data/higher-timeframe/timeframe';
@@ -76,12 +77,12 @@ function candlePayload(candle: CanonicalCandle1m | HigherTimeframeCandle): Reado
     timeframeMinutes: 'timeframeMinutes' in candle ? candle.timeframeMinutes : 1,
     openTimeMs: candle.openTimeMs,
     closeTimeExclusiveMs: candle.closeTimeExclusiveMs,
-    open: candle.open.value,
-    high: candle.high.value,
-    low: candle.low.value,
-    close: candle.close.value,
-    volume: candle.volume.value,
-    quoteVolume: candle.quoteVolume?.value ?? null,
+    open: canonicalFixedPointIdentity(candle.open.value),
+    high: canonicalFixedPointIdentity(candle.high.value),
+    low: canonicalFixedPointIdentity(candle.low.value),
+    close: canonicalFixedPointIdentity(candle.close.value),
+    volume: canonicalFixedPointIdentity(candle.volume.value),
+    quoteVolume: candle.quoteVolume === null ? null : canonicalFixedPointIdentity(candle.quoteVolume.value),
   };
 }
 

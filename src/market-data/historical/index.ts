@@ -1,13 +1,15 @@
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { finished } from 'node:stream/promises';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../persistence/prisma';
 import { Clock, SystemClock } from '../../integration/coindcx/clock';
 import { CanonicalDecimal } from '../canonical-decimal';
+import { canonicalFixedPointIdentity } from '../fixed-point-identity';
 import { Decimal } from '../../core/decimal/decimal';
 import { createCanonicalCandle1m } from '../models';
 import { Candle1mRepository } from '../persistence/candle-repository';
@@ -116,13 +118,7 @@ export function findMissingMinuteSpans(pair: string, range: HistoricalRange, row
 /** Exact textual normalization for hash bytes; it never performs financial arithmetic. */
 export function canonicalHashDecimal(value: CanonicalDecimal | string): string {
   const raw = value instanceof CanonicalDecimal ? value.value : value;
-  const decimal = CanonicalDecimal.from(raw).value;
-  const match = /^(-?)(\d+)(?:\.(\d+))?$/.exec(decimal);
-  if (!match) throw new HistoricalDatasetError('CANONICAL_VALIDATION_FAILURE', 'Invalid hash decimal');
-  const integer = (match[2] ?? '0').replace(/^0+(?!$)/, '');
-  const fraction = (match[3] ?? '').replace(/0+$/, '');
-  if (integer === '0' && fraction === '') return '0';
-  return `${match[1] === '-' ? '-' : ''}${integer}${fraction === '' ? '' : `.${fraction}`}`;
+  return canonicalFixedPointIdentity(CanonicalDecimal.from(raw).value);
 }
 
 export interface HistoricalLogicalRow {
@@ -277,14 +273,38 @@ export class HistoricalDatasetService {
   }
   public async exportDataset(datasetId: string, outputDirectory: string): Promise<{ readonly manifestFilePath: string; readonly ndjsonFilePath: string }> {
     const manifest = await this.getManifest(datasetId); if (!manifest) throw new HistoricalDatasetError('DATASET_INCOMPLETE', 'Historical dataset manifest was not found');
-    await mkdir(outputDirectory, { recursive: true }); const stem = `dataset-${manifest.datasetId}`; const dataPath = join(outputDirectory, `${stem}.candles.ndjson`); const manifestPath = join(outputDirectory, `${stem}.manifest.json`); const tempPath = join(outputDirectory, `.${stem}.${process.pid}.tmp`);
-    const stream = createWriteStream(tempPath, { encoding: 'utf8', flags: 'wx' });
+    await mkdir(outputDirectory, { recursive: true });
+    const stem = `dataset-${manifest.datasetId}`;
+    const dataPath = join(outputDirectory, `${stem}.candles.ndjson`);
+    const manifestPath = join(outputDirectory, `${stem}.manifest.json`);
+    const operationDirectory = await mkdtemp(join(outputDirectory, `.${stem}.`));
+    const tempPath = join(operationDirectory, 'candles.tmp');
+    const tempManifestPath = join(operationDirectory, 'manifest.tmp');
     try {
-      const verified = await verifyCanonicalRange(this.#reader, manifest.pair, manifest, this.#pageMinutes, async (row) => { if (!stream.write(`${JSON.stringify(logicalJson(row))}\n`)) await onceDrain(stream); });
-      await closeStream(stream); const id = computeDatasetId(manifest.pair, manifest, verified.contentSha256);
-      if (!sameManifestIdentity(manifest, { ...manifest, ...verified, datasetId: id })) throw new HistoricalDatasetError('HASH_MISMATCH', 'Exported DB truth does not match manifest');
-      await rename(tempPath, dataPath); await writeJsonAtomic(manifestPath, manifest); return { manifestFilePath: manifestPath, ndjsonFilePath: dataPath };
-    } catch (error) { stream.destroy(); await rm(tempPath, { force: true }); throw error; }
+      const stream = createWriteStream(tempPath, { encoding: 'utf8', flags: 'wx' });
+      // Own errors before any asynchronous reader work. Consume rejection immediately,
+      // and retain finished's error listener through destroy/close and cleanup.
+      const completion = finished(stream).then(() => null, (error: unknown) => ({ error }));
+      try {
+        const verified = await verifyCanonicalRange(this.#reader, manifest.pair, manifest, this.#pageMinutes, async (row) => {
+          if (stream.destroyed) throw stream.errored ?? new Error('Export stream closed');
+          await new Promise<void>((resolve, reject) => {
+            stream.write(`${JSON.stringify(logicalJson(row))}\n`, (error) => error ? reject(error) : resolve());
+          });
+        });
+        stream.end();
+        const outcome = await completion;
+        if (outcome) throw outcome.error;
+        const id = computeDatasetId(manifest.pair, manifest, verified.contentSha256);
+        if (!sameManifestIdentity(manifest, { ...manifest, ...verified, datasetId: id })) throw new HistoricalDatasetError('HASH_MISMATCH', 'Exported DB truth does not match manifest');
+      } finally {
+        stream.destroy();
+        await completion;
+      }
+      await writeFile(tempManifestPath, `${JSON.stringify(manifest)}\n`, { encoding: 'utf8', flag: 'wx' });
+      await publishExport(outputDirectory, stem, tempPath, tempManifestPath, dataPath, manifestPath, manifest);
+      return { manifestFilePath: manifestPath, ndjsonFilePath: dataPath };
+    } finally { await rm(operationDirectory, { recursive: true, force: true }); }
   }
   public async importDataset(manifestFilePath: string, ndjsonFilePath: string): Promise<HistoricalDatasetManifest> {
     const snapshotDir = await mkdtemp(join(tmpdir(), 'coindcx-phase7-')); const snapshotPath = join(snapshotDir, basename(ndjsonFilePath));
@@ -308,9 +328,35 @@ function sameManifestIdentity(a: HistoricalDatasetManifest, b: Omit<HistoricalDa
   return a.datasetId === b.datasetId && a.schemaVersion === b.schemaVersion && a.venue === b.venue && a.market === b.market && a.resolutionMinutes === b.resolutionMinutes && a.pair === b.pair && a.fromInclusiveMs === b.fromInclusiveMs && a.toExclusiveMs === b.toExclusiveMs && a.expectedCandleCount === b.expectedCandleCount && a.actualCandleCount === b.actualCandleCount && a.firstOpenTimeMs === b.firstOpenTimeMs && a.lastOpenTimeMs === b.lastOpenTimeMs && a.contentSha256 === b.contentSha256;
 }
 function logicalJson(row: HistoricalLogicalRow): Record<string, string | number | null> { return { pair: row.pair, openTimeMs: row.openTimeMs, open: row.open.value, high: row.high.value, low: row.low.value, close: row.close.value, volume: row.volume.value, quoteVolume: row.quoteVolume?.value ?? null }; }
-function onceDrain(stream: ReturnType<typeof createWriteStream>): Promise<void> { return new Promise((resolve, reject) => { stream.once('drain', resolve); stream.once('error', reject); }); }
-function closeStream(stream: ReturnType<typeof createWriteStream>): Promise<void> { return new Promise((resolve, reject) => { stream.once('error', reject); stream.end(resolve); }); }
-async function writeJsonAtomic(path: string, value: unknown): Promise<void> { const temp = join(dirname(path), `.${basename(path)}.${process.pid}.tmp`); await writeFile(temp, `${JSON.stringify(value)}\n`, 'utf8'); await rename(temp, path); }
+async function exportPathExists(path: string): Promise<boolean> {
+  try { await stat(path); return true; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error; }
+}
+
+async function publishExport(directory: string, stem: string, tempData: string, tempManifest: string, dataPath: string, manifestPath: string, manifest: HistoricalDatasetManifest): Promise<void> {
+  // Only publication to this destination is exclusive; streaming and other datasets
+  // remain independent. A competing publisher receives a controlled conflict.
+  const lockPath = join(directory, `.${stem}.publish`);
+  try { await mkdir(lockPath); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new HistoricalDatasetError('MANIFEST_CONFLICT', 'Dataset export publication is already in progress');
+    throw error;
+  }
+  try {
+    const dataExists = await exportPathExists(dataPath);
+    const manifestExists = await exportPathExists(manifestPath);
+    if (dataExists || manifestExists) {
+      if (!dataExists || !manifestExists) throw new HistoricalDatasetError('MANIFEST_CONFLICT', 'Destination contains an incomplete export');
+      const existing = parseManifest(JSON.parse(await readFile(manifestPath, 'utf8')));
+      const verified = await verifyArtifact(dataPath, existing);
+      if (!sameManifestIdentity(manifest, existing) || verified.contentSha256 !== manifest.contentSha256) throw new HistoricalDatasetError('MANIFEST_CONFLICT', 'Destination differs from verified export');
+      return;
+    }
+    await rename(tempData, dataPath);
+    try { await rename(tempManifest, manifestPath); }
+    catch (error) { await rm(dataPath, { force: true }); throw error; }
+  } finally { await rm(lockPath, { recursive: true, force: true }); }
+}
 
 function parseManifest(input: unknown): HistoricalDatasetManifest {
   if (!isPlainRecord(input) || !exactKeys(input, ['datasetId', 'schemaVersion', 'venue', 'market', 'resolutionMinutes', 'pair', 'fromInclusiveMs', 'toExclusiveMs', 'expectedCandleCount', 'actualCandleCount', 'firstOpenTimeMs', 'lastOpenTimeMs', 'contentSha256', 'createdAt']) ||
@@ -325,7 +371,31 @@ function parseManifest(input: unknown): HistoricalDatasetManifest {
   return Object.freeze({ datasetId: input.datasetId, schemaVersion: 1, venue: 'COINDCX', market: 'FUTURES', resolutionMinutes: 1, pair: input.pair, fromInclusiveMs, toExclusiveMs, expectedCandleCount, actualCandleCount, firstOpenTimeMs, lastOpenTimeMs, contentSha256: input.contentSha256, createdAt: new Date(input.createdAt) });
 }
 async function verifyArtifact(path: string, manifest: HistoricalDatasetManifest): Promise<VerificationResult> { let count = 0; let previous: number | null = null; const hash = createHash('sha256'); for await (const row of readArtifactRows(path, manifest)) { if (previous !== null && row.openTimeMs !== previous + MINUTE_MS) throw new HistoricalDatasetError('IMPORT_FORMAT_INVALID', 'NDJSON minute sequence is discontinuous'); hash.update(encodeHistoricalLogicalRow(row)); previous = row.openTimeMs; count++; } if (count !== manifest.expectedCandleCount || count !== manifest.actualCandleCount || previous !== manifest.lastOpenTimeMs || manifest.firstOpenTimeMs !== manifest.fromInclusiveMs) throw new HistoricalDatasetError('DATASET_INCOMPLETE', 'Artifact is incomplete'); return { expectedCandleCount: manifest.expectedCandleCount, actualCandleCount: count, firstOpenTimeMs: manifest.fromInclusiveMs, lastOpenTimeMs: manifest.lastOpenTimeMs, contentSha256: hash.digest('hex') }; }
-async function* readArtifactRows(path: string, manifest: HistoricalDatasetManifest): AsyncGenerator<HistoricalLogicalRow> { const reader = createInterface({ input: createReadStream(path, { encoding: 'utf8' }), crlfDelay: Infinity }); let lineNumber = 0; for await (const line of reader) { lineNumber++; if (line === '') throw new HistoricalDatasetError('IMPORT_FORMAT_INVALID', 'Blank NDJSON line'); let parsed: unknown; try { parsed = JSON.parse(line); } catch { throw new HistoricalDatasetError('IMPORT_FORMAT_INVALID', `Invalid NDJSON at line ${lineNumber}`); } const row = parseLogicalRow(parsed); if (row.pair !== manifest.pair || row.openTimeMs < manifest.fromInclusiveMs || row.openTimeMs >= manifest.toExclusiveMs) throw new HistoricalDatasetError('IMPORT_FORMAT_INVALID', 'NDJSON row outside manifest range'); yield row; } }
+async function* readArtifactRows(path: string, manifest: HistoricalDatasetManifest): AsyncGenerator<HistoricalLogicalRow> {
+  const input = createReadStream(path, { encoding: 'utf8' });
+  const completion = finished(input).then(() => null, (error: unknown) => ({ error }));
+  const reader = createInterface({ input, crlfDelay: Infinity });
+  input.once('error', () => reader.close());
+  try {
+    let lineNumber = 0;
+    for await (const line of reader) {
+      lineNumber++;
+      if (line === '') throw new HistoricalDatasetError('IMPORT_FORMAT_INVALID', 'Blank NDJSON line');
+      let parsed: unknown;
+      try { parsed = JSON.parse(line); }
+      catch { throw new HistoricalDatasetError('IMPORT_FORMAT_INVALID', `Invalid NDJSON at line ${lineNumber}`); }
+      const row = parseLogicalRow(parsed);
+      if (row.pair !== manifest.pair || row.openTimeMs < manifest.fromInclusiveMs || row.openTimeMs >= manifest.toExclusiveMs) throw new HistoricalDatasetError('IMPORT_FORMAT_INVALID', 'NDJSON row outside manifest range');
+      yield row;
+    }
+    const outcome = await completion;
+    if (outcome) throw outcome.error;
+  } finally {
+    reader.close();
+    input.destroy();
+    await completion;
+  }
+}
 function parseLogicalRow(input: unknown): HistoricalLogicalRow {
   if (!isPlainRecord(input) || !exactKeys(input, ['pair', 'openTimeMs', 'open', 'high', 'low', 'close', 'volume', 'quoteVolume']) || typeof input.pair !== 'string' || typeof input.open !== 'string' || typeof input.high !== 'string' || typeof input.low !== 'string' || typeof input.close !== 'string' || typeof input.volume !== 'string' || !(typeof input.quoteVolume === 'string' || input.quoteVolume === null)) throw new HistoricalDatasetError('IMPORT_FORMAT_INVALID', 'NDJSON row has invalid strict schema');
   const openTimeMs = numberField(input, 'openTimeMs');
