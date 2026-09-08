@@ -7,6 +7,9 @@ const undefinedMetric = (reason: 'ZERO_SAMPLE_VARIANCE' | 'DSR_ESTIMATOR_VARIANC
 export interface DeflatedSharpeAnalysis { readonly sr0: ValidationMetric; readonly deflatedSharpeZ: ValidationMetric }
 function unavailableAnalysis(metric: ValidationMetric): DeflatedSharpeAnalysis { return freezeValidationRuntime({ sr0: metric, deflatedSharpeZ: metric }); }
 export function calculateDeflatedSharpeAnalysis(candidateReturns: readonly string[], familyReturns: readonly (readonly string[])[], annualRiskFreeRate: string, minDailyObservations: number): DeflatedSharpeAnalysis {
+  candidateReturns.forEach(calc);
+  familyReturns.forEach((returns) => returns.forEach(calc));
+  calc(annualRiskFreeRate);
   if (candidateReturns.length < minDailyObservations || candidateReturns.length < 2) return unavailableAnalysis(freezeValidationRuntime({ status: 'INSUFFICIENT_DATA', reason: 'INSUFFICIENT_DSR_OBSERVATIONS', count: candidateReturns.length, required: Math.max(minDailyObservations, 2), value: null }));
   const dailyRate = calc(annualRiskFreeRate).plus(1).pow(new BacktestCalcDecimal(1).div(365)).minus(1);
   const familyValues = familyReturns.map((returns) => {

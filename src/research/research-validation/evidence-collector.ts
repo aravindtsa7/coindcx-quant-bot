@@ -1,6 +1,6 @@
 import { createHash, type Hash } from 'node:crypto';
 import { sha256CanonicalJson, updateCanonicalEventHash } from '../../backtest/canonical-json';
-import { BacktestDecimal, BacktestCalcDecimal } from '../../backtest/decimal';
+import { BacktestCalcDecimal } from '../../backtest/decimal';
 import type { BacktestEvent, BacktestEventSink, BacktestRunResult } from '../../backtest/types';
 import { ResearchValidationError } from './errors';
 import { freezeValidationRuntime } from './immutable';
@@ -16,7 +16,7 @@ function fail(message: string): never { throw new ResearchValidationError('EVIDE
 function decimalPayload(payload: Readonly<Record<string, unknown>>, key: string): string {
   const value = payload[key];
   if (typeof value !== 'string') fail(`Expected canonical decimal payload '${key}'`);
-  try { return new BacktestDecimal(value).value; } catch { fail(`Malformed canonical decimal payload '${key}'`); }
+  try { return canonical(calc(value)); } catch { fail(`Malformed canonical decimal payload '${key}'`); }
 }
 function nestedRecord(payload: Readonly<Record<string, unknown>>, key: string): Readonly<Record<string, unknown>> {
   const value = payload[key];
@@ -28,7 +28,7 @@ export class ValidationEvidenceCollector implements BacktestEventSink {
   readonly #hash: Hash = createHash('sha256');
   readonly #binding: ValidationEvidenceCollectorBinding;
   readonly #dailyEquities = new Map<number, string>();
-  readonly #equityPath: string[] = [];
+  readonly #equityPath: { readonly eventTimeMs: number; readonly equity: string }[] = [];
   readonly #closedTradeGrossPnls: string[] = [];
   #priorSequence = 0; #observedEventCount = 0; #runCompletedCount = 0; #terminalSeen = false; #digested = false;
   #currentTimestamp: number | null = null; #currentEquity: string | null = null;
@@ -68,7 +68,7 @@ export class ValidationEvidenceCollector implements BacktestEventSink {
     const timestamp = this.#currentTimestamp; const equity = this.#currentEquity;
     if (timestamp === null || equity === null) return;
     if (timestamp >= this.#binding.analysisStartMs && timestamp <= this.#binding.analysisEndExclusiveMs) {
-      this.#equityPath.push(equity);
+      this.#equityPath.push({ eventTimeMs: timestamp, equity });
       if (timestamp % DAY_MS === 0) {
         if (this.#dailyEquities.has(timestamp)) fail('Duplicate UTC equity boundary');
         this.#dailyEquities.set(timestamp, equity);
@@ -111,8 +111,8 @@ export class ValidationEvidenceCollector implements BacktestEventSink {
     const baseline = calc(baselineEquity); const terminal = calc(terminalAnalysisEquity);
     const totalNetReturn = baseline.lessThanOrEqualTo(0) ? '0' : canonical(terminal.minus(baseline).div(baseline));
     let peak = baseline; let maxAmount = new BacktestCalcDecimal(0); let maxPercent = new BacktestCalcDecimal(0);
-    for (const value of [baselineEquity, ...this.#equityPath]) {
-      const equity = calc(value); if (equity.greaterThan(peak)) peak = equity;
+    for (const point of this.#equityPath) {
+      const equity = calc(point.equity); if (equity.greaterThan(peak)) peak = equity;
       const amount = peak.minus(equity); if (amount.greaterThan(maxAmount)) maxAmount = amount;
       if (peak.greaterThan(0)) { const percent = amount.div(peak).times(100); if (percent.greaterThan(maxPercent)) maxPercent = percent; }
     }
@@ -121,7 +121,7 @@ export class ValidationEvidenceCollector implements BacktestEventSink {
       expectedRunId: this.#binding.expectedRunId, runId: outcome.runId, resultSha256, observedEventLedgerSha256, phase9EventLedgerSha256: outcome.eventLedgerSha256,
       observedEventCount: this.#observedEventCount, baselineEquity, terminalAnalysisEquity, totalNetReturn, maxDrawdownAmount: canonical(maxAmount), maxDrawdownPercent: canonical(maxPercent),
       totalFills: outcome.totalFills, totalClosedTrades: outcome.totalClosedTrades, totalFees: outcome.financialSummary.totalFees.value, fundingPnl: outcome.financialSummary.fundingPnl.value,
-      dailyEquities: Object.freeze(dailyEquities), dailyReturns, closedTradeGrossPnls: Object.freeze([...this.#closedTradeGrossPnls]) });
+      equityPath: Object.freeze([...this.#equityPath]), dailyEquities: Object.freeze(dailyEquities), dailyReturns, closedTradeGrossPnls: Object.freeze([...this.#closedTradeGrossPnls]) });
     return freezeValidationRuntime({ ...payload, validationEvidenceSha256: sha256CanonicalJson(payload) });
   }
 }

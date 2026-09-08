@@ -6,6 +6,7 @@ import { planWithGitSourceVerifier } from '../strategy-coin-matrix/planner';
 import type { MatrixPairCatalogEntry, MatrixPlanningDependencies, StrategyCoinMatrixPlanInput } from '../strategy-coin-matrix/types';
 import { ResearchValidationError, type ValidationErrorCode } from './errors';
 import { validationDeepCopyFreeze } from './immutable';
+import { calc, canonical } from './numeric';
 import { DAY_MS, type FinalizedResearchValidationPlan, type ResearchValidationPlanInput, type ResearchValidationSubject, type ValidationFoldDefinition } from './types';
 
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -33,7 +34,7 @@ function count(value: number, label: string, minimum = 0): number {
 }
 function decimal(value: string, label: string, predicate?: (value: ReturnType<BacktestDecimal['toCalculationDecimal']>) => boolean): string {
   try {
-    const normalized = new BacktestDecimal(value);
+    const normalized = new BacktestDecimal(canonical(calc(value)));
     if (predicate !== undefined && !predicate(normalized.toCalculationDecimal())) invalid(`${label} is outside its allowed range`);
     return normalized.value;
   } catch (error) { invalid(`${label} must be a canonical finite decimal`, error); }
@@ -83,12 +84,20 @@ export function deriveWalkForwardFolds(input: Pick<ResearchValidationPlanInput, 
   return validationDeepCopyFreeze({ folds, unusedTailMs });
 }
 
+export function normalizeValidationPolicies(input: ResearchValidationPlanInput): Omit<ResearchValidationPlanInput, 'pairBindings' | 'strategies'> {
+  try { return normalizePolicies(input); }
+  catch (error) { if (error instanceof ResearchValidationError && error.code === 'VALIDATION_PLAN_INVALID') throw error; invalid('Validation policy fields are malformed or missing', error); }
+}
+
 function normalizePolicies(input: ResearchValidationPlanInput): Omit<ResearchValidationPlanInput, 'pairBindings' | 'strategies'> {
   if (typeof input.planName !== 'string' || input.planName.length === 0 || input.planName.trim() !== input.planName) invalid('planName must be a non-empty exact string');
   if (input.validationPolicyVersion !== 'P12_VALIDATION_POLICY_V1' || input.walkForward.policyId !== 'P12_WALK_FORWARD_V1' || input.metricPolicy.policyId !== 'P12_METRIC_POLICY_V1' ||
       input.costStress.policyId !== 'P12_COST_STRESS_V1' || input.monteCarlo.policyId !== 'P12_MONTE_CARLO_PERMUTATION_V1' || input.monteCarlo.seedDerivationPolicy !== 'HMAC_SHA256_V1' ||
       input.overfitting.policyId !== 'P12_DEFLATED_SHARPE_Z_V1' || input.overfitting.metric !== 'DEFLATED_SHARPE_Z') invalid('Unsupported Phase 12 policy identifier');
   if (input.metricPolicy.annualizationFactor !== 365) invalid('annualizationFactor must be 365');
+  for (const key of ['requireFreshHoldout', 'requireHoldoutPositiveReturn', 'requireCostStressSurvival'] as const) {
+    if (typeof input.thresholds[key] !== 'boolean') invalid(`thresholds.${key} must be an explicit boolean`);
+  }
   count(input.metricPolicy.minDailyObservations, 'metricPolicy.minDailyObservations', 1); count(input.metricPolicy.minClosedTrades, 'metricPolicy.minClosedTrades', 1);
   count(input.thresholds.minOosClosedTrades, 'thresholds.minOosClosedTrades'); count(input.thresholds.minDailyObservations, 'thresholds.minDailyObservations', 1);
   count(input.monteCarlo.simulationCount, 'monteCarlo.simulationCount', 1); count(input.monteCarlo.adversePercentile, 'monteCarlo.adversePercentile', 1);
@@ -136,7 +145,7 @@ class CapturedVerifier implements GitSourceVerifier {
 
 export async function planResearchValidationWithGitSourceVerifier(input: ResearchValidationPlanInput, dependencies: MatrixPlanningDependencies, verifier: GitSourceVerifier): Promise<FinalizedResearchValidationPlan> {
   const copied = validationDeepCopyFreeze(input);
-  const normalizedPolicies = normalizePolicies(copied);
+  const normalizedPolicies = normalizeValidationPolicies(copied);
   const pairBindings = normalizePairs(copied.pairBindings);
   const { folds, unusedTailMs } = deriveWalkForwardFolds(copied);
   let gitCommitHash: string;

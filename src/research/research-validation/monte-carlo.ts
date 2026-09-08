@@ -3,7 +3,7 @@ import { canonicalJson } from '../../backtest/canonical-json';
 import { BacktestCalcDecimal } from '../../backtest/decimal';
 import { ResearchValidationError } from './errors';
 import { freezeValidationRuntime } from './immutable';
-import { calc, canonical } from './numeric';
+import { calc, canonical, finite } from './numeric';
 import type { ValidationMonteCarloConfig, ValidationMonteCarloResult } from './types';
 
 export function deriveMonteCarloSeed(validationPlanId: string, validationSubjectId: string): Buffer {
@@ -36,12 +36,17 @@ export function deterministicPermutation<T>(values: readonly T[], prng: Determin
   return Object.freeze(result);
 }
 export function runMonteCarlo(validationPlanId: string, validationSubjectId: string, returns: readonly string[], config: ValidationMonteCarloConfig): ValidationMonteCarloResult {
+  returns.forEach(calc);
+  if (config.policyId !== 'P12_MONTE_CARLO_PERMUTATION_V1' || config.seedDerivationPolicy !== 'HMAC_SHA256_V1' ||
+      !Number.isSafeInteger(config.simulationCount) || config.simulationCount < 1 || !Number.isSafeInteger(config.adversePercentile) || config.adversePercentile < 1 || config.adversePercentile > 99) {
+    throw new ResearchValidationError('MONTE_CARLO_FAILURE', 'Monte Carlo configuration is invalid');
+  }
   const seed = deriveMonteCarloSeed(validationPlanId, validationSubjectId); const seedHex = seed.toString('hex'); const prng = new DeterministicCounterPrng(seed); const drawdowns: string[] = [];
   if (returns.length === 0) return freezeValidationRuntime({ status: 'INSUFFICIENT_DATA', adversePercentile: config.adversePercentile, simulationCount: config.simulationCount, seedHex, adverseDrawdownPercent: null, reason: 'NO_OOS_DAILY_RETURNS' });
   try {
     for (let simulation = 0; simulation < config.simulationCount; simulation++) {
       const permutation = deterministicPermutation(returns, prng); let equity = new BacktestCalcDecimal(1); let peak = equity; let maximum = new BacktestCalcDecimal(0);
-      for (const item of permutation) { const multiplier = calc(item).plus(1); if (multiplier.lessThanOrEqualTo(0)) return freezeValidationRuntime({ status: 'UNDEFINED', adversePercentile: config.adversePercentile, simulationCount: config.simulationCount, seedHex, adverseDrawdownPercent: null, reason: 'NON_POSITIVE_SIMULATED_EQUITY' }); equity = equity.times(multiplier); if (equity.greaterThan(peak)) peak = equity; const drawdown = peak.minus(equity).div(peak).times(100); if (drawdown.greaterThan(maximum)) maximum = drawdown; }
+      for (const item of permutation) { const multiplier = calc(item).plus(1); if (multiplier.lessThanOrEqualTo(0)) return freezeValidationRuntime({ status: 'UNDEFINED', adversePercentile: config.adversePercentile, simulationCount: config.simulationCount, seedHex, adverseDrawdownPercent: null, reason: 'NON_POSITIVE_SIMULATED_EQUITY' }); equity = finite(equity.times(multiplier)); if (equity.greaterThan(peak)) peak = equity; const drawdown = finite(peak.minus(equity).div(peak).times(100)); if (drawdown.greaterThan(maximum)) maximum = drawdown; }
       drawdowns.push(canonical(maximum));
     }
     drawdowns.sort((left, right) => calc(left).comparedTo(calc(right)));

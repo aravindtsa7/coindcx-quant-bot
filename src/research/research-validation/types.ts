@@ -46,6 +46,7 @@ export interface MetricInsufficientDataResult { readonly status: 'INSUFFICIENT_D
 export type ValidationMetric<T = string> = MetricValueResult<T> | MetricUndefinedResult | MetricInsufficientDataResult;
 export interface CanonicalDailyTerminalEquity { readonly boundaryTimeMs: number; readonly equity: string }
 export interface CanonicalValidationEvidence {
+  readonly equityPath: readonly { readonly eventTimeMs: number; readonly equity: string }[];
   readonly schemaVersion: 1; readonly validationPlanId: string; readonly validationSubjectId: string; readonly validationFoldId: string; readonly scenarioId: string;
   readonly matrixPlanId: string; readonly matrixCellId: string; readonly expectedRunId: string; readonly runId: string; readonly resultSha256: string;
   readonly observedEventLedgerSha256: string; readonly phase9EventLedgerSha256: string; readonly observedEventCount: number; readonly baselineEquity: string;

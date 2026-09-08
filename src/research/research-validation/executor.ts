@@ -2,7 +2,6 @@ import { canonicalJson, sha256CanonicalJson } from '../../backtest/canonical-jso
 import { StrategyCoinMatrixError } from '../strategy-coin-matrix/errors';
 import { ProductionGitSourceVerifier, type GitSourceVerifier } from '../strategy-coin-matrix/git-source';
 import { executeWithGitSourceVerifier } from '../strategy-coin-matrix/executor';
-import { expandNormalizedCandidates, normalizeCandidateSpace } from '../strategy-coin-matrix/candidate-space';
 import { assertPairResourceIdentity, planWithGitSourceVerifier } from '../strategy-coin-matrix/planner';
 import type { FinalizedStrategyCoinMatrixPlan, MatrixBacktestExecutionConfig, StrategyCoinMatrixCell, StrategyCoinMatrixPlanInput } from '../strategy-coin-matrix/types';
 import { calculateDeflatedSharpeZ } from './deflated-sharpe';
@@ -14,7 +13,7 @@ import { calculateMetricsFromEvidence } from './metrics';
 import { runMonteCarlo } from './monte-carlo';
 import { calc, canonical } from './numeric';
 import type { CanonicalValidationEvidence, FinalizedResearchValidationPlan, ResearchValidationPlanResult, StrategyValidationRecord, ValidationCostStressEvaluation, ValidationExecutionDependencies, ValidationExecutionOptions, ValidationFoldResult, ValidationGateEvaluation, ValidationHoldoutEvaluation, ValidationMetric, ValidationMetrics } from './types';
-import { deriveWalkForwardFolds, planResearchValidation, planResearchValidationWithGitSourceVerifier } from './planner';
+import { normalizeValidationPolicies, planResearchValidation, planResearchValidationWithGitSourceVerifier } from './planner';
 import type { ResearchValidationPlanInput } from './types';
 
 function ascii(left: string, right: string): number { return left < right ? -1 : left > right ? 1 : 0; }
@@ -103,18 +102,16 @@ function failedResult(finalized: FinalizedResearchValidationPlan, abortedCode: s
 export async function executeResearchValidationWithGitSourceVerifier(finalizedInput: FinalizedResearchValidationPlan, dependencies: ValidationExecutionDependencies, options: ValidationExecutionOptions, sourceVerifier: GitSourceVerifier): Promise<ResearchValidationPlanResult> {
   const verifier = new LatchingGitSourceVerifier(sourceVerifier);
   const finalized = validationDeepCopyFreeze(finalizedInput); const expected = finalized.plan.sourceIdentity.gitCommitHash;
+  normalizeValidationPolicies(finalized.plan);
   if (sha256CanonicalJson(finalized.plan) !== finalized.validationPlanId) throw new ResearchValidationError('VALIDATION_PLAN_INVALID', 'Finalized validation plan identity is invalid');
-  const derivedFolds = deriveWalkForwardFolds(finalized.plan);
-  if (canonicalJson(derivedFolds.folds) !== canonicalJson(finalized.folds) || derivedFolds.unusedTailMs !== finalized.unusedTailMs) throw new ResearchValidationError('VALIDATION_PLAN_INVALID', 'Finalized fold definitions are not authoritative');
-  const expectedSubjects = finalized.plan.pairBindings.flatMap((pair) => finalized.plan.strategies.flatMap((strategy) => {
-    const definition = dependencies.registry.get(strategy.strategyId, strategy.strategyVersion); const candidates = expandNormalizedCandidates(normalizeCandidateSpace(strategy.candidateSpace), definition);
-    return candidates.map((candidate) => ({ validationSubjectId: sha256CanonicalJson({ pair: pair.pair, strategyId: strategy.strategyId, strategyVersion: strategy.strategyVersion, parameterHash: candidate.parameterHash }), pair: pair.pair, strategyId: strategy.strategyId, strategyVersion: strategy.strategyVersion, parameterHash: candidate.parameterHash, normalizedParameters: candidate.normalizedParameters }));
-  })).sort((left, right) => ascii(left.validationSubjectId, right.validationSubjectId));
-  if (canonicalJson(expectedSubjects) !== canonicalJson(finalized.subjects)) throw new ResearchValidationError('VALIDATION_PLAN_INVALID', 'Finalized validation subjects are not authoritative');
   const runtimePairs = new Set<string>(); for (const resource of dependencies.pairResources) { if (runtimePairs.has(resource.pair) || !finalized.plan.pairUniverse.includes(resource.pair)) throw new ResearchValidationError('RESOURCE_IDENTITY_MISMATCH', 'Runtime pair resources are duplicate or foreign'); runtimePairs.add(resource.pair); }
   if (runtimePairs.size !== finalized.plan.pairBindings.length) throw new ResearchValidationError('RESOURCE_IDENTITY_MISMATCH', 'Runtime pair resources do not exactly cover pairBindings');
   try { for (const binding of finalized.plan.pairBindings) { const resource = dependencies.pairResources.find((item) => item.pair === binding.pair); if (resource === undefined) throw new ResearchValidationError('RESOURCE_IDENTITY_MISMATCH', 'Runtime pair is missing'); assertPairResourceIdentity(binding, resource); } }
   catch (error) { if (error instanceof ResearchValidationError) throw error; throw new ResearchValidationError('RESOURCE_IDENTITY_MISMATCH', 'Runtime pair identity differs from the validation plan', { cause: error }); }
+  // A matching hash authenticates bytes, not their meaning. Reuse the actual
+  // planner with the stored commit, without recapturing source or consuming latch checks.
+  const authoritative = await planResearchValidationWithGitSourceVerifier(finalized.plan, dependencies, new FixedCaptureVerifier(expected));
+  if (canonicalJson(authoritative) !== canonicalJson(finalized)) throw new ResearchValidationError('VALIDATION_PLAN_INVALID', 'Finalized validation plan is not the canonical semantically valid plan');
   try { await verifier.assertExpected(expected); } catch (error) { return failedResult(finalized, validationSourceCode(error)); }
   const foldResults = new Map<string, ValidationFoldResult[]>(); const stressEvidence = new Map<string, Map<string, CanonicalValidationEvidence[]>>(); const holdoutEvidence = new Map<string, CanonicalValidationEvidence | null>();
   const aborted = new Map<string, string>();
@@ -166,7 +163,7 @@ export async function executeResearchValidationWithGitSourceVerifier(finalizedIn
     const monteCarloResult = subjectOosReturns.status === 'VALUE'
       ? runMonteCarlo(finalized.validationPlanId, subject.validationSubjectId, subjectOosReturns.value, finalized.plan.monteCarlo)
       : freezeValidationRuntime({ status: subjectOosReturns.status, adversePercentile: finalized.plan.monteCarlo.adversePercentile, simulationCount: finalized.plan.monteCarlo.simulationCount, seedHex: '', adverseDrawdownPercent: null, reason: subjectOosReturns.reason });
-    gates.push(monteCarloResult.status !== 'VALUE' ? { gateId: 'GATE-11', gateName: 'MONTE_CARLO_ADVERSE_DRAWDOWN', status: 'UNAVAILABLE', observedValue: null, thresholdValue: finalized.plan.thresholds.maxMonteCarloAdverseDrawdownPercent, ...(monteCarloResult.reason === undefined ? {} : { reason: monteCarloResult.reason }) } : metricGate('GATE-11', 'MONTE_CARLO_ADVERSE_DRAWDOWN', { status: 'VALUE', value: monteCarloResult.adverseDrawdownPercent ?? '0' }, finalized.plan.thresholds.maxMonteCarloAdverseDrawdownPercent, 'MAX'));
+    gates.push(monteCarloResult.status !== 'VALUE' ? { gateId: 'GATE-11', gateName: 'MONTE_CARLO_ADVERSE_DRAWDOWN', status: 'UNAVAILABLE', observedValue: null, thresholdValue: finalized.plan.thresholds.maxMonteCarloAdverseDrawdownPercent, ...(monteCarloResult.reason === undefined ? {} : { reason: monteCarloResult.reason }) } : metricGate('GATE-11', 'MONTE_CARLO_ADVERSE_DRAWDOWN', { status: 'VALUE', value: canonical(calc(monteCarloResult.adverseDrawdownPercent)) }, finalized.plan.thresholds.maxMonteCarloAdverseDrawdownPercent, 'MAX'));
     const family = finalized.subjects.filter((item) => item.pair === subject.pair && item.strategyId === subject.strategyId && item.strategyVersion === subject.strategyVersion).map((item) => oosReturns.get(item.validationSubjectId) ?? unavailableSeries('OOS_RETURNS_UNAVAILABLE'));
     const dsr = subjectOosReturns.status !== 'VALUE' ? subjectOosReturns : family.some((item) => item.status !== 'VALUE') ? unavailable('DSR_FAMILY_RETURNS_UNAVAILABLE')
       : calculateDeflatedSharpeZ(subjectOosReturns.value, family.map((item) => item.status === 'VALUE' ? item.value : []), finalized.plan.metricPolicy.annualRiskFreeRate, finalized.plan.metricPolicy.minDailyObservations);

@@ -3,8 +3,9 @@ import { calc, canonical } from './numeric';
 import type { ValidationApprovalThresholds, ValidationGateEvaluation, ValidationMetric, ValidationMetrics } from './types';
 
 export function metricGate(gateId: string, gateName: string, metric: ValidationMetric, threshold: string, direction: 'MIN' | 'MAX'): ValidationGateEvaluation {
+  const limit = calc(threshold);
   if (metric.status !== 'VALUE') return freezeValidationRuntime({ gateId, gateName, status: 'UNAVAILABLE', observedValue: null, thresholdValue: threshold, reason: metric.reason });
-  const passes = direction === 'MIN' ? calc(metric.value).greaterThanOrEqualTo(calc(threshold)) : calc(metric.value).lessThanOrEqualTo(calc(threshold));
+  const passes = direction === 'MIN' ? calc(metric.value).greaterThanOrEqualTo(limit) : calc(metric.value).lessThanOrEqualTo(limit);
   return freezeValidationRuntime({ gateId, gateName, status: passes ? 'PASS' : 'FAIL', observedValue: metric.value, thresholdValue: threshold });
 }
 export function evaluateFoldLocalGates(metrics: ValidationMetrics, totalClosedTrades: number, dailyCount: number, thresholds: ValidationApprovalThresholds): readonly ValidationGateEvaluation[] {
