@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { Decimal } from '../../../core/decimal/decimal';
 import { CoinDcxSocketValidationError } from '../../../core/errors/app-error';
+import { decodeCandlePayload } from './candle-json';
 import {
   PrivateBalanceNotificationPayload,
   PrivateBalanceRecord,
@@ -90,9 +91,9 @@ const RawCandleItemSchema = z.object({
   low: z.union([z.string(), z.number()]),
   close: z.union([z.string(), z.number()]),
   volume: z.union([z.string(), z.number()]),
-  quote_volume: z.union([z.string(), z.number()]).optional(),
-  open_time: z.number(),
-  close_time: z.number(),
+  quote_volume: z.union([z.string(), z.number()]).nullable().optional(),
+  open_time: z.union([z.string(), z.number()]),
+  close_time: z.union([z.string(), z.number()]),
   pair: z.string().min(1),
   duration: z.string().min(1),
   symbol: z.string().optional(),
@@ -100,40 +101,58 @@ const RawCandleItemSchema = z.object({
 
 export const RawCandleEnvelopeSchema = z.object({
   data: z.array(RawCandleItemSchema).min(1, 'Candle data array must contain at least one candle'),
-  Ets: z.number(),
+  Ets: z.union([z.string(), z.number()]),
   i: z.string(),
   channel: z.string(),
   pr: z.string(),
 });
 
+function parseExactCandleFinancialDecimal(value: unknown, field: string): Decimal {
+  // Non-integer decoded Numbers have already lost their original lexeme. The production
+  // socket decoder supplies strings; accept only exact safe integers from object adapters.
+  if (typeof value === 'number' && !Number.isSafeInteger(value)) {
+    throw new CoinDcxSocketValidationError(`Financial field ${field} requires exact wire evidence`);
+  }
+  if (typeof value === 'string' && !/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(value.trim())) {
+    throw new CoinDcxSocketValidationError(`Invalid financial decimal token for ${field}`);
+  }
+  const decimal = parseFinancialDecimal(value, field);
+  // Match the canonical/REST range before any fixed-point expansion can allocate
+  // an unbounded string. Values outside that range cannot become canonical truth.
+  if (decimal.decimalPlaces() > 18 || decimal.abs().greaterThanOrEqualTo('1000000000000000000')) {
+    throw new CoinDcxSocketValidationError(`Candle financial field ${field} exceeds canonical bounds`);
+  }
+  return decimal;
+}
+
+function normalizeCandleTimestampToMs(value: string | number, field: string): number {
+  if (!/^(?:\d+(?:\.\d+)?)(?:e[+-]?\d+)?$/i.test(String(value))) {
+    throw new CoinDcxSocketValidationError(`Invalid timestamp for ${field}: ${String(value)}`);
+  }
+  const time = new Decimal(String(value));
+  if (!time.isFinite() || time.isNegative() || time.greaterThan(Number.MAX_SAFE_INTEGER)) {
+    throw new CoinDcxSocketValidationError(`Unsafe timestamp for ${field}`);
+  }
+  const seconds = time.lessThan('100000000000');
+  // Validate scale before arithmetic so Decimal's operation precision cannot hide
+  // an invalid fractional millisecond in a very long timestamp token.
+  if ((seconds && time.decimalPlaces() > 3) || (!seconds && !time.isInteger())) {
+    throw new CoinDcxSocketValidationError(`Timestamp must represent exact milliseconds for ${field}`);
+  }
+  const milliseconds = seconds ? time.times(1000) : time;
+  if (!milliseconds.isInteger() || milliseconds.greaterThan(Number.MAX_SAFE_INTEGER)) {
+    throw new CoinDcxSocketValidationError(`Timestamp must represent exact safe milliseconds for ${field}`);
+  }
+  return Number(milliseconds.toFixed(0));
+}
+
 export function validateAndNormalizeCandleEvent(
   raw: unknown,
   expectedPair?: string
 ): PublicCandleUpdatePayload {
-  let normalizedRaw = raw;
-  if (typeof raw === 'string') {
-    try {
-      normalizedRaw = JSON.parse(raw);
-    } catch {
-      throw new CoinDcxSocketValidationError('Malformed JSON candlestick envelope string');
-    }
-  }
-
-  if (normalizedRaw && typeof normalizedRaw === 'object') {
-    const rawObj = normalizedRaw as Record<string, unknown>;
-    if (typeof rawObj['data'] === 'string') {
-      try {
-        const inner = JSON.parse(rawObj['data']);
-        if (Array.isArray(inner)) {
-          normalizedRaw = { ...rawObj, data: inner };
-        } else if (typeof inner === 'object' && inner !== null) {
-          normalizedRaw = { ...rawObj, ...inner };
-        }
-      } catch {
-        throw new CoinDcxSocketValidationError('Malformed inner JSON candlestick data');
-      }
-    }
-  }
+  let normalizedRaw: unknown;
+  try { normalizedRaw = decodeCandlePayload(raw); }
+  catch { throw new CoinDcxSocketValidationError('Malformed JSON candlestick payload'); }
 
   const parsed = RawCandleEnvelopeSchema.safeParse(normalizedRaw);
   if (!parsed.success) {
@@ -167,13 +186,13 @@ export function validateAndNormalizeCandleEvent(
     );
   }
 
-  const open = parseFinancialDecimal(candle.open, 'open');
-  const high = parseFinancialDecimal(candle.high, 'high');
-  const low = parseFinancialDecimal(candle.low, 'low');
-  const close = parseFinancialDecimal(candle.close, 'close');
-  const volume = parseFinancialDecimal(candle.volume, 'volume');
-  const quoteVolume = candle.quote_volume !== undefined
-    ? parseFinancialDecimal(candle.quote_volume, 'quote_volume')
+  const open = parseExactCandleFinancialDecimal(candle.open, 'open');
+  const high = parseExactCandleFinancialDecimal(candle.high, 'high');
+  const low = parseExactCandleFinancialDecimal(candle.low, 'low');
+  const close = parseExactCandleFinancialDecimal(candle.close, 'close');
+  const volume = parseExactCandleFinancialDecimal(candle.volume, 'volume');
+  const quoteVolume = candle.quote_volume != null
+    ? parseExactCandleFinancialDecimal(candle.quote_volume, 'quote_volume')
     : null;
 
   // Prices must be non-negative
@@ -213,9 +232,9 @@ export function validateAndNormalizeCandleEvent(
     );
   }
 
-  const openTimeMs = normalizeTimestampToMs(candle.open_time, 'open_time');
-  const closeTimeMs = normalizeTimestampToMs(candle.close_time, 'close_time');
-  const providerEventTimeMs = normalizeTimestampToMs(Ets, 'Ets');
+  const openTimeMs = normalizeCandleTimestampToMs(candle.open_time, 'open_time');
+  const closeTimeMs = normalizeCandleTimestampToMs(candle.close_time, 'close_time');
+  const providerEventTimeMs = normalizeCandleTimestampToMs(Ets, 'Ets');
 
   if (openTimeMs > closeTimeMs) {
     throw new CoinDcxSocketValidationError(

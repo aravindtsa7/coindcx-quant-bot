@@ -364,6 +364,7 @@ export class PairCanonicalStateMachine {
     }
 
     // F10: Buffer live envelopes when RECOVERING with full metadata and same-minute coalescing
+    if (this.#truthFault !== 'NONE' && this.#truthFault !== 'RECOVERY_INCOMPLETE') return;
     if (this.#recoveryActive) {
       if (this.#emptyReconciliation !== null && this.#truthFault === 'NONE') {
         // Empty REST ranges still need fresh evidence from the new generation to establish
@@ -553,10 +554,15 @@ export class PairCanonicalStateMachine {
     this.#truthFault = 'CANONICAL_CONFLICT';
     this.#state = 'INVALID';
     this.#clearAllPendingFinalizations();
+    this.#workingManager.clear(this.#pair);
+    this.#recoveryBuffer.length = 0;
     this.#callbacks.onConflictDetected(this.#pair, 'Conflicting snapshots have equal provider event timestamps');
   }
 
   #bufferEnvelope(item: BufferedEnvelope): void {
+    const fault = this.#workingManager.observeEvidence(item.envelope.payload);
+    if (fault === 'CONFLICT') { this.#latchEqualTimeConflict(); return; }
+    if (fault === 'EVIDENCE_LIMIT') { this.#latchEvidenceLimit(); return; }
     // Check if an envelope for the exact same pair & openTimeMs is already buffered
     const existingIndex = this.#recoveryBuffer.findIndex((b) => b.openTimeMs === item.openTimeMs);
     if (existingIndex >= 0) {
@@ -578,12 +584,19 @@ export class PairCanonicalStateMachine {
 
     // Capacity limit check
     if (this.#recoveryBuffer.length >= this.#maxRecoveryBuffer) {
-      this.#truthFault = 'BUFFER_OVERFLOW';
-      this.#state = 'INVALID';
+      this.#latchEvidenceLimit();
       return;
     }
 
     this.#recoveryBuffer.push(item);
+  }
+
+  #latchEvidenceLimit(): void {
+    this.#truthFault = 'BUFFER_OVERFLOW';
+    this.#state = 'INVALID';
+    this.#clearAllPendingFinalizations();
+    this.#workingManager.clear(this.#pair);
+    this.#recoveryBuffer.length = 0;
   }
 
   #applyWorkingUpdate(
@@ -610,6 +623,7 @@ export class PairCanonicalStateMachine {
     const res = this.#workingManager.update(snapshot);
     if (!res.applied) {
       if (res.reason === 'CONFLICT') this.#latchEqualTimeConflict();
+      if (res.reason === 'EVIDENCE_LIMIT') this.#latchEvidenceLimit();
       this.#lateDropCount++;
     } else if (res.reason === 'IDEMPOTENT_DUPLICATE') {
       this.#duplicateCount++;

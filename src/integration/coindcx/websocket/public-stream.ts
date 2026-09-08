@@ -8,6 +8,7 @@ import { logger as rootLogger } from '../../../monitoring/logger';
 import { BackoffPolicyConfig, calculateBackoffWithJitter, DEFAULT_BACKOFF_CONFIG } from './backoff';
 import { buildFuturesCandleChannel } from './channel-builder';
 import { validateAndNormalizeCandleEvent } from './schemas';
+import { decodeCandlePayload } from './candle-json';
 import {
   COINDCX_DEFAULT_SOCKET_ENDPOINT,
   ProductionCoinDcxSocketFactory,
@@ -497,31 +498,7 @@ export class CoinDcxPublicFuturesStream {
     }
 
     try {
-      let parsed: unknown = raw;
-      if (typeof raw === 'string') {
-        try {
-          parsed = JSON.parse(raw);
-        } catch {
-          this.#invalidEventCount++;
-          return;
-        }
-      }
-      if (parsed && typeof parsed === 'object') {
-        const rawObj = parsed as Record<string, unknown>;
-        if (typeof rawObj['data'] === 'string') {
-          try {
-            const inner = JSON.parse(rawObj['data'] as string);
-            if (Array.isArray(inner)) {
-              parsed = { ...rawObj, data: inner };
-            } else if (typeof inner === 'object' && inner !== null) {
-              parsed = { ...rawObj, ...inner };
-            }
-          } catch {
-            this.#invalidEventCount++;
-            return;
-          }
-        }
-      }
+      const parsed = decodeCandlePayload(raw);
 
       const envelopeData = parsed as { channel?: string; data?: Array<{ pair?: string }> };
       const rawChannel = typeof envelopeData?.channel === 'string' ? envelopeData.channel : '';

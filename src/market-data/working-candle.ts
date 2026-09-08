@@ -1,4 +1,9 @@
 import { Decimal } from '../core/decimal/decimal';
+import { createHash } from 'node:crypto';
+
+export const MAX_PROVIDER_TIMES_PER_WORKING_MINUTE = 4096;
+type EvidenceSnapshot = Pick<WorkingCandleSnapshot, 'pair' | 'openTimeMs' | 'providerEventTimeMs' | 'open' | 'high' | 'low' | 'close' | 'volume' | 'quoteVolume'>;
+type EvidenceFault = 'CONFLICT' | 'EVIDENCE_LIMIT';
 
 export interface WorkingCandleSnapshot {
   readonly pair: string;
@@ -19,7 +24,7 @@ export interface WorkingCandleSnapshot {
 
 export type WorkingCandleUpdateResult =
   | { applied: true; reason: 'ACCEPTED' | 'IDEMPOTENT_DUPLICATE' }
-  | { applied: false; reason: 'SUPERSEDED' | 'CONFLICT' };
+  | { applied: false; reason: 'SUPERSEDED' | EvidenceFault };
 
 export function haveIdenticalCandleValues(a: Pick<WorkingCandleSnapshot, 'open' | 'high' | 'low' | 'close' | 'volume' | 'quoteVolume'>, b: Pick<WorkingCandleSnapshot, 'open' | 'high' | 'low' | 'close' | 'volume' | 'quoteVolume'>): boolean {
   return a.open.equals(b.open) && a.high.equals(b.high) && a.low.equals(b.low) &&
@@ -43,6 +48,37 @@ export class WorkingCandleManager {
   readonly #workingMap = new Map<string, WorkingCandleSnapshot>();
   // Tracks the current working openTimeMs per pair
   readonly #currentOpenTimeByPair = new Map<string, number>();
+  // Fixed-size fingerprints, not historical snapshots. Overflow fails closed, never evicts
+  // an ordering assertion that a delayed conflicting counterpart might still reference.
+  readonly #evidence = new Map<string, { times: Map<number, string>; fault: EvidenceFault | null }>();
+
+  public get retainedEvidenceCount(): number {
+    let count = 0;
+    for (const item of this.#evidence.values()) count += item.times.size;
+    return count;
+  }
+
+  public observeEvidence(snapshot: EvidenceSnapshot): EvidenceFault | null {
+    const key = this.#buildKey(snapshot.pair, snapshot.openTimeMs);
+    let evidence = this.#evidence.get(key);
+    if (!evidence) {
+      evidence = { times: new Map(), fault: null };
+      this.#evidence.set(key, evidence);
+    }
+    if (evidence.fault) return evidence.fault;
+    const fingerprint = createHash('sha256').update(JSON.stringify([
+      snapshot.open.toString(), snapshot.high.toString(), snapshot.low.toString(),
+      snapshot.close.toString(), snapshot.volume.toString(), snapshot.quoteVolume?.toString() ?? null,
+    ])).digest('hex');
+    const previous = evidence.times.get(snapshot.providerEventTimeMs);
+    if (previous !== undefined && previous !== fingerprint) evidence.fault = 'CONFLICT';
+    else if (previous === undefined) {
+      if (evidence.times.size >= MAX_PROVIDER_TIMES_PER_WORKING_MINUTE) evidence.fault = 'EVIDENCE_LIMIT';
+      else evidence.times.set(snapshot.providerEventTimeMs, fingerprint);
+    }
+    if (evidence.fault) evidence.times.clear(); // Keep only the fault until disposal/reset.
+    return evidence.fault;
+  }
 
   #buildKey(pair: string, openTimeMs: number): string {
     return `${pair}:${openTimeMs}`;
@@ -63,6 +99,8 @@ export class WorkingCandleManager {
   }
 
   public update(snapshot: WorkingCandleSnapshot): WorkingCandleUpdateResult {
+    const fault = this.observeEvidence(snapshot);
+    if (fault) return { applied: false, reason: fault };
     const key = this.#buildKey(snapshot.pair, snapshot.openTimeMs);
     const existing = this.#workingMap.get(key);
 
@@ -102,6 +140,7 @@ export class WorkingCandleManager {
   public delete(pair: string, openTimeMs: number): void {
     const key = this.#buildKey(pair, openTimeMs);
     this.#workingMap.delete(key);
+    this.#evidence.delete(key);
     if (this.#currentOpenTimeByPair.get(pair) === openTimeMs) {
       this.#currentOpenTimeByPair.delete(pair);
     }
@@ -109,6 +148,7 @@ export class WorkingCandleManager {
 
   public clear(pair: string): void {
     const prefix = `${pair}:`;
+    for (const key of this.#evidence.keys()) if (key.startsWith(prefix)) this.#evidence.delete(key);
     for (const key of this.#workingMap.keys()) {
       if (key.startsWith(prefix)) {
         this.#workingMap.delete(key);
@@ -118,6 +158,7 @@ export class WorkingCandleManager {
   }
 
   public clearAll(): void {
+    this.#evidence.clear();
     this.#workingMap.clear();
     this.#currentOpenTimeByPair.clear();
   }

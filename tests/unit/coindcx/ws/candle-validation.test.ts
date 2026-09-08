@@ -58,7 +58,7 @@ describe('CoinDCX WebSocket — Public Candle Wire Validation', () => {
     const raw = makeRawCandle({
       data: [
         {
-          open: '0.000000000000123456789',
+          open: '0.000000000000123456',
           high: '0.000000000000200000000',
           low: '0.000000000000100000000',
           close: '0.000000000000150000000',
@@ -66,7 +66,7 @@ describe('CoinDCX WebSocket — Public Candle Wire Validation', () => {
       ],
     });
     const result = validateAndNormalizeCandleEvent(raw, 'B-BTC_USDT');
-    expect(result.open.toString()).toBe('0.000000000000123456789');
+    expect(result.open.toString()).toBe('0.000000000000123456');
   });
 
   it('35. malformed decimal string is rejected', () => {

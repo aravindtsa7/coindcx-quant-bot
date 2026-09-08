@@ -1,4 +1,5 @@
 import io from 'socket.io-client';
+import { EXACT_CANDLE_SOCKET_PARSER } from './candle-json';
 import {
   CoinDcxSocket,
   CoinDcxSocketFactory,
@@ -36,6 +37,8 @@ export class ProductionCoinDcxSocket implements CoinDcxSocket {
       reconnection: false,
       autoConnect: false,
       ...options,
+      parser: EXACT_CANDLE_SOCKET_PARSER,
+      forceNew: true, // Never reuse a manager created with a different decoding contract.
     };
 
     const ioFactory = io as unknown as (url: string, opts: unknown) => RawSocketIoClient;

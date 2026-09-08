@@ -1,6 +1,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { URL } from 'node:url';
+import { performance } from 'node:perf_hooks';
 import { z } from 'zod';
 import { parse as parseLosslessJson } from 'lossless-json';
 import { Decimal } from '../core/decimal/decimal';
@@ -80,6 +81,10 @@ export class CoinDcxFuturesCandleRestReader {
   }
 
   public async fetchClosedCandles(query: FetchCandlesQuery): Promise<readonly RestCandleRecord[]> {
+    const started = performance.now();
+    const assertDeadline = () => {
+      if (performance.now() - started >= this.#timeoutMs) throw new CanonicalRecoveryError('REST candle operation deadline exceeded');
+    };
     const { pair, fromMs, toMs } = query;
 
     if (!pair || pair.trim() === '') {
@@ -100,6 +105,7 @@ export class CoinDcxFuturesCandleRestReader {
     let rawBody: string;
     try {
       rawBody = await this.#httpTransport(endpointUrl, this.#timeoutMs);
+      assertDeadline();
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'HTTP request failed';
       throw new CanonicalRecoveryError(`Futures candlestick recovery request failed: ${msg}`);
@@ -213,27 +219,51 @@ export class CoinDcxFuturesCandleRestReader {
 
     // Sort ascending by openTimeMs
     const sorted = Array.from(dedupeMap.values()).sort((a, b) => a.openTimeMs - b.openTimeMs);
+    // Parsing and normalization are synchronous: check elapsed time before successful settlement.
+    assertDeadline();
     return Object.freeze(sorted);
   }
 }
 
 async function defaultHttpTransport(urlString: string, timeoutMs: number): Promise<string> {
+  const started = performance.now();
   const parsedUrl = new URL(urlString);
   const isHttps = parsedUrl.protocol === 'https:';
   const transportModule = isHttps ? https : http;
 
-  return new Promise<string>((resolve, reject) => {
+  return new Promise<string>((resolveWire, rejectWire) => {
+    let settled = false;
+    let response: http.IncomingMessage | undefined;
+    let deadline: NodeJS.Timeout | undefined;
+    const clearDeadline = () => { clearTimeout(deadline); deadline = undefined; };
+    const timeoutError = () => new Error(`Request timed out after ${timeoutMs}ms`);
+    const reject = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      clearDeadline();
+      rejectWire(error);
+      response?.destroy();
+      req.destroy();
+    };
+    const resolve = (body: string) => {
+      if (settled) return;
+      if (performance.now() - started >= timeoutMs) { reject(timeoutError()); return; }
+      settled = true;
+      clearDeadline();
+      resolveWire(body);
+    };
     const req = transportModule.request(
       parsedUrl,
       {
         method: 'GET',
-        timeout: timeoutMs,
         headers: {
           Accept: 'application/json',
           'User-Agent': 'CoinDCX-Quant-Bot/0.1.0',
         },
       },
       (res) => {
+        response = res;
+        if (settled) { res.destroy(); return; }
         const statusCode = res.statusCode ?? 0;
         let responseData = '';
         let totalBytes = 0;
@@ -241,9 +271,9 @@ async function defaultHttpTransport(urlString: string, timeoutMs: number): Promi
         res.setEncoding('utf8');
 
         res.on('data', (chunk: string) => {
+          if (settled) return;
           totalBytes += Buffer.byteLength(chunk, 'utf8');
           if (totalBytes > DEFAULT_MAX_RESPONSE_BYTES) {
-            req.destroy();
             reject(new Error(`Response exceeded maximum size of ${DEFAULT_MAX_RESPONSE_BYTES} bytes`));
             return;
           }
@@ -251,22 +281,34 @@ async function defaultHttpTransport(urlString: string, timeoutMs: number): Promi
         });
 
         res.on('end', () => {
+          if (settled) return;
+          if (!res.complete) { reject(new Error('REST response ended before complete body')); return; }
           if (statusCode < 200 || statusCode >= 300) {
             reject(new Error(`HTTP status ${statusCode}`));
             return;
           }
           resolve(responseData);
         });
+        res.on('error', reject);
+        res.once('aborted', () => reject(new Error('REST response aborted before completion')));
+        res.once('close', () => {
+          if (!settled) reject(new Error('REST response closed before completion'));
+          res.removeAllListeners('data');
+          res.removeAllListeners('end');
+          res.removeAllListeners('error');
+          res.removeAllListeners('aborted');
+        });
       }
     );
 
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error(`Request timed out after ${timeoutMs}ms`));
-    });
+    deadline = setTimeout(() => reject(timeoutError()), Math.max(0, timeoutMs - (performance.now() - started)));
 
     req.on('error', (err) => {
       reject(err);
+    });
+    req.once('close', () => {
+      if (!response && !settled) reject(new Error('REST request closed before response'));
+      req.removeAllListeners('error');
     });
 
     req.end();
