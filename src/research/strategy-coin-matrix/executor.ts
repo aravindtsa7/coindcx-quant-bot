@@ -1,5 +1,6 @@
 import { BacktestEngine } from '../../backtest/engine';
 import { BacktestDecimal } from '../../backtest/decimal';
+import { deriveBacktestFundingScheduleForWindow } from '../../backtest/manifest';
 import { sha256CanonicalJson } from '../../backtest/canonical-json';
 import type { BacktestCostModel, BacktestRunOutcome } from '../../backtest/types';
 import {
@@ -139,7 +140,7 @@ async function executeCell(
       configuredTimeframes: configuredTimeframesFromRequirements(kernel.indicatorRequirements),
       instrumentSpec: resource.instrumentSpec,
       costModel: costModel(finalized.plan.backtestConfig),
-      fundingSchedule: resource.fundingSchedule,
+      fundingSchedule: deriveBacktestFundingScheduleForWindow(resource.fundingSchedule, cell.timeRange.evaluationFromInclusiveMs, cell.timeRange.replayToExclusiveMs),
       indicatorBindings: createStrategyBacktestIndicatorBindings(kernel),
       participant,
       participantIdentity,

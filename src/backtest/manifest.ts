@@ -96,11 +96,7 @@ function normalizeCost(cost: BacktestCostModel): BacktestCostModel {
   return normalized;
 }
 
-function normalizeFunding(
-  schedule: BacktestFundingSchedule,
-  bootstrapFromInclusiveMs: number,
-  replayToExclusiveMs: number,
-): BacktestFundingSchedule {
+function normalizeFundingSource(schedule: BacktestFundingSchedule): BacktestFundingSchedule {
   if (!ID.test(schedule.sourceId) || !SHA256.test(schedule.contentSha256) ||
       !['VERIFIED_SCHEDULE', 'ASSUMPTION', 'TEST_ONLY'].includes(schedule.fidelity)) {
     throw new BacktestError('FUNDING_SCHEDULE_INVALID', 'Funding schedule identity is invalid');
@@ -108,9 +104,8 @@ function normalizeFunding(
   let previous: number | null = null;
   const events = schedule.events.map((event) => {
     safeAligned(event.fundingTimeMs, 'fundingTimeMs');
-    if (event.fundingTimeMs <= bootstrapFromInclusiveMs || event.fundingTimeMs > replayToExclusiveMs ||
-        (previous !== null && event.fundingTimeMs <= previous)) {
-      throw new BacktestError('FUNDING_SCHEDULE_INVALID', 'Funding events must be strictly ordered within (bootstrap, replayTo]');
+    if (previous !== null && event.fundingTimeMs <= previous) {
+      throw new BacktestError('FUNDING_SCHEDULE_INVALID', 'Funding source events must be strictly ordered and unique');
     }
     previous = event.fundingTimeMs;
     const fundingRate = new BacktestDecimal(event.fundingRate);
@@ -129,6 +124,36 @@ function normalizeFunding(
     fidelity: schedule.fidelity,
     events: Object.freeze(events),
   });
+}
+
+/**
+ * Validate ALL authoritative evidence before selecting close-time settlements in
+ * (start, end]. Research callers use analysisStart, excluding flat warmup and
+ * assigning an adjacent boundary to the preceding window exactly once.
+ *
+ * The returned content hash binds only the effective events. sourceId/fidelity
+ * remain unchanged; the full source hash stays in the pair-bound research plan.
+ * Direct Phase9 inputs still require an already bounded schedule.
+ */
+export function deriveBacktestFundingScheduleForWindow(
+  authoritative: BacktestFundingSchedule,
+  startExclusiveMs: number,
+  endInclusiveMs: number,
+): BacktestFundingSchedule {
+  safeAligned(startExclusiveMs, 'funding window start');
+  safeAligned(endInclusiveMs, 'funding window end');
+  if (startExclusiveMs >= endInclusiveMs) throw new BacktestError('FUNDING_SCHEDULE_INVALID', 'Funding window must be non-empty and ordered');
+  const source = normalizeFundingSource(authoritative);
+  const events = source.events.filter((event) => event.fundingTimeMs > startExclusiveMs && event.fundingTimeMs <= endInclusiveMs);
+  return deepFreeze({ sourceId: source.sourceId, fidelity: source.fidelity, contentSha256: computeBacktestFundingScheduleContentSha256(events), events });
+}
+
+function normalizeFunding(schedule: BacktestFundingSchedule, bootstrapFromInclusiveMs: number, replayToExclusiveMs: number): BacktestFundingSchedule {
+  const normalized = normalizeFundingSource(schedule);
+  if (normalized.events.some((event) => event.fundingTimeMs <= bootstrapFromInclusiveMs || event.fundingTimeMs > replayToExclusiveMs)) {
+    throw new BacktestError('FUNDING_SCHEDULE_INVALID', 'Funding events must be strictly ordered within (bootstrap, replayTo]');
+  }
+  return normalized;
 }
 
 export function computeBacktestFundingScheduleContentSha256(

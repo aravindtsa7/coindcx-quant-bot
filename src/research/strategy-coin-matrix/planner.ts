@@ -1,7 +1,7 @@
 import { BacktestDecimal } from '../../backtest/decimal';
 import { canonicalJson, sha256CanonicalJson } from '../../backtest/canonical-json';
 import { BacktestError } from '../../backtest/errors';
-import { normalizeBacktestInputs } from '../../backtest/manifest';
+import { deriveBacktestFundingScheduleForWindow, normalizeBacktestInputs } from '../../backtest/manifest';
 import type { BacktestCostModel } from '../../backtest/types';
 import { buildStrategyBacktestParticipantIdentity, normalizeFixedResearchQuantity } from '../../strategies/adapters/backtest';
 import { computeStrategyParameterHash } from '../../strategies/core/identity';
@@ -282,7 +282,7 @@ function deriveAuthoritativeCells(
             configuredTimeframes,
             instrumentSpec: resource.instrumentSpec,
             costModel: costModel(backtestConfig),
-            fundingSchedule: resource.fundingSchedule,
+            fundingSchedule: deriveBacktestFundingScheduleForWindow(resource.fundingSchedule, researchWindow.analysisStartMs, researchWindow.analysisEndExclusiveMs),
             participantIdentity,
             initialEquity: backtestConfig.initialEquity,
             intrabarAmbiguityPolicy: backtestConfig.intrabarAmbiguityPolicy,
