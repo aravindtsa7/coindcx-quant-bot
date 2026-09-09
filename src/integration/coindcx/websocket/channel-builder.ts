@@ -56,6 +56,20 @@ export function buildFuturesTradeChannel(pair: string): string {
   return `${trimmedPair}@trades-futures`;
 }
 
+/** Frozen P14-B Futures depth channel (V1 supports provider depth 50 only). */
+export function buildFuturesOrderbookChannel(pair: string, depth: 50 = 50): string {
+  if (!pair || typeof pair !== 'string' || !FUTURES_PAIR_REGEX.test(pair.trim())) {
+    throw new CoinDcxSocketValidationError('Invalid CoinDCX Futures canonical pair for orderbook channel');
+  }
+  if (depth !== 50) throw new CoinDcxSocketValidationError('P14-B supports only CoinDCX Futures orderbook depth 50');
+  return `${pair.trim()}@orderbook@50-futures`;
+}
+
+/** Frozen P14-B multi-pair real-time Futures mark channel. */
+export function buildFuturesRealtimeMarkChannel(): 'currentPrices@futures@rt' {
+  return 'currentPrices@futures@rt';
+}
+
 /**
  * Validates whether a channel string matches the expected futures candle channel for a given pair and interval.
  */

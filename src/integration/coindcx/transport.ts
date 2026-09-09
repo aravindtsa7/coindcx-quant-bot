@@ -30,12 +30,23 @@ export type CoinDcxReadEndpoint =
   | 'FUTURES_ORDERS'
   | 'POSITION_TRANSACTIONS'
   | 'FUTURES_TRADES'
-  | 'WALLET_TRANSACTIONS';
+  | 'WALLET_TRANSACTIONS'
+  /** Phase 14 public, read-only Futures orderbook. */
+  | 'FUTURES_ORDERBOOK'
+  /** Phase 14 public, read-only Futures real-time prices. */
+  | 'FUTURES_CURRENT_PRICES'
+  /** Phase 14 public, read-only USDT/INR conversion. */
+  | 'FUTURES_CONVERSIONS';
 
 interface ReadEndpointDef {
   readonly method: 'GET' | 'POST';
   readonly path: string;
   readonly auth: boolean;
+}
+
+export interface EvidenceReadPathParams {
+  readonly pair?: string;
+  readonly depth?: number;
 }
 
 /**
@@ -89,6 +100,21 @@ const READ_ENDPOINT_DEFINITIONS: Readonly<Record<CoinDcxReadEndpoint, Readonly<R
       path: '/exchange/v1/derivatives/futures/wallets/transactions',
       auth: true,
     }),
+    FUTURES_ORDERBOOK: Object.freeze({
+      method: 'GET',
+      path: '/market_data/v3/orderbook/{pair}-futures/{depth}',
+      auth: false,
+    }),
+    FUTURES_CURRENT_PRICES: Object.freeze({
+      method: 'GET',
+      path: '/market_data/v3/current_prices/futures/rt',
+      auth: false,
+    }),
+    FUTURES_CONVERSIONS: Object.freeze({
+      method: 'GET',
+      path: '/api/v1/derivatives/futures/data/conversions',
+      auth: false,
+    }),
   });
 
 export interface TransportOptions {
@@ -103,6 +129,8 @@ export interface ExecuteReadOptions {
   readonly endpoint: CoinDcxReadEndpoint;
   readonly queryParams?: Record<string, string | number | boolean | readonly string[]> | undefined;
   readonly body?: string | undefined;
+  /** Only used by the closed FUTURES_ORDERBOOK endpoint template. */
+  readonly pathParams?: EvidenceReadPathParams | undefined;
 }
 
 export interface HttpResponse<T = unknown> {
@@ -152,13 +180,30 @@ export class CoinDcxTransport {
       );
     }
 
+    const path = this.#resolveReadPath(options.endpoint, def.path, options.pathParams);
     return this.#executeWireRequest<T>(
       def.method,
-      def.path,
+      path,
       def.auth,
       options.queryParams,
       options.body
     );
+  }
+
+  #resolveReadPath(endpoint: CoinDcxReadEndpoint, template: string, params?: EvidenceReadPathParams): string {
+    if (endpoint !== 'FUTURES_ORDERBOOK') {
+      if (params !== undefined) {
+        throw new CoinDcxProviderError('Path parameters are not permitted for this read endpoint', 500, { endpoint });
+      }
+      return template;
+    }
+    const pair = params?.pair;
+    const depth = params?.depth;
+    if (typeof pair !== 'string' || !/^B-[A-Z0-9]+_[A-Z0-9]+$/.test(pair) ||
+      (depth !== 10 && depth !== 20 && depth !== 50)) {
+      throw new CoinDcxProviderError('Invalid Futures orderbook path parameters', 500, { endpoint });
+    }
+    return template.replace('{pair}', encodeURIComponent(pair)).replace('{depth}', String(depth));
   }
 
   /**

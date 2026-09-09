@@ -15,4 +15,5 @@ export * from './schemas';
 export * from './models';
 export * from './normalizers';
 export * from './client';
+export * from './paper-evidence';
 export * from './websocket';
