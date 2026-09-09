@@ -1,4 +1,5 @@
 import { canonicalJson, sha256CanonicalJson } from '../../backtest/canonical-json';
+import { registerGenuineResearchValidationResult } from './approval-authority';
 import { StrategyCoinMatrixError } from '../strategy-coin-matrix/errors';
 import { ProductionGitSourceVerifier, type GitSourceVerifier } from '../strategy-coin-matrix/git-source';
 import { executeWithGitSourceVerifier } from '../strategy-coin-matrix/executor';
@@ -96,7 +97,9 @@ function failedResult(finalized: FinalizedResearchValidationPlan, abortedCode: s
   const hashPayload = { validationPlanId: payload.validationPlanId, planName: payload.planName, status: payload.status, totalSubjects: payload.totalSubjects,
     passedSubjects: payload.passedSubjects, failedSubjects: payload.failedSubjects, insufficientEvidenceSubjects: payload.insufficientEvidenceSubjects,
     totalFolds: payload.totalFolds, unusedTailMs: payload.unusedTailMs, freshnessBasis: payload.freshnessBasis, subjectDigests: Object.freeze([]), abortedSubjects: payload.abortedSubjects };
-  return freezeValidationRuntime({ ...payload, validationResultSha256: sha256CanonicalJson(hashPayload) });
+  const result = freezeValidationRuntime({ ...payload, validationResultSha256: sha256CanonicalJson(hashPayload) });
+  registerGenuineResearchValidationResult(result);
+  return result;
 }
 
 export async function executeResearchValidationWithGitSourceVerifier(finalizedInput: FinalizedResearchValidationPlan, dependencies: ValidationExecutionDependencies, options: ValidationExecutionOptions, sourceVerifier: GitSourceVerifier): Promise<ResearchValidationPlanResult> {
@@ -188,7 +191,9 @@ export async function executeResearchValidationWithGitSourceVerifier(finalizedIn
     passedSubjects: payload.passedSubjects, failedSubjects: payload.failedSubjects, insufficientEvidenceSubjects: payload.insufficientEvidenceSubjects,
     totalFolds: payload.totalFolds, unusedTailMs: payload.unusedTailMs, freshnessBasis: payload.freshnessBasis,
     subjectDigests: subjectResults.map((item) => ({ validationSubjectId: item.validationSubjectId, verdict: item.verdict, validationSubjectResultSha256: item.validationSubjectResultSha256 })), abortedSubjects: payload.abortedSubjects };
-  return freezeValidationRuntime({ ...payload, validationResultSha256: sha256CanonicalJson(hashPayload) });
+  const result = freezeValidationRuntime({ ...payload, validationResultSha256: sha256CanonicalJson(hashPayload) });
+  registerGenuineResearchValidationResult(result);
+  return result;
 }
 
 export async function executeResearchValidation(finalized: FinalizedResearchValidationPlan, dependencies: ValidationExecutionDependencies, options: ValidationExecutionOptions = {}): Promise<ResearchValidationPlanResult> { return executeResearchValidationWithGitSourceVerifier(finalized, dependencies, options, new ProductionGitSourceVerifier(process.cwd())); }
