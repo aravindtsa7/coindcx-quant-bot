@@ -21,6 +21,8 @@ function exposure(changes: Partial<PortfolioExposureSnapshot> = {}, reverseReser
     ...changes,
     pending: {
       ...base.pending,
+      // Global must cover both instance reservations below it (C-F04 aggregate consistency).
+      globalPendingNotionalInr: '20',
       instancePendingReservations: reverseReservations ? reservations.reverse() : reservations,
       pendingReservationCount: changes.pending?.status === 'KNOWN' ? changes.pending.pendingReservationCount : base.pending.pendingReservationCount,
       ...(changes.pending?.status === 'KNOWN' ? changes.pending : {}),

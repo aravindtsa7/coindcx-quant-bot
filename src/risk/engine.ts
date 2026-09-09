@@ -1,3 +1,4 @@
+import { accountStateReasons } from './account';
 import { evidenceContentSha256, sha256CanonicalJson } from './canonical';
 import { canonicalRiskDecimal, checkedProduct, riskDecimal, ValuationNumericContextError } from './decimal';
 import { RiskConfigError, RiskEngineError } from './errors';
@@ -157,6 +158,7 @@ export class RiskEngine {
     if (action === 'OPEN') {
       stepReasons[11]?.push(...exposureReasons(normalized.exposureSnapshot, normalized.candidate, this.policy, sizing.decision.sizing?.finalNotionalInr ?? null));
       stepReasons[11]?.push(...lossDrawdownReasons(normalized.accountSnapshot, this.policy, normalized.evaluationTimeMs));
+      stepReasons[11]?.push(...accountStateReasons(normalized.accountSnapshot));
     }
     let closeNotionalUsdt: string | null = null;
     if (action === 'CLOSE' && ownership.ownedQuantity !== null && normalized.pairSnapshot.position.state === 'OPEN' && normalized.pairSnapshot.position.valuation !== null) {
@@ -231,6 +233,7 @@ export class RiskEngine {
           stepReasons[5]?.push(...evidence.identity); stepReasons[6]?.push(...evidence.temporal);
         }
       }
+      stepReasons[6]?.push(...accountStateReasons(context.accountSnapshot));
       stepReasons[9]?.push(...reservationIdentityReasons(context.exposureSnapshot, context.candidate));
     }
     const executed = action === 'OPEN' ? [3, 4, 5, 6, 7, 10] : [3, 4, 5, 7];

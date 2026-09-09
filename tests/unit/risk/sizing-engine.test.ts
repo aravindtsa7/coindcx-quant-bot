@@ -136,7 +136,7 @@ describe('Phase 13 deterministic sizing, tiers, exposure, and decision union', (
   it('isolates pending reservations by full instance identity', () => {
     const exposure = makeExposure();
     if (exposure.pending.status !== 'KNOWN') throw new Error('fixture');
-    const pending = { ...exposure.pending, instancePendingReservations: [{ strategyInstanceId: 'instance-2', strategyId: 'EMA_TREND', strategyVersion: '1.0.0', parameterHash: TEST_PARAMETER_HASH, pendingNotionalInr: '10', pendingReservationCount: 1 }] };
+    const pending = { ...exposure.pending, globalPendingNotionalInr: '10', instancePendingReservations: [{ strategyInstanceId: 'instance-2', strategyId: 'EMA_TREND', strategyVersion: '1.0.0', parameterHash: TEST_PARAMETER_HASH, pendingNotionalInr: '10', pendingReservationCount: 1 }] };
     expect(evaluate({ exposureSnapshot: seal({ ...exposure, pending }) }).status).toBe('ACCEPTED');
   });
 

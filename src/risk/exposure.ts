@@ -28,15 +28,34 @@ function recordNonNegative(record: Readonly<Record<string, string>>): boolean {
   return Object.values(record).every(nonNegative);
 }
 
+// [C-F04] A parent aggregate can never be smaller than any single child component it is
+// declared to include (docs/RISK_LEVERAGE_ENGINE.md §4.1/§4.3: global is "genuine gross
+// accounting ... across all pairs/strategies"). This checks that minimum floor only — it
+// never sums components or requires exact derivability, which §4.1 explicitly does not
+// guarantee between strategyPendingNotionalInr and instancePendingReservations.
+function noComponentExceedsParent(parent: string, components: readonly string[]): boolean {
+  const value = riskDecimal(parent);
+  return components.every((component) => !value.lt(component));
+}
+
 export function exposureStateReasons(snapshot: PortfolioExposureSnapshot): readonly RiskRejectionCode[] {
   if (snapshot.concurrentOpenPositions < 0) return ['EXPOSURE_STATE_UNAVAILABLE'];
   if (!nonNegative(snapshot.globalOpenNotionalInr) || !recordNonNegative(snapshot.perPairOpenNotionalInr) ||
       !recordNonNegative(snapshot.perStrategyOpenNotionalInr)) return ['EXPOSURE_STATE_UNAVAILABLE'];
+  if (!noComponentExceedsParent(snapshot.globalOpenNotionalInr, [...Object.values(snapshot.perPairOpenNotionalInr), ...Object.values(snapshot.perStrategyOpenNotionalInr)])) {
+    return ['EXPOSURE_STATE_UNAVAILABLE'];
+  }
   if (snapshot.pending.status === 'UNKNOWN') return [];
   if (!nonNegative(snapshot.pending.globalPendingNotionalInr) || !recordNonNegative(snapshot.pending.pairPendingNotionalInr) ||
       !recordNonNegative(snapshot.pending.strategyPendingNotionalInr) || snapshot.pending.pendingReservationCount < 0 ||
       !nonNegative(snapshot.pending.pendingDirectionalNotionalInr.longInr) || !nonNegative(snapshot.pending.pendingDirectionalNotionalInr.shortInr) ||
       snapshot.pending.instancePendingReservations.some((reservation) => !nonNegative(reservation.pendingNotionalInr) || reservation.pendingReservationCount < 0)) {
+    return ['EXPOSURE_STATE_UNAVAILABLE'];
+  }
+  if (!noComponentExceedsParent(snapshot.pending.globalPendingNotionalInr, [
+    ...Object.values(snapshot.pending.pairPendingNotionalInr), ...Object.values(snapshot.pending.strategyPendingNotionalInr),
+    ...snapshot.pending.instancePendingReservations.map((reservation) => reservation.pendingNotionalInr),
+  ])) {
     return ['EXPOSURE_STATE_UNAVAILABLE'];
   }
   return [];
