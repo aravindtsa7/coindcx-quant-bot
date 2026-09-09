@@ -16,6 +16,36 @@ import type {
 const FIXED_DECIMAL = /^-?[0-9]+(?:\.[0-9]+)?$/;
 const MINUTE_MS = 60_000;
 
+const ORIGIN_ISSUER = Symbol('Phase10 kernel decision origin');
+export interface StrategyDecisionOriginRecord {
+  readonly decision: StrategyDecision;
+  readonly instance: {
+    readonly pair: string;
+    readonly strategyId: string;
+    readonly strategyVersion: string;
+    readonly parameterHash: string;
+    readonly strategyInstanceId: string;
+    readonly normalizedParameters: Readonly<Record<string, unknown>>;
+    readonly indicatorBootstrapIdentity: readonly StrategyIndicatorBootstrapIdentityEntry[];
+    readonly triggerTimeframeMinutes: number;
+  };
+}
+
+/** Runtime ownership capability; never part of canonical semantic identity. */
+export class StrategyDecisionOrigin {
+  readonly #record: StrategyDecisionOriginRecord;
+  public constructor(issuer: symbol, record: StrategyDecisionOriginRecord) {
+    if (issuer !== ORIGIN_ISSUER) throw new StrategyError('STRATEGY_INPUT_INVALID', 'Only a producing kernel can issue decision origin');
+    this.#record = deepCopyFreeze(record);
+    Object.freeze(this);
+  }
+  public static read(value: unknown): StrategyDecisionOriginRecord | null {
+    return value !== null && typeof value === 'object' && #record in value ? value.#record : null;
+  }
+}
+Object.freeze(StrategyDecisionOrigin.prototype);
+Object.freeze(StrategyDecisionOrigin);
+
 export interface StrategyOutcome {
   readonly status: StrategyDecisionStatus;
   readonly targetExposure: StrategyTargetExposure | null;
@@ -86,6 +116,8 @@ export abstract class BaseStrategyKernel implements StrategyKernel {
   #nextDecisionSequence = 1;
   #lastEvaluationTimeMs: number | null = null;
   readonly #indicatorReadySeenByAlias = new Set<string>();
+  readonly #issuedDecisions = new WeakSet<StrategyDecision>();
+  readonly #originInstance: StrategyDecisionOriginRecord['instance'];
 
   protected constructor(config: BaseStrategyKernelConfig) {
     this.strategyId = config.strategyId;
@@ -114,6 +146,14 @@ export abstract class BaseStrategyKernel implements StrategyKernel {
       indicatorBootstrapIdentity: this.indicatorBootstrapIdentity,
     });
     Object.freeze(this.indicatorBootstrapIdentity);
+    this.#originInstance = deepCopyFreeze({ pair: this.pair, strategyId: this.strategyId, strategyVersion: this.strategyVersion,
+      parameterHash: this.parameterHash, strategyInstanceId: this.strategyInstanceId, normalizedParameters: this.normalizedParameters,
+      indicatorBootstrapIdentity: this.indicatorBootstrapIdentity, triggerTimeframeMinutes: this.triggerTimeframeMinutes });
+  }
+
+  public static issueDecisionOrigin(kernel: StrategyKernel, decision: StrategyDecision): StrategyDecisionOrigin | null {
+    if (kernel === null || typeof kernel !== 'object' || !(#issuedDecisions in kernel) || !kernel.#issuedDecisions.has(decision)) return null;
+    return new StrategyDecisionOrigin(ORIGIN_ISSUER, { decision, instance: kernel.#originInstance });
   }
 
   public get isTerminated(): boolean { return this.#terminated; }
@@ -158,6 +198,7 @@ export abstract class BaseStrategyKernel implements StrategyKernel {
         if (point.value !== null) this.#indicatorReadySeenByAlias.add(alias);
       }
       outcome.commit?.();
+      this.#issuedDecisions.add(decision);
       return decision;
     } catch (error) {
       this.#terminated = true;

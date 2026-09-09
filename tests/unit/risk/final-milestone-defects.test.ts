@@ -1,3 +1,5 @@
+import { makeOrigin } from './helpers';
+import { TEST_INSTANCE_ID, TEST_PARAMETER_HASH, makeLineage } from './helpers';
 import { describe, expect, it } from 'vitest';
 import {
   REJECTION_PRECEDENCE_V1, riskDecimal, RiskConfigError, RiskEngine, RiskEngineError,
@@ -40,7 +42,7 @@ function openPair(records: readonly InstanceOwnershipRecord[], quantity = '10'):
 
 function record(currentQuantity: string, currentNotionalInr: string, changes: Partial<InstanceOwnershipRecord> = {}): InstanceOwnershipRecord {
   return {
-    strategyInstanceId: 'instance-1', strategyId: 'strategy-1', strategyVersion: '1.0.0', parameterHash: 'a'.repeat(64),
+    strategyInstanceId: TEST_INSTANCE_ID, strategyId: 'EMA_TREND', strategyVersion: '1.0.0', parameterHash: TEST_PARAMETER_HASH,
     currentQuantity, currentNotionalInr, ...changes,
   };
 }
@@ -48,7 +50,7 @@ function record(currentQuantity: string, currentNotionalInr: string, changes: Pa
 function closeResult(pairSnapshot: PairRiskSnapshot, accountStateKnown = true, target: 'FLAT' | 'SHORT' | 'LONG' = 'FLAT'): RiskDecision {
   const strategyDecision = makeDecision(target);
   return new RiskEngine(makePolicy()).evaluateRisk(resealContext({
-    ...makeContext(), candidate: { strategyDecision, pair: strategyDecision.pair, instrumentSpecSnapshotId: 'instrument-1' },
+    ...makeContext(), strategyOrigin: makeOrigin(strategyDecision), candidate: { strategyLineage: makeLineage(), strategyDecision, pair: strategyDecision.pair, instrumentSpecSnapshotId: 'instrument-1' },
     entryStopProposal: null, leverageProposal: null, pairSnapshot,
     accountSnapshot: seal({ ...makeAccount(), accountStateKnown }),
   }));
@@ -173,7 +175,7 @@ describe('P13-FINAL-004 nonnegative gross exposure', () => {
   it.each([
     changedExposure((pending, exposure) => ({ ...exposure, pending: { ...pending, globalPendingNotionalInr: '-1' } })),
     changedExposure((pending, exposure) => ({ ...exposure, pending: { ...pending, pairPendingNotionalInr: { 'B-BTC_USDT': '-1' } } })),
-    changedExposure((pending, exposure) => ({ ...exposure, pending: { ...pending, strategyPendingNotionalInr: { 'strategy-1': '-1' } } })),
+    changedExposure((pending, exposure) => ({ ...exposure, pending: { ...pending, strategyPendingNotionalInr: { 'EMA_TREND': '-1' } } })),
     changedExposure((pending, exposure) => ({ ...exposure, globalOpenNotionalInr: '-1', pending })),
   ])('rejects negative gross exposure evidence', (exposureSnapshot) => {
     expect(rejectionCodes(evaluate({ exposureSnapshot }))).toContain('EXPOSURE_STATE_UNAVAILABLE');
@@ -201,7 +203,7 @@ describe('P13-FINAL-004 nonnegative gross exposure', () => {
   it('retains independently provable limits when pending exposure is UNKNOWN', () => {
     const unknown = seal({
       ...makeExposure(), globalOpenNotionalInr: '800000', perPairOpenNotionalInr: { 'B-BTC_USDT': '400000' },
-      perStrategyOpenNotionalInr: { 'strategy-1': '300000' }, concurrentOpenPositions: 10, pending: { status: 'UNKNOWN' as const },
+      perStrategyOpenNotionalInr: { 'EMA_TREND': '300000' }, concurrentOpenPositions: 10, pending: { status: 'UNKNOWN' as const },
     });
     expect(rejectionCodes(evaluate({ exposureSnapshot: unknown }))).toEqual(expect.arrayContaining([
       'PENDING_EXPOSURE_UNKNOWN', 'GLOBAL_EXPOSURE_LIMIT', 'PAIR_EXPOSURE_LIMIT',

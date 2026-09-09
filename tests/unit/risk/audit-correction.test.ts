@@ -1,3 +1,5 @@
+import { makeOrigin } from './helpers';
+import { TEST_INSTANCE_ID, TEST_PARAMETER_HASH, makeLineage } from './helpers';
 import { describe, expect, it } from 'vitest';
 import { RiskEngine, type PairRiskSnapshot, type RiskDecisionAction } from '../../../src/risk';
 import { EVALUATION_TIME, makeContext, makeDecision, makePair, makePolicy, resealContext, seal } from './helpers';
@@ -13,7 +15,7 @@ function openPair(reconciled: boolean): PairRiskSnapshot {
     ...makePair(), position: { state: 'OPEN' as const, positionId: 'position-1', positionDirection: 'LONG' as const, quantityMagnitude: '10', valuation },
     ownership: reconciled
       ? { status: 'RECONCILED' as const, positionState: 'OPEN' as const, accountId: 'account-1', pair: 'B-BTC_USDT', positionId: 'position-1',
-          instanceOwnership: [{ strategyInstanceId: 'instance-1', strategyId: 'strategy-1', strategyVersion: '1.0.0', parameterHash: 'a'.repeat(64), currentQuantity: '10', currentNotionalInr: '80' }] }
+          instanceOwnership: [{ strategyInstanceId: TEST_INSTANCE_ID, strategyId: 'EMA_TREND', strategyVersion: '1.0.0', parameterHash: TEST_PARAMETER_HASH, currentQuantity: '10', currentNotionalInr: '80' }] }
       : { status: 'UNRECONCILED' as const },
   });
 }
@@ -21,7 +23,7 @@ function openPair(reconciled: boolean): PairRiskSnapshot {
 function decision(action: 'SHORT' | 'LONG') {
   const strategyDecision = makeDecision(action);
   return new RiskEngine(makePolicy()).evaluateRisk(resealContext({
-    ...makeContext(), candidate: { strategyDecision, pair: strategyDecision.pair, instrumentSpecSnapshotId: 'instrument-1' },
+    ...makeContext(), strategyOrigin: makeOrigin(strategyDecision), candidate: { strategyLineage: makeLineage(), strategyDecision, pair: strategyDecision.pair, instrumentSpecSnapshotId: 'instrument-1' },
     entryStopProposal: null, leverageProposal: null, pairSnapshot: openPair(true),
   }));
 }
@@ -36,7 +38,7 @@ describe('P13-IMPL-R02 audit applicability', () => {
   it('executes reversal ownership and reports an unreconciled failure at step 10', () => {
     const strategyDecision = makeDecision('SHORT');
     const result = new RiskEngine(makePolicy()).evaluateRisk(resealContext({
-      ...makeContext(), candidate: { strategyDecision, pair: strategyDecision.pair, instrumentSpecSnapshotId: 'instrument-1' },
+      ...makeContext(), strategyOrigin: makeOrigin(strategyDecision), candidate: { strategyLineage: makeLineage(), strategyDecision, pair: strategyDecision.pair, instrumentSpecSnapshotId: 'instrument-1' },
       entryStopProposal: null, leverageProposal: null, pairSnapshot: openPair(false),
     }));
     expect(step(result, 10)).toMatchObject({ outcome: 'FAIL', reasonCodes: ['POSITION_OWNERSHIP_UNRECONCILED'] });

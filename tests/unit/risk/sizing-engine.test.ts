@@ -1,3 +1,4 @@
+import { TEST_INSTANCE_ID, TEST_PARAMETER_HASH, makeLineage } from './helpers';
 import { describe, expect, it } from 'vitest';
 import { RiskEngine, type RiskEvaluationContext } from '../../../src/risk';
 import { EVALUATION_TIME, makeAccount, makeContext, makeDecision, makeExposure, makePair, makePolicy, makeTiers, resealContext, seal } from './helpers';
@@ -135,27 +136,27 @@ describe('Phase 13 deterministic sizing, tiers, exposure, and decision union', (
   it('isolates pending reservations by full instance identity', () => {
     const exposure = makeExposure();
     if (exposure.pending.status !== 'KNOWN') throw new Error('fixture');
-    const pending = { ...exposure.pending, instancePendingReservations: [{ strategyInstanceId: 'instance-2', strategyId: 'strategy-1', strategyVersion: '1.0.0', parameterHash: 'a'.repeat(64), pendingNotionalInr: '10', pendingReservationCount: 1 }] };
+    const pending = { ...exposure.pending, instancePendingReservations: [{ strategyInstanceId: 'instance-2', strategyId: 'EMA_TREND', strategyVersion: '1.0.0', parameterHash: TEST_PARAMETER_HASH, pendingNotionalInr: '10', pendingReservationCount: 1 }] };
     expect(evaluate({ exposureSnapshot: seal({ ...exposure, pending }) }).status).toBe('ACCEPTED');
   });
 
   it('rejects a corrupt reservation identity for the requesting instance', () => {
     const exposure = makeExposure();
     if (exposure.pending.status !== 'KNOWN') throw new Error('fixture');
-    const pending = { ...exposure.pending, instancePendingReservations: [{ strategyInstanceId: 'instance-1', strategyId: 'wrong', strategyVersion: '1.0.0', parameterHash: 'a'.repeat(64), pendingNotionalInr: '10', pendingReservationCount: 1 }] };
+    const pending = { ...exposure.pending, instancePendingReservations: [{ strategyInstanceId: TEST_INSTANCE_ID, strategyId: 'wrong', strategyVersion: '1.0.0', parameterHash: TEST_PARAMETER_HASH, pendingNotionalInr: '10', pendingReservationCount: 1 }] };
     expect(rejectionCodes(evaluate({ exposureSnapshot: seal({ ...exposure, pending }) }))).toContain('DECISION_IDENTITY_MISMATCH');
   });
 
   it('returns NO_CHANGE only as a rejected non-actionable union variant', () => {
     const decision = makeDecision('FLAT');
-    const result = evaluate({ candidate: { strategyDecision: decision, pair: decision.pair, instrumentSpecSnapshotId: 'instrument-1' }, entryStopProposal: null, leverageProposal: null });
+    const result = evaluate({ candidate: { strategyLineage: makeLineage(), strategyDecision: decision, pair: decision.pair, instrumentSpecSnapshotId: 'instrument-1' }, entryStopProposal: null, leverageProposal: null });
     expect(result).toMatchObject({ status: 'REJECTED', action: 'NO_CHANGE', approved: null, primaryReasonCode: 'NO_CHANGE_TARGET_ALREADY_HELD' });
   });
 
   it('returns REVERSAL_DEFERRED only as a rejected non-executable variant', () => {
     const decision = makeDecision('SHORT');
     const pair = { ...makePair(), position: { state: 'OPEN' as const, positionId: 'p', positionDirection: 'LONG' as const, quantityMagnitude: '1', valuation: null }, ownership: { status: 'UNRECONCILED' as const } };
-    const result = evaluate({ candidate: { strategyDecision: decision, pair: decision.pair, instrumentSpecSnapshotId: 'instrument-1' }, pairSnapshot: seal(pair), entryStopProposal: null, leverageProposal: null });
+    const result = evaluate({ candidate: { strategyLineage: makeLineage(), strategyDecision: decision, pair: decision.pair, instrumentSpecSnapshotId: 'instrument-1' }, pairSnapshot: seal(pair), entryStopProposal: null, leverageProposal: null });
     expect(result.status).toBe('REJECTED');
     if (result.status === 'REJECTED') { expect(result.action).toBe('REVERSAL_DEFERRED'); expect(result.approved).toBeNull(); expect(rejectionCodes(result)).toContain('REVERSAL_REQUIRES_SEQUENTIAL_EVALUATION'); }
   });

@@ -1,3 +1,4 @@
+import { makeLineage } from './helpers';
 import { describe, expect, it } from 'vitest';
 import {
   RiskConfigError, RiskEngine, RiskEngineError, canonicalDecimalString,
@@ -13,7 +14,7 @@ describe('Phase 13 strategy lineage and policy authority', () => {
   });
 
   it('treats WARMING as a structural no-op', () => {
-    expect(createStrategyRiskCandidate(makeDecision(null, 'WARMING'), 'instrument-1')).toBeNull();
+    expect(createStrategyRiskCandidate(makeDecision(null, 'WARMING'), 'instrument-1', makeLineage())).toBeNull();
   });
 
   it('rejects a well-formed decision ID mismatch without throwing', () => {

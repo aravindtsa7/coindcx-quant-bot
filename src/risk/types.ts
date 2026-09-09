@@ -1,4 +1,5 @@
-import type { StrategyDecision } from '../strategies/core/types';
+import type { StrategyDecision, StrategyIndicatorBootstrapIdentityEntry } from '../strategies/core/types';
+import type { StrategyDecisionOrigin } from '../strategies/core/kernel';
 
 export type RiskMode = 'SAFE' | 'NORMAL' | 'HIGH' | 'CUSTOM';
 export type RiskDecisionAction = 'OPEN' | 'CLOSE' | 'NO_CHANGE' | 'REVERSAL_DEFERRED';
@@ -28,8 +29,15 @@ export interface LeverageProposal {
   readonly requestedLeverage: string | null;
 }
 
+/** Phase 10 construction inputs; IDs and trigger rules are re-derived at ingestion. */
+export interface StrategyRiskLineage {
+  readonly normalizedParameters: Readonly<Record<string, unknown>>;
+  readonly indicatorBootstrapIdentity: readonly StrategyIndicatorBootstrapIdentityEntry[];
+}
+
 export interface StrategyRiskCandidate {
   readonly strategyDecision: StrategyDecision;
+  readonly strategyLineage: StrategyRiskLineage;
   readonly pair: string;
   readonly instrumentSpecSnapshotId: string;
 }
@@ -414,6 +422,8 @@ export interface RejectedRiskDecision extends RiskDecisionBase {
 export type RiskDecision = AcceptedOpenRiskDecision | AcceptedCloseRiskDecision | RejectedRiskDecision;
 
 export interface RiskEvaluationContext {
+  /** Kernel-issued runtime authority, deliberately excluded from semantic hashes. */
+  readonly strategyOrigin: StrategyDecisionOrigin | null;
   readonly candidate: StrategyRiskCandidate;
   readonly entryStopProposal: EntryStopProposal | null;
   readonly leverageProposal: LeverageProposal | null;

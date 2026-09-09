@@ -10,6 +10,8 @@ import type {
   VerifiedLeverageTier,
 } from './types';
 import type { StrategyDecision } from '../strategies/core/types';
+import { strategyCanonicalJson } from '../strategies/core/canonical';
+import { StrategyError } from '../strategies/core/errors';
 
 const SHA = /^[a-f0-9]{64}$/;
 function boolean(value: unknown, label: string): boolean { if (typeof value !== 'boolean') riskSourceInvalid(`${label} must be boolean`); return value; }
@@ -47,10 +49,27 @@ function strategyDecision(value: unknown): StrategyDecision {
 }
 
 function candidate(value: unknown): StrategyRiskCandidate {
-  assertExactKeys(value, ['strategyDecision', 'pair', 'instrumentSpecSnapshotId'], 'StrategyRiskCandidate');
+  assertExactKeys(value, ['strategyDecision', 'strategyLineage', 'pair', 'instrumentSpecSnapshotId'], 'StrategyRiskCandidate');
   assertString(value.pair, 'StrategyRiskCandidate.pair');
   assertString(value.instrumentSpecSnapshotId, 'StrategyRiskCandidate.instrumentSpecSnapshotId');
-  return { strategyDecision: strategyDecision(value.strategyDecision), pair: value.pair, instrumentSpecSnapshotId: value.instrumentSpecSnapshotId };
+  assertExactKeys(value.strategyLineage, ['normalizedParameters', 'indicatorBootstrapIdentity'], 'StrategyRiskLineage');
+  const parameters = value.strategyLineage.normalizedParameters;
+  if (parameters === null || typeof parameters !== 'object' || Array.isArray(parameters)) riskSourceInvalid('normalizedParameters must be an object');
+  const copiedParameters = riskDeepCopyFreeze(parameters as Record<string, unknown>);
+  try { strategyCanonicalJson(copiedParameters); }
+  catch (error) {
+    if (error instanceof StrategyError) riskSourceInvalid('Strategy lineage parameters must use Phase 10 canonical values', error);
+    throw error;
+  }
+  if (!Array.isArray(value.strategyLineage.indicatorBootstrapIdentity)) riskSourceInvalid('indicatorBootstrapIdentity must be an array');
+  const bootstrap = value.strategyLineage.indicatorBootstrapIdentity.map((entry: unknown) => {
+    assertExactKeys(entry, ['timeframeMinutes', 'bootstrapStartOpenTimeMs'], 'indicatorBootstrapIdentity entry');
+    assertSafeInteger(entry.timeframeMinutes, 'bootstrap timeframeMinutes', 1);
+    assertSafeInteger(entry.bootstrapStartOpenTimeMs, 'bootstrapStartOpenTimeMs');
+    return { timeframeMinutes: entry.timeframeMinutes, bootstrapStartOpenTimeMs: entry.bootstrapStartOpenTimeMs };
+  }).sort((left, right) => left.timeframeMinutes - right.timeframeMinutes);
+  return { strategyDecision: strategyDecision(value.strategyDecision), pair: value.pair, instrumentSpecSnapshotId: value.instrumentSpecSnapshotId,
+    strategyLineage: { normalizedParameters: copiedParameters, indicatorBootstrapIdentity: bootstrap } };
 }
 
 function entryStop(value: unknown): EntryStopProposal {
@@ -201,16 +220,16 @@ function settlementSnapshot(value: unknown): SettlementConversionSnapshot {
 
 export function normalizeRiskEvaluationContext(value: RiskEvaluationContext): RiskEvaluationContext {
   assertExactKeys(value, value.expectedRiskPolicyId === undefined
-    ? ['candidate', 'entryStopProposal', 'leverageProposal', 'override', 'evaluationTimeMs', 'accountSnapshot', 'pairSnapshot', 'exposureSnapshot', 'leverageTierSnapshot', 'settlementRateSnapshot']
-    : ['candidate', 'entryStopProposal', 'leverageProposal', 'override', 'evaluationTimeMs', 'expectedRiskPolicyId', 'accountSnapshot', 'pairSnapshot', 'exposureSnapshot', 'leverageTierSnapshot', 'settlementRateSnapshot'], 'RiskEvaluationContext');
+    ? ['strategyOrigin', 'candidate', 'entryStopProposal', 'leverageProposal', 'override', 'evaluationTimeMs', 'accountSnapshot', 'pairSnapshot', 'exposureSnapshot', 'leverageTierSnapshot', 'settlementRateSnapshot']
+    : ['strategyOrigin', 'candidate', 'entryStopProposal', 'leverageProposal', 'override', 'evaluationTimeMs', 'expectedRiskPolicyId', 'accountSnapshot', 'pairSnapshot', 'exposureSnapshot', 'leverageTierSnapshot', 'settlementRateSnapshot'], 'RiskEvaluationContext');
   assertSafeInteger(value.evaluationTimeMs, 'evaluationTimeMs');
   if (value.expectedRiskPolicyId !== undefined && (typeof value.expectedRiskPolicyId !== 'string' || !SHA.test(value.expectedRiskPolicyId))) riskSourceInvalid('expectedRiskPolicyId must be SHA-256');
-  const normalized: RiskEvaluationContext = {
+  const normalized: Omit<RiskEvaluationContext, 'strategyOrigin'> = {
     candidate: candidate(value.candidate), entryStopProposal: value.entryStopProposal === null ? null : entryStop(value.entryStopProposal), leverageProposal: value.leverageProposal === null ? null : leverage(value.leverageProposal),
     override: value.override === null ? null : { ...value.override }, evaluationTimeMs: value.evaluationTimeMs,
     ...(value.expectedRiskPolicyId === undefined ? {} : { expectedRiskPolicyId: value.expectedRiskPolicyId }),
     accountSnapshot: value.accountSnapshot === null ? null : accountSnapshot(value.accountSnapshot), pairSnapshot: pairSnapshot(value.pairSnapshot), exposureSnapshot: value.exposureSnapshot === null ? null : exposureSnapshot(value.exposureSnapshot),
     leverageTierSnapshot: value.leverageTierSnapshot === null ? null : tierSnapshot(value.leverageTierSnapshot), settlementRateSnapshot: value.settlementRateSnapshot === null ? null : settlementSnapshot(value.settlementRateSnapshot),
   };
-  return riskDeepCopyFreeze(normalized);
+  return Object.freeze({ ...riskDeepCopyFreeze(normalized), strategyOrigin: value.strategyOrigin });
 }

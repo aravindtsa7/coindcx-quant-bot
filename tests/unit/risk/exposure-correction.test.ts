@@ -1,10 +1,11 @@
+import { TEST_INSTANCE_ID, TEST_PARAMETER_HASH } from './helpers';
 import { describe, expect, it } from 'vitest';
 import { REJECTION_PRECEDENCE_V1, RiskEngine, type PortfolioExposureSnapshot, type RiskEvaluationContext } from '../../../src/risk';
 import { makeContext, makeExposure, makePolicy, resealContext } from './helpers';
 
 function invalidReservation(suffix: string) {
   return {
-    strategyInstanceId: 'instance-1', strategyId: `wrong-${suffix}`, strategyVersion: '1.0.0', parameterHash: 'a'.repeat(64),
+    strategyInstanceId: TEST_INSTANCE_ID, strategyId: `wrong-${suffix}`, strategyVersion: '1.0.0', parameterHash: TEST_PARAMETER_HASH,
     pendingNotionalInr: '10', pendingReservationCount: 1,
   };
 }
@@ -58,7 +59,7 @@ describe('P13-IMPL-R01 exposure reason accumulation', () => {
   });
 
   it('retains identity mismatch with a simultaneous strategy breach', () => {
-    const result = codes(exposure({ perStrategyOpenNotionalInr: { 'strategy-1': '300000' } }));
+    const result = codes(exposure({ perStrategyOpenNotionalInr: { 'EMA_TREND': '300000' } }));
     expect(result).toContain('DECISION_IDENTITY_MISMATCH');
     expect(result).toContain('STRATEGY_EXPOSURE_LIMIT');
   });
@@ -72,7 +73,7 @@ describe('P13-IMPL-R01 exposure reason accumulation', () => {
   it('orders every simultaneous exposure reason by canonical precedence', () => {
     const result = codes(exposure({
       globalOpenNotionalInr: '800000', perPairOpenNotionalInr: { 'B-BTC_USDT': '400000' },
-      perStrategyOpenNotionalInr: { 'strategy-1': '300000' }, concurrentOpenPositions: 10,
+      perStrategyOpenNotionalInr: { 'EMA_TREND': '300000' }, concurrentOpenPositions: 10,
     }));
     expect(result).toEqual(REJECTION_PRECEDENCE_V1.filter((code) => result.includes(code)));
     expect(result).toEqual(expect.arrayContaining([
@@ -84,7 +85,7 @@ describe('P13-IMPL-R01 exposure reason accumulation', () => {
   it('keeps reason order invariant when reservation input order changes', () => {
     const changes = {
       globalOpenNotionalInr: '800000', perPairOpenNotionalInr: { 'B-BTC_USDT': '400000' },
-      perStrategyOpenNotionalInr: { 'strategy-1': '300000' }, concurrentOpenPositions: 10,
+      perStrategyOpenNotionalInr: { 'EMA_TREND': '300000' }, concurrentOpenPositions: 10,
     };
     expect(codes(exposure(changes, true))).toEqual(codes(exposure(changes, false)));
   });

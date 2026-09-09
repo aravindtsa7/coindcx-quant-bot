@@ -1,3 +1,5 @@
+import { makeOrigin } from './helpers';
+import { TEST_INSTANCE_ID, TEST_PARAMETER_HASH, makeLineage } from './helpers';
 import { describe, expect, it } from 'vitest';
 import { RiskEngine, type CanonicalPositionValuation, type PairRiskSnapshot } from '../../../src/risk';
 import { EVALUATION_TIME, makeContext, makeDecision, makePair, makePolicy, resealContext, seal } from './helpers';
@@ -16,14 +18,14 @@ function openPair(reportedAggregate: string, instanceNotional: string): PairRisk
     ...makePair(),
     position: { state: 'OPEN' as const, positionId: 'position-1', positionDirection: 'LONG' as const, quantityMagnitude: '10', valuation: valuation(reportedAggregate) },
     ownership: { status: 'RECONCILED' as const, positionState: 'OPEN' as const, accountId: 'account-1', pair: 'B-BTC_USDT', positionId: 'position-1',
-      instanceOwnership: [{ strategyInstanceId: 'instance-1', strategyId: 'strategy-1', strategyVersion: '1.0.0', parameterHash: 'a'.repeat(64), currentQuantity: '10', currentNotionalInr: instanceNotional }] },
+      instanceOwnership: [{ strategyInstanceId: TEST_INSTANCE_ID, strategyId: 'EMA_TREND', strategyVersion: '1.0.0', parameterHash: TEST_PARAMETER_HASH, currentQuantity: '10', currentNotionalInr: instanceNotional }] },
   });
 }
 
 function result(reportedAggregate: string, instanceNotional: string) {
   const strategyDecision = makeDecision('FLAT');
   return new RiskEngine(makePolicy()).evaluateRisk(resealContext({
-    ...makeContext(), candidate: { strategyDecision, pair: strategyDecision.pair, instrumentSpecSnapshotId: 'instrument-1' },
+    ...makeContext(), strategyOrigin: makeOrigin(strategyDecision), candidate: { strategyLineage: makeLineage(), strategyDecision, pair: strategyDecision.pair, instrumentSpecSnapshotId: 'instrument-1' },
     entryStopProposal: null, leverageProposal: null, pairSnapshot: openPair(reportedAggregate, instanceNotional),
     exposureSnapshot: null, leverageTierSnapshot: null,
   }));

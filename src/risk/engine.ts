@@ -10,13 +10,16 @@ import { createRiskPolicy, normalizeRiskOverride } from './policy';
 import { evaluatePositionSizing, type PositionSizingEvaluation } from './position-sizing';
 import { orderReasonCodes, type RiskRejectionCode } from './reason-codes';
 import { verifyEvidence } from './source-authority';
-import { deriveRiskAction, recomputeStrategyDecisionId } from './strategy-lineage';
+import { deriveRiskAction, strategyLineageReasons } from './strategy-lineage';
 import { normalizeRiskEvaluationContext } from './validation';
 import { verifyCurrentValuation } from './valuation';
 import type {
-  AcceptedCloseRiskDecision, AcceptedOpenRiskDecision, RiskAuditStep, RiskDecision,
+  AcceptedCloseRiskDecision, AcceptedOpenRiskDecision, RejectedRiskDecision, RiskAuditStep, RiskDecision,
   RiskEvaluationContext, RiskInputContentHashes, RiskPolicy, RiskPolicyDraft,
 } from './types';
+
+type RiskDecisionDraft = Omit<AcceptedOpenRiskDecision, 'riskDecisionId'> |
+  Omit<AcceptedCloseRiskDecision, 'riskDecisionId'> | Omit<RejectedRiskDecision, 'riskDecisionId'>;
 
 const STEP_NAMES = [
   'STATIC_POLICY_CONFIG_INTEGRITY', 'CANONICAL_SOURCE_SHAPE', 'STRATEGY_DECISION_IDENTITY',
@@ -97,7 +100,8 @@ export class RiskEngine {
     if (decision.status !== 'READY' || decision.targetExposure === null) throw new RiskEngineError('RISK_SOURCE_INVALID', 'Only READY StrategyDecision inputs are actionable');
     const action = deriveRiskAction(decision, normalized.pairSnapshot.position);
     const stepReasons: RiskRejectionCode[][] = Array.from({ length: 13 }, () => []);
-    if (recomputeStrategyDecisionId(decision) !== decision.decisionId) stepReasons[2]?.push('DECISION_IDENTITY_MISMATCH');
+    stepReasons[2]?.push(...strategyLineageReasons(normalized.candidate, normalized.strategyOrigin));
+    if (decision.evaluationTimeMs > normalized.evaluationTimeMs) stepReasons[6]?.push('EVIDENCE_TEMPORAL_CAUSALITY_VIOLATION');
     if (normalized.candidate.pair !== decision.pair || normalized.pairSnapshot.pair !== decision.pair || this.policy.pairConfig.pair !== decision.pair || normalized.candidate.instrumentSpecSnapshotId !== normalized.pairSnapshot.instrumentSpecSnapshotId) stepReasons[3]?.push('DECISION_IDENTITY_MISMATCH');
     if (normalized.entryStopProposal !== null && (normalized.entryStopProposal.sourceStrategyDecisionId !== decision.decisionId || normalized.entryStopProposal.pair !== decision.pair)) stepReasons[4]?.push('DECISION_IDENTITY_MISMATCH');
     if (normalized.leverageProposal !== null && normalized.leverageProposal.sourceStrategyDecisionId !== decision.decisionId) stepReasons[4]?.push('DECISION_IDENTITY_MISMATCH');
@@ -173,14 +177,20 @@ export class RiskEngine {
       parameterHash: decision.parameterHash, strategyInstanceId: decision.strategyInstanceId, pair: decision.pair, riskMode: this.policy.modeConfig.mode,
       evaluationTimeMs: normalized.evaluationTimeMs, capsApplied: sizing.capsApplied, auditTrail: trail, inputContentHashes: hashes,
     };
-    const riskDecisionId = sha256CanonicalJson(riskDecisionIdentityPayload(normalized, this.policy, sizing.decision.positionSizingDecisionId, hashes));
+    const identify = (result: RiskDecisionDraft): RiskDecision => {
+      const reasonCodes = result.status === 'REJECTED'
+        ? [result.primaryReasonCode, ...result.secondaryReasonCodes] : result.reasonCodes;
+      const riskDecisionId = sha256CanonicalJson(riskDecisionIdentityPayload(normalized, this.policy, sizing.decision.positionSizingDecisionId, hashes,
+        { status: result.status, action: result.action, approved: result.approved, reasonCodes }));
+      return freezeRiskRuntime({ ...result, riskDecisionId });
+    };
     if (allReasons.length > 0) {
       const primary = allReasons[0];
       if (primary === undefined) throw new Error('Rejected decision requires a primary reason');
-      return freezeRiskRuntime({ ...base, riskDecisionId, status: 'REJECTED' as const, action, approved: null, primaryReasonCode: primary, secondaryReasonCodes: allReasons.slice(1) });
+      return identify({ ...base, status: 'REJECTED', action, approved: null, primaryReasonCode: primary, secondaryReasonCodes: allReasons.slice(1) });
     }
-    if (action === 'OPEN') return this.acceptOpen(base, riskDecisionId, sizing);
-    if (action === 'CLOSE') return this.acceptClose(base, riskDecisionId, normalized, ownership.ownedQuantity, ownership.ownedNotionalInr, closeNotionalUsdt);
+    if (action === 'OPEN') return identify(this.acceptOpen(base, sizing));
+    if (action === 'CLOSE') return identify(this.acceptClose(base, normalized, ownership.ownedQuantity, ownership.ownedNotionalInr, closeNotionalUsdt));
     throw new Error('Non-executable action cannot be accepted');
   }
 
@@ -194,7 +204,8 @@ export class RiskEngine {
   private positionSizingPreflightAudit(context: RiskEvaluationContext, action: string): readonly RiskAuditStep[] {
     const decision = context.candidate.strategyDecision;
     const stepReasons: RiskRejectionCode[][] = Array.from({ length: 10 }, () => []);
-    if (recomputeStrategyDecisionId(decision) !== decision.decisionId) stepReasons[2]?.push('DECISION_IDENTITY_MISMATCH');
+    stepReasons[2]?.push(...strategyLineageReasons(context.candidate, context.strategyOrigin));
+    if (decision.evaluationTimeMs > context.evaluationTimeMs) stepReasons[6]?.push('EVIDENCE_TEMPORAL_CAUSALITY_VIOLATION');
     if (context.candidate.pair !== decision.pair || context.pairSnapshot.pair !== decision.pair ||
         this.policy.pairConfig.pair !== decision.pair || context.candidate.instrumentSpecSnapshotId !== context.pairSnapshot.instrumentSpecSnapshotId) {
       stepReasons[3]?.push('DECISION_IDENTITY_MISMATCH');
@@ -222,23 +233,23 @@ export class RiskEngine {
       }
       stepReasons[9]?.push(...reservationIdentityReasons(context.exposureSnapshot, context.candidate));
     }
-    const executed = [3, 4, 5, ...(action === 'OPEN' ? [6, 7, 10] : [])];
+    const executed = action === 'OPEN' ? [3, 4, 5, 6, 7, 10] : [3, 4, 5, 7];
     return executed.map((step) => ({ step, name: STEP_NAMES[step - 1] ?? '', outcome: (stepReasons[step - 1]?.length ?? 0) > 0 ? 'FAIL' : 'PASS', reasonCodes: orderReasonCodes(stepReasons[step - 1] ?? []) }));
   }
 
-  private acceptOpen(base: Omit<AcceptedOpenRiskDecision, 'riskDecisionId' | 'status' | 'action' | 'approved' | 'reasonCodes'>, riskDecisionId: string, sizing: PositionSizingEvaluation): AcceptedOpenRiskDecision {
+  private acceptOpen(base: Omit<AcceptedOpenRiskDecision, 'riskDecisionId' | 'status' | 'action' | 'approved' | 'reasonCodes'>, sizing: PositionSizingEvaluation): Omit<AcceptedOpenRiskDecision, 'riskDecisionId'> {
     const value = sizing.decision.sizing;
     if (sizing.decision.outcome !== 'SIZED' || value === null) throw new Error('Accepted OPEN requires SIZED decision');
-    return freezeRiskRuntime({ ...base, riskDecisionId, status: 'ACCEPTED', action: 'OPEN', approved: {
+    return freezeRiskRuntime({ ...base, status: 'ACCEPTED', action: 'OPEN', approved: {
       approvedQuantity: value.finalQuantity, approvedLeverage: value.finalLeverage, approvedNotionalUsdt: value.finalNotionalUsdt,
       approvedNotionalInr: value.finalNotionalInr, estimatedInitialMarginUsdt: value.estimatedInitialMarginUsdt,
       estimatedInitialMarginInr: value.estimatedInitialMarginInr, estimatedStopLossRiskInr: value.estimatedStopLossRiskInr,
     }, reasonCodes: [] });
   }
 
-  private acceptClose(base: Omit<AcceptedCloseRiskDecision, 'riskDecisionId' | 'status' | 'action' | 'approved' | 'reasonCodes'>, riskDecisionId: string, context: RiskEvaluationContext, quantity: string | null, notionalInr: string | null, notionalUsdt: string | null): AcceptedCloseRiskDecision {
+  private acceptClose(base: Omit<AcceptedCloseRiskDecision, 'riskDecisionId' | 'status' | 'action' | 'approved' | 'reasonCodes'>, context: RiskEvaluationContext, quantity: string | null, notionalInr: string | null, notionalUsdt: string | null): Omit<AcceptedCloseRiskDecision, 'riskDecisionId'> {
     if (quantity === null || notionalInr === null || notionalUsdt === null || context.pairSnapshot.position.state !== 'OPEN' || context.pairSnapshot.position.valuation === null) throw new Error('Accepted CLOSE requires reconciled ownership');
-    return freezeRiskRuntime({ ...base, riskDecisionId, status: 'ACCEPTED', action: 'CLOSE', approved: { approvedQuantity: quantity, approvedNotionalUsdt: notionalUsdt, approvedNotionalInr: notionalInr }, reasonCodes: [] });
+    return freezeRiskRuntime({ ...base, status: 'ACCEPTED', action: 'CLOSE', approved: { approvedQuantity: quantity, approvedNotionalUsdt: notionalUsdt, approvedNotionalInr: notionalInr }, reasonCodes: [] });
   }
 }
 

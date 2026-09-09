@@ -1,3 +1,4 @@
+import { makeOrigin } from './helpers';
 import Decimal from 'decimal.js';
 import { describe, expect, it } from 'vitest';
 import * as api from '../../../src/risk';
@@ -40,7 +41,7 @@ function actionContext(action: RiskDecisionAction): RiskEvaluationContext {
   if (action === 'OPEN') return makeContext();
   const context = makeContext();
   const decision = makeDecision(action === 'CLOSE' ? 'FLAT' : action === 'REVERSAL_DEFERRED' ? 'SHORT' : 'LONG');
-  return { ...context, candidate: { ...context.candidate, strategyDecision: decision }, entryStopProposal: null, leverageProposal: null,
+  return { ...context, strategyOrigin: makeOrigin(decision), candidate: { ...context.candidate, strategyDecision: decision }, entryStopProposal: null, leverageProposal: null,
     pairSnapshot: { ...context.pairSnapshot,
       position: { state: 'OPEN', positionId: 'p', positionDirection: 'LONG', quantityMagnitude: '10', valuation: {
         valuationMethodVersion: 'P13_MARK_PRICE_MULTIPLIER_SETTLEMENT_V1', valuationPriceField: 'markPriceUsdt', valuationPriceUsdt: '100',

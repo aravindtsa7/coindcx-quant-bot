@@ -13,9 +13,20 @@ import {
   type SettlementConversionSnapshot,
 } from '../../../src/risk';
 import type { StrategyDecision } from '../../../src/strategies';
+import { BaseStrategyKernel, emaTrendV1Definition, StrategyReadonlyMap, type StrategyKernel } from '../../../src/strategies';
+import { IndicatorDecimal } from '../../../src/indicators';
 
 export const SHA_A = 'a'.repeat(64);
-export const EVALUATION_TIME = 1_000_000;
+export const EVALUATION_TIME = 1_200_000;
+const identityKernel = emaTrendV1Definition.createKernel({ pair: 'B-BTC_USDT',
+  parameters: { timeframeMinutes: 5, fastPeriod: 1, slowPeriod: 2, priceSource: 'CLOSE' },
+  indicatorBootstrapIdentity: [{ timeframeMinutes: 5, bootstrapStartOpenTimeMs: 0 }] });
+export const TEST_INSTANCE_ID = identityKernel.strategyInstanceId;
+export const TEST_PARAMETER_HASH = identityKernel.parameterHash;
+export function makeLineage() {
+  return { normalizedParameters: { ...identityKernel.normalizedParameters },
+    indicatorBootstrapIdentity: identityKernel.indicatorBootstrapIdentity.map((entry) => ({ ...entry })) };
+}
 
 export function seal<T extends { readonly provenance: { readonly sourceId: string; readonly sourceTimeMs: number | null; readonly observedAtMs: number; readonly contentSha256: string } }>(value: T): T {
   return { ...value, provenance: { ...value.provenance, contentSha256: evidenceContentSha256(value) } };
@@ -80,13 +91,27 @@ export function makePolicy(overrides: Partial<RiskPolicyDraft> = {}): RiskPolicy
   });
 }
 
+const decisionKernels = new WeakMap<StrategyDecision, StrategyKernel>();
+export function makeOrigin(decision: StrategyDecision) {
+  const kernel = decisionKernels.get(decision);
+  if (kernel === undefined) throw new Error('Fixture decision must originate from makeDecision');
+  const origin = BaseStrategyKernel.issueDecisionOrigin(kernel, decision);
+  if (origin === null) throw new Error('Fixture origin missing');
+  return origin;
+}
 export function makeDecision(targetExposure: StrategyDecision['targetExposure'] = 'LONG', status: StrategyDecision['status'] = 'READY'): StrategyDecision {
-  const body: StrategyDecision = {
-    decisionId: SHA_A, decisionSequence: 1, strategyInstanceId: 'instance-1', strategyId: 'strategy-1',
-    strategyVersion: '1.0.0', parameterHash: SHA_A, pair: 'B-BTC_USDT', evaluationTimeMs: EVALUATION_TIME,
-    triggerTimeframeMinutes: 5, status, targetExposure, reasonCodes: ['SIGNAL'],
-  };
-  return { ...body, decisionId: recomputeStrategyDecisionId(body) };
+  const kernel = emaTrendV1Definition.createKernel({ pair: identityKernel.pair, parameters: identityKernel.normalizedParameters,
+    indicatorBootstrapIdentity: identityKernel.indicatorBootstrapIdentity });
+  const candle = { pair: kernel.pair, timeframeMinutes: 5, openTimeMs: EVALUATION_TIME - 300_000,
+    closeTimeExclusiveMs: EVALUATION_TIME, open: '100', high: '110', low: '90', close: '100', volume: '1', quoteVolume: null };
+  const point = (value: string) => ({ pair: candle.pair, timeframeMinutes: 5, openTimeMs: candle.openTimeMs,
+    closeTimeExclusiveMs: EVALUATION_TIME, value: status === 'WARMING' ? null : new IndicatorDecimal(value) });
+  const decision = kernel.evaluate({ pair: kernel.pair, evaluationTimeMs: EVALUATION_TIME, triggerClosedCandle: candle,
+    latestClosedCandleByTimeframe: new StrategyReadonlyMap([[5, candle]]), candlesClosedAtThisTimestamp: [candle],
+    latestIndicatorPointByAlias: new StrategyReadonlyMap([['ema.fast', point(targetExposure === 'LONG' ? '110' : targetExposure === 'SHORT' ? '90' : '100')], ['ema.slow', point('100')]]) });
+  if (recomputeStrategyDecisionId(decision) !== decision.decisionId) throw new Error('Fixture identity mismatch');
+  decisionKernels.set(decision, kernel);
+  return decision;
 }
 
 function provenance(sourceId: string) {
@@ -142,7 +167,8 @@ export function makeEntry(decision = makeDecision()): EntryStopProposal {
 export function makeContext(changes: Partial<RiskEvaluationContext> = {}): RiskEvaluationContext {
   const decision = makeDecision();
   return {
-    candidate: { strategyDecision: decision, pair: decision.pair, instrumentSpecSnapshotId: 'instrument-1' },
+    strategyOrigin: makeOrigin(changes.candidate?.strategyDecision ?? decision),
+    candidate: { strategyDecision: decision, strategyLineage: makeLineage(), pair: decision.pair, instrumentSpecSnapshotId: 'instrument-1' },
     entryStopProposal: makeEntry(decision), leverageProposal: { proposalId: 'lev-1', proposalPolicyId: 'NONE_USE_MODE_DEFAULT_V1', sourceStrategyDecisionId: decision.decisionId, requestedLeverage: null },
     override: null, evaluationTimeMs: EVALUATION_TIME, accountSnapshot: makeAccount(), pairSnapshot: makePair(), exposureSnapshot: makeExposure(),
     leverageTierSnapshot: makeTiers(), settlementRateSnapshot: makeSettlement(), ...changes,

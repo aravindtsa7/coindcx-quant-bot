@@ -1,5 +1,5 @@
 import { sha256CanonicalJson } from './canonical';
-import type { PositionSizingDecision, RiskEvaluationContext, RiskInputContentHashes, RiskPolicy } from './types';
+import type { PositionSizingDecision, RiskDecision, RiskEvaluationContext, RiskInputContentHashes, RiskPolicy } from './types';
 
 export const POSITION_SIZING_POLICY_PAYLOAD = Object.freeze({
   policyId: 'P13_POSITION_SIZING_V1',
@@ -36,8 +36,10 @@ export function riskDecisionIdentityPayload(
   policy: RiskPolicy,
   positionSizingDecisionId: string,
   hashes: RiskInputContentHashes,
+  outcome: Pick<RiskDecision, 'status' | 'action' | 'approved'> & { readonly reasonCodes: readonly string[] },
 ): Readonly<Record<string, unknown>> {
   return {
+    identityPolicyId: 'P13_RISK_DECISION_IDENTITY_V2',
     riskPolicyId: policy.riskPolicyId,
     positionSizingDecisionId,
     sourceStrategyDecisionId: context.candidate.strategyDecision.decisionId,
@@ -47,5 +49,6 @@ export function riskDecisionIdentityPayload(
     override: context.override,
     evaluationTimeMs: context.evaluationTimeMs,
     ...hashes,
+    outcome,
   };
 }

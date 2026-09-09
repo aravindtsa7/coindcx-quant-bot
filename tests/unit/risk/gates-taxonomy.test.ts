@@ -78,7 +78,7 @@ describe('Phase 13 source time, loss/drawdown, taxonomy, and numeric safety', ()
   });
 
   it('enforces pair, strategy, and concurrent-position limits', () => {
-    const exposure = seal({ ...makeExposure(), perPairOpenNotionalInr: { 'B-BTC_USDT': '400000' }, perStrategyOpenNotionalInr: { 'strategy-1': '300000' }, concurrentOpenPositions: 10 });
+    const exposure = seal({ ...makeExposure(), perPairOpenNotionalInr: { 'B-BTC_USDT': '400000' }, perStrategyOpenNotionalInr: { 'EMA_TREND': '300000' }, concurrentOpenPositions: 10 });
     const resultCodes = codes(run({ exposureSnapshot: exposure }));
     expect(resultCodes).toContain('PAIR_EXPOSURE_LIMIT');
     expect(resultCodes).toContain('STRATEGY_EXPOSURE_LIMIT');

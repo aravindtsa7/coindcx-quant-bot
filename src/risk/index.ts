@@ -8,7 +8,7 @@ export type {
   RiskDecision, RiskDecisionAction, RiskEvaluationContext, RiskFreshnessPolicy, RiskFreshnessPolicyDraft,
   RiskInputContentHashes, RiskMode, RiskModeConfig, RiskModeConfigDraft, RiskOverride, RiskPolicy, RiskPolicyDraft,
   RiskSourceAuthorityPolicy, RiskSourceAuthorityPolicyDraft, RiskValuationPolicy, RiskValuationPolicyDraft,
-  SettlementConversionProvider, SettlementConversionSnapshot, StrategyRiskCandidate, VerifiedLeverageTier,
+  SettlementConversionProvider, SettlementConversionSnapshot, StrategyRiskCandidate, StrategyRiskLineage, VerifiedLeverageTier,
 } from './types';
 export { RiskConfigError, RiskEngineError } from './errors';
 export type { RiskRejectionCode } from './reason-codes';
@@ -17,6 +17,6 @@ export { canonicalDecimalString, riskDecimal } from './decimal';
 export { evidenceContentSha256, sha256CanonicalJson } from './canonical';
 export { createRiskPolicy, normalizeRiskOverride } from './policy';
 export { computePositionSizingDecisionId, computePositionSizingPolicyId, computeRiskPolicyId } from './identity';
-export { createStrategyRiskCandidate, deriveRiskAction, recomputeStrategyDecisionId } from './strategy-lineage';
+export { createStrategyRiskCandidate, createStrategyRiskHandoff, deriveRiskAction, recomputeStrategyDecisionId } from './strategy-lineage';
 export { normalizeCoinDcxPosition } from './ownership';
 export { RiskEngine, createRiskEngine, evaluateRisk } from './engine';
