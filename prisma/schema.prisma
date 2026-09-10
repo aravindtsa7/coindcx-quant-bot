@@ -62,3 +62,438 @@ model HistoricalDataset {
   @@index([pair], map: "historical_datasets_pair_idx")
   @@map("historical_datasets")
 }
+
+// =============================================================================
+// PHASE 14 — PAPER TRADING PERSISTENCE (P14-C)
+//
+// Storage/schema only. No repository, service, transaction orchestration,
+// account-owner runtime, RiskAdmissionCoordinator restore, order/fill/position
+// engine, funding settlement, restart/rehydration, or reconciliation logic is
+// implemented here — see the frozen Phase14 architecture (V2, V2.1, V2.2,
+// V2.3; override precedence V2.3 > V2.2 > V2.1 > V2) for the full contract
+// these tables persist. Every identity/Decimal-precision/enum choice below is
+// derived directly from the already-committed `src/execution/**` (P14-A) and
+// `src/integration/coindcx/paper-evidence.ts` (P14-B) source, which already
+// implement these exact frozen contracts in application code.
+// =============================================================================
+
+/// V2.1 frozen reservation states. `REJECTED` (introduced in V2.1 for pair-slot
+/// contention) is deliberately NOT retained: V2.2 froze that a pre-admission
+/// pair-slot rejection never creates a reservation row at all (no genuine
+/// AdmissionRecord/admissionId/generation exists to persist), making
+/// `REJECTED` dead on arrival. Only the states with a genuine writer remain.
+enum PaperReservationStatus {
+  ADMITTED
+  RELEASED
+  CONSUMED
+}
+
+/// V2.1 MySQL-safe pair-slot states (no partial/filtered index — the slot's
+/// PK `(accountId, pair)` plus this status column is the entire enforcement
+/// mechanism for "at most one pending/active OPEN owner per pair").
+enum PaperPairSlotStatus {
+  EMPTY
+  PENDING
+  OPEN
+}
+
+/// Matches `AdmissionRecord.direction` (`src/dispatch/types.ts`) and doubles
+/// as the open position's side once a pair slot is `OPEN`.
+enum PaperPositionSide {
+  LONG
+  SHORT
+}
+
+/// V2.2 frozen: `paper_execution_intent`/`paper_order` support both actions.
+enum PaperExecutionAction {
+  OPEN
+  CLOSE
+}
+
+/// V2 §6 frozen order state machine. `PARTIALLY_FILLED` is explicitly
+/// deferred/not built in V1 — not included here because no frozen writer for
+/// it exists (introducing it now would be speculative, forbidden by §25).
+enum PaperOrderState {
+  CREATED
+  ACCEPTED
+  FILLED
+  CANCELLED
+  REJECTED
+}
+
+/// V2 §23/§26 frozen immutable economic fact types.
+enum PaperLedgerEntryType {
+  STARTING_CAPITAL
+  FEE
+  FUNDING
+  REALIZED_PNL
+  MARGIN_ESTABLISH
+  MARGIN_RELEASE
+}
+
+/// One shared production paper account per `accountId` (V2 §9/§16). Owns the
+/// account-owner lease/fencing storage (`ownerFence`, `revision`) required by
+/// the future P14-D account-owner transaction boundary — this model persists
+/// the fields only; lease acquisition/renewal/fence-check logic is P14-D's.
+/// `startingCapitalInr`/`cumulativeRealizedPnlInr`/`cumulativeFeesInr`/
+/// `cumulativeFundingInr` are the frozen S/R/F/G terms of the V2 §12 equation
+/// `cashBalance = S + R - F + G`; `lockedMargin`(L)/`reservedCapacity`(P) are
+/// deliberately NOT stored here — they are rebuildable from `PaperPosition`/
+/// `PaperReservation` per the V2 §23 reconciliation hierarchy (facts are
+/// authoritative, this projection's cumulative fields are the only cached
+/// facts that don't already live elsewhere as their own immutable postings).
+model PaperAccount {
+  accountId                String   @id @map("account_id") @db.VarChar(128)
+  /// Monotonic fencing token for the future single-active-owner lease (V2 §16/§18). BigInt: must not silently overflow over the account's lifetime.
+  ownerFence               BigInt   @default(0) @map("owner_fence")
+  /// Monotonic account-state revision, bumped on every durable mutation (V2 §17 coherent snapshot revision).
+  revision                 BigInt   @default(0) @map("revision")
+  startingCapitalInr       Decimal  @map("starting_capital_inr") @db.Decimal(36, 18)
+  cumulativeRealizedPnlInr Decimal  @default(0) @map("cumulative_realized_pnl_inr") @db.Decimal(36, 18)
+  cumulativeFeesInr        Decimal  @default(0) @map("cumulative_fees_inr") @db.Decimal(36, 18)
+  cumulativeFundingInr     Decimal  @default(0) @map("cumulative_funding_inr") @db.Decimal(36, 18)
+  peakEquityInr            Decimal  @map("peak_equity_inr") @db.Decimal(36, 18)
+  consecutiveLossCount     Int      @default(0) @map("consecutive_loss_count")
+  /// Semantic epoch-ms timestamp (not wall-clock `createdAt`/`updatedAt`) — V2 §22/§28.
+  cooldownActiveUntilMs    BigInt?  @map("cooldown_active_until_ms")
+  createdAt                DateTime @default(now()) @map("created_at")
+  updatedAt                DateTime @updatedAt @map("updated_at")
+
+  reservations         PaperReservation[]
+  executionIntents     PaperExecutionIntent[]
+  orders               PaperOrder[]
+  fills                PaperFill[]
+  positions            PaperPosition[]
+  positionHistory      PaperPositionOwnershipHistory[]
+  ledgerEntries        PaperLedgerEntry[]
+  reconciliationFaults PaperReconciliationFault[]
+
+  @@map("paper_account")
+}
+
+/// Immutable, content-addressed `ExecutionPolicySnapshot` (V2 §6, `src/execution/policy.ts`).
+/// An `ExecutionIntent` binds this id, never "current config" — restart/replay
+/// of an existing intent always re-reads the exact original policy content.
+model PaperExecutionPolicySnapshot {
+  executionPolicySnapshotId String   @id @map("execution_policy_snapshot_id") @db.VarChar(64)
+  policyVersion             String   @map("policy_version") @db.VarChar(64)
+  fillSelectionPolicy       String   @map("fill_selection_policy") @db.VarChar(64)
+  maxEvidenceAgeMs          Int      @map("max_evidence_age_ms")
+  requiredHealthState       String   @map("required_health_state") @db.VarChar(32)
+  takerFeeRate              Decimal  @map("taker_fee_rate") @db.Decimal(36, 18)
+  slippageBps               Decimal  @map("slippage_bps") @db.Decimal(36, 18)
+  spreadSemantics           String   @map("spread_semantics") @db.VarChar(64)
+  tickRoundingPolicy        String   @map("tick_rounding_policy") @db.VarChar(64)
+  quantityPolicy            String   @map("quantity_policy") @db.VarChar(64)
+  contractMultiplier        Decimal  @map("contract_multiplier") @db.Decimal(36, 18)
+  currencyConversionPolicy  String   @map("currency_conversion_policy") @db.VarChar(64)
+  accountingPolicy          String   @map("accounting_policy") @db.VarChar(64)
+  executionSemanticsVersion String   @map("execution_semantics_version") @db.VarChar(64)
+  createdAt                 DateTime @default(now()) @map("created_at")
+
+  executionIntents PaperExecutionIntent[]
+
+  @@map("paper_execution_policy_snapshot")
+}
+
+/// Order-side, distinct from `PaperPositionSide` (position direction). V2 §7 fill model: BUY ceils to tick, SELL floors to tick.
+enum PaperOrderSide {
+  BUY
+  SELL
+}
+
+/// Durable counterpart of the in-memory `AdmissionRecord` (`src/dispatch/types.ts`).
+/// Fact — one row per genuine admission attempt that actually reached
+/// `RiskAdmissionCoordinator.admit()` and returned `ADMITTED`. A pre-admission
+/// pair-slot rejection (V2.2 §1) never reaches this table at all — there is no
+/// genuine `admissionId`/`generation` to persist for it.
+model PaperReservation {
+  admissionId              String                 @id @map("admission_id") @db.VarChar(64)
+  accountId                String                 @map("account_id") @db.VarChar(128)
+  riskDecisionId           String                 @map("risk_decision_id") @db.VarChar(64)
+  sourceStrategyDecisionId String                 @map("source_strategy_decision_id") @db.VarChar(64)
+  strategyInstanceId       String                 @map("strategy_instance_id") @db.VarChar(64)
+  strategyId               String                 @map("strategy_id") @db.VarChar(128)
+  strategyVersion          String                 @map("strategy_version") @db.VarChar(32)
+  parameterHash            String                 @map("parameter_hash") @db.VarChar(64)
+  pair                     String                 @map("pair") @db.VarChar(64)
+  decisionSequence         Int                    @map("decision_sequence")
+  direction                PaperPositionSide      @map("direction")
+  approvedNotionalInr      Decimal                @map("approved_notional_inr") @db.Decimal(36, 18)
+  approvedMarginInr        Decimal                @map("approved_margin_inr") @db.Decimal(36, 18)
+  /// Distinguishes successive admission attempts for the same `(accountId, riskDecisionId)` — V2.1 frozen correction.
+  generation               Int                    @map("generation")
+  status                   PaperReservationStatus @map("status")
+  createdAt                DateTime               @default(now()) @map("created_at")
+  updatedAt                DateTime               @updatedAt @map("updated_at")
+
+  account          PaperAccount           @relation(fields: [accountId], references: [accountId], onDelete: Restrict, onUpdate: Restrict)
+  executionIntents PaperExecutionIntent[]
+
+  /// V2.1 frozen correction: NOT `UNIQUE(accountId, riskDecisionId)` — that
+  /// would block a legitimate fresh generation after a released/unfilled
+  /// attempt. `generation` participates so the same generation stays
+  /// idempotent while a fresh one remains persistable.
+  @@unique([accountId, riskDecisionId, generation], map: "paper_reservation_account_risk_decision_generation_unique")
+  /// Supports the V2.2 §4 self-retry check (same `sourceStrategyDecisionId` reusing a still-pending slot claim) and restart watermark reconstruction (V2 §18).
+  @@index([accountId, sourceStrategyDecisionId], map: "paper_reservation_account_source_decision_idx")
+  @@index([accountId, strategyInstanceId, decisionSequence], map: "paper_reservation_account_instance_sequence_idx")
+  @@map("paper_reservation")
+}
+
+/// Deterministic OPEN/CLOSE execution authority record + full lineage
+/// (V2.2 §5/§6, `src/execution/identity.ts`). `admissionId` is populated for
+/// OPEN only (CLOSE is research-exempt and never capacity-tracked, so it is
+/// NULL by design); `positionInstanceId`/`positionRevision`/`reduceOnlyQuantity`
+/// are populated for CLOSE only. Research/origin lineage columns are
+/// immutable, write-once audit facts (V2.2 §2) — excluded from both the OPEN
+/// and CLOSE identity hashes, never overwritten on a later equivalent reissue.
+model PaperExecutionIntent {
+  executionIntentId         String               @id @map("execution_intent_id") @db.VarChar(64)
+  action                    PaperExecutionAction @map("action")
+  accountId                 String               @map("account_id") @db.VarChar(128)
+  pair                      String               @map("pair") @db.VarChar(64)
+  strategyInstanceId        String               @map("strategy_instance_id") @db.VarChar(64)
+  strategyId                String               @map("strategy_id") @db.VarChar(128)
+  strategyVersion           String               @map("strategy_version") @db.VarChar(32)
+  parameterHash             String               @map("parameter_hash") @db.VarChar(64)
+  riskDecisionId            String               @map("risk_decision_id") @db.VarChar(64)
+  evaluationTimeMs          BigInt               @map("evaluation_time_ms")
+  executionPolicySnapshotId String               @map("execution_policy_snapshot_id") @db.VarChar(64)
+
+  /// OPEN-only (NULL for CLOSE — CLOSE is never capacity-tracked).
+  admissionId         String?  @map("admission_id") @db.VarChar(64)
+  approvedQuantity    Decimal? @map("approved_quantity") @db.Decimal(36, 18)
+  approvedLeverage    Decimal? @map("approved_leverage") @db.Decimal(36, 18)
+  approvedNotionalInr Decimal? @map("approved_notional_inr") @db.Decimal(36, 18)
+  approvedMarginInr   Decimal? @map("approved_margin_inr") @db.Decimal(36, 18)
+
+  /// CLOSE-only (NULL for OPEN).
+  positionInstanceId String?  @map("position_instance_id") @db.VarChar(64)
+  positionRevision   Int?     @map("position_revision")
+  reduceOnlyQuantity Decimal? @map("reduce_only_quantity") @db.Decimal(36, 18)
+
+  /// Audit-only lineage (excluded from both identity hashes). OPEN-only except `strategyOriginId`, which both actions capture.
+  researchApprovalOriginId      String? @map("research_approval_origin_id") @db.VarChar(64)
+  validationSubjectId           String? @map("validation_subject_id") @db.VarChar(64)
+  validationPlanId              String? @map("validation_plan_id") @db.VarChar(64)
+  validationSubjectResultSha256 String? @map("validation_subject_result_sha256") @db.VarChar(64)
+  strategyOriginId              String? @map("strategy_origin_id") @db.VarChar(64)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  account         PaperAccount                 @relation(fields: [accountId], references: [accountId], onDelete: Restrict, onUpdate: Restrict)
+  executionPolicy PaperExecutionPolicySnapshot @relation(fields: [executionPolicySnapshotId], references: [executionPolicySnapshotId], onDelete: Restrict, onUpdate: Restrict)
+  reservation     PaperReservation?            @relation(fields: [admissionId], references: [admissionId], onDelete: Restrict, onUpdate: Restrict)
+  order           PaperOrder?
+
+  /// One reservation may back at most one execution intent (V2 §11).
+  @@unique([admissionId], map: "paper_execution_intent_admission_unique")
+  @@index([accountId, pair], map: "paper_execution_intent_account_pair_idx")
+  @@index([positionInstanceId], map: "paper_execution_intent_position_instance_idx")
+  @@map("paper_execution_intent")
+}
+
+/// Order state machine (V2 §6). Frozen cardinality: one `ExecutionIntent` →
+/// one `PaperOrder` — enforced structurally by using `executionIntentId`
+/// itself as the primary key (`orderId = executionIntentId`, V2.2 §11), not a
+/// separately-generated id with a redundant unique constraint.
+model PaperOrder {
+  executionIntentId String               @id @map("execution_intent_id") @db.VarChar(64)
+  accountId         String               @map("account_id") @db.VarChar(128)
+  action            PaperExecutionAction @map("action")
+  state             PaperOrderState      @map("state")
+  createdAt         DateTime             @default(now()) @map("created_at")
+  updatedAt         DateTime             @updatedAt @map("updated_at")
+
+  executionIntent PaperExecutionIntent @relation(fields: [executionIntentId], references: [executionIntentId], onDelete: Restrict, onUpdate: Restrict)
+  account         PaperAccount         @relation(fields: [accountId], references: [accountId], onDelete: Restrict, onUpdate: Restrict)
+  fill            PaperFill?
+
+  @@index([accountId, state], map: "paper_order_account_state_idx")
+  @@map("paper_order")
+}
+
+/// Immutable authoritative economic execution fact (V2 §23). Frozen
+/// cardinality: one `PaperOrder` → at most one `PaperFill` (`fillId = orderId`,
+/// `UNIQUE(orderId)` — enforced by using `orderId` as the primary key itself).
+/// V2.3 additionally requires the terminal, generation-independent
+/// `UNIQUE(accountId, sourceStrategyDecisionId)` — both constraints coexist;
+/// neither replaces the other (they guard different invariants: one order per
+/// intent-generation vs. at most one economic fill per source decision ever).
+model PaperFill {
+  orderId                    String               @id @map("order_id") @db.VarChar(64)
+  accountId                  String               @map("account_id") @db.VarChar(128)
+  sourceStrategyDecisionId   String               @map("source_strategy_decision_id") @db.VarChar(64)
+  /// `hash({identityPolicyId:'P14_SOURCE_EXECUTION_IDENTITY_V1', accountId, sourceStrategyDecisionId})` — application-computed (`src/execution/identity.ts`), never recomputed in the DB.
+  sourceExecutionKey         String               @map("source_execution_key") @db.VarChar(64)
+  pair                       String               @map("pair") @db.VarChar(64)
+  action                     PaperExecutionAction @map("action")
+  side                       PaperOrderSide       @map("side")
+  fillPrice                  Decimal              @map("fill_price") @db.Decimal(36, 18)
+  quantity                   Decimal              @map("quantity") @db.Decimal(36, 18)
+  feeInr                     Decimal              @map("fee_inr") @db.Decimal(36, 18)
+  /// CLOSE/reducing fills only.
+  realizedPnlInr             Decimal?             @map("realized_pnl_inr") @db.Decimal(36, 18)
+  /// Selected market evidence identity persisted with the fill (V2 §7) — references `PaperExecutionQuoteSnapshot.contentSha256`/`PaperMarkSnapshot.contentSha256`, not FK-enforced (evidence is not itself a durable table).
+  quoteSnapshotContentSha256 String               @map("quote_snapshot_content_sha256") @db.VarChar(64)
+  markSnapshotContentSha256  String?              @map("mark_snapshot_content_sha256") @db.VarChar(64)
+  /// Causal observation/evidence time, never historical bar time (V2 §7).
+  eventTimeMs                BigInt               @map("event_time_ms")
+  createdAt                  DateTime             @default(now()) @map("created_at")
+
+  order              PaperOrder         @relation(fields: [orderId], references: [executionIntentId], onDelete: Restrict, onUpdate: Restrict)
+  account            PaperAccount       @relation(fields: [accountId], references: [accountId], onDelete: Restrict, onUpdate: Restrict)
+  paperLedgerEntries PaperLedgerEntry[]
+
+  /// V2.3 §6 frozen terminal source-execution dedup: one genuine source `StrategyDecision` → at most one economic fill per account, across every admission generation and process restart. Deliberately NOT placed on `paper_reservation`/`paper_execution_intent` — a released/unfilled source decision may legitimately retry there.
+  @@unique([accountId, sourceStrategyDecisionId], map: "paper_fill_account_source_decision_terminal_unique")
+  @@map("paper_fill")
+}
+
+/// Current per-`(accountId, pair)` pair-slot projection AND live position
+/// economics when `status = OPEN` (V2.1 §3 MySQL-safe pair-slot correction —
+/// merges the "slot" concept directly into this table rather than a
+/// PostgreSQL-style partial/filtered unique index, which MySQL cannot
+/// express). Rows are pre-provisioned once per `(accountId, pair)` at
+/// pair-onboarding time; the composite primary key itself is the entire "at
+/// most one pending/active OPEN owner per pair" enforcement mechanism — no
+/// additional index is needed or added. Projection — rebuildable from
+/// `PaperFill`/`PaperLedgerEntry` (V2 §23); never the sole source of economic
+/// truth.
+model PaperPosition {
+  accountId String @map("account_id") @db.VarChar(128)
+  pair      String @map("pair") @db.VarChar(64)
+
+  status             PaperPairSlotStatus @default(EMPTY) @map("status")
+  /// Current claim while `PENDING`/`OPEN` — nullable while `EMPTY`.
+  admissionId        String?             @map("admission_id") @db.VarChar(64)
+  /// Current value while `OPEN` — a fresh OPEN always derives a fresh id (V2 §10); nullable while not `OPEN`.
+  positionInstanceId String?             @map("position_instance_id") @db.VarChar(64)
+  /// Monotonic; incremented on every state-affecting mutation. What `PaperCloseExecutionAuthority` binds to (V2.2 §3, V2.3 §7 stale-successor protection).
+  revision           Int                 @default(0) @map("revision")
+
+  ownerStrategyInstanceId String? @map("owner_strategy_instance_id") @db.VarChar(64)
+  ownerStrategyId         String? @map("owner_strategy_id") @db.VarChar(128)
+  ownerStrategyVersion    String? @map("owner_strategy_version") @db.VarChar(32)
+  ownerParameterHash      String? @map("owner_parameter_hash") @db.VarChar(64)
+
+  side                     PaperPositionSide? @map("side")
+  quantity                 Decimal?           @db.Decimal(36, 18)
+  averageEntryPriceInr     Decimal?           @map("average_entry_price_inr") @db.Decimal(36, 18)
+  leverage                 Decimal?           @db.Decimal(36, 18)
+  initialMarginInr         Decimal?           @map("initial_margin_inr") @db.Decimal(36, 18)
+  cumulativeRealizedPnlInr Decimal            @default(0) @map("cumulative_realized_pnl_inr") @db.Decimal(36, 18)
+  cumulativeFeesInr        Decimal            @default(0) @map("cumulative_fees_inr") @db.Decimal(36, 18)
+  cumulativeFundingInr     Decimal            @default(0) @map("cumulative_funding_inr") @db.Decimal(36, 18)
+  openedAtMs               BigInt?            @map("opened_at_ms")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  account PaperAccount @relation(fields: [accountId], references: [accountId], onDelete: Restrict, onUpdate: Restrict)
+
+  @@id([accountId, pair])
+  @@map("paper_position")
+}
+
+/// Immutable, finalized OPEN→CLOSE position lifecycle fact (V2 §9/§10, V2.1
+/// §4 correction). Only a genuinely completed lifecycle ever receives a row —
+/// a losing pair-slot competitor never had a `positionInstanceId` and MUST
+/// NOT be represented here (that audit fact belongs to observability/logging,
+/// never a fabricated history row, per V2.2 §1).
+model PaperPositionOwnershipHistory {
+  positionInstanceId String @id @map("position_instance_id") @db.VarChar(64)
+
+  accountId          String            @map("account_id") @db.VarChar(128)
+  pair               String            @map("pair") @db.VarChar(64)
+  strategyInstanceId String            @map("strategy_instance_id") @db.VarChar(64)
+  strategyId         String            @map("strategy_id") @db.VarChar(128)
+  strategyVersion    String            @map("strategy_version") @db.VarChar(32)
+  parameterHash      String            @map("parameter_hash") @db.VarChar(64)
+  side               PaperPositionSide @map("side")
+
+  openingExecutionIntentId String @map("opening_execution_intent_id") @db.VarChar(64)
+  closingExecutionIntentId String @map("closing_execution_intent_id") @db.VarChar(64)
+
+  quantity             Decimal  @db.Decimal(36, 18)
+  averageEntryPriceInr Decimal  @map("average_entry_price_inr") @db.Decimal(36, 18)
+  exitPriceInr         Decimal  @map("exit_price_inr") @db.Decimal(36, 18)
+  realizedPnlInr       Decimal  @map("realized_pnl_inr") @db.Decimal(36, 18)
+  totalFeesInr         Decimal  @map("total_fees_inr") @db.Decimal(36, 18)
+  totalFundingInr      Decimal  @map("total_funding_inr") @db.Decimal(36, 18)
+  openedAtMs           BigInt   @map("opened_at_ms")
+  closedAtMs           BigInt   @map("closed_at_ms")
+  createdAt            DateTime @default(now()) @map("created_at")
+
+  account PaperAccount @relation(fields: [accountId], references: [accountId], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([openingExecutionIntentId], map: "paper_position_ownership_history_opening_intent_unique")
+  @@index([accountId, pair], map: "paper_position_ownership_history_account_pair_idx")
+  @@index([closingExecutionIntentId], map: "paper_position_ownership_history_closing_intent_idx")
+  @@map("paper_position_ownership_history")
+}
+
+/// Immutable economic postings ledger (V2 §23 authoritative-facts layer). One
+/// row per genuine economic event — fee/funding/realized-PnL/margin-establish
+/// /margin-release/starting-capital. `PaperAccount`'s cumulative fields and
+/// `PaperPosition`'s cumulative fields are rebuildable by summing these rows;
+/// this table, not those projections, is the source of economic truth.
+model PaperLedgerEntry {
+  entryId String @id @map("entry_id") @db.VarChar(64)
+
+  type               PaperLedgerEntryType @map("type")
+  accountId          String               @map("account_id") @db.VarChar(128)
+  positionInstanceId String?              @map("position_instance_id") @db.VarChar(64)
+  pair               String?              @map("pair") @db.VarChar(64)
+  strategyInstanceId String?              @map("strategy_instance_id") @db.VarChar(64)
+  strategyId         String?              @map("strategy_id") @db.VarChar(128)
+  strategyVersion    String?              @map("strategy_version") @db.VarChar(32)
+  parameterHash      String?              @map("parameter_hash") @db.VarChar(64)
+
+  /// Signed — realized loss/fee charge is negative, credit is positive.
+  amountInr Decimal @map("amount_inr") @db.Decimal(36, 18)
+
+  /// FEE/REALIZED_PNL provenance.
+  sourceFillId   String? @map("source_fill_id") @db.VarChar(64)
+  /// FUNDING provenance — V2.3 §21 frozen key: `(accountId, positionInstanceId, authoritativeFundingEventId)`. No funding schedule/interval semantics are implied or implemented here (P14-F scope).
+  fundingEventId String? @map("funding_event_id") @db.VarChar(64)
+
+  /// V2 §13: every economic posting binds its conversion evidence — never retrospectively rewritten.
+  conversionSnapshotContentSha256 String?  @map("conversion_snapshot_content_sha256") @db.VarChar(64)
+  conversionRateInrPerUsdt        Decimal? @map("conversion_rate_inr_per_usdt") @db.Decimal(36, 18)
+
+  /// Semantic event time — distinct from operational `createdAt` (V2 §28).
+  eventTimeMs BigInt   @map("event_time_ms")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  account PaperAccount @relation(fields: [accountId], references: [accountId], onDelete: Restrict, onUpdate: Restrict)
+  fill    PaperFill?   @relation(fields: [sourceFillId], references: [orderId], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([type, sourceFillId], map: "paper_ledger_entry_type_source_fill_unique")
+  @@unique([type, accountId, positionInstanceId, fundingEventId], map: "paper_ledger_entry_funding_dedup_unique")
+  @@index([accountId, positionInstanceId], map: "paper_ledger_entry_account_position_idx")
+  @@map("paper_ledger_entry")
+}
+
+/// Detected fact/projection mismatch or fault record (V2 §23). Pure
+/// observation storage — detection/classification logic is a later slice's
+/// responsibility; this table never repairs anything, only records it.
+model PaperReconciliationFault {
+  faultId String @id @default(uuid()) @map("fault_id")
+
+  accountId    String  @map("account_id") @db.VarChar(128)
+  faultType    String  @map("fault_type") @db.VarChar(64)
+  detectedAtMs BigInt  @map("detected_at_ms")
+  /// Snapshot of the mismatching evidence for audit — never used to silently repair.
+  evidenceJson String  @map("evidence_json") @db.Text
+  resolvedAtMs BigInt? @map("resolved_at_ms")
+  resolvedBy   String? @map("resolved_by") @db.VarChar(128)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  account PaperAccount @relation(fields: [accountId], references: [accountId], onDelete: Restrict, onUpdate: Restrict)
+
+  @@index([accountId, faultType], map: "paper_reconciliation_fault_account_type_idx")
+  @@map("paper_reconciliation_fault")
+}
