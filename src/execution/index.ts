@@ -27,6 +27,7 @@ export {
   PaperCloseExecutionAuthority, type PaperClosePositionBinding, type PaperCloseExecutionAuthorityRecord,
 } from './close-authority';
 export type { PaperExecutionQuoteSnapshot } from './evidence';
+export type { TrustedPaperExecutionEvidence } from './trusted-evidence';
 export type { PaperMarkSnapshot } from './mark';
 export {
   computeAvailableMargin, computeCashBalance, computeEquity, computeFeeInr, computeFundingPnlInr,

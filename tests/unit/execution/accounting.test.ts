@@ -96,6 +96,20 @@ describe('P14-A posting formulas — fee/realized/unrealized/funding signs', () 
 });
 
 describe('P14-A Q18 durable-posting quantization boundary', () => {
+  it('retains high-precision calculation inputs and rounds once to an exact Q18 posting', () => {
+    const pnl = computeRealizedPnlInr({
+      side: 'LONG', entryPriceInr: paperDecimal('100.123456789012345678'), exitPriceInr: paperDecimal('110.987654321098765432'),
+      closingQuantity: paperDecimal('1.234567890123456789'), contractMultiplier: paperDecimal('0.001'),
+    });
+    expect(pnl.toFixed()).toBe('0.013412589425072397475723212913335009906');
+    expect(quantizePaperPosting(pnl).value).toBe('0.013412589425072397');
+  });
+
+  it('accepts the exact Decimal(36,18) positive maximum and rejects the next minimal unit', () => {
+    expect(quantizePaperPosting(paperDecimal('999999999999999999.999999999999999999')).value).toBe('999999999999999999.999999999999999999');
+    expect(() => quantizePaperPosting(paperDecimal('1000000000000000000'))).toThrow(PaperEngineError);
+  });
+
   it('quantizes at exactly the posting boundary, not mid-calculation', () => {
     const highPrecision = computeRealizedPnlInr({
       side: 'LONG', entryPriceInr: paperDecimal('100.1234567890123456789'), exitPriceInr: paperDecimal('110.9876543210987654321'),

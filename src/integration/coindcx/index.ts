@@ -16,4 +16,5 @@ export * from './models';
 export * from './normalizers';
 export * from './client';
 export * from './paper-evidence';
+export { getTrustedPaperExecutionEvidence, type TrustedExecutionEvidenceReadResult } from './execution-evidence-adapter';
 export * from './websocket';

@@ -10,8 +10,13 @@ import { PaperAccountOwnership } from './account-ownership';
 // non-forgeable token that proves a call to the bridge originates from a
 // session that has already completed restore (see admission-bridge.ts).
 import { PaperAdmissionBridge, SESSION_PROOF, type AdmitAndPersistResult } from './admission-bridge';
+import {
+  PaperExecutionEngine, type PaperCloseExecutionInputs, type PaperCloseExecutionResult, type PaperOpenExecutionInputs, type PaperOpenExecutionResult,
+} from './execution-engine';
 import { PaperPersistenceError } from './errors';
 import { restoreAccountAdmissionState, type RestoreResult } from './restore';
+import type { PaperOpenExecutionAuthority } from '../open-authority';
+import type { PaperCloseExecutionAuthority } from '../close-authority';
 
 const SESSION_ISSUER = Symbol('P14-D PaperAccountSession issuer — only openPaperAccountSession may construct a session');
 
@@ -51,11 +56,12 @@ export class PaperAccountSession {
   #state: PaperAccountSessionState = 'READY';
   readonly #bridge: PaperAdmissionBridge;
   readonly #repository: PaperAccountRepository;
+  readonly #executionEngine: PaperExecutionEngine;
 
   /** @internal — only `openPaperAccountSession` may construct one; throws for any other caller. */
   public constructor(
     issuer: symbol, accountId: string, ownership: PaperAccountOwnership, snapshot: PaperAccountSnapshot, restoreResult: RestoreResult,
-    bridge: PaperAdmissionBridge, repository: PaperAccountRepository,
+    bridge: PaperAdmissionBridge, repository: PaperAccountRepository, executionEngine: PaperExecutionEngine,
   ) {
     if (issuer !== SESSION_ISSUER) throw new PaperPersistenceError('NOT_OWNER', 'Only openPaperAccountSession may construct a PaperAccountSession');
     this.accountId = accountId;
@@ -64,6 +70,7 @@ export class PaperAccountSession {
     this.restoreResult = restoreResult;
     this.#bridge = bridge;
     this.#repository = repository;
+    this.#executionEngine = executionEngine;
     Object.freeze(this);
   }
 
@@ -90,6 +97,35 @@ export class PaperAccountSession {
       await this.#faultIfAmbiguous(cause, coordinator);
       throw cause;
     }
+  }
+
+  /**
+   * [P14-E] Integrated PAPER OPEN economic execution. Same fault-on-ambiguous
+   * wrapper as `admitAndPersist` — `PaperExecutionEngine.executeOpen` calls
+   * `coordinator.release()` (reused P14-D coordinator, no fork) before its
+   * final durable writes, so a failure after that point is outcome-ambiguous
+   * for the identical reason and is handled identically.
+   */
+  public async executeOpen(authority: PaperOpenExecutionAuthority, inputs: PaperOpenExecutionInputs, coordinator: RiskAdmissionCoordinator): Promise<PaperOpenExecutionResult> {
+    this.#assertReady();
+    try {
+      return await this.#executionEngine.executeOpen(SESSION_PROOF, this.ownership, authority, inputs, coordinator);
+    } catch (cause) {
+      await this.#faultIfAmbiguous(cause, coordinator);
+      throw cause;
+    }
+  }
+
+  /**
+   * [P14-E] Integrated PAPER CLOSE economic execution. CLOSE has no
+   * reservation/coordinator interaction at all (V2.2 §41) — every write is a
+   * plain DB mutation with no preceding in-memory mutation, so a failure here
+   * is an ordinary rollback, never an outcome-ambiguous fault; this session is
+   * never faulted by a CLOSE failure.
+   */
+  public executeClose(authority: PaperCloseExecutionAuthority, inputs: PaperCloseExecutionInputs): Promise<PaperCloseExecutionResult> {
+    this.#assertReady();
+    return this.#executionEngine.executeClose(SESSION_PROOF, this.ownership, authority, inputs);
   }
 
   /** Re-reads a fresh coherent snapshot under the same held ownership (does not require/change READY state — a plain read). */
@@ -144,10 +180,11 @@ export async function openPaperAccountSession(params: OpenPaperAccountSessionPar
   const prismaClient = params.prisma ?? defaultPrisma;
   const repository = new PaperAccountRepository(prismaClient, params.clock);
   const bridge = new PaperAdmissionBridge(prismaClient);
+  const executionEngine = new PaperExecutionEngine(prismaClient);
 
   const ownership = await repository.acquireOwnership(params.accountId);
   const snapshot = await repository.loadCoherentSnapshot(ownership);
   const restoreResult = await restoreAccountAdmissionState(ownership, params.coordinator, prismaClient);
 
-  return new PaperAccountSession(SESSION_ISSUER, params.accountId, ownership, snapshot, restoreResult, bridge, repository);
+  return new PaperAccountSession(SESSION_ISSUER, params.accountId, ownership, snapshot, restoreResult, bridge, repository, executionEngine);
 }

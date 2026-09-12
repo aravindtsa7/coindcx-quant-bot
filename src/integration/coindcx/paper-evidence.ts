@@ -275,6 +275,8 @@ export class CoinDcxPaperEvidence {
 
   public get orderbookGenerationId(): number { return this.#orderbookSocket.generationId; }
   public get markGenerationId(): number { return this.#markSocket.generationId; }
+  /** Exact frozen P14-B local-observation SLA consumed by the trusted P14-E adapter. */
+  public get conversionLocalPollFreshnessMs(): number { return this.#policy.conversionLocalPollFreshnessMs; }
   public get orderbookSourceSessionId(): string { return this.#sessionId(P14_B_ORDERBOOK_SOURCE_ID, this.#orderbookSocket.generationId); }
   public get markSourceSessionId(): string { return this.#sessionId(P14_B_MARK_SOURCE_ID, this.#markSocket.generationId); }
 
