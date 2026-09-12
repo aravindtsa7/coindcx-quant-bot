@@ -518,3 +518,65 @@ describe('P14-D live-DB — same-account operation serialization', () => {
     expect(reservationCount).toBe(admittedCount);
   });
 });
+
+describe('P14-F live-DB — unsupported funding restore invariants', () => {
+  it('rejects nonzero account cumulative funding without repairing it or returning READY', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    const repository = new PaperAccountRepository(prisma);
+    await initAccount(repository, accountId);
+    await prisma.paperAccount.update({ where: { accountId }, data: { cumulativeFundingInr: '1' } });
+
+    await expect(openPaperAccountSession({ accountId, coordinator: new RiskAdmissionCoordinator(), prisma })).rejects.toMatchObject({
+      code: 'FUNDING_INVARIANT_VIOLATION',
+      message: expect.stringContaining('ACCOUNT_CUMULATIVE_FUNDING_NONZERO'),
+    });
+    expect((await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).cumulativeFundingInr.toFixed()).toBe('1');
+  });
+
+  it('rejects a nonzero position cumulative funding projection without repair', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    const repository = new PaperAccountRepository(prisma);
+    await initAccount(repository, accountId);
+    await prisma.paperPosition.create({
+      data: { accountId, pair: 'B-BTC_USDT', status: 'EMPTY', cumulativeFundingInr: '-0.25' },
+    });
+
+    await expect(openPaperAccountSession({ accountId, coordinator: new RiskAdmissionCoordinator(), prisma })).rejects.toMatchObject({
+      code: 'FUNDING_INVARIANT_VIOLATION',
+      message: expect.stringContaining('POSITION_CUMULATIVE_FUNDING_NONZERO'),
+    });
+    const position = await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: 'B-BTC_USDT' } } });
+    expect(position.cumulativeFundingInr.toFixed()).toBe('-0.25');
+  });
+
+  it('rejects even a zero-valued FUNDING ledger entry without deleting it', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    const repository = new PaperAccountRepository(prisma);
+    await initAccount(repository, accountId);
+    await prisma.paperLedgerEntry.create({
+      data: { entryId: `${accountId}-funding`, type: 'FUNDING', accountId, amountInr: '0', eventTimeMs: 1n },
+    });
+
+    await expect(openPaperAccountSession({ accountId, coordinator: new RiskAdmissionCoordinator(), prisma })).rejects.toMatchObject({
+      code: 'FUNDING_INVARIANT_VIOLATION',
+      message: expect.stringContaining('FUNDING_LEDGER_ENTRY_PRESENT'),
+    });
+    expect(await prisma.paperLedgerEntry.count({ where: { accountId, type: 'FUNDING' } })).toBe(1);
+  });
+
+  it('returns a READY session for exact-zero account/positions with no FUNDING ledger entries', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    const repository = new PaperAccountRepository(prisma);
+    await initAccount(repository, accountId);
+    await provisionPairSlot(accountId, 'B-BTC_USDT');
+
+    const session = await openPaperAccountSession({ accountId, coordinator: new RiskAdmissionCoordinator(), prisma });
+    expect(session.state).toBe('READY');
+    expect(session.snapshot.cumulativeFundingInr).toBe('0');
+    expect(await prisma.paperLedgerEntry.count({ where: { accountId, type: 'FUNDING' } })).toBe(0);
+  });
+});

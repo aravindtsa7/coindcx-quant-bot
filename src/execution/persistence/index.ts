@@ -11,14 +11,17 @@ export {
 // tests that explicitly exercise its own logic.
 export { type AdmitAndPersistResult } from './admission-bridge';
 export { restoreAccountAdmissionState, type RestoreResult } from './restore';
-export { PaperAccountSession, openPaperAccountSession, type OpenPaperAccountSessionParams, type PaperAccountSessionState } from './paper-account-session';
+export {
+  PaperAccountSession, openPaperAccountSession, type OpenPaperAccountSessionParams,
+  type PaperAccountSessionState, type PaperCloseExecutionResult, type PaperOpenExecutionResult,
+} from './paper-account-session';
 // [P14-E §60] `PaperExecutionEngine` itself is NOT exported here — same
 // reasoning as `PaperAdmissionBridge` above: the only public route to durable
 // OPEN/CLOSE economic execution is a READY `PaperAccountSession`. Its input/
 // result data shapes ARE exported, since they carry no mutation capability.
 export {
   type PaperExecutionSide,
-  type PaperOpenExecutionInputs, type PaperOpenExecutionResult,
-  type PaperCloseExecutionInputs, type PaperCloseExecutionResult,
+  type PaperOpenExecutionInputs,
+  type PaperCloseExecutionInputs,
 } from './execution-engine';
 export type { TrustedPaperExecutionEvidence } from '../trusted-evidence';

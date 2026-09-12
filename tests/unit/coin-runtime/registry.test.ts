@@ -8,7 +8,8 @@ import {
   UndiscoveredDisabledCoinRuntime,
 } from '../../../src/coin-runtime';
 import { Decimal } from '../../../src/core/decimal/decimal';
-import { CoinRegistrationError, NotFoundError } from '../../../src/core/errors/app-error';
+import { CoinLifecycleError, CoinRegistrationError, NotFoundError } from '../../../src/core/errors/app-error';
+import { instrument } from '../coindcx/audit-a2-helpers';
 
 // Genuinely mutable test types for caller-owned fixture testing
 interface MutableCoinProfile extends Omit<CoinProfile, 'timeframes' | 'strategyAssignments'> {
@@ -440,6 +441,29 @@ describe('CoinRegistry & Deep Immutability Boundary Invariants', () => {
     expect(byUnderlying.lifecycle).toBe('DATA_LOADING');
     expect(byPair.lifecycle).toBe('DATA_LOADING');
     expect(byUnderlying.instrument?.pair).toBe(byPair.instrument.pair);
+  });
+
+  it('production registry centrally blocks PAPER promotion while funding is unsupported', async () => {
+    const registry = new CoinRegistry();
+    const btc = createMutableFixture('BTC', 'B-BTC_USDT');
+    registry.register({
+      status: 'DISCOVERED',
+      profile: btc.profile,
+      instrument: btc.instrument,
+      lifecycle: 'DISCOVERED',
+      entryEligibility: 'ELIGIBLE',
+    });
+
+    registry.transitionLifecycle('BTC', 'DATA_LOADING');
+    const proof = await registry.prepareDataReadiness('BTC', { getInrFuturesInstrument: async () => instrument('BTC') });
+    registry.promoteDataReady('BTC', proof);
+    registry.transitionLifecycle('BTC', 'BACKTESTING');
+    registry.transitionLifecycle('BTC', 'RESEARCH_APPROVED');
+    registry.transitionLifecycle('BTC', 'PAPER');
+
+    expect(() => registry.transitionLifecycle('BTC', 'PAPER_APPROVED')).toThrow(CoinLifecycleError);
+    expect(() => registry.transitionLifecycle('BTC', 'PAPER_APPROVED')).toThrow(/FUNDING_UNSUPPORTED/);
+    expect(registry.getByUnderlying('BTC').lifecycle).toBe('PAPER');
   });
 
   it('atomically replaces undiscovered runtime with discovered runtime on rediscovery', () => {

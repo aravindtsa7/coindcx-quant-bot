@@ -183,7 +183,7 @@ export interface PaperOpenExecutionInputs {
   readonly nowMs: number;
 }
 
-export type PaperOpenExecutionResult =
+export type PaperOpenExecutionOutcome =
   | {
       readonly outcome: 'FILLED';
       readonly executionIntentId: string;
@@ -211,7 +211,7 @@ export interface PaperCloseExecutionInputs {
   readonly nowMs: number;
 }
 
-export type PaperCloseExecutionResult =
+export type PaperCloseExecutionOutcome =
   | {
       readonly outcome: 'CLOSED';
       readonly executionIntentId: string;
@@ -265,7 +265,7 @@ export class PaperExecutionEngine {
     authority: PaperOpenExecutionAuthority,
     inputs: PaperOpenExecutionInputs,
     coordinator: RiskAdmissionCoordinator,
-  ): Promise<PaperOpenExecutionResult> {
+  ): Promise<PaperOpenExecutionOutcome> {
     assertSessionProof(sessionProof);
     const held = readGenuineOwnership(ownership);
     const record = PaperOpenExecutionAuthority.read(authority);
@@ -464,7 +464,7 @@ export class PaperExecutionEngine {
     ownership: PaperAccountOwnership,
     authority: PaperCloseExecutionAuthority,
     inputs: PaperCloseExecutionInputs,
-  ): Promise<PaperCloseExecutionResult> {
+  ): Promise<PaperCloseExecutionOutcome> {
     assertSessionProof(sessionProof);
     const held = readGenuineOwnership(ownership);
     const record = PaperCloseExecutionAuthority.read(authority);

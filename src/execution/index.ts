@@ -1,5 +1,12 @@
 export { PaperConfigError, PaperEngineError, paperSourceInvalid, type PaperEngineFailureCode } from './errors';
 export {
+  PAPER_FUNDING_CAPABILITY, PaperFundingUnsupportedError, disclosePaperFundingExcluded,
+  isPaperFundingProductionPromotionEvidence, rejectUnsupportedPaperFundingOperation,
+  type PaperEconomicCompleteness, type PaperEconomicStatus, type PaperFundingCapability,
+  type PaperFundingCapabilityReason, type PaperFundingDisclosure, type PaperFundingDisclosedResult,
+  type PaperFundingOperation, type PaperPnlLabel,
+} from './funding-capability';
+export {
   assertQuantityAligned, canonicalPaperDecimalString, ceilToTick, floorToTick, paperDecimal, paperMax, paperMin,
   PaperCalcDecimal, PaperDecimal, PAPER_ONE, PAPER_ZERO, toPaperCalcDecimal,
   MAX_PAPER_INTEGER_DIGITS, MAX_PAPER_PRECISION, MAX_PAPER_SCALE,

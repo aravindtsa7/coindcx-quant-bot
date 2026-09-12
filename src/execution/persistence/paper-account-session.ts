@@ -11,14 +11,19 @@ import { PaperAccountOwnership } from './account-ownership';
 // session that has already completed restore (see admission-bridge.ts).
 import { PaperAdmissionBridge, SESSION_PROOF, type AdmitAndPersistResult } from './admission-bridge';
 import {
-  PaperExecutionEngine, type PaperCloseExecutionInputs, type PaperCloseExecutionResult, type PaperOpenExecutionInputs, type PaperOpenExecutionResult,
+  PaperExecutionEngine, type PaperCloseExecutionInputs, type PaperCloseExecutionOutcome,
+  type PaperOpenExecutionInputs, type PaperOpenExecutionOutcome,
 } from './execution-engine';
 import { PaperPersistenceError } from './errors';
 import { restoreAccountAdmissionState, type RestoreResult } from './restore';
+import { disclosePaperFundingExcluded, type PaperFundingDisclosedResult } from '../funding-capability';
 import type { PaperOpenExecutionAuthority } from '../open-authority';
 import type { PaperCloseExecutionAuthority } from '../close-authority';
 
 const SESSION_ISSUER = Symbol('P14-D PaperAccountSession issuer — only openPaperAccountSession may construct a session');
+
+export type PaperOpenExecutionResult = PaperFundingDisclosedResult<PaperOpenExecutionOutcome>;
+export type PaperCloseExecutionResult = PaperFundingDisclosedResult<PaperCloseExecutionOutcome>;
 
 /**
  * [P14-D BLK-01/§15] A session's mutation lifecycle. `READY` may admit/
@@ -109,7 +114,8 @@ export class PaperAccountSession {
   public async executeOpen(authority: PaperOpenExecutionAuthority, inputs: PaperOpenExecutionInputs, coordinator: RiskAdmissionCoordinator): Promise<PaperOpenExecutionResult> {
     this.#assertReady();
     try {
-      return await this.#executionEngine.executeOpen(SESSION_PROOF, this.ownership, authority, inputs, coordinator);
+      const outcome = await this.#executionEngine.executeOpen(SESSION_PROOF, this.ownership, authority, inputs, coordinator);
+      return disclosePaperFundingExcluded(outcome);
     } catch (cause) {
       await this.#faultIfAmbiguous(cause, coordinator);
       throw cause;
@@ -125,7 +131,8 @@ export class PaperAccountSession {
    */
   public executeClose(authority: PaperCloseExecutionAuthority, inputs: PaperCloseExecutionInputs): Promise<PaperCloseExecutionResult> {
     this.#assertReady();
-    return this.#executionEngine.executeClose(SESSION_PROOF, this.ownership, authority, inputs);
+    return this.#executionEngine.executeClose(SESSION_PROOF, this.ownership, authority, inputs)
+      .then((outcome) => disclosePaperFundingExcluded(outcome));
   }
 
   /** Re-reads a fresh coherent snapshot under the same held ownership (does not require/change READY state — a plain read). */

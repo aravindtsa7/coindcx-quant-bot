@@ -218,6 +218,34 @@ export class PaperAccountRepository {
       }
       const reservations = await tx.paperReservation.findMany({ where: { accountId: record.accountId, status: 'ADMITTED' } });
       const pairSlots = await tx.paperPosition.findMany({ where: { accountId: record.accountId } });
+      const fundingLedgerEntry = await tx.paperLedgerEntry.findFirst({
+        where: { accountId: record.accountId, type: 'FUNDING' },
+        select: { entryId: true },
+      });
+
+      // P14-F: the account lock is acquired first and all three checks share
+      // this coherent transaction. Unsupported funding is never repaired or
+      // interpreted as economic zero; any persisted funding fact prevents a
+      // READY session.
+      if (!account.cumulativeFundingInr.isZero()) {
+        throw new PaperPersistenceError(
+          'FUNDING_INVARIANT_VIOLATION',
+          `ACCOUNT_CUMULATIVE_FUNDING_NONZERO for paper account ${record.accountId}`,
+        );
+      }
+      const nonzeroFundingPosition = pairSlots.find((position) => !position.cumulativeFundingInr.isZero());
+      if (nonzeroFundingPosition !== undefined) {
+        throw new PaperPersistenceError(
+          'FUNDING_INVARIANT_VIOLATION',
+          `POSITION_CUMULATIVE_FUNDING_NONZERO for paper account ${record.accountId}, pair ${nonzeroFundingPosition.pair}`,
+        );
+      }
+      if (fundingLedgerEntry !== null) {
+        throw new PaperPersistenceError(
+          'FUNDING_INVARIANT_VIOLATION',
+          `FUNDING_LEDGER_ENTRY_PRESENT for paper account ${record.accountId}`,
+        );
+      }
       const snapshot: PaperAccountSnapshot = Object.freeze({
         accountId: record.accountId,
         fence: account.ownerFence,

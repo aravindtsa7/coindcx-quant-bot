@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  assertProductionLifecycleTransitionAuthorized,
   assertValidLifecycleTransition,
   CoinLifecycleState,
   isValidLifecycleTransition,
@@ -35,6 +36,39 @@ describe('Coin Lifecycle State Machine Invariants', () => {
     for (const state of statesBeforeDisabled) {
       expect(isValidLifecycleTransition(state, 'DISABLED')).toBe(true);
     }
+  });
+
+  it('keeps the abstract graph valid but blocks the first production promotion beyond PAPER', () => {
+    expect(isValidLifecycleTransition('PAPER', 'PAPER_APPROVED')).toBe(true);
+    expect(() => assertProductionLifecycleTransitionAuthorized('PAPER', 'PAPER_APPROVED', 'BTC')).toThrow(
+      /FUNDING_UNSUPPORTED/,
+    );
+    try {
+      assertProductionLifecycleTransitionAuthorized('PAPER', 'PAPER_APPROVED', 'BTC');
+    } catch (error) {
+      const lifecycleError = error as CoinLifecycleError;
+      expect(lifecycleError.details).toMatchObject({
+        reason: 'FUNDING_UNSUPPORTED',
+        providerReason: 'COINDCX_PROVIDER_EVIDENCE_INCOMPLETE',
+        economicCompleteness: 'FUNDING_EXCLUDED',
+        maximumLifecycle: 'PAPER',
+      });
+    }
+  });
+
+  it.each([
+    ['PAPER_APPROVED', 'SHADOW'],
+    ['SHADOW', 'LIVE_CANDIDATE'],
+    ['LIVE_CANDIDATE', 'LIVE'],
+  ] as const)('blocks later valid forward promotion %s -> %s with the same funding reason', (current, target) => {
+    expect(() => assertProductionLifecycleTransitionAuthorized(current, target, 'BTC', true)).toThrow(
+      /FUNDING_UNSUPPORTED/,
+    );
+  });
+
+  it('allows valid transitions at or below PAPER and has no strategy, pair, duration, or schedule exemption inputs', () => {
+    expect(() => assertProductionLifecycleTransitionAuthorized('RESEARCH_APPROVED', 'PAPER', 'BTC')).not.toThrow();
+    expect(() => assertProductionLifecycleTransitionAuthorized('PAPER_APPROVED', 'PAPER', 'BTC')).not.toThrow();
   });
 
   it('6. REACTIVATION: ordinary transition from DISABLED to DISCOVERED is strictly rejected', () => {

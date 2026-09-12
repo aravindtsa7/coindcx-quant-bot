@@ -1,7 +1,7 @@
 import { Decimal } from '../core/decimal/decimal';
 import { CoinLifecycleError, CoinRegistrationError, NotFoundError } from '../core/errors/app-error';
 import { logger } from '../monitoring/logger';
-import { assertValidLifecycleTransition } from './lifecycle';
+import { assertProductionLifecycleTransitionAuthorized, assertValidLifecycleTransition } from './lifecycle';
 import { assertDataInitializationMetadata, DataReadinessInstrumentReader } from './data-readiness';
 import { determineEntryEligibility, mapInstrumentToMetadata } from './instrument-mapper';
 import { createSubscriptionIntent } from './subscription-intent';
@@ -430,7 +430,7 @@ export class CoinRegistry {
       this.#notifyChanged(canonical);
       return createRuntimeSnapshot(record);
     }
-    assertValidLifecycleTransition(
+    assertProductionLifecycleTransitionAuthorized(
       previousState,
       nextState,
       canonical,

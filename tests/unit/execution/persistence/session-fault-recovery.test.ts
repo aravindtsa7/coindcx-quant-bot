@@ -30,6 +30,7 @@ interface AccountRow {
 interface PositionRow {
   accountId: string; pair: string; status: 'EMPTY' | 'PENDING' | 'OPEN'; admissionId: string | null; positionInstanceId: string | null;
   revision: number; ownerStrategyInstanceId: string | null; ownerStrategyId: string | null; ownerStrategyVersion: string | null; ownerParameterHash: string | null;
+  cumulativeFundingInr: Prisma.Decimal;
 }
 type ReservationRow = Record<string, unknown> & { admissionId: string; accountId: string; status: 'ADMITTED' | 'RELEASED' | 'CONSUMED' };
 
@@ -96,6 +97,7 @@ function createFakePersistence() {
           return { ...reservations.get(where.admissionId) };
         },
       },
+      paperLedgerEntry: { findFirst: async () => null },
       paperFill: { findUnique: async () => null },
     };
   }
@@ -132,6 +134,7 @@ function createFakePersistence() {
       positions.set(posKey(accountId, pair), {
         accountId, pair, status: 'EMPTY', admissionId: null, positionInstanceId: null, revision: 0,
         ownerStrategyInstanceId: null, ownerStrategyId: null, ownerStrategyVersion: null, ownerParameterHash: null,
+        cumulativeFundingInr: new Prisma.Decimal('0'),
       });
     },
     injectFailureOnce(accountId: string, at: 'paperPosition.update' | 'paperReservation.upsert'): void {

@@ -1,4 +1,5 @@
 import { CoinLifecycleError } from '../core/errors/app-error';
+import { PAPER_FUNDING_CAPABILITY, isPaperFundingProductionPromotionEvidence } from '../execution/funding-capability';
 import { CoinLifecycleState } from './types';
 
 /**
@@ -77,6 +78,44 @@ export function assertValidLifecycleTransition(
         targetLifecycle: target,
         allowedTransitions: ALLOWED_LIFECYCLE_TRANSITIONS[current] ?? [],
       }
+    );
+  }
+}
+
+const FUNDING_BLOCKED_PROMOTION_TARGETS: readonly CoinLifecycleState[] = Object.freeze([
+  'PAPER_APPROVED',
+  'SHADOW',
+  'LIVE_CANDIDATE',
+  'LIVE',
+]);
+
+/**
+ * Central production authorization layered on top of the abstract lifecycle
+ * graph. The graph remains independently testable, while normal registry
+ * transitions cannot promote funding-excluded paper evidence beyond PAPER.
+ */
+export function assertProductionLifecycleTransitionAuthorized(
+  current: CoinLifecycleState,
+  target: CoinLifecycleState,
+  underlying = 'UNKNOWN',
+  liveEnabled = true,
+): void {
+  assertValidLifecycleTransition(current, target, underlying, liveEnabled);
+  if (
+    !isPaperFundingProductionPromotionEvidence()
+    && FUNDING_BLOCKED_PROMOTION_TARGETS.includes(target)
+  ) {
+    throw new CoinLifecycleError(
+      `[FUNDING_UNSUPPORTED] Cannot promote coin '${underlying}' from '${current}' to '${target}': paper economics exclude CoinDCX funding`,
+      {
+        underlying,
+        currentLifecycle: current,
+        targetLifecycle: target,
+        reason: PAPER_FUNDING_CAPABILITY.fundingCapability,
+        providerReason: PAPER_FUNDING_CAPABILITY.reason,
+        economicCompleteness: PAPER_FUNDING_CAPABILITY.economicCompleteness,
+        maximumLifecycle: 'PAPER',
+      },
     );
   }
 }

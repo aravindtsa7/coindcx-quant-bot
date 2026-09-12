@@ -6,7 +6,8 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { RiskAdmissionCoordinator } from '../../../src/dispatch/admission';
 import type { AdmissionRequest } from '../../../src/dispatch';
 import {
-  buildExecutionPolicySnapshot, computeOpenExecutionIntentId, computeSourceExecutionKey, EXECUTION_POLICY_VERSION, paperDecimal, type ExecutionPolicySnapshot, type PaperExecutionQuoteSnapshot,
+  buildExecutionPolicySnapshot, computeOpenExecutionIntentId, computeSourceExecutionKey, EXECUTION_POLICY_VERSION,
+  PAPER_FUNDING_CAPABILITY, paperDecimal, type ExecutionPolicySnapshot, type PaperExecutionQuoteSnapshot,
 } from '../../../src/execution';
 import { mintPaperOpenExecutionAuthority, PaperOpenExecutionAuthority } from '../../../src/execution/open-authority';
 import { mintPaperCloseExecutionAuthority, PaperCloseExecutionAuthority, type PaperClosePositionBinding } from '../../../src/execution/close-authority';
@@ -147,6 +148,11 @@ function trust(
   return issueTrustedPaperExecutionEvidence({ quote, orderbookDepth: depth, conversion, conversionLocalPollFreshnessMs });
 }
 
+function expectFundingExcluded(result: object): void {
+  expect(result).toMatchObject({ fundingDisclosure: PAPER_FUNDING_CAPABILITY });
+  expect(Object.isFrozen(result)).toBe(true);
+}
+
 // Fixed per-unit valuation used by the CLOSE-reconciliation fixture below — RiskEngine
 // cross-verifies `aggregateCurrentNotionalInr`/`currentNotionalInr` genuinely equal
 // `quantity * unitValuationInrPerQty` (POSITION_OWNERSHIP_UNRECONCILED otherwise), so
@@ -233,6 +239,7 @@ describe('P14-E live-DB — OPEN then CLOSE happy path', () => {
       executionPolicy: EXECUTION_POLICY, nowMs: openNowMs,
     }, coordinator);
     expect(openResult.outcome).toBe('FILLED');
+    expectFundingExcluded(openResult);
     if (openResult.outcome !== 'FILLED') return;
     expect(openResult.side).toBe('BUY');
 
@@ -256,12 +263,14 @@ describe('P14-E live-DB — OPEN then CLOSE happy path', () => {
     expect(positionAfterOpen?.positionInstanceId).toBe(openResult.positionInstanceId);
     expect(positionAfterOpen?.admissionId).toBe(admitted.admission.admissionId);
     expect(positionAfterOpen?.cumulativeFeesInr.toFixed()).toBe(fill!.feeInr.toFixed());
+    expect(positionAfterOpen?.cumulativeFundingInr.toFixed()).toBe('0');
 
     const reservationAfterOpen = await prisma.paperReservation.findUnique({ where: { admissionId: admitted.admission.admissionId } });
     expect(reservationAfterOpen?.status).toBe('CONSUMED');
 
     const accountAfterOpen = await prisma.paperAccount.findUnique({ where: { accountId } });
     expect(accountAfterOpen?.cumulativeFeesInr.toFixed()).toBe(fill!.feeInr.toFixed());
+    expect(accountAfterOpen?.cumulativeFundingInr.toFixed()).toBe('0');
     expect(coordinator.isAccountFaulted(accountId)).toBe(false);
 
     // --- CLOSE --- (a second decision, one full candle later, on the same kernel)
@@ -288,6 +297,7 @@ describe('P14-E live-DB — OPEN then CLOSE happy path', () => {
       executionPolicy: EXECUTION_POLICY, nowMs: closeNowMs,
     });
     expect(closeResult.outcome).toBe('CLOSED');
+    expectFundingExcluded(closeResult);
     if (closeResult.outcome !== 'CLOSED') return;
     expect(closeResult.side).toBe('SELL');
     expect(closeResult.realizedPnlInr).toBe('900');
@@ -302,6 +312,8 @@ describe('P14-E live-DB — OPEN then CLOSE happy path', () => {
     expect(history?.openingExecutionIntentId).toBe(openResult.executionIntentId);
     expect(history?.closingExecutionIntentId).toBe(closeResult.executionIntentId);
     expect(history?.realizedPnlInr.toFixed()).toBe(closeResult.realizedPnlInr);
+    expect(history?.totalFundingInr.toFixed()).toBe('0');
+    expect(await prisma.paperLedgerEntry.count({ where: { accountId, type: 'FUNDING' } })).toBe(0);
 
     const positionAfterClose = await prisma.paperPosition.findUnique({ where: { accountId_pair: { accountId, pair: PAIR } } });
     expect(positionAfterClose?.status).toBe('EMPTY');
@@ -312,6 +324,76 @@ describe('P14-E live-DB — OPEN then CLOSE happy path', () => {
     const totalFees = accountAfterOpen!.cumulativeFeesInr.plus(closeFill!.feeInr);
     expect(accountAfterClose?.cumulativeFeesInr.toFixed()).toBe(totalFees.toFixed());
     expect(accountAfterClose?.cumulativeRealizedPnlInr.toFixed()).toBe(closeResult.realizedPnlInr);
+    expect(accountAfterClose?.cumulativeFundingInr.toFixed()).toBe('0');
+  }, 60_000);
+});
+
+describe('P14-F live-DB — long-held restored position remains mechanically closable', () => {
+  it('restores and closes after a long elapsed time without synthesizing funding', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const { result: planResult } = await genuineResearchApproval();
+    const kernel = makeKernel(PAIR);
+    const openDecision = evaluateDecision(kernel, T0);
+    const firstCoordinator = new RiskAdmissionCoordinator();
+    const openContext = buildContext(kernel, openDecision);
+    const firstSession = await openPaperAccountSession({ accountId, coordinator: firstCoordinator, prisma });
+    const admitted = await firstSession.admitAndPersist(
+      PAIR,
+      { accountId, policy: policyFor(PAIR), context: openContext },
+      firstCoordinator,
+    );
+    if (admitted.outcome !== 'ADMITTED') throw new Error('fixture');
+    const openAuthority = await mintPaperOpenExecutionAuthority({
+      coordinator: firstCoordinator, accountId, kernel, decision: openDecision,
+      instrumentSpecSnapshotId: INSTRUMENT_SPEC_SNAPSHOT_ID, planResult,
+      policy: policyFor(PAIR), evidence: evidenceFrom(openContext),
+    });
+    if (openAuthority === null) throw new Error('fixture');
+    const openQuote = buildQuote(PAIR, '99', '99.5', T0);
+    const openResult = await firstSession.executeOpen(openAuthority, {
+      evidence: trust(openQuote, buildDepth(openQuote, '1000000', '1000000'), buildConversion('80', T0)),
+      priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT,
+      executionPolicy: EXECUTION_POLICY, nowMs: T0,
+    }, firstCoordinator);
+    if (openResult.outcome !== 'FILLED') throw new Error('fixture');
+    expectFundingExcluded(openResult);
+    firstSession.release();
+
+    const restartedCoordinator = new RiskAdmissionCoordinator();
+    const restoredSession = await openPaperAccountSession({ accountId, coordinator: restartedCoordinator, prisma });
+    expect(restoredSession.state).toBe('READY');
+    const position = await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } });
+    const closeTimeMs = T0 + (30 * 24 * 60 * 60 * 1000);
+    const closeDecision = evaluateDecision(kernel, closeTimeMs, 'FLAT');
+    const closeContext = buildContext(kernel, closeDecision, {
+      pairSnapshot: openPairSnapshotFor(kernel, openResult.quantity, closeTimeMs),
+    });
+    const closeAuthority = await mintPaperCloseExecutionAuthority({
+      coordinator: restartedCoordinator, accountId, kernel, decision: closeDecision,
+      instrumentSpecSnapshotId: INSTRUMENT_SPEC_SNAPSHOT_ID, policy: policyFor(PAIR),
+      evidence: evidenceFrom(closeContext), position: {
+        positionInstanceId: openResult.positionInstanceId, positionRevision: position.revision,
+        ownerStrategyInstanceId: kernel.strategyInstanceId, ownerStrategyId: kernel.strategyId,
+        ownerStrategyVersion: kernel.strategyVersion, ownerParameterHash: kernel.parameterHash,
+        ownedQuantity: openResult.quantity,
+      },
+    });
+    if (closeAuthority === null) throw new Error('fixture');
+    const closeQuote = buildQuote(PAIR, '110', '112', closeTimeMs);
+    const closeResult = await restoredSession.executeClose(closeAuthority, {
+      evidence: trust(closeQuote, buildDepth(closeQuote, '1000000', '1000000'), buildConversion('80', closeTimeMs)),
+      priceIncrement: PRICE_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: closeTimeMs,
+    });
+
+    expect(closeResult.outcome).toBe('CLOSED');
+    expectFundingExcluded(closeResult);
+    expect(await prisma.paperLedgerEntry.count({ where: { accountId, type: 'FUNDING' } })).toBe(0);
+    const history = await prisma.paperPositionOwnershipHistory.findUniqueOrThrow({ where: { positionInstanceId: openResult.positionInstanceId } });
+    expect(history.totalFundingInr.toFixed()).toBe('0');
+    expect((await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).cumulativeFundingInr.toFixed()).toBe('0');
   }, 60_000);
 });
 
@@ -400,6 +482,7 @@ describe('P14-E live-DB — OPEN safety', () => {
     };
     const first = await session.executeOpen(authority, inputs, coordinator);
     expect(first.outcome).toBe('FILLED');
+    expectFundingExcluded(first);
     const before = {
       fills: await prisma.paperFill.count({ where: { accountId, pair: PAIR } }),
       ledger: await prisma.paperLedgerEntry.count({ where: { accountId, pair: PAIR } }),
@@ -408,6 +491,7 @@ describe('P14-E live-DB — OPEN safety', () => {
     };
     const retry = await session.executeOpen(authority, { ...inputs, nowMs: T0 + 100_000 }, coordinator);
     expect(retry.outcome).toBe('SOURCE_DECISION_ALREADY_EXECUTED');
+    expectFundingExcluded(retry);
     expect(await prisma.paperFill.count({ where: { accountId, pair: PAIR } })).toBe(1);
     expect(await prisma.paperLedgerEntry.count({ where: { accountId, pair: PAIR } })).toBe(before.ledger);
     expect(await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).toEqual(before.account);
@@ -564,6 +648,7 @@ describe('P14-E live-DB — CLOSE safety', () => {
     };
     const firstClose = await session.executeClose(closeAuthority, closeInputs);
     expect(firstClose.outcome).toBe('CLOSED');
+    expectFundingExcluded(firstClose);
     const beforeRetry = {
       fillCount: await prisma.paperFill.count({ where: { accountId, pair: PAIR, action: 'CLOSE' } }),
       ledgerCount: await prisma.paperLedgerEntry.count({ where: { accountId, sourceFillId: firstClose.outcome === 'CLOSED' ? firstClose.executionIntentId : '' } }),
@@ -575,6 +660,7 @@ describe('P14-E live-DB — CLOSE safety', () => {
     // A second attempt with the SAME (now-stale, already-consumed) authority must not double-apply anything.
     const secondClose = await session.executeClose(closeAuthority, { ...closeInputs, nowMs: T0 + 200_000 });
     expect(secondClose.outcome).toBe('SOURCE_DECISION_ALREADY_EXECUTED');
+    expectFundingExcluded(secondClose);
 
     expect(await prisma.paperFill.count({ where: { accountId, pair: PAIR, action: 'CLOSE' } })).toBe(beforeRetry.fillCount);
     expect(await prisma.paperLedgerEntry.count({ where: { accountId, sourceFillId: firstClose.outcome === 'CLOSED' ? firstClose.executionIntentId : '' } })).toBe(beforeRetry.ledgerCount);
@@ -619,8 +705,8 @@ describe('P14-E correction proofs — evidence freshness and approved economics'
       priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs,
     }, coordinator);
 
-    await expect(run(buildConversion('80', nowMs - 60_001))).resolves.toEqual({ outcome: 'EVIDENCE_INVALID', reason: 'CONVERSION_STALE_AT_USE' });
-    await expect(run(buildConversion('80', nowMs + 1))).resolves.toEqual({ outcome: 'EVIDENCE_INVALID', reason: 'CONVERSION_CLOCK_FAULT' });
+    await expect(run(buildConversion('80', nowMs - 60_001))).resolves.toMatchObject({ outcome: 'EVIDENCE_INVALID', reason: 'CONVERSION_STALE_AT_USE', fundingDisclosure: PAPER_FUNDING_CAPABILITY });
+    await expect(run(buildConversion('80', nowMs + 1))).resolves.toMatchObject({ outcome: 'EVIDENCE_INVALID', reason: 'CONVERSION_CLOCK_FAULT', fundingDisclosure: PAPER_FUNDING_CAPABILITY });
     expect(await prisma.paperExecutionIntent.count({ where: { accountId } })).toBe(baseCounts.intents);
     expect(await prisma.paperOrder.count({ where: { accountId } })).toBe(baseCounts.orders);
     expect(await prisma.paperFill.count({ where: { accountId } })).toBe(baseCounts.fills);
@@ -673,7 +759,7 @@ describe('P14-E correction proofs — evidence freshness and approved economics'
       evidence: trust(quote, buildDepth(quote, '1000000', '1000000'), buildConversion('80', T0)),
       priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: T0,
     }, coordinator);
-    expect(result).toEqual({ outcome: 'APPROVED_RISK_EXCEEDED', reason: 'EXECUTION_EXCEEDS_APPROVED_NOTIONAL' });
+    expect(result).toMatchObject({ outcome: 'APPROVED_RISK_EXCEEDED', reason: 'EXECUTION_EXCEEDS_APPROVED_NOTIONAL', fundingDisclosure: PAPER_FUNDING_CAPABILITY });
     expect(await prisma.paperExecutionIntent.count({ where: { accountId } })).toBe(0);
     expect(await prisma.paperOrder.count({ where: { accountId } })).toBe(0);
     expect(await prisma.paperFill.count({ where: { accountId } })).toBe(0);
@@ -704,7 +790,7 @@ describe('P14-E correction proofs — evidence freshness and approved economics'
       evidence: { __trustedPaperExecutionEvidence: undefined } as never,
       priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: T0,
     }, coordinator);
-    expect(result).toEqual({ outcome: 'EVIDENCE_INVALID', reason: 'UNTRUSTED_EXECUTION_EVIDENCE' });
+    expect(result).toMatchObject({ outcome: 'EVIDENCE_INVALID', reason: 'UNTRUSTED_EXECUTION_EVIDENCE', fundingDisclosure: PAPER_FUNDING_CAPABILITY });
     expect(await prisma.paperFill.count({ where: { accountId } })).toBe(0);
     expect(await prisma.paperLedgerEntry.count({ where: { accountId } })).toBe(0);
   }, 30_000);
