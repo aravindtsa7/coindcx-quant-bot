@@ -17,7 +17,12 @@ export type PaperPersistenceFailureCode =
   | 'RESTORE_MALFORMED'
   | 'FUNDING_INVARIANT_VIOLATION'
   | 'DB_FAILURE'
-  | 'ADMISSION_OUTCOME_AMBIGUOUS';
+  | 'ADMISSION_OUTCOME_AMBIGUOUS'
+  // [P14-G] A durable row exists but its required lineage/mechanical facts are
+  // structurally impossible/incomplete (e.g. an OPEN pair slot with no
+  // terminal opening PaperFill) — P14-G detects this and fails closed at
+  // startup; it never repairs it. Repair is P14-H's exclusive scope.
+  | 'RECONCILIATION_REQUIRED';
 
 export class PaperPersistenceError extends Error {
   public readonly code: PaperPersistenceFailureCode;

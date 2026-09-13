@@ -15,6 +15,14 @@ export {
   PaperAccountSession, openPaperAccountSession, type OpenPaperAccountSessionParams,
   type PaperAccountSessionState, type PaperCloseExecutionResult, type PaperOpenExecutionResult,
 } from './paper-account-session';
+// [P14-G] Restart/rehydration/kernel startup sequence. `PaperAccountKernel`
+// is the only production entry point — it composes around the frozen
+// `openPaperAccountSession` above rather than re-exposing any lower-level
+// restore primitive.
+export {
+  PaperAccountKernel, PaperAccountRuntime, type PaperAccountKernelState, type StartPaperAccountRuntimeParams,
+  type PaperPositionRehydration, type PaperPositionRehydrationEmpty, type PaperPositionRehydrationOpen, type PaperPositionRehydrationPending,
+} from './paper-account-kernel';
 // [P14-E §60] `PaperExecutionEngine` itself is NOT exported here — same
 // reasoning as `PaperAdmissionBridge` above: the only public route to durable
 // OPEN/CLOSE economic execution is a READY `PaperAccountSession`. Its input/
