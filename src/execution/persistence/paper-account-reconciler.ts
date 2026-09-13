@@ -1,0 +1,427 @@
+import { Prisma, type PrismaClient } from '@prisma/client';
+import { prisma as defaultPrisma } from '../../persistence/prisma';
+import { sha256CanonicalJson } from '../../risk';
+import { paperDecimal } from '../decimal';
+import { computePositionInstanceId } from '../identity';
+import { PAPER_FUNDING_CAPABILITY, type PaperFundingDisclosure } from '../funding-capability';
+import { SystemClock, type Clock } from './account-repository';
+import { PaperPersistenceError } from './errors';
+
+/**
+ * [P14-H] Paper durable reconciliation / account health.
+ *
+ * Read-only fact/projection verification against durable MySQL state for one
+ * paper account (V2 §23 reconciliation hierarchy: `PaperFill`/
+ * `PaperLedgerEntry` are Tier-1 authoritative facts; `PaperAccount`/
+ * `PaperPosition` cumulative fields are Tier-2 rebuildable/cached
+ * projections). A detected mismatch is classified and persisted as a
+ * `PaperReconciliationFault` row — it is NEVER repaired. This module never
+ * writes to `PaperAccount`, `PaperPosition`, `PaperReservation`,
+ * `PaperExecutionIntent`, `PaperOrder`, `PaperFill`,
+ * `PaperPositionOwnershipHistory`, or `PaperLedgerEntry`; the only table it
+ * ever mutates is `PaperReconciliationFault`, and only to append fault
+ * evidence, never to alter/delete a prior fault fact.
+ *
+ * Scope: PAPER-vs-PAPER internal consistency only. This never reconciles
+ * against real CoinDCX positions/fills/funding/wallet balance — zero
+ * provider/network calls occur here. A `HEALTHY` result means "internally
+ * consistent with currently supported paper accounting," never "funding-
+ * complete" or "production-promotion-eligible" — P14-F's funding-unsupported
+ * disclosure and promotion gate are untouched and unaffected by this module.
+ */
+
+// ---------------------------------------------------------------------------
+// Fault taxonomy and result shapes
+// ---------------------------------------------------------------------------
+
+/** Stable, machine-readable fault categories (§22 — deliberately coarse; the `evidence` payload carries the specific discriminating detail). */
+export type PaperReconciliationFaultType =
+  | 'ACCOUNT_LEDGER_MISMATCH'
+  | 'FUNDING_INVARIANT_VIOLATION'
+  | 'POSITION_STATE_MISMATCH'
+  | 'RESERVATION_STATE_MISMATCH'
+  | 'ORDER_FILL_MISMATCH'
+  | 'OWNERSHIP_HISTORY_MISMATCH';
+
+export interface PaperAccountReconciliationIssue {
+  readonly faultId: string;
+  readonly faultType: PaperReconciliationFaultType;
+  readonly pair: string | null;
+  readonly positionInstanceId: string | null;
+  readonly admissionId: string | null;
+  readonly message: string;
+  readonly evidence: Readonly<Record<string, unknown>>;
+}
+
+export type PaperAccountReconciliationStatus = 'HEALTHY' | 'UNHEALTHY';
+
+export interface PaperAccountReconciliationResult {
+  readonly accountId: string;
+  readonly status: PaperAccountReconciliationStatus;
+  /** The `PaperAccount.ownerFence` observed at read time — never acquired/incremented by this module (§34: durable-snapshot-scoped, not a competing ownership). */
+  readonly ownerFence: bigint;
+  readonly revision: bigint;
+  readonly observedAtMs: number;
+  readonly issues: readonly PaperAccountReconciliationIssue[];
+  /** Reconciliation health never implies funding/economic completeness (§30). */
+  readonly fundingDisclosure: PaperFundingDisclosure;
+}
+
+const FAULT_IDENTITY_POLICY_ID = 'P14_H_RECONCILIATION_FAULT_IDENTITY_V1';
+
+/**
+ * Deterministic, content-addressed fault identity — reruns against unchanged
+ * durable state produce the same id (idempotent `upsert`, §26); a materially
+ * different subsequent observation (different evidence) produces a fresh,
+ * additional immutable fact rather than overwriting the earlier one (§27/§28).
+ * `detectedAtMs`/wall-clock time is deliberately EXCLUDED from this hash — it
+ * is stored metadata, never part of the health/identity determination (§21).
+ */
+function computeReconciliationFaultId(input: {
+  readonly accountId: string;
+  readonly faultType: PaperReconciliationFaultType;
+  readonly pair: string | null;
+  readonly positionInstanceId: string | null;
+  readonly admissionId: string | null;
+  readonly evidence: Readonly<Record<string, unknown>>;
+}): string {
+  return sha256CanonicalJson({ identityPolicyId: FAULT_IDENTITY_POLICY_ID, ...input });
+}
+
+interface Builder {
+  readonly accountId: string;
+  readonly issues: PaperAccountReconciliationIssue[];
+}
+
+function addIssue(
+  builder: Builder,
+  faultType: PaperReconciliationFaultType,
+  subject: { readonly pair?: string | null; readonly positionInstanceId?: string | null; readonly admissionId?: string | null },
+  message: string,
+  evidence: Readonly<Record<string, unknown>>,
+): void {
+  const pair = subject.pair ?? null;
+  const positionInstanceId = subject.positionInstanceId ?? null;
+  const admissionId = subject.admissionId ?? null;
+  const faultId = computeReconciliationFaultId({ accountId: builder.accountId, faultType, pair, positionInstanceId, admissionId, evidence });
+  builder.issues.push(Object.freeze({ faultId, faultType, pair, positionInstanceId, admissionId, message, evidence: Object.freeze({ ...evidence }) }));
+}
+
+/**
+ * [P14-H] Reusable, account-scoped PAPER reconciliation/health reader.
+ * Constructor-injectable `prisma`/`clock`, mirroring
+ * `PaperAccountRepository`/`PaperExecutionEngine`/`PaperAccountKernel`'s own
+ * convention. Reusable from a future P14-I composition layer; builds/owns no
+ * daemon, scheduler, or continuous loop itself (§57).
+ */
+export class PaperAccountReconciler {
+  readonly #prisma: PrismaClient;
+  readonly #clock: Clock;
+
+  public constructor(prismaClient: PrismaClient = defaultPrisma, clock: Clock = new SystemClock()) {
+    this.#prisma = prismaClient;
+    this.#clock = clock;
+  }
+
+  /**
+   * Runs one coherent, account-scoped reconciliation pass and returns an
+   * immutable result. Persists any detected mismatch as a
+   * `PaperReconciliationFault` row (idempotent by content-addressed
+   * `faultId`) in the SAME transaction as the read — a healthy account
+   * creates no fault row and this call is otherwise side-effect free (§25).
+   * Never touches any economic table (§6). Follows the exact frozen P14-D
+   * lock ordering (`paper_account` row first, `SELECT ... FOR UPDATE`) so it
+   * never inverts against OPEN/CLOSE/admission/restore locking (§5) — but,
+   * unlike `acquireOwnership`, never writes `ownerFence`, so a live session
+   * elsewhere is never invalidated by running this (§34).
+   */
+  public async reconcile(accountId: string): Promise<PaperAccountReconciliationResult> {
+    const observedAtMs = this.#clock.nowMs();
+
+    return this.#prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT account_id FROM paper_account WHERE account_id = ${accountId} FOR UPDATE`;
+      const account = await tx.paperAccount.findUnique({ where: { accountId } });
+      if (account === null) throw new PaperPersistenceError('ACCOUNT_NOT_FOUND', `No paper_account row for ${accountId}`);
+
+      const [positions, reservations, intents, orders, fills, ledgerEntries, history] = await Promise.all([
+        tx.paperPosition.findMany({ where: { accountId } }),
+        tx.paperReservation.findMany({ where: { accountId } }),
+        tx.paperExecutionIntent.findMany({ where: { accountId } }),
+        tx.paperOrder.findMany({ where: { accountId } }),
+        tx.paperFill.findMany({ where: { accountId } }),
+        tx.paperLedgerEntry.findMany({ where: { accountId } }),
+        tx.paperPositionOwnershipHistory.findMany({ where: { accountId } }),
+      ]);
+
+      const reservationByAdmissionId = new Map(reservations.map((r) => [r.admissionId, r]));
+      const intentByAdmissionId = new Map(intents.filter((i) => i.admissionId !== null).map((i) => [i.admissionId as string, i]));
+      const orderByIntentId = new Map(orders.map((o) => [o.executionIntentId, o]));
+      const fillByOrderId = new Map(fills.map((f) => [f.orderId, f]));
+
+      const builder: Builder = { accountId, issues: [] };
+
+      this.#reconcileFunding(builder, account, positions, ledgerEntries);
+      this.#reconcileAccountLedger(builder, account, ledgerEntries);
+      for (const slot of positions) this.#reconcilePosition(builder, accountId, slot, reservationByAdmissionId, intentByAdmissionId, orderByIntentId, fillByOrderId);
+      this.#reconcileOrders(builder, orders, fillByOrderId);
+      this.#reconcileTerminalDedup(builder, fills);
+      for (const row of history) this.#reconcileHistory(builder, row, fillByOrderId, ledgerEntries, positions);
+
+      for (const issue of builder.issues) {
+        await tx.paperReconciliationFault.upsert({
+          where: { faultId: issue.faultId },
+          create: {
+            faultId: issue.faultId, accountId, faultType: issue.faultType, detectedAtMs: BigInt(observedAtMs),
+            evidenceJson: JSON.stringify({ message: issue.message, pair: issue.pair, positionInstanceId: issue.positionInstanceId, admissionId: issue.admissionId, evidence: issue.evidence }),
+          },
+          update: {},
+        });
+      }
+
+      return Object.freeze({
+        accountId, status: builder.issues.length === 0 ? 'HEALTHY' as const : 'UNHEALTHY' as const,
+        ownerFence: account.ownerFence, revision: account.revision, observedAtMs,
+        issues: Object.freeze(builder.issues), fundingDisclosure: PAPER_FUNDING_CAPABILITY,
+      });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted });
+  }
+
+  // -------------------------------------------------------------------------
+  // §29/§43 — P14-F funding invariant (defense-in-depth alongside the
+  // `loadCoherentSnapshot` fail-closed gate; recorded as a durable fault here
+  // rather than merely blocking session-open). Never queries/repairs funding.
+  // -------------------------------------------------------------------------
+  #reconcileFunding(
+    builder: Builder,
+    account: { readonly cumulativeFundingInr: { readonly isZero: () => boolean; readonly toFixed: () => string } },
+    positions: readonly { readonly pair: string; readonly cumulativeFundingInr: { readonly isZero: () => boolean; readonly toFixed: () => string } }[],
+    ledgerEntries: readonly { readonly type: string; readonly entryId: string }[],
+  ): void {
+    if (!account.cumulativeFundingInr.isZero()) {
+      addIssue(builder, 'FUNDING_INVARIANT_VIOLATION', {}, 'ACCOUNT_CUMULATIVE_FUNDING_NONZERO', { cumulativeFundingInr: account.cumulativeFundingInr.toFixed() });
+    }
+    for (const position of positions) {
+      if (!position.cumulativeFundingInr.isZero()) {
+        addIssue(builder, 'FUNDING_INVARIANT_VIOLATION', { pair: position.pair }, 'POSITION_CUMULATIVE_FUNDING_NONZERO', { pair: position.pair, cumulativeFundingInr: position.cumulativeFundingInr.toFixed() });
+      }
+    }
+    const fundingEntry = ledgerEntries.find((e) => e.type === 'FUNDING');
+    if (fundingEntry !== undefined) {
+      addIssue(builder, 'FUNDING_INVARIANT_VIOLATION', {}, 'FUNDING_LEDGER_ENTRY_PRESENT', { entryId: fundingEntry.entryId });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // §8/§41/§42 — cumulative-projection vs. immutable-ledger-fact reconciliation.
+  // Ledger FEE postings are negative (`amountInr: post(feeInr.negated())` in
+  // execution-engine.ts); `cumulativeFeesInr` is stored positive, so the
+  // expected relationship is `cumulativeFeesInr === -sum(FEE)`.
+  // -------------------------------------------------------------------------
+  #reconcileAccountLedger(
+    builder: Builder,
+    account: { readonly cumulativeFeesInr: { readonly toFixed: () => string }; readonly cumulativeRealizedPnlInr: { readonly toFixed: () => string } },
+    ledgerEntries: readonly { readonly type: string; readonly amountInr: { readonly toFixed: () => string } }[],
+  ): void {
+    const feeLedgerSum = ledgerEntries.filter((e) => e.type === 'FEE').reduce((sum, e) => sum.plus(paperDecimal(e.amountInr.toFixed())), paperDecimal('0'));
+    const expectedCumulativeFees = feeLedgerSum.negated();
+    const actualCumulativeFees = paperDecimal(account.cumulativeFeesInr.toFixed());
+    if (!actualCumulativeFees.equals(expectedCumulativeFees)) {
+      addIssue(builder, 'ACCOUNT_LEDGER_MISMATCH', {}, 'ACCOUNT_CUMULATIVE_FEES_DOES_NOT_MATCH_LEDGER', {
+        field: 'cumulativeFeesInr', actual: actualCumulativeFees.toFixed(), expected: expectedCumulativeFees.toFixed(),
+      });
+    }
+
+    const pnlLedgerSum = ledgerEntries.filter((e) => e.type === 'REALIZED_PNL').reduce((sum, e) => sum.plus(paperDecimal(e.amountInr.toFixed())), paperDecimal('0'));
+    const actualCumulativePnl = paperDecimal(account.cumulativeRealizedPnlInr.toFixed());
+    if (!actualCumulativePnl.equals(pnlLedgerSum)) {
+      addIssue(builder, 'ACCOUNT_LEDGER_MISMATCH', {}, 'ACCOUNT_CUMULATIVE_REALIZED_PNL_DOES_NOT_MATCH_LEDGER', {
+        field: 'cumulativeRealizedPnlInr', actual: actualCumulativePnl.toFixed(), expected: pnlLedgerSum.toFixed(),
+      });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // §10/§11/§12/§13/§18 — per-slot structural + economic reconciliation,
+  // mirroring `paper-account-kernel.ts`'s `rehydratePositions` structural
+  // checks exactly, but non-throwing: every mismatch is collected as a fault
+  // instead of aborting (P14-G fails a startup; P14-H reports a health fact).
+  // -------------------------------------------------------------------------
+  #reconcilePosition(
+    builder: Builder,
+    accountId: string,
+    slot: {
+      readonly pair: string; readonly status: string; readonly admissionId: string | null; readonly positionInstanceId: string | null;
+      readonly side: string | null; readonly quantity: { readonly toFixed: () => string } | null; readonly averageEntryPriceInr: { readonly toFixed: () => string } | null;
+      readonly leverage: unknown; readonly initialMarginInr: unknown; readonly openedAtMs: bigint | null;
+      readonly cumulativeFeesInr: { readonly toFixed: () => string }; readonly cumulativeRealizedPnlInr: { readonly toFixed: () => string };
+      readonly ownerStrategyInstanceId: string | null; readonly ownerStrategyId: string | null; readonly ownerStrategyVersion: string | null; readonly ownerParameterHash: string | null;
+    },
+    reservationByAdmissionId: ReadonlyMap<string, { readonly accountId: string; readonly pair: string; readonly status: string; readonly direction: string }>,
+    intentByAdmissionId: ReadonlyMap<string, { readonly executionIntentId: string; readonly action: string; readonly accountId: string; readonly strategyInstanceId: string }>,
+    orderByIntentId: ReadonlyMap<string, { readonly executionIntentId: string; readonly state: string }>,
+    fillByOrderId: ReadonlyMap<string, { readonly quantity: { readonly toFixed: () => string }; readonly fillPrice: { readonly toFixed: () => string }; readonly feeInr: { readonly toFixed: () => string }; readonly eventTimeMs: bigint }>,
+  ): void {
+    const subject = { pair: slot.pair, positionInstanceId: slot.positionInstanceId, admissionId: slot.admissionId };
+
+    if (slot.status === 'EMPTY') {
+      if (slot.admissionId !== null || slot.positionInstanceId !== null) {
+        addIssue(builder, 'POSITION_STATE_MISMATCH', subject, 'EMPTY_SLOT_RETAINS_CLAIM', { admissionId: slot.admissionId, positionInstanceId: slot.positionInstanceId });
+      }
+      return;
+    }
+
+    if (slot.admissionId === null) {
+      addIssue(builder, 'POSITION_STATE_MISMATCH', subject, `${slot.status}_SLOT_MISSING_ADMISSION_ID`, {});
+      return;
+    }
+    const reservation = reservationByAdmissionId.get(slot.admissionId);
+    if (reservation === undefined || reservation.accountId !== accountId) {
+      addIssue(builder, 'RESERVATION_STATE_MISMATCH', subject, 'NO_MATCHING_DURABLE_RESERVATION', { admissionId: slot.admissionId });
+      return;
+    }
+    if (reservation.pair !== slot.pair) {
+      addIssue(builder, 'RESERVATION_STATE_MISMATCH', subject, 'RESERVATION_PAIR_MISMATCH', { admissionId: slot.admissionId, reservationPair: reservation.pair, slotPair: slot.pair });
+    }
+
+    if (slot.status === 'PENDING') {
+      if (reservation.status !== 'ADMITTED') {
+        addIssue(builder, 'RESERVATION_STATE_MISMATCH', subject, 'PENDING_SLOT_RESERVATION_NOT_ADMITTED', { admissionId: slot.admissionId, reservationStatus: reservation.status });
+      }
+      if (intentByAdmissionId.has(slot.admissionId)) {
+        addIssue(builder, 'POSITION_STATE_MISMATCH', subject, 'PENDING_SLOT_HAS_OPENING_EXECUTION_INTENT', { admissionId: slot.admissionId });
+      }
+      return;
+    }
+
+    // OPEN (§12/§13).
+    if (reservation.status !== 'CONSUMED') {
+      addIssue(builder, 'RESERVATION_STATE_MISMATCH', subject, 'OPEN_SLOT_RESERVATION_NOT_CONSUMED', { admissionId: slot.admissionId, reservationStatus: reservation.status });
+    }
+    if (
+      slot.positionInstanceId === null || slot.side === null || slot.quantity === null || slot.averageEntryPriceInr === null
+      || slot.openedAtMs === null || slot.ownerStrategyInstanceId === null || slot.ownerStrategyId === null
+      || slot.ownerStrategyVersion === null || slot.ownerParameterHash === null
+    ) {
+      addIssue(builder, 'POSITION_STATE_MISMATCH', subject, 'OPEN_SLOT_MISSING_REQUIRED_FIELDS', {});
+      return;
+    }
+    const intent = intentByAdmissionId.get(slot.admissionId);
+    if (intent === undefined || intent.action !== 'OPEN' || intent.accountId !== accountId) {
+      addIssue(builder, 'ORDER_FILL_MISMATCH', subject, 'OPEN_SLOT_NO_MATCHING_OPENING_INTENT', { admissionId: slot.admissionId });
+      return;
+    }
+    const order = orderByIntentId.get(intent.executionIntentId);
+    if (order === undefined || order.state !== 'FILLED') {
+      addIssue(builder, 'ORDER_FILL_MISMATCH', subject, 'OPEN_SLOT_OPENING_ORDER_NOT_FILLED', { executionIntentId: intent.executionIntentId, orderState: order?.state ?? null });
+      return;
+    }
+    const fill = fillByOrderId.get(order.executionIntentId);
+    if (fill === undefined) {
+      addIssue(builder, 'ORDER_FILL_MISMATCH', subject, 'OPEN_SLOT_OPENING_ORDER_HAS_NO_FILL', { executionIntentId: intent.executionIntentId });
+      return;
+    }
+
+    const mismatches: Record<string, unknown>[] = [];
+    const expectedPositionInstanceId = computePositionInstanceId({ accountId, strategyInstanceId: intent.strategyInstanceId, pair: slot.pair, openingExecutionIntentId: intent.executionIntentId });
+    if (expectedPositionInstanceId !== slot.positionInstanceId) mismatches.push({ field: 'positionInstanceId', actual: slot.positionInstanceId, expected: expectedPositionInstanceId });
+    if (slot.side !== reservation.direction) mismatches.push({ field: 'side', actual: slot.side, expected: reservation.direction });
+    if (!paperDecimal(slot.quantity.toFixed()).equals(paperDecimal(fill.quantity.toFixed()))) mismatches.push({ field: 'quantity', actual: slot.quantity.toFixed(), expected: fill.quantity.toFixed() });
+    if (!paperDecimal(slot.averageEntryPriceInr.toFixed()).equals(paperDecimal(fill.fillPrice.toFixed()))) mismatches.push({ field: 'averageEntryPriceInr', actual: slot.averageEntryPriceInr.toFixed(), expected: fill.fillPrice.toFixed() });
+    if (!paperDecimal(slot.cumulativeFeesInr.toFixed()).equals(paperDecimal(fill.feeInr.toFixed()))) mismatches.push({ field: 'cumulativeFeesInr', actual: slot.cumulativeFeesInr.toFixed(), expected: fill.feeInr.toFixed() });
+    if (!paperDecimal(slot.cumulativeRealizedPnlInr.toFixed()).equals(paperDecimal('0'))) mismatches.push({ field: 'cumulativeRealizedPnlInr', actual: slot.cumulativeRealizedPnlInr.toFixed(), expected: '0' });
+    if (slot.openedAtMs !== fill.eventTimeMs) mismatches.push({ field: 'openedAtMs', actual: slot.openedAtMs.toString(), expected: fill.eventTimeMs.toString() });
+
+    if (mismatches.length > 0) {
+      addIssue(builder, 'POSITION_STATE_MISMATCH', subject, 'OPEN_SLOT_ECONOMIC_FACT_MISMATCH', { mismatches });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // §17/§44 — order/fill state machine: a FILLED order must have a terminal
+  // fill. (The reverse — a fill without an order — is already impossible;
+  // `PaperFill.orderId` is a `Restrict`-on-delete FK to `PaperOrder`.)
+  // -------------------------------------------------------------------------
+  #reconcileOrders(
+    builder: Builder,
+    orders: readonly { readonly executionIntentId: string; readonly state: string }[],
+    fillByOrderId: ReadonlyMap<string, unknown>,
+  ): void {
+    for (const order of orders) {
+      if (order.state === 'FILLED' && !fillByOrderId.has(order.executionIntentId)) {
+        addIssue(builder, 'ORDER_FILL_MISMATCH', {}, 'FILLED_ORDER_HAS_NO_FILL', { executionIntentId: order.executionIntentId });
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // §16 — terminal source-execution dedup. `PaperFill`'s own
+  // `UNIQUE(accountId, sourceStrategyDecisionId)` is the primary/only
+  // enforcement mechanism; this is a defensive detection pass over
+  // already-loaded rows, never a second dedup system.
+  // -------------------------------------------------------------------------
+  #reconcileTerminalDedup(builder: Builder, fills: readonly { readonly orderId: string; readonly sourceStrategyDecisionId: string }[]): void {
+    const byDecision = new Map<string, string[]>();
+    for (const fill of fills) {
+      const existing = byDecision.get(fill.sourceStrategyDecisionId);
+      if (existing === undefined) byDecision.set(fill.sourceStrategyDecisionId, [fill.orderId]);
+      else existing.push(fill.orderId);
+    }
+    for (const [sourceStrategyDecisionId, orderIds] of byDecision) {
+      if (orderIds.length > 1) {
+        addIssue(builder, 'ORDER_FILL_MISMATCH', {}, 'MULTIPLE_TERMINAL_FILLS_FOR_SOURCE_DECISION', { sourceStrategyDecisionId, orderIds });
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // §14/§15/§46 — completed OPEN→CLOSE lifecycle fact agreement. History is
+  // immutable (V2.1 §4) — never reopened/rewritten here, only cross-checked.
+  // -------------------------------------------------------------------------
+  #reconcileHistory(
+    builder: Builder,
+    row: {
+      readonly positionInstanceId: string; readonly pair: string; readonly openingExecutionIntentId: string; readonly closingExecutionIntentId: string;
+      readonly quantity: { readonly toFixed: () => string }; readonly averageEntryPriceInr: { readonly toFixed: () => string }; readonly exitPriceInr: { readonly toFixed: () => string };
+      readonly realizedPnlInr: { readonly toFixed: () => string }; readonly totalFeesInr: { readonly toFixed: () => string }; readonly totalFundingInr: { readonly toFixed: () => string };
+    },
+    fillByOrderId: ReadonlyMap<string, { readonly quantity: { readonly toFixed: () => string }; readonly fillPrice: { readonly toFixed: () => string }; readonly feeInr: { readonly toFixed: () => string }; readonly realizedPnlInr: { readonly toFixed: () => string } | null }>,
+    ledgerEntries: readonly { readonly type: string; readonly sourceFillId: string | null; readonly amountInr: { readonly toFixed: () => string } }[],
+    positions: readonly { readonly pair: string; readonly status: string; readonly positionInstanceId: string | null }[],
+  ): void {
+    const subject = { pair: row.pair, positionInstanceId: row.positionInstanceId };
+    const openFill = fillByOrderId.get(row.openingExecutionIntentId);
+    const closeFill = fillByOrderId.get(row.closingExecutionIntentId);
+    if (openFill === undefined || closeFill === undefined) {
+      addIssue(builder, 'OWNERSHIP_HISTORY_MISMATCH', subject, 'HISTORY_MISSING_LINKED_FILL', {
+        openingExecutionIntentId: row.openingExecutionIntentId, closingExecutionIntentId: row.closingExecutionIntentId,
+        openFillFound: openFill !== undefined, closeFillFound: closeFill !== undefined,
+      });
+    } else {
+      const mismatches: Record<string, unknown>[] = [];
+      if (!paperDecimal(row.quantity.toFixed()).equals(paperDecimal(openFill.quantity.toFixed()))) mismatches.push({ field: 'quantity', actual: row.quantity.toFixed(), expected: openFill.quantity.toFixed() });
+      if (!paperDecimal(row.averageEntryPriceInr.toFixed()).equals(paperDecimal(openFill.fillPrice.toFixed()))) mismatches.push({ field: 'averageEntryPriceInr', actual: row.averageEntryPriceInr.toFixed(), expected: openFill.fillPrice.toFixed() });
+      if (!paperDecimal(row.exitPriceInr.toFixed()).equals(paperDecimal(closeFill.fillPrice.toFixed()))) mismatches.push({ field: 'exitPriceInr', actual: row.exitPriceInr.toFixed(), expected: closeFill.fillPrice.toFixed() });
+      if (closeFill.realizedPnlInr === null || !paperDecimal(row.realizedPnlInr.toFixed()).equals(paperDecimal(closeFill.realizedPnlInr.toFixed()))) {
+        mismatches.push({ field: 'realizedPnlInr', actual: row.realizedPnlInr.toFixed(), expected: closeFill.realizedPnlInr === null ? null : closeFill.realizedPnlInr.toFixed() });
+      }
+      const expectedTotalFees = paperDecimal(openFill.feeInr.toFixed()).plus(paperDecimal(closeFill.feeInr.toFixed()));
+      if (!paperDecimal(row.totalFeesInr.toFixed()).equals(expectedTotalFees)) mismatches.push({ field: 'totalFeesInr', actual: row.totalFeesInr.toFixed(), expected: expectedTotalFees.toFixed() });
+      if (!paperDecimal(row.totalFundingInr.toFixed()).equals(paperDecimal('0'))) mismatches.push({ field: 'totalFundingInr', actual: row.totalFundingInr.toFixed(), expected: '0' });
+
+      const feeLedgerSum = ledgerEntries.filter((e) => e.type === 'FEE' && (e.sourceFillId === row.openingExecutionIntentId || e.sourceFillId === row.closingExecutionIntentId))
+        .reduce((sum, e) => sum.plus(paperDecimal(e.amountInr.toFixed())), paperDecimal('0'));
+      if (!feeLedgerSum.negated().equals(expectedTotalFees)) mismatches.push({ field: 'ledgerFeeSum', actual: feeLedgerSum.toFixed(), expectedNegated: expectedTotalFees.toFixed() });
+      const pnlLedgerEntry = ledgerEntries.find((e) => e.type === 'REALIZED_PNL' && e.sourceFillId === row.closingExecutionIntentId);
+      if (pnlLedgerEntry === undefined || !paperDecimal(pnlLedgerEntry.amountInr.toFixed()).equals(paperDecimal(row.realizedPnlInr.toFixed()))) {
+        mismatches.push({ field: 'ledgerRealizedPnl', actual: pnlLedgerEntry === undefined ? null : pnlLedgerEntry.amountInr.toFixed(), expected: row.realizedPnlInr.toFixed() });
+      }
+
+      if (mismatches.length > 0) addIssue(builder, 'OWNERSHIP_HISTORY_MISMATCH', subject, 'HISTORY_ECONOMIC_FACT_MISMATCH', { mismatches });
+    }
+
+    const currentSlot = positions.find((p) => p.pair === row.pair);
+    if (currentSlot !== undefined && currentSlot.status === 'OPEN' && currentSlot.positionInstanceId === row.positionInstanceId) {
+      addIssue(builder, 'OWNERSHIP_HISTORY_MISMATCH', subject, 'SLOT_STILL_OPEN_FOR_COMPLETED_HISTORY', { pair: row.pair, positionInstanceId: row.positionInstanceId });
+    }
+  }
+}

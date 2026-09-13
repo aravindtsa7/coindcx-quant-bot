@@ -33,3 +33,11 @@ export {
   type PaperCloseExecutionInputs,
 } from './execution-engine';
 export type { TrustedPaperExecutionEvidence } from '../trusted-evidence';
+// [P14-H] Read-only PAPER durable reconciliation/health. `PaperAccountReconciler`
+// is the only production entry point — it never mutates economic state and
+// never repairs a detected mismatch; it only appends immutable
+// `PaperReconciliationFault` evidence.
+export {
+  PaperAccountReconciler, type PaperAccountReconciliationResult, type PaperAccountReconciliationIssue,
+  type PaperAccountReconciliationStatus, type PaperReconciliationFaultType,
+} from './paper-account-reconciler';
