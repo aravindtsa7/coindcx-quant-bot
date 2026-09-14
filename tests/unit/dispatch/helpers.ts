@@ -70,6 +70,29 @@ export function buildContext(kernel: StrategyKernel, decision: StrategyDecision,
   });
 }
 
+/**
+ * [F14-01] The NON-authoritative half of a production risk request, as
+ * `ProductionOpenParams.riskRequest`/`ProductionCloseParams.riskRequest` now
+ * demand: `accountSnapshot`/`exposureSnapshot` are stripped entirely (P14-I
+ * derives both from durable state), and the pair snapshot's reconciled
+ * ownership is rebound to the REAL runtime `accountId` — the fixtures'
+ * hard-coded `'account-1'` is precisely the wrong-account evidence F14-01
+ * now rejects.
+ */
+export function productionRiskRequest(
+  kernel: StrategyKernel, decision: StrategyDecision, accountId: string, overrides: Partial<RiskEvaluationContext> = {},
+): Omit<RiskEvaluationContext, 'strategyOrigin' | 'candidate' | 'accountSnapshot' | 'exposureSnapshot'> {
+  const base = buildContext(kernel, decision, overrides);
+  const { strategyOrigin: _strategyOrigin, candidate: _candidate, accountSnapshot: _accountSnapshot, exposureSnapshot: _exposureSnapshot, ...request } = base;
+  return { ...request, pairSnapshot: rebindPairSnapshotAccount(base.pairSnapshot, accountId) };
+}
+
+/** Rebinds a fixture pair snapshot's reconciled ownership to `accountId`, resealing its content hash. */
+export function rebindPairSnapshotAccount(pairSnapshot: RiskEvaluationContext['pairSnapshot'], accountId: string): RiskEvaluationContext['pairSnapshot'] {
+  if (pairSnapshot.ownership.status !== 'RECONCILED') return pairSnapshot;
+  return seal({ ...pairSnapshot, ownership: { ...pairSnapshot.ownership, accountId } });
+}
+
 export function policyFor(pair: string = PAIR, tightCapInr?: string) {
   const pairMaxExposureInr = tightCapInr ?? '500000';
   return makePolicy({
@@ -81,13 +104,24 @@ export function policyFor(pair: string = PAIR, tightCapInr?: string) {
   });
 }
 
-/** One genuine, memoized Phase 12 PASSED result for `PAIR`/EMA_TREND/`PARAMETERS` — matches `makeKernel()` exactly. */
-let cachedApproval: Promise<{ readonly result: ResearchValidationPlanResult; readonly origin: ResearchApprovalOrigin }> | null = null;
-export function genuineResearchApproval(): Promise<{ readonly result: ResearchValidationPlanResult; readonly origin: ResearchApprovalOrigin }> {
-  cachedApproval ??= (async () => {
-    const rows = candles(PAIR, 10 * 24 * 60);
-    const base = resources(PAIR);
-    const resource = { ...base, datasetManifest: datasetManifest(rows), datasetSource: new InMemoryBacktestDatasetSource('dispatch-approval-memory', rows) };
+/**
+ * One genuine, memoized-per-pair Phase 12 PASSED result for
+ * `pair`/EMA_TREND/`PARAMETERS` — matches `makeKernel(pair)` exactly.
+ *
+ * [F14-01] Parameterised by pair (defaulting to `PAIR`, so every existing
+ * caller is unchanged) because proving mark-to-market equity across a
+ * multi-pair account requires a second genuinely research-approved pair: one
+ * pair holds the durable OPEN position being valued, the other carries the
+ * candidate OPEN. Each pair's validation runs at most once per process.
+ */
+const cachedApprovals = new Map<string, Promise<{ readonly result: ResearchValidationPlanResult; readonly origin: ResearchApprovalOrigin }>>();
+export function genuineResearchApproval(pair: string = PAIR): Promise<{ readonly result: ResearchValidationPlanResult; readonly origin: ResearchApprovalOrigin }> {
+  const existing = cachedApprovals.get(pair);
+  if (existing !== undefined) return existing;
+  const approval = (async () => {
+    const rows = candles(pair, 10 * 24 * 60);
+    const base = resources(pair);
+    const resource = { ...base, datasetManifest: datasetManifest(rows), datasetSource: new InMemoryBacktestDatasetSource(`dispatch-approval-memory-${pair}`, rows) };
     const definitions = registry();
     const input = {
       ...validationInput([resource]),
@@ -101,7 +135,7 @@ export function genuineResearchApproval(): Promise<{ readonly result: ResearchVa
     const record = result.subjectResults[0];
     if (record === undefined) throw new Error('dispatch test fixture requires a subject');
     expect(record.verdict).toBe('PASSED');
-    const kernel = makeKernel();
+    const kernel = makeKernel(pair);
     expect(record.strategyId).toBe(kernel.strategyId);
     expect(record.strategyVersion).toBe(kernel.strategyVersion);
     expect(record.parameterHash).toBe(kernel.parameterHash);
@@ -110,5 +144,6 @@ export function genuineResearchApproval(): Promise<{ readonly result: ResearchVa
     if (origin === null) throw new Error('dispatch test fixture requires a genuine approval origin');
     return { result, origin };
   })();
-  return cachedApproval;
+  cachedApprovals.set(pair, approval);
+  return approval;
 }

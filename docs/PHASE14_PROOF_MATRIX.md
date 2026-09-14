@@ -276,14 +276,59 @@ overall Phase14 final milestone gate is therefore **not yet** claimed PASS
 | F14-06 | `PaperAccount.revision` was observed by P14-H but never enforced at mutation time — admission/release never advanced it at all, and OPEN/CLOSE checked only `ownerFence`, so durable state could change between a HEALTHY observation and the mutation it authorized, even under the same fence | `admitAndPersist`/`releaseAndPersist`/`executeOpen`/`executeClose` all accept an optional `expectedRevision` and re-verify it under the same `SELECT ... FOR UPDATE` account lock as the mutation itself (never a separate preflight read); admission and release now atomically advance `PaperAccount.revision`; P14-I's production runtime binds every OPEN to its own fresh `#assertFreshlyHealthy()` revision, and CLOSE/the post-admission OPEN fill bind to the exact new revision admission produced | `tests/integration/execution/paper-account-persistence.test.ts` ("F14-06 correction" — revision transitions, multi-account isolation, stale-OPEN-revision rejection) + `tests/integration/execution/paper-account-kernel.test.ts` ("F14-06 correction" — stale-CLOSE-revision rejection) | CORRECTED |
 | F14-07 | `PaperAccountProductionComposer.start()` trusted `PaperAccountKernel.getState()` (a diagnostic map set once at successful startup) to decide whether a cached READY facade was still valid — that map never reflects a `PaperAccountSession` faulting after startup (e.g. an outcome-ambiguous admission failure), so a stale READY facade over a FAULTED session could be returned indefinitely | `start()` now always re-verifies through `PaperAccountKernel.startPaperAccountRuntime` itself (the kernel's own recovery authority) before trusting a cached facade — a genuinely-still-READY session returns the identical cached `PaperAccountRuntime` instance with no re-reconciliation (§7's original idempotent fast path preserved); any other outcome (kernel had to recover, or recovery itself failed) discards the stale facade and requires a full fresh startup — fresh reconciliation included — before any new READY facade is produced | `tests/unit/execution/persistence/session-fault-recovery.test.ts` ("F14-07 correction" — 2 new tests: successful kernel-mediated recovery with no duplicate economics, and a failed recovery leaving the account NOT_READY) | CORRECTED |
 
-### 13.5 Conservative final-gate status (unchanged from before this wave)
+### 13.5 Conservative final-gate status (as of Wave 1)
 
-F14-01/F14-02/F14-03 are untouched by this wave and remain open. Phase14's
-overall final milestone gate is **NOT** claimed PASS here — only
-`PHASE14_WAVE1_COMPLETE`. The "Final Phase14 Status" table in §14 below still
-governs the mechanical-readiness claim already established through P14-J;
-this wave neither raises nor lowers it, and does not itself constitute
-`PRODUCTION PAPER MECHANICS READY`.
+F14-01/F14-02/F14-03 were untouched by Wave 1. Phase14's overall final
+milestone gate was **NOT** claimed PASS there — only
+`PHASE14_WAVE1_COMPLETE`. (F14-01/F14-02 are corrected in Wave 2, §13B below;
+F14-03 remains open.)
+
+---
+
+## 13B. Phase14 Final-Gate Correction Wave 2 (F14-01/F14-02)
+
+Two authority/provenance defects from the same Astra pass. Both are corrected
+here. **F14-03 (ExecutionPolicy content/hash validation, negative fee/slippage
+domains, zero multiplier, authoritative instrument-multiplier binding) is
+deliberately untouched and remains OPEN** — no policy economics,
+`contractMultiplier` semantics, or fee/slippage validation were modified by
+this wave. No schema, migration, funding, or live-execution change was made.
+
+| Finding | Defect | Correction | Test evidence | Status |
+|---|---|---|---|---|
+| F14-01 | Production OPEN admission accepted caller-supplied `accountSnapshot`/`exposureSnapshot` risk evidence that was never bound to the current durable `PaperAccount`; the first correction then derived `currentEquityInr` as realized-only cash, contradicting Phase13 §12.3 and allowing an OPEN position's unrealized loss to be omitted from drawdown and risk-budget sizing | `src/execution/persistence/authoritative-risk-input.ts` now separates (A) one fence-verified, revision-bound durable transaction from (B) production-acquired mark/conversion evidence and (C/D) pure Decimal MTM derivation. The durable base contains every OPEN position's side, quantity, INR entry price, and its own opening execution-policy multiplier lineage. P14-I acquires a fresh current-generation CoinDCX mark for every distinct OPEN pair plus a locally-fresh conversion, then computes every position's frozen LONG/SHORT unrealized PnL and `equity = cashBalance + ΣU`; one missing, stale, or caller-supplied constituent fails the whole OPEN before admission. Positive U remains non-spendable through `min(cashBalance, equity)`, while negative U reduces both available margin and Phase13's equity-based risk budget. Caller account/exposure fields remain removed and durable-dependent pair facts remain strictly checked. Health/base revision disagreement is `HEALTH_STALE`; any later mutation is rejected atomically by admission's `expectedRevision` as `STALE_ACCOUNT_REVISION`. CLOSE deliberately performs no MTM risk gate because every equity-sensitive Phase13 gate is OPEN-only and de-risking must not be blocked by a new valuation prerequisite | `tests/unit/execution/persistence/authoritative-mtm-equity.test.ts` (19 tests: LONG/SHORT, conversion, precision, all positions, no fallback, margin, insolvency, daily-PnL isolation, CLOSE boundary, drawdown and risk-budget adversaries); `tests/unit/execution/trusted-evidence.test.ts` (5 valuation-provenance/freshness tests); `tests/integration/execution/paper-production-runtime.test.ts` (15 F14-01 live-DB tests: durable authority, smuggling/mismatch rejection, revision races, second-pair MTM sizing, unrealized-only drawdown rejection, and all-OPEN-pair valuation) | CORRECTED |
+| F14-02 | Trusted evidence was non-forgeable as an *object* but not in its *provenance*: a caller could publicly construct a `CoinDcxPaperEvidence`, hand it a fake socket factory, feed fabricated `depth-snapshot`/conversion payloads through the public `ingest*` methods, and the trusted adapter minted an AVAILABLE, production-usable `TrustedPaperExecutionEvidence` — it only proved "an adapter wrapped a provider object" | New module-private `PRODUCTION_ACQUISITION_CAPABILITY` (`src/integration/coindcx/acquisition-capability.ts`, absent from the public barrel, mirroring `SESSION_PROOF`/`ACCOUNT_FAULT_RECOVERY_CAPABILITY`). Every stored P14-B datum now carries `PRODUCTION_ACQUISITION` vs `CALLER_SUPPLIED` provenance; only the provider's own approved acquisition paths (`startOrderbookWebSocket`/`startMarkWebSocket` callbacks, `readOrderbookBootstrap`/`readConversion`) supply the capability, and only on a provider whose acquisition seams are the genuine defaults (no injected socket factory, REST transport, or clock) or which holds the capability itself. The adapter now reads through `readProductionAcquiredPaperExecutionEvidence`, which requires (a) an instance registered by the real constructor's own `new.target` identity (subclasses excluded), (b) invocation of the PROTOTYPE reader over private twins of the public getters (own-property shadows excluded), and (c) production provenance on the quote, depth **and** conversion. `FakeCoinDcxSocket`/`FakeCoinDcxSocketFactory` were removed from the public CoinDCX barrel | `tests/unit/execution/trusted-evidence.test.ts` — "F14-02" (10 new tests): Astra's fabrication reproducer yields `EVIDENCE_NOT_PRODUCTION_ACQUIRED`; fake-socket laundering through the internal callback rejected; subclass rejected; own-property shadow cannot substitute the reader or any getter it uses; structural look-alike rejected; one caller-supplied constituent poisons the bundle; string brand / `isProduction: true` insufficient; generation/staleness/clock-regression/REST-never-blesses gates all still fire; barrel exposes neither the capability nor the fakes. Plus `tests/integration/execution/paper-production-runtime.test.ts` — "F14-02 live-DB": fabricated evidence cannot fill an OPEN and cannot close a genuinely OPEN position | CORRECTED |
+
+### 13B.1 F14-01 final MTM correction boundary
+
+V2 §12 defines `equity = cashBalance + U` (U = unrealized mark-to-market).
+The durable base is loaded and unlocked before any provider read; P14-I then
+obtains production-acquired mark/conversion valuation evidence and performs a
+pure Decimal derivation over **every** durable OPEN position. This preserves
+the no-network-inside-account-transaction boundary while making §12.4
+drawdown and §11 risk-budget sizing fully unrealized-sensitive. A revision
+change after the base read remains fail-closed at admission under the original
+account lock. There is no entry-price, candle, LTP, partial-account, or
+assume-zero fallback. Zero OPEN positions require no valuation provider work.
+
+CLOSE retains the realized-only snapshot construction solely because Phase13
+does not consult equity, drawdown, exposure, or sizing gates for CLOSE; adding
+a mark prerequisite there would newly block de-risking. Execution's existing
+fresh trusted quote/depth/conversion gate is unchanged.
+
+`AccountRiskSnapshot.accountMaxLeverage` remains an explicit caller/config
+input (`ProductionOpenParams.accountMaxLeverage`, default `null`): the P14-C
+paper schema persists no per-account exchange leverage cap, so deriving one
+would be invention. It is classified as external policy/config, not durable
+account state.
+
+### 13B.2 Conservative final-gate status after Wave 2
+
+F14-01 and F14-02 are corrected; **F14-03 remains OPEN**. Phase14's overall
+final milestone gate is **NOT** claimed PASS here — only
+`PHASE14_WAVE2_COMPLETE`. This wave does not constitute
+`PRODUCTION PAPER MECHANICS READY`, `PAPER_APPROVED`, `SHADOW`, or `LIVE`;
+the maximum lifecycle remains `PAPER`.
 
 ---
 
@@ -294,21 +339,25 @@ this wave neither raises nor lowers it, and does not itself constitute
 | Phase 14 implementation complete? | **YES** (A through J) |
 | Production PAPER mechanical path (dispatch → risk → durable admission → evidence → execution) | **PROVEN** |
 | Restart / fencing / reconciliation | **PROVEN, Wave1-corrected** (§13: F14-04/05/06/07) |
+| Production risk-input authority | **PROVEN, Wave2-corrected** (§13B: F14-01 — derived from durable state under the admitted revision) |
+| Production market-evidence provenance | **PROVEN, Wave2-corrected** (§13B: F14-02 — approved CoinDCX acquisition required) |
 | Funding economic parity | **INTENTIONALLY UNSUPPORTED / PROVIDER-BLOCKED** (§11) |
 | Maximum lifecycle | **PAPER** |
 | Transitive paper/live import isolation | **PROVEN — strict zero, no exceptions** (§10) |
 | Live execution adapter | **NOT_IMPLEMENTED / NOT_ACTIVE** (§10) |
-| F14-01 / F14-02 / F14-03 (risk-evidence authority / market-evidence public ingestion / ExecutionPolicy validation-multiplier binding) | **OPEN — not addressed by this wave** |
-| Final Astra milestone gate | **NOT YET PASS** — pending F14-01/02/03 and a final targeted re-verify of this wave |
+| Drawdown gate sensitivity to unrealized PnL | **FULL MTM FOR OPEN ADMISSION** — every durable OPEN position valued from production-acquired fresh mark/conversion evidence (§13B.1) |
+| F14-01 / F14-02 | **CORRECTED** (§13B) |
+| F14-03 (ExecutionPolicy content/hash validation, fee/slippage domains, zero multiplier, authoritative instrument-multiplier binding) | **OPEN — deliberately out of Wave 2 scope** |
+| Final Astra milestone gate | **NOT YET PASS** — pending F14-03; Waves 1–2 targeted re-verification is complete |
 | Ready for Phase 15 ranking? | Only if Phase 15 explicitly consumes funding-excluded diagnostics as diagnostics, and does **not** treat funding-excluded PnL as production-approval economics. If Phase 15's dependency on funding-excluded profitability is ever ambiguous, that ambiguity should be documented as a Phase 15 limitation — P14-J does not invent or authorize Phase 15 policy here. |
 
 **Correct one-line summary:** Phase 14 is a mechanically production-ready
 PAPER runtime with restart-safe fencing, durable admission, trusted-evidence-
 gated execution, and account-scoped reconciliation health-gating — **not** a
 full CoinDCX economic-parity paper simulation, and **not** promotion-eligible.
-Wave 1 of the final-gate correction (F14-04/05/06/07) is complete;
-F14-01/02/03 remain open, so **PRODUCTION PAPER MECHANICS READY is not yet
-claimed**.
+Wave 1 (F14-04/05/06/07) and Wave 2 (F14-01/F14-02) of the final-gate
+correction are complete; **F14-03 remains open**, so **PRODUCTION PAPER
+MECHANICS READY is not yet claimed**.
 
 ---
 
@@ -329,4 +378,21 @@ Wave 1 correction (F14-04/05/06/07) additionally ran:
 npx vitest run tests/integration/execution tests/unit/dispatch tests/unit/risk \
   tests/unit/coin-runtime tests/unit/execution tests/architecture
 npx vitest run   # full suite — 159 files / 1947 tests passed
+```
+
+Wave 2 correction (F14-01/F14-02) additionally ran:
+
+```
+npx prisma validate                               # schema UNCHANGED (no migration)
+npm run typecheck                                 # 0 errors
+npm run lint                                      # 0 errors (10 pre-existing `any` warnings, untouched fixture code)
+npm run build                                     # clean
+npx vitest run tests/integration/execution/paper-production-runtime.test.ts \
+  tests/unit/execution/trusted-evidence.test.ts \
+  tests/unit/execution/persistence/session-fault-recovery.test.ts \
+  tests/architecture/phase14-import-graph.test.ts
+npx vitest run tests/integration/execution tests/unit/dispatch tests/unit/risk \
+  tests/unit/coin-runtime tests/unit/execution tests/architecture
+                                                  # 48 files / 779 tests passed
+npm test   # full suite — 160 files / 1998 tests passed, 0 failures (+51 vs Wave 1)
 ```

@@ -5,7 +5,10 @@ import { SerialQueue } from '../../dispatch/serial-queue';
 import type { AdmissionRequest } from '../../dispatch';
 import {
   PaperAccountKernel, PaperAccountReconciler, PaperPersistenceError, SystemClock,
-  type Clock, type PaperAccountReconciliationResult, type PaperAccountRuntime, type PaperCloseExecutionResult, type PaperOpenExecutionResult,
+  deriveCloseRiskInput, deriveMarkToMarketRiskInput, loadAuthoritativePaperRiskBase, pairSnapshotDurableMismatch,
+  type AuthoritativePaperRiskBase, type AuthoritativePaperRiskInput, type AuthoritativeValuationEvidence,
+  type Clock, type PaperAccountReconciliationResult, type PaperAccountRuntime,
+  type PaperCloseExecutionResult, type PaperOpenExecutionResult,
 } from '../../execution/persistence';
 import { disclosePaperFundingExcluded } from '../../execution/funding-capability';
 import { mintPaperOpenExecutionAuthority, type PaperOpenRiskEvidence } from '../../execution/open-authority';
@@ -15,7 +18,7 @@ import { issueResearchApprovalOrigin, type ResearchValidationPlanResult } from '
 import type { RiskEvaluationContext, RiskPolicy } from '../../risk';
 import type { StrategyDecision, StrategyKernel } from '../../strategies';
 import { getTrustedPaperExecutionEvidence } from './execution-evidence-adapter';
-import { CoinDcxPaperEvidence } from './paper-evidence';
+import { CoinDcxPaperEvidence, readProductionAcquiredPaperValuationEvidence } from './paper-evidence';
 
 /**
  * [P14-I] Production PAPER runtime composition.
@@ -57,7 +60,9 @@ export type PaperProductionRuntimeFailureCode =
   | 'HEALTH_STALE'
   | 'EVIDENCE_UNAVAILABLE'
   | 'AUTHORITY_REJECTED'
-  | 'POSITION_NOT_OPEN';
+  | 'POSITION_NOT_OPEN'
+  /** [F14-01] A caller tried to supply authoritative account/exposure risk evidence, or supplied a pair snapshot contradicting current durable state. */
+  | 'RISK_INPUT_NOT_AUTHORITATIVE';
 
 /** Mirrors `PaperPersistenceError`'s exact `code`+message+`cause` shape. Lower-layer errors (`STALE_FENCE`, `RECONCILIATION_REQUIRED`, `FUNDING_INVARIANT_VIOLATION`, ...) are never wrapped — they propagate as their own `PaperPersistenceError` untouched (§36/§46). */
 export class PaperProductionRuntimeError extends Error {
@@ -74,8 +79,28 @@ export class PaperProductionRuntimeError extends Error {
 // Public parameter/state shapes
 // ---------------------------------------------------------------------------
 
-/** Same shape as `PaperOpenRiskEvidence`/`PaperCloseRiskEvidence` (both `Omit<RiskEvaluationContext, 'strategyOrigin' | 'candidate'>`) — defined once here for P14-I's own public surface. */
-export type PaperProductionRiskEvidence = Omit<RiskEvaluationContext, 'strategyOrigin' | 'candidate'>;
+/**
+ * [F14-01] The NON-authoritative half of the risk evaluation context — the
+ * only half a production caller may supply.
+ *
+ * `accountSnapshot` and `exposureSnapshot` are deliberately removed (§6's
+ * preferred outcome: remove the caller-authoritative fields outright rather
+ * than compare-and-hope). Both are now derived by this runtime from the
+ * current fenced durable paper account at the exact revision this call's own
+ * fresh P14-H health observation saw, so a caller can no longer present
+ * another account's capital, omit an OPEN position's exposure, understate its
+ * realized loss/fee state, or replay a stale account observation.
+ *
+ * `pairSnapshot` remains caller-supplied because it also carries instrument
+ * spec and market valuation facts this layer has no durable source for — but
+ * its durable-state-dependent members (`position`, `ownership`) are strictly
+ * verified against the authoritative slot before admission and REJECTED on any
+ * disagreement (never silently rewritten).
+ */
+export type PaperProductionRiskRequest = Omit<
+  RiskEvaluationContext,
+  'strategyOrigin' | 'candidate' | 'accountSnapshot' | 'exposureSnapshot'
+>;
 
 export interface ProductionOpenParams {
   readonly kernel: StrategyKernel;
@@ -83,10 +108,12 @@ export interface ProductionOpenParams {
   readonly instrumentSpecSnapshotId: string;
   readonly planResult: ResearchValidationPlanResult;
   readonly policy: RiskPolicy;
-  readonly riskEvidence: PaperProductionRiskEvidence;
+  readonly riskRequest: PaperProductionRiskRequest;
   readonly executionPolicy: ExecutionPolicySnapshot;
   readonly priceIncrement: string;
   readonly quantityIncrement: string;
+  /** [F14-01 class F] External config, not durable account state — no per-account exchange leverage cap is persisted. Omitted/`null` = no account-level cap. */
+  readonly accountMaxLeverage?: string | null;
 }
 
 export interface ProductionCloseParams {
@@ -94,9 +121,10 @@ export interface ProductionCloseParams {
   readonly decision: StrategyDecision;
   readonly instrumentSpecSnapshotId: string;
   readonly policy: RiskPolicy;
-  readonly riskEvidence: PaperProductionRiskEvidence;
+  readonly riskRequest: PaperProductionRiskRequest;
   readonly executionPolicy: ExecutionPolicySnapshot;
   readonly priceIncrement: string;
+  readonly accountMaxLeverage?: string | null;
 }
 
 /** P14-I's OWN readiness — distinct from `CoinRuntime` lifecycle and from `PaperAccountKernelState` (§32). */
@@ -215,8 +243,133 @@ export class PaperAccountProductionRuntime {
     return health;
   }
 
+  /**
+   * [F14-01] Derives the authoritative account/exposure risk evidence for THIS
+   * call from the current fenced durable paper account, and proves it
+   * corresponds to the exact revision this call's own fresh P14-H health
+   * observation just saw.
+   *
+   * Two independent revision guards, in this order:
+   *  1. Here: the durable derivation itself must observe revision R (a
+   *     same-account mutation landing between the health read and this read
+   *     fails `HEALTH_STALE` before any provider/economic work is attempted).
+   *  2. At admission: `admitAndPersist(..., expectedRevision R)` atomically
+   *     re-verifies R under the account lock (the unweakened Wave1/F14-06
+   *     binding), so a mutation landing after THIS read still fails
+   *     `STALE_ACCOUNT_REVISION` with no reservation and no economics.
+   * A derived snapshot therefore can never drift from the state it is admitted
+   * against.
+   */
+  async #authoritativeRiskBase(
+    params: { readonly policy: RiskPolicy; readonly riskRequest: PaperProductionRiskRequest },
+    health: PaperAccountReconciliationResult,
+  ): Promise<AuthoritativePaperRiskBase> {
+    // A JS caller (no compile-time checking) must not be able to smuggle an
+    // authoritative snapshot in through the request object.
+    for (const forbidden of ['accountSnapshot', 'exposureSnapshot'] as const) {
+      if (Object.prototype.hasOwnProperty.call(params.riskRequest, forbidden)) {
+        throw new PaperProductionRuntimeError(
+          'RISK_INPUT_NOT_AUTHORITATIVE',
+          `riskRequest must not carry ${forbidden} — production ${forbidden} is derived from durable paper-account state, never accepted from a caller`,
+        );
+      }
+    }
+    // [F14-01 step A] Durable, locked, revision-bound. No network I/O occurs
+    // inside this transaction (§5) — valuation evidence is acquired only after
+    // it has committed and released the account-row lock.
+    const base = await loadAuthoritativePaperRiskBase({
+      ownership: this.#kernelRuntime.session.ownership, policy: params.policy, evaluationTimeMs: params.riskRequest.evaluationTimeMs,
+    }, this.#prisma);
+    if (base.revision !== health.revision || base.fence !== health.ownerFence) {
+      throw new PaperProductionRuntimeError(
+        'HEALTH_STALE',
+        `Authoritative risk derivation observed (fence ${base.fence}, revision ${base.revision}) for ${this.accountId}, which no longer matches this call's fresh health observation (fence ${health.ownerFence}, revision ${health.revision})`,
+      );
+    }
+    // Ordered before any valuation work, so a request that is already
+    // structurally rejected never causes provider work.
+    const mismatch = pairSnapshotDurableMismatch(params.riskRequest.pairSnapshot, this.accountId, base.pairSlots);
+    if (mismatch !== null) throw new PaperProductionRuntimeError('RISK_INPUT_NOT_AUTHORITATIVE', mismatch);
+    return base;
+  }
+
+  /**
+   * [F14-01] OPEN risk input with authoritative mark-to-market equity.
+   *
+   * `docs/RISK_LEVERAGE_ENGINE.md` §12.3 defines `currentEquityInr` as
+   * INCLUDING unrealized PnL, and §12.4's drawdown gate is sensitive to it. So
+   * after the durable transaction has closed (step A), this acquires
+   * production-acquired CoinDCX mark + conversion evidence for EVERY pair the
+   * account currently holds open (step B) and derives
+   * `equity = cashBalance + Σ U` (steps C/D). It fails closed — never at zero,
+   * never from the entry price — if any open position cannot be valued.
+   *
+   * An account with zero OPEN positions performs NO provider work at all
+   * (§21): unrealized PnL is exactly zero by construction.
+   *
+   * Acquiring a MARK before admission is legitimate and now required, because
+   * Phase13 cannot evaluate equity without it. The EXECUTABLE quote/depth
+   * bundle is deliberately still acquired only AFTER admission (§22) — this
+   * reads the narrower valuation evidence, through the same F14-02 production
+   * acquisition boundary.
+   */
+  async #openRiskInput(params: ProductionOpenParams, health: PaperAccountReconciliationResult): Promise<AuthoritativePaperRiskInput> {
+    const base = await this.#authoritativeRiskBase(params, health);
+
+    let valuation: AuthoritativeValuationEvidence | null = null;
+    if (base.openPositions.length > 0) {
+      const pairs = [...new Set(base.openPositions.map((position) => position.pair))];
+      const read = readProductionAcquiredPaperValuationEvidence(this.#provider, pairs);
+      if (read.state !== 'AVAILABLE') {
+        throw new PaperProductionRuntimeError(
+          'EVIDENCE_UNAVAILABLE',
+          `Mark-to-market equity for ${this.accountId} requires production-acquired valuation evidence for [${pairs.join(', ')}]: ${read.reason}`,
+        );
+      }
+      valuation = {
+        conversionRateInrPerUsdt: read.snapshot.conversion.conversionPriceInrPerUsdt,
+        markPriceUsdtByPair: new Map([...read.snapshot.marksByPair].map(([pair, mark]) => [pair, mark.markPrice])),
+      };
+    }
+
+    const derived = deriveMarkToMarketRiskInput({ base, policy: params.policy, valuation, accountMaxLeverage: params.accountMaxLeverage ?? null });
+    if (derived.status !== 'DERIVED') {
+      throw new PaperProductionRuntimeError('EVIDENCE_UNAVAILABLE', `Mark-to-market equity could not be derived for ${this.accountId}: ${derived.reason}`);
+    }
+    return derived.input;
+  }
+
+  /** [F14-01] The full, admission-ready context: caller request + derived authoritative account/exposure evidence + genuinely-issued strategy authority. */
+  static #riskContext(
+    request: PaperProductionRiskRequest, authoritative: AuthoritativePaperRiskInput,
+    strategyOrigin: RiskEvaluationContext['strategyOrigin'], candidate: RiskEvaluationContext['candidate'],
+  ): RiskEvaluationContext {
+    return {
+      ...request, strategyOrigin, candidate,
+      accountSnapshot: authoritative.accountSnapshot, exposureSnapshot: authoritative.exposureSnapshot,
+    };
+  }
+
   async #executeOpenLocked(params: ProductionOpenParams): Promise<PaperOpenExecutionResult> {
     const health = await this.#assertFreshlyHealthy();
+
+    // [F14-01/§52] Read-only terminal fast path, required to keep the frozen
+    // retry-idempotency contract intact under the new ordering. Once this
+    // source decision has a durable terminal `PaperFill`, the pair slot it
+    // filled is legitimately OPEN — so the authoritative pair-snapshot binding
+    // below would (correctly, for any OTHER request) reject the retry's
+    // decision-time FLAT snapshot. `PaperFill`'s own
+    // `UNIQUE(accountId, sourceStrategyDecisionId)` makes this an already-
+    // terminal FACT, never a guess, and `admitAndPersist` still performs the
+    // authoritative in-transaction dedup for every path that reaches it — this
+    // only surfaces the identical outcome earlier, mutating nothing.
+    const terminalFill = await this.#prisma.paperFill.findUnique({
+      where: { accountId_sourceStrategyDecisionId: { accountId: this.accountId, sourceStrategyDecisionId: params.decision.decisionId } },
+      select: { orderId: true },
+    });
+    if (terminalFill !== null) return disclosePaperFundingExcluded({ outcome: 'SOURCE_DECISION_ALREADY_EXECUTED' as const });
+
+    const authoritative = await this.#openRiskInput(params, health);
 
     const researchApproval = issueResearchApprovalOrigin(params.planResult, {
       pair: params.kernel.pair, strategyId: params.kernel.strategyId, strategyVersion: params.kernel.strategyVersion, parameterHash: params.kernel.parameterHash,
@@ -225,7 +378,7 @@ export class PaperAccountProductionRuntime {
     const authorized = authorizeStrategyDispatch(params.kernel, params.decision, params.instrumentSpecSnapshotId, researchApproval);
     if (authorized === null) throw new PaperProductionRuntimeError('AUTHORITY_REJECTED', 'Strategy dispatch authorization was rejected');
 
-    const admissionContext: RiskEvaluationContext = { ...params.riskEvidence, strategyOrigin: authorized.strategyOrigin, candidate: authorized.candidate };
+    const admissionContext = PaperAccountProductionRuntime.#riskContext(params.riskRequest, authoritative, authorized.strategyOrigin, authorized.candidate);
     const admissionRequest: AdmissionRequest = { accountId: this.accountId, policy: params.policy, context: admissionContext };
     // [F14-06] Bind admission to the exact revision this call's own fresh
     // health observation just saw, atomically re-verified under the account
@@ -245,7 +398,12 @@ export class PaperAccountProductionRuntime {
     const authority = await mintPaperOpenExecutionAuthority({
       coordinator: this.#coordinator, accountId: this.accountId, kernel: params.kernel, decision: params.decision,
       instrumentSpecSnapshotId: params.instrumentSpecSnapshotId, planResult: params.planResult, policy: params.policy,
-      evidence: params.riskEvidence as PaperOpenRiskEvidence,
+      // [F14-01] The exact same authoritative evidence admission itself used —
+      // the mint's own idempotent `coordinator.admit` must see byte-identical
+      // account/exposure facts, never a second, differently-sourced object.
+      evidence: {
+        ...params.riskRequest, accountSnapshot: authoritative.accountSnapshot, exposureSnapshot: authoritative.exposureSnapshot,
+      } satisfies PaperOpenRiskEvidence,
     });
     if (authority === null) throw new PaperProductionRuntimeError('AUTHORITY_REJECTED', 'OPEN execution authority was not granted');
 
@@ -279,12 +437,27 @@ export class PaperAccountProductionRuntime {
       ownedQuantity: slot.quantity.toFixed(),
     };
 
+    // [F14-01/§23] CLOSE gains no research/admission step and NO mark-to-market
+    // risk gate — it simply stops trusting caller-supplied account/exposure/
+    // position evidence, exactly as OPEN now does. Every equity-sensitive
+    // Phase13 gate is OPEN-only (see `deriveCloseRiskInput`'s own note), so
+    // requiring a fresh mark here would only add a new way for de-risking to
+    // be blocked, which the frozen rule forbids. Ordered AFTER the durable
+    // position read so CLOSE's own primary precondition still surfaces as
+    // `POSITION_NOT_OPEN` (§46: the most meaningful lower-layer reason, never
+    // masked by a generic one).
+    const base = await this.#authoritativeRiskBase(params, health);
+    const authoritative = deriveCloseRiskInput({ base, policy: params.policy, accountMaxLeverage: params.accountMaxLeverage ?? null });
+
     const evidenceRead = getTrustedPaperExecutionEvidence(this.#provider, pair);
     if (evidenceRead.state !== 'AVAILABLE') throw new PaperProductionRuntimeError('EVIDENCE_UNAVAILABLE', `Fresh P14-B trusted evidence unavailable for ${pair}: ${evidenceRead.reason}`);
 
     const authority = await mintPaperCloseExecutionAuthority({
       coordinator: this.#coordinator, accountId: this.accountId, kernel: params.kernel, decision: params.decision,
-      instrumentSpecSnapshotId: params.instrumentSpecSnapshotId, policy: params.policy, evidence: params.riskEvidence as PaperCloseRiskEvidence, position,
+      instrumentSpecSnapshotId: params.instrumentSpecSnapshotId, policy: params.policy, position,
+      evidence: {
+        ...params.riskRequest, accountSnapshot: authoritative.accountSnapshot, exposureSnapshot: authoritative.exposureSnapshot,
+      } satisfies PaperCloseRiskEvidence,
     });
     if (authority === null) throw new PaperProductionRuntimeError('AUTHORITY_REJECTED', 'CLOSE execution authority was not granted');
 

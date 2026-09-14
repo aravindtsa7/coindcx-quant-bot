@@ -269,6 +269,12 @@ describe('P14-J capability export safety (§18/§19/§52)', () => {
     PRODUCTION_ISSUER: 'src/integration/coindcx/paper-production-runtime.ts',
     SESSION_PROOF: 'src/execution/persistence/admission-bridge.ts',
     ACCOUNT_FAULT_RECOVERY_CAPABILITY: 'src/dispatch/admission.ts',
+    // [F14-02] The production market-evidence acquisition capability. Like
+    // SESSION_PROOF/ACCOUNT_FAULT_RECOVERY_CAPABILITY it IS exported from its
+    // own concrete module (so the P14-B provider, the trusted adapter, and
+    // zero-network test harnesses can import it directly) but must never be
+    // reachable through the public CoinDCX barrel.
+    PRODUCTION_ACQUISITION_CAPABILITY: 'src/integration/coindcx/acquisition-capability.ts',
   };
 
   const PUBLIC_BARRELS = [
@@ -305,7 +311,7 @@ describe('P14-J capability export safety (§18/§19/§52)', () => {
     for (const [name, definingFile] of Object.entries(DEFINING_FILES)) {
       const absDefiningFile = path.join(REPO_ROOT, definingFile);
       const ownExports = collectPublicExportNames(absDefiningFile, readFile, () => null);
-      if (name === 'SESSION_PROOF' || name === 'ACCOUNT_FAULT_RECOVERY_CAPABILITY') {
+      if (name === 'SESSION_PROOF' || name === 'ACCOUNT_FAULT_RECOVERY_CAPABILITY' || name === 'PRODUCTION_ACQUISITION_CAPABILITY') {
         expect(ownExports.has(name), `${definingFile} was expected to export ${name} at its own module level`).toBe(true);
       } else {
         expect(ownExports.has(name), `${definingFile} must keep ${name} module-private (not exported even from its own file)`).toBe(false);

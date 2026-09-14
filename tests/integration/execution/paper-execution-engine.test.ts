@@ -18,6 +18,7 @@ import {
   type TrustedPaperConversionEvidence,
   type TrustedPaperOrderbookDepth,
 } from '../../../src/execution/trusted-evidence';
+import { PRODUCTION_ACQUISITION_CAPABILITY } from '../../../src/integration/coindcx/acquisition-capability';
 import { FakeClock } from '../../../src/integration/coindcx/clock';
 import { getTrustedPaperExecutionEvidence } from '../../../src/integration/coindcx/execution-evidence-adapter';
 import { CoinDcxPaperEvidence } from '../../../src/integration/coindcx/paper-evidence';
@@ -712,18 +713,23 @@ describe('P14-E correction proofs — evidence freshness and approved economics'
     expect(await prisma.paperFill.count({ where: { accountId } })).toBe(baseCounts.fills);
     expect(await prisma.paperLedgerEntry.count({ where: { accountId } })).toBe(baseCounts.ledger);
 
+    // [F14-02] Production-usable trusted evidence now additionally requires
+    // approved CoinDCX acquisition provenance, so this zero-network fixture
+    // reaches the genuine acquisition path through the module-private,
+    // non-barrel capability (the sanctioned internal test harness route).
     const provider = new CoinDcxPaperEvidence({
       instruments: [{ pair: PAIR, underlying: 'BTC', quoteCurrency: 'USDT', instrumentSpecSnapshotId: INSTRUMENT_SPEC_SNAPSHOT_ID }],
       clock: new FakeClock(nowMs), socketFactory: new FakeCoinDcxSocketFactory(),
       policy: { orderbookFreshnessMs: 5_000, markFreshnessMs: 5_000, conversionLocalPollFreshnessMs: 60_000, allowedProviderFutureSkewMs: 1_000 },
+      acquisitionCapability: PRODUCTION_ACQUISITION_CAPABILITY,
     });
     const generation = provider.startOrderbookWebSocket();
     expect(provider.ingestOrderbookWebSocket({
       data: JSON.stringify({ type: 'depth-snapshot', pr: 'futures', s: 'BTCUSDT', ts: String(nowMs), vs: '1', bids: [['99', '1000000']], asks: [['99.5', '1000000']] }),
-    }, generation)).toMatchObject({ accepted: true });
+    }, generation, undefined, PRODUCTION_ACQUISITION_CAPABILITY)).toMatchObject({ accepted: true });
     expect(provider.ingestConversionRest([{
       symbol: 'USDTINR', margin_currency_short_name: 'INR', target_currency_short_name: 'USDT', conversion_price: '80', last_updated_at: '1',
-    }])).toMatchObject({ accepted: true });
+    }], PRODUCTION_ACQUISITION_CAPABILITY)).toMatchObject({ accepted: true });
     const trusted = getTrustedPaperExecutionEvidence(provider, PAIR);
     expect(trusted.state).toBe('AVAILABLE');
     if (trusted.state !== 'AVAILABLE') return;

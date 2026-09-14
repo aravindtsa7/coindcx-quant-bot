@@ -84,6 +84,8 @@ export function buildBaseExposureSnapshot(
   accountId: string,
   openPositions: readonly { readonly pair: string; readonly strategyId: string; readonly quantity: string; readonly averageEntryPriceInr: string }[],
   observedAtMs: number,
+  /** [F14-01] The configured `RiskSourceAuthorityPolicy.exposureSourceId` when this projection is fed to a real `RiskEngine` (which rejects a snapshot whose `sourceId` disagrees with policy). Defaults to the historical fixed id so every existing caller/test is unchanged. */
+  sourceId: string = 'PAPER_POSITION_PROJECTION_V1',
 ): PortfolioExposureSnapshot {
   let global = riskDecimal('0');
   const perPair = new Map<string, ReturnType<typeof riskDecimal>>();
@@ -105,7 +107,7 @@ export function buildBaseExposureSnapshot(
   return Object.freeze({
     ...content,
     pending: { status: 'UNKNOWN' as const },
-    provenance: provenance('PAPER_POSITION_PROJECTION_V1', observedAtMs, content),
+    provenance: provenance(sourceId, observedAtMs, content),
   });
 }
 

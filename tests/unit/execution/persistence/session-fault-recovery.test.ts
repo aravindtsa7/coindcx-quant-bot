@@ -1,4 +1,4 @@
-import { Prisma, type PrismaClient } from '@prisma/client';
+﻿import { Prisma, type PrismaClient } from '@prisma/client';
 import { describe, expect, it } from 'vitest';
 import { RiskAdmissionCoordinator } from '../../../../src/dispatch/admission';
 import type { AdmissionRequest } from '../../../../src/dispatch';
@@ -12,21 +12,21 @@ import { CoinDcxPaperEvidence, type PaperEvidenceInstrument } from '../../../../
 import { FakeCoinDcxSocketFactory } from '../../../../src/integration/coindcx/websocket/socket-adapter';
 import { PaperAccountProductionComposer, type ProductionOpenParams } from '../../../../src/integration/coindcx/paper-production-runtime';
 import { buildExecutionPolicySnapshot, EXECUTION_POLICY_VERSION, type ExecutionPolicySnapshot } from '../../../../src/execution';
-import { buildContext, evaluateDecision, genuineResearchApproval, makeKernel, policyFor } from '../../dispatch/helpers';
+import { buildContext, evaluateDecision, genuineResearchApproval, makeKernel, policyFor, productionRiskRequest } from '../../dispatch/helpers';
 
 // P14-D-BLK-01/MAJ-01 correction tests (Antigravity targeted-verify findings).
 //
 // A genuine MySQL "commit acknowledged but client saw an error" is
 // impractical to reproduce deterministically (the correction mission
-// explicitly does not require it — §9). What MUST be proven deterministically
+// explicitly does not require it â€” Â§9). What MUST be proven deterministically
 // is that our own code treats ANY error occurring after
 // `RiskAdmissionCoordinator.admit()`/`.release()` has already mutated
 // in-memory state as outcome-ambiguous and fails closed, never as "rollback
 // memory and continue". This suite injects a failure at exactly that point
-// using a small, fully in-memory fake `PrismaClient` (no real DB needed) —
+// using a small, fully in-memory fake `PrismaClient` (no real DB needed) â€”
 // the real, unmocked `RiskAdmissionCoordinator`/`RiskEngine` still perform the
 // actual admission logic; only the DB layer is faked, per the mission's own
-// explicit allowance for injected transaction-level failure (§8).
+// explicit allowance for injected transaction-level failure (Â§8).
 
 interface AccountRow {
   accountId: string; ownerFence: bigint; revision: bigint;
@@ -106,7 +106,7 @@ function createFakePersistence() {
       paperLedgerEntry: { findFirst: async () => null, findMany: async () => [] },
       paperFill: { findUnique: async () => null, findMany: async () => [] },
       // [F14-07] Only reachable for an account that never has an OPEN
-      // position in these fake-persistence tests (PENDING/EMPTY only) — these
+      // position in these fake-persistence tests (PENDING/EMPTY only) â€” these
       // three always report empty since P14-G rehydration and P14-H
       // reconciliation only inspect them for OPEN-slot lineage.
       paperExecutionIntent: { findMany: async () => [], findUnique: async () => null },
@@ -118,6 +118,10 @@ function createFakePersistence() {
   }
 
   const prisma = {
+    // [F14-01] P14-I's read-only §52 terminal fast path queries this directly
+    // on the client (outside any transaction). This fake account never has a
+    // terminal fill, so it always reports none and the normal path runs.
+    paperFill: { findUnique: async () => null },
     $transaction: async (fn: any) => {
       const accountsSnapshot = new Map(accounts);
       const positionsSnapshot = new Map(positions);
@@ -158,7 +162,7 @@ function createFakePersistence() {
     reservationCount(accountId: string): number {
       return [...reservations.values()].filter((r) => r.accountId === accountId).length;
     },
-    /** [F14-07] Simulates a genuine recovery-restore failure (e.g. the account row vanishing) — never reachable in real operation, only used to prove no READY facade escapes a failed recovery. */
+    /** [F14-07] Simulates a genuine recovery-restore failure (e.g. the account row vanishing) â€” never reachable in real operation, only used to prove no READY facade escapes a failed recovery. */
     dropAccount(accountId: string): void {
       accounts.delete(accountId);
     },
@@ -174,7 +178,7 @@ function buildRequest(accountId: string, pair: string, evaluationTimeMs: number)
 // ---------------------------------------------------------------------------
 // [F14-07] Fixtures reused from the P14-I production-composer suite's own
 // pattern (`CoinDcxPaperEvidence`/`FakeCoinDcxSocketFactory` are fully
-// in-memory — no real network — so they are just as usable in this
+// in-memory â€” no real network â€” so they are just as usable in this
 // fake-Prisma unit suite as they are in the live-DB one).
 // ---------------------------------------------------------------------------
 
@@ -189,12 +193,7 @@ const F14_07_EXECUTION_POLICY: ExecutionPolicySnapshot = buildExecutionPolicySna
 const F14_07_INSTRUMENT_SPEC_SNAPSHOT_ID = 'instrument-1';
 const F14_07_WALL_CLOCK = { nowMs: () => Date.now() };
 
-function evidenceFrom(context: ReturnType<typeof buildContext>) {
-  const { strategyOrigin: _strategyOrigin, candidate: _candidate, ...evidence } = context;
-  return evidence;
-}
-
-/** A real, in-memory `CoinDcxPaperEvidence` provider — deliberately never fed any evidence, so any OPEN that reaches evidence-read fails closed with `EVIDENCE_UNAVAILABLE` rather than proceeding to a fill (this suite's fake Prisma implements no fill-transaction tables at all — proving a genuine ADMISSION succeeded is sufficient to prove the facade is usable and produced no duplicate economics). */
+/** A real, in-memory `CoinDcxPaperEvidence` provider â€” deliberately never fed any evidence, so any OPEN that reaches evidence-read fails closed with `EVIDENCE_UNAVAILABLE` rather than proceeding to a fill (this suite's fake Prisma implements no fill-transaction tables at all â€” proving a genuine ADMISSION succeeded is sufficient to prove the facade is usable and produced no duplicate economics). */
 function f1407Provider(pair: string): CoinDcxPaperEvidence {
   const instruments: readonly PaperEvidenceInstrument[] = Object.freeze([
     Object.freeze({ pair, underlying: 'BTC', quoteCurrency: 'USDT', instrumentSpecSnapshotId: F14_07_INSTRUMENT_SPEC_SNAPSHOT_ID }),
@@ -205,18 +204,19 @@ function f1407Provider(pair: string): CoinDcxPaperEvidence {
   });
 }
 
-async function f1407OpenParams(pair: string, evaluationTimeMs: number): Promise<ProductionOpenParams> {
+async function f1407OpenParams(accountId: string, pair: string, evaluationTimeMs: number): Promise<ProductionOpenParams> {
   const { result: planResult } = await genuineResearchApproval();
   const kernel = makeKernel(pair);
   const decision = evaluateDecision(kernel, evaluationTimeMs);
-  const context = buildContext(kernel, decision);
   return {
     kernel, decision, instrumentSpecSnapshotId: F14_07_INSTRUMENT_SPEC_SNAPSHOT_ID, planResult, policy: policyFor(pair),
-    riskEvidence: evidenceFrom(context), executionPolicy: F14_07_EXECUTION_POLICY, priceIncrement: '1', quantityIncrement: '1',
+    // [F14-01] account/exposure evidence is no longer caller-supplied at all.
+    riskRequest: productionRiskRequest(kernel, decision, accountId),
+    executionPolicy: F14_07_EXECUTION_POLICY, priceIncrement: '1', quantityIncrement: '1',
   };
 }
 
-describe('F14-07 correction — production composer never returns a cached READY facade over a FAULTED session', () => {
+describe('F14-07 correction â€” production composer never returns a cached READY facade over a FAULTED session', () => {
   it('a genuine ambiguous OPEN admission failure faults the session; the next composer.start() discards the stale facade, recovers through the kernel, and returns a fresh, usable READY facade with no duplicate economics', async () => {
     const { prisma, seedAccount, seedPairSlot, reservationCount, injectFailureOnce } = createFakePersistence();
     const accountId = 'f1407-account-1';
@@ -234,29 +234,29 @@ describe('F14-07 correction — production composer never returns a cached READY
     expect(composer.getState(accountId)).toBe('READY');
 
     // A genuine ambiguous OPEN admission failure: coordinator.admit() mutates
-    // in-memory state, then the durable commit fails — the exact P14-D-BLK-01
+    // in-memory state, then the durable commit fails â€” the exact P14-D-BLK-01
     // condition, here reached through the full P14-I public OPEN surface.
     injectFailureOnce(accountId, 'paperPosition.update');
-    const openParams = await f1407OpenParams(pair, 1_200_000);
+    const openParams = await f1407OpenParams(accountId, pair, 1_200_000);
     await expect(runtime1.executeOpen(openParams)).rejects.toMatchObject({ code: 'ADMISSION_OUTCOME_AMBIGUOUS' });
     expect(coordinator.isAccountFaulted(accountId)).toBe(true);
     expect(reservationCount(accountId)).toBe(0); // the injected failure rolled the (simulated) transaction back
 
     // [F14-07 defect] The kernel's own diagnostic getState() never reflects a
-    // post-startup session fault — it still reads READY even though the
+    // post-startup session fault â€” it still reads READY even though the
     // underlying PaperAccountSession is now genuinely FAULTED. A composer
     // that trusted this alone would return the stale cached facade forever.
     expect(kernel.getState(accountId)).toBe('READY');
 
     const runtime2 = await composer.start({ accountId, coordinator, provider });
-    expect(runtime2).not.toBe(runtime1); // never the stale facade — a genuinely fresh one, produced only after kernel recovery + fresh P14-H reconciliation
+    expect(runtime2).not.toBe(runtime1); // never the stale facade â€” a genuinely fresh one, produced only after kernel recovery + fresh P14-H reconciliation
     expect(composer.getState(accountId)).toBe('READY');
     expect(coordinator.isAccountFaulted(accountId)).toBe(false); // the kernel's recovery path cleared it
 
     // The fresh facade is genuinely usable: a clean retry reaches (and completes) admission.
-    const retryParams = await f1407OpenParams(pair, 1_260_000);
-    await expect(runtime2.executeOpen(retryParams)).rejects.toMatchObject({ code: 'EVIDENCE_UNAVAILABLE' }); // expected — this provider was never fed evidence
-    expect(reservationCount(accountId)).toBe(1); // exactly one genuine admission — no duplicate/phantom economics survived the earlier fault
+    const retryParams = await f1407OpenParams(accountId, pair, 1_260_000);
+    await expect(runtime2.executeOpen(retryParams)).rejects.toMatchObject({ code: 'EVIDENCE_UNAVAILABLE' }); // expected â€” this provider was never fed evidence
+    expect(reservationCount(accountId)).toBe(1); // exactly one genuine admission â€” no duplicate/phantom economics survived the earlier fault
   }, 30_000); // genuineResearchApproval() performs real (CPU-bound, no network) backtest validation
 
   it('a recovery restore that itself fails never lets a READY facade escape', async () => {
@@ -273,18 +273,18 @@ describe('F14-07 correction — production composer never returns a cached READY
 
     await composer.start({ accountId, coordinator, provider });
     injectFailureOnce(accountId, 'paperPosition.update');
-    const openParams = await f1407OpenParams(pair, 1_200_000);
+    const openParams = await f1407OpenParams(accountId, pair, 1_200_000);
     await expect(composer.start({ accountId, coordinator, provider }).then((r) => r.executeOpen(openParams))).rejects.toMatchObject({ code: 'ADMISSION_OUTCOME_AMBIGUOUS' });
     expect(coordinator.isAccountFaulted(accountId)).toBe(true);
 
-    // The account row itself is now gone — the kernel's recovery-path restore must fail.
+    // The account row itself is now gone â€” the kernel's recovery-path restore must fail.
     dropAccount(accountId);
     await expect(composer.start({ accountId, coordinator, provider })).rejects.toMatchObject({ code: 'ACCOUNT_NOT_FOUND' });
     expect(composer.getState(accountId)).toBe('NOT_READY');
   }, 30_000);
 });
 
-describe('P14-D-BLK-01 — post-admit durable-persistence failure is treated as FAULTED, never a silent rollback-and-continue', () => {
+describe('P14-D-BLK-01 â€” post-admit durable-persistence failure is treated as FAULTED, never a silent rollback-and-continue', () => {
   it('a failure at paperPosition.update after coordinator.admit() succeeded yields ADMISSION_OUTCOME_AMBIGUOUS, faults the session and the account, and leaves no durable row behind', async () => {
     const { prisma, seedAccount, seedPairSlot, reservationCount, injectFailureOnce } = createFakePersistence();
     const accountId = 'blk01-account-1';
@@ -299,12 +299,12 @@ describe('P14-D-BLK-01 — post-admit durable-persistence failure is treated as 
     const request = buildRequest(accountId, pair, 1_200_000);
     await expect(session.admitAndPersist(pair, request, coordinator)).rejects.toMatchObject({ code: 'ADMISSION_OUTCOME_AMBIGUOUS' });
 
-    // Session and account are both FAULTED — no successful result escaped.
+    // Session and account are both FAULTED â€” no successful result escaped.
     expect(session.state).toBe('FAULTED');
     expect(coordinator.isAccountFaulted(accountId)).toBe(true);
     await expect(coordinator.admit(request)).rejects.toThrow(/FAULTED/);
 
-    // The (simulated) DB transaction rolled back — no phantom reservation survives.
+    // The (simulated) DB transaction rolled back â€” no phantom reservation survives.
     expect(reservationCount(accountId)).toBe(0);
 
     // The same session cannot be used again for anything mutating.
@@ -356,7 +356,7 @@ describe('P14-D-BLK-01 — post-admit durable-persistence failure is treated as 
     expect(reservationCount(accountId)).toBe(1);
   });
 
-  it('one account faulting never affects an unrelated account — both share the same coordinator and DB layer', async () => {
+  it('one account faulting never affects an unrelated account â€” both share the same coordinator and DB layer', async () => {
     const { prisma, seedAccount, seedPairSlot, injectFailureOnce } = createFakePersistence();
     const accountA = 'blk01-account-a';
     const accountB = 'blk01-account-b';
@@ -378,13 +378,13 @@ describe('P14-D-BLK-01 — post-admit durable-persistence failure is treated as 
   });
 });
 
-describe('P14-D-MAJ-01 — production durable admission requires a READY PaperAccountSession, never raw ownership alone', () => {
+describe('P14-D-MAJ-01 â€” production durable admission requires a READY PaperAccountSession, never raw ownership alone', () => {
   it('PaperAdmissionBridge and its session-proof token are not exported from the persistence barrel', () => {
     expect((persistenceBarrel as Record<string, unknown>)['PaperAdmissionBridge']).toBeUndefined();
     expect((persistenceBarrel as Record<string, unknown>)['SESSION_PROOF']).toBeUndefined();
   });
 
-  it('ownership acquired directly from the repository — without ever restoring — cannot drive the bridge without the genuine session proof', async () => {
+  it('ownership acquired directly from the repository â€” without ever restoring â€” cannot drive the bridge without the genuine session proof', async () => {
     const { prisma, seedAccount, seedPairSlot } = createFakePersistence();
     const accountId = 'maj01-account-1';
     const pair = 'B-BTC_USDT';
@@ -400,7 +400,7 @@ describe('P14-D-MAJ-01 — production durable admission requires a READY PaperAc
     ).rejects.toMatchObject({ code: 'NOT_OWNER' });
   });
 
-  it('the genuine (internal, non-barrel) SESSION_PROOF still lets the bridge admit for a session that has already restored — proving the guard is the proof, not obscurity', async () => {
+  it('the genuine (internal, non-barrel) SESSION_PROOF still lets the bridge admit for a session that has already restored â€” proving the guard is the proof, not obscurity', async () => {
     const { prisma, seedAccount, seedPairSlot, reservationCount } = createFakePersistence();
     const accountId = 'maj01-account-2';
     const pair = 'B-BTC_USDT';
@@ -415,7 +415,7 @@ describe('P14-D-MAJ-01 — production durable admission requires a READY PaperAc
     expect(reservationCount(accountId)).toBe(1);
   });
 
-  it('a caller cannot construct a PaperAccountSession directly with a foreign issuer — only openPaperAccountSession can produce a live one', () => {
+  it('a caller cannot construct a PaperAccountSession directly with a foreign issuer â€” only openPaperAccountSession can produce a live one', () => {
     const PaperAccountSessionCtor = (persistenceBarrel as unknown as { PaperAccountSession: new (...args: unknown[]) => unknown }).PaperAccountSession;
     expect(() => new PaperAccountSessionCtor(Symbol('forged'), 'acc', {}, {}, {}, {}, {})).toThrow();
   });
@@ -436,9 +436,9 @@ describe('P14-D-MAJ-01 — production durable admission requires a READY PaperAc
 
   it('a stale session after a fence takeover by a new process/coordinator fails closed on STALE_FENCE without faulting the account or mutating any row', async () => {
     // A takeover is realistically a different process (or a fault-recovery
-    // reopen) — i.e. a DIFFERENT coordinator instance, not a second live
+    // reopen) â€” i.e. a DIFFERENT coordinator instance, not a second live
     // session sharing the same in-process coordinator (which ordinary
-    // restore correctly refuses — single-owner-per-coordinator semantics,
+    // restore correctly refuses â€” single-owner-per-coordinator semantics,
     // proven by the account-isolation/duplicate-restore tests elsewhere).
     const { prisma, seedAccount, seedPairSlot, reservationCount } = createFakePersistence();
     const accountId = 'maj01-account-4';
@@ -448,7 +448,7 @@ describe('P14-D-MAJ-01 — production durable admission requires a READY PaperAc
     const coordinatorA = new RiskAdmissionCoordinator();
     const coordinatorB = new RiskAdmissionCoordinator();
     const sessionA = await openPaperAccountSession({ accountId, coordinator: coordinatorA, prisma }); // fence 1
-    await openPaperAccountSession({ accountId, coordinator: coordinatorB, prisma }); // fence 2 — takeover by a new process
+    await openPaperAccountSession({ accountId, coordinator: coordinatorB, prisma }); // fence 2 â€” takeover by a new process
 
     await expect(sessionA.admitAndPersist(pair, buildRequest(accountId, pair, 1_200_000), coordinatorA)).rejects.toMatchObject({ code: 'STALE_FENCE' });
     // No coordinator mutation ever occurred (the fence check runs before admit()), so this is a clean failure, not a fault.

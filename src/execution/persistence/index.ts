@@ -4,6 +4,16 @@ export {
   PaperAccountRepository, SystemClock, buildBaseExposureSnapshot,
   type Clock, type PaperAccountSnapshot, type PaperPairSlotSnapshot,
 } from './account-repository';
+// [F14-01] Authoritative durable risk input derivation — the production
+// replacement for caller-supplied account/exposure risk evidence. Pure
+// durable-state derivation plus a strict (never silently rewriting)
+// pair-snapshot binding check; it mints no capability and mutates nothing.
+export {
+  DAILY_WINDOW_MS, deriveCloseRiskInput, deriveMarkToMarketRiskInput, loadAuthoritativePaperRiskBase, pairSnapshotDurableMismatch,
+  type AuthoritativeOpenPositionValuation, type AuthoritativePairSlotFacts, type AuthoritativePaperRiskBase,
+  type AuthoritativePaperRiskInput, type AuthoritativeRiskInputResult, type AuthoritativeValuationEvidence,
+  type DeriveAuthoritativePaperRiskInputParams, type LoadAuthoritativePaperRiskBaseParams,
+} from './authoritative-risk-input';
 // [P14-D MAJ-01] `PaperAdmissionBridge` itself and its `SESSION_PROOF` token
 // are deliberately NOT exported here — the only public route to durable
 // admission/release is a READY `PaperAccountSession` (below). The bridge
