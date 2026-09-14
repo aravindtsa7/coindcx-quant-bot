@@ -1,4 +1,5 @@
 import { Decimal } from '../../core/decimal/decimal';
+import type { DynamicLeverageTier, DynamicSafetyMarginTier } from '../../core/types';
 
 /**
  * Normalized domain models for CoinDCX Read-Only Integration Layer.
@@ -11,15 +12,7 @@ import { Decimal } from '../../core/decimal/decimal';
  * - ALL financial values are represented strictly as Decimal instances.
  */
 
-export interface DynamicLeverageTier {
-  readonly leverage: Decimal;
-  readonly maxPositionSizeUsdt: Decimal;
-}
-
-export interface DynamicSafetyMarginTier {
-  readonly positionSizeThresholdUsdt: Decimal;
-  readonly maintenanceMarginPercent: Decimal;
-}
+export type { DynamicLeverageTier, DynamicSafetyMarginTier } from '../../core/types';
 
 export interface InrFuturesInstrument {
   readonly pair: string;

@@ -5,7 +5,7 @@ import { performance } from 'node:perf_hooks';
 import { z } from 'zod';
 import { parse as parseLosslessJson } from 'lossless-json';
 import { Decimal } from '../core/decimal/decimal';
-import { Clock, SystemClock } from '../integration/coindcx/clock';
+import { Clock, SystemClock } from '../core/time/clock';
 import { toLosslessDecimal, toSafeIntegerTimestamp } from '../integration/coindcx/normalizers';
 import { WireNumericSchema } from '../integration/coindcx/schemas';
 import { CanonicalDecimal } from './canonical-decimal';

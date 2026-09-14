@@ -1,4 +1,4 @@
-import { Clock, SystemClock } from '../integration/coindcx/clock';
+import { Clock, SystemClock } from '../core/time/clock';
 import { CoinDcxPublicFuturesStream, StreamScheduler, SystemStreamScheduler } from '../integration/coindcx/websocket/public-stream';
 import {
   CoinDcxStreamEnvelope,

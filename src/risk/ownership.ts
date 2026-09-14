@@ -1,9 +1,8 @@
-import type { InrFuturesPosition } from '../integration/coindcx/models';
 import { canonicalDecimalString, canonicalRiskDecimal, checkedProduct, riskDecimal, ValuationNumericContextError } from './decimal';
 import type { RiskRejectionCode } from './reason-codes';
-import type { CanonicalPositionValuation, PairPositionState, PairRiskSnapshot, StrategyRiskCandidate } from './types';
+import type { CanonicalPositionValuation, PairPositionState, PairRiskSnapshot, RiskPositionExposureInput, StrategyRiskCandidate } from './types';
 
-export function normalizeCoinDcxPosition(position: InrFuturesPosition, valuation: CanonicalPositionValuation | null): PairPositionState {
+export function normalizeCoinDcxPosition(position: RiskPositionExposureInput, valuation: CanonicalPositionValuation | null): PairPositionState {
   if (position.activePositionQuantity.isZero()) return { state: 'FLAT' };
   return {
     state: 'OPEN', positionId: position.id,

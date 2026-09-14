@@ -1,5 +1,5 @@
 import { Decimal } from '../core/decimal/decimal';
-import { DynamicLeverageTier, DynamicSafetyMarginTier } from '../integration/coindcx/models';
+import { DynamicLeverageTier, DynamicSafetyMarginTier } from '../core/types';
 
 /**
  * Supported timeframe granularities for candle aggregation in the bot.

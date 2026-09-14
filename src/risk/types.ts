@@ -1,5 +1,17 @@
+import type { Decimal } from '../core/decimal/decimal';
 import type { StrategyDecision, StrategyIndicatorBootstrapIdentityEntry } from '../strategies/core/types';
 import type { StrategyDecisionOrigin } from '../strategies/core/kernel';
+
+/**
+ * Exchange-neutral structural contract for the position fields risk ownership
+ * logic needs. Any exchange-specific position model (e.g. CoinDCX's
+ * InrFuturesPosition) that carries these fields is structurally assignable
+ * here without a runtime mapping step.
+ */
+export interface RiskPositionExposureInput {
+  readonly id: string;
+  readonly activePositionQuantity: Decimal;
+}
 
 export type RiskMode = 'SAFE' | 'NORMAL' | 'HIGH' | 'CUSTOM';
 export type RiskDecisionAction = 'OPEN' | 'CLOSE' | 'NO_CHANGE' | 'REVERSAL_DEFERRED';

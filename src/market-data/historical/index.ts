@@ -7,7 +7,7 @@ import { createInterface } from 'node:readline';
 import { finished } from 'node:stream/promises';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../persistence/prisma';
-import { Clock, SystemClock } from '../../integration/coindcx/clock';
+import { Clock, SystemClock } from '../../core/time/clock';
 import { CanonicalDecimal } from '../canonical-decimal';
 import { canonicalFixedPointIdentity } from '../fixed-point-identity';
 import { Decimal } from '../../core/decimal/decimal';
