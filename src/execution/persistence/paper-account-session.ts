@@ -84,10 +84,10 @@ export class PaperAccountSession {
     return this.#state;
   }
 
-  public async admitAndPersist(pair: string, request: AdmissionRequest, coordinator: RiskAdmissionCoordinator): Promise<AdmitAndPersistResult> {
+  public async admitAndPersist(pair: string, request: AdmissionRequest, coordinator: RiskAdmissionCoordinator, expectedRevision?: bigint): Promise<AdmitAndPersistResult> {
     this.#assertReady();
     try {
-      return await this.#bridge.admitAndPersist(SESSION_PROOF, this.ownership, pair, request, coordinator);
+      return await this.#bridge.admitAndPersist(SESSION_PROOF, this.ownership, pair, request, coordinator, expectedRevision);
     } catch (cause) {
       await this.#faultIfAmbiguous(cause, coordinator);
       throw cause;
@@ -111,10 +111,10 @@ export class PaperAccountSession {
    * final durable writes, so a failure after that point is outcome-ambiguous
    * for the identical reason and is handled identically.
    */
-  public async executeOpen(authority: PaperOpenExecutionAuthority, inputs: PaperOpenExecutionInputs, coordinator: RiskAdmissionCoordinator): Promise<PaperOpenExecutionResult> {
+  public async executeOpen(authority: PaperOpenExecutionAuthority, inputs: PaperOpenExecutionInputs, coordinator: RiskAdmissionCoordinator, expectedRevision?: bigint): Promise<PaperOpenExecutionResult> {
     this.#assertReady();
     try {
-      const outcome = await this.#executionEngine.executeOpen(SESSION_PROOF, this.ownership, authority, inputs, coordinator);
+      const outcome = await this.#executionEngine.executeOpen(SESSION_PROOF, this.ownership, authority, inputs, coordinator, expectedRevision);
       return disclosePaperFundingExcluded(outcome);
     } catch (cause) {
       await this.#faultIfAmbiguous(cause, coordinator);
@@ -129,9 +129,9 @@ export class PaperAccountSession {
    * is an ordinary rollback, never an outcome-ambiguous fault; this session is
    * never faulted by a CLOSE failure.
    */
-  public executeClose(authority: PaperCloseExecutionAuthority, inputs: PaperCloseExecutionInputs): Promise<PaperCloseExecutionResult> {
+  public executeClose(authority: PaperCloseExecutionAuthority, inputs: PaperCloseExecutionInputs, expectedRevision?: bigint): Promise<PaperCloseExecutionResult> {
     this.#assertReady();
-    return this.#executionEngine.executeClose(SESSION_PROOF, this.ownership, authority, inputs)
+    return this.#executionEngine.executeClose(SESSION_PROOF, this.ownership, authority, inputs, expectedRevision)
       .then((outcome) => disclosePaperFundingExcluded(outcome));
   }
 

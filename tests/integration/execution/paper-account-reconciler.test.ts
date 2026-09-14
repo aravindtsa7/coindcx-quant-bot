@@ -448,6 +448,110 @@ describe('P14-H live-DB — reservation mismatch (§47)', () => {
   });
 });
 
+describe('F14-05 correction — bidirectional reservation <-> slot reverse checks', () => {
+  it('an ADMITTED reservation next to an EMPTY, unclaimed slot is UNHEALTHY (the exact previously-invisible defect)', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const kernel = makeKernel(PAIR);
+    const decision = evaluateDecision(kernel, T0);
+    const coordinator = new RiskAdmissionCoordinator();
+    const session = await openPaperAccountSession({ accountId, coordinator, prisma });
+    const admitted = await session.admitAndPersist(PAIR, { accountId, policy: policyFor(PAIR), context: buildContext(kernel, decision) }, coordinator);
+    if (admitted.outcome !== 'ADMITTED') throw new Error('setup failed');
+
+    // Directly corrupt the durable slot back to EMPTY while the reservation remains genuinely ADMITTED
+    // (impossible under normal operation — the forward-only check over existing slots cannot see this).
+    await prisma.paperPosition.update({ where: { accountId_pair: { accountId, pair: PAIR } }, data: { status: 'EMPTY', admissionId: null } });
+
+    const result = await new PaperAccountReconciler(prisma).reconcile(accountId);
+    expect(result.status).toBe('UNHEALTHY');
+    expect(result.issues).toContainEqual(expect.objectContaining({ faultType: 'RESERVATION_STATE_MISMATCH', message: 'ADMITTED_RESERVATION_NOT_REFLECTED_IN_PENDING_SLOT' }));
+
+    const reservationAfter = await prisma.paperReservation.findUniqueOrThrow({ where: { admissionId: admitted.admission.admissionId } });
+    expect(reservationAfter.status).toBe('ADMITTED'); // no repair
+  });
+
+  it('an ADMITTED reservation whose slot points at a DIFFERENT admissionId is UNHEALTHY', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const kernel = makeKernel(PAIR);
+    const decision = evaluateDecision(kernel, T0);
+    const coordinator = new RiskAdmissionCoordinator();
+    const session = await openPaperAccountSession({ accountId, coordinator, prisma });
+    const admitted = await session.admitAndPersist(PAIR, { accountId, policy: policyFor(PAIR), context: buildContext(kernel, decision) }, coordinator);
+    if (admitted.outcome !== 'ADMITTED') throw new Error('setup failed');
+
+    // Slot claims a well-formed but wrong (nonexistent) admissionId while the genuine reservation stays ADMITTED.
+    await prisma.paperPosition.update({ where: { accountId_pair: { accountId, pair: PAIR } }, data: { admissionId: 'f'.repeat(64) } });
+
+    const result = await new PaperAccountReconciler(prisma).reconcile(accountId);
+    expect(result.status).toBe('UNHEALTHY');
+    expect(result.issues).toContainEqual(expect.objectContaining({ faultType: 'RESERVATION_STATE_MISMATCH', message: 'ADMITTED_RESERVATION_NOT_REFLECTED_IN_PENDING_SLOT' }));
+  });
+
+  it('a CONSUMED reservation with neither a current OPEN slot nor completed ownership history is UNHEALTHY', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const { openResult } = await setupGenuineClosed(accountId, PAIR);
+
+    // The CONSUMED opening reservation's slot is now EMPTY (genuinely closed) — delete
+    // its ownership history row entirely, leaving NEITHER an open slot NOR history.
+    await prisma.paperPositionOwnershipHistory.delete({ where: { positionInstanceId: openResult.positionInstanceId } });
+
+    const result = await new PaperAccountReconciler(prisma).reconcile(accountId);
+    expect(result.status).toBe('UNHEALTHY');
+    expect(result.issues).toContainEqual(expect.objectContaining({ faultType: 'RESERVATION_STATE_MISMATCH', message: 'CONSUMED_RESERVATION_WITHOUT_OPEN_OR_COMPLETED_LIFECYCLE' }));
+    expect(result.issues).toContainEqual(expect.objectContaining({ faultType: 'OWNERSHIP_HISTORY_MISMATCH', message: 'COMPLETED_CLOSE_MISSING_OWNERSHIP_HISTORY' }));
+  }, 30_000);
+});
+
+describe('F14-05 correction — OPEN leverage / initial margin economic checks', () => {
+  it('a tampered OPEN slot leverage (opening intent unchanged) is UNHEALTHY with no repair', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const { openResult } = await setupGenuineOpen(accountId, PAIR);
+
+    const positionBefore = await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } });
+    const tamperedLeverage = positionBefore.leverage!.plus('1');
+    await prisma.paperPosition.update({ where: { accountId_pair: { accountId, pair: PAIR } }, data: { leverage: tamperedLeverage } });
+
+    const result = await new PaperAccountReconciler(prisma).reconcile(accountId);
+    expect(result.status).toBe('UNHEALTHY');
+    expect(result.issues).toContainEqual(expect.objectContaining({ faultType: 'POSITION_STATE_MISMATCH', message: 'OPEN_SLOT_ECONOMIC_FACT_MISMATCH', evidence: expect.objectContaining({ mismatches: expect.arrayContaining([expect.objectContaining({ field: 'leverage' })]) }) }));
+
+    const positionAfter = await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } });
+    expect(positionAfter.leverage!.toFixed()).toBe(tamperedLeverage.toFixed()); // no repair
+    expect(openResult.outcome).toBe('FILLED');
+  }, 30_000);
+
+  it('a tampered OPEN slot initial margin (opening intent/fill unchanged) is UNHEALTHY with no repair', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    await setupGenuineOpen(accountId, PAIR);
+
+    const positionBefore = await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } });
+    const tamperedMargin = positionBefore.initialMarginInr!.plus('1');
+    await prisma.paperPosition.update({ where: { accountId_pair: { accountId, pair: PAIR } }, data: { initialMarginInr: tamperedMargin } });
+
+    const result = await new PaperAccountReconciler(prisma).reconcile(accountId);
+    expect(result.status).toBe('UNHEALTHY');
+    expect(result.issues).toContainEqual(expect.objectContaining({ faultType: 'POSITION_STATE_MISMATCH', message: 'OPEN_SLOT_ECONOMIC_FACT_MISMATCH', evidence: expect.objectContaining({ mismatches: expect.arrayContaining([expect.objectContaining({ field: 'initialMarginInr' })]) }) }));
+
+    const positionAfter = await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } });
+    expect(positionAfter.initialMarginInr!.toFixed()).toBe(tamperedMargin.toFixed()); // no repair
+  }, 30_000);
+});
+
 describe('P14-H live-DB — repeated fault / idempotency (§26/§48)', () => {
   it('running reconciliation twice against unchanged bad state does not create duplicate fault rows', async () => {
     if (skip()) return;

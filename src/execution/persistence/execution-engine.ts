@@ -265,6 +265,7 @@ export class PaperExecutionEngine {
     authority: PaperOpenExecutionAuthority,
     inputs: PaperOpenExecutionInputs,
     coordinator: RiskAdmissionCoordinator,
+    expectedRevision?: bigint,
   ): Promise<PaperOpenExecutionOutcome> {
     assertSessionProof(sessionProof);
     const held = readGenuineOwnership(ownership);
@@ -315,6 +316,10 @@ export class PaperExecutionEngine {
         const account = await tx.paperAccount.findUnique({ where: { accountId: held.accountId } });
         if (account === null) throw new PaperPersistenceError('ACCOUNT_NOT_FOUND', `No paper_account row for ${held.accountId}`);
         if (account.ownerFence !== held.fence) throw new PaperPersistenceError('STALE_FENCE', `Held fence ${held.fence} no longer matches current ${account.ownerFence}`);
+        // [F14-06] Atomic version check under the same account-row lock — see admission-bridge.ts.
+        if (expectedRevision !== undefined && account.revision !== expectedRevision) {
+          throw new PaperPersistenceError('STALE_ACCOUNT_REVISION', `Expected account revision ${expectedRevision} for ${held.accountId} but current revision is ${account.revision}`);
+        }
 
         const terminalFill = await tx.paperFill.findUnique({ where: { accountId_sourceStrategyDecisionId: { accountId: held.accountId, sourceStrategyDecisionId: decision.sourceStrategyDecisionId } } });
         if (terminalFill !== null) {
@@ -464,6 +469,7 @@ export class PaperExecutionEngine {
     ownership: PaperAccountOwnership,
     authority: PaperCloseExecutionAuthority,
     inputs: PaperCloseExecutionInputs,
+    expectedRevision?: bigint,
   ): Promise<PaperCloseExecutionOutcome> {
     assertSessionProof(sessionProof);
     const held = readGenuineOwnership(ownership);
@@ -514,6 +520,10 @@ export class PaperExecutionEngine {
       const account = await tx.paperAccount.findUnique({ where: { accountId: held.accountId } });
       if (account === null) throw new PaperPersistenceError('ACCOUNT_NOT_FOUND', `No paper_account row for ${held.accountId}`);
       if (account.ownerFence !== held.fence) throw new PaperPersistenceError('STALE_FENCE', `Held fence ${held.fence} no longer matches current ${account.ownerFence}`);
+      // [F14-06] Atomic version check under the same account-row lock — see admission-bridge.ts.
+      if (expectedRevision !== undefined && account.revision !== expectedRevision) {
+        throw new PaperPersistenceError('STALE_ACCOUNT_REVISION', `Expected account revision ${expectedRevision} for ${held.accountId} but current revision is ${account.revision}`);
+      }
 
       const terminalFill = await tx.paperFill.findUnique({ where: { accountId_sourceStrategyDecisionId: { accountId: held.accountId, sourceStrategyDecisionId: decision.sourceStrategyDecisionId } } });
       if (terminalFill !== null) {

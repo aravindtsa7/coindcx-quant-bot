@@ -5,8 +5,8 @@
 This document records what Phase 14 (the PAPER trading subsystem) actually
 proves, as built, against what is actually tested — not what was originally
 aspired to. It does not claim CoinDCX economic parity, and it does not claim
-production-promotion eligibility. See §11 for the funding limitation and §13
-for the final status conclusion.
+production-promotion eligibility. See §11 for the funding limitation, §13 for
+the Wave1 final-gate correction record, and §14 for the final status conclusion.
 
 Commit hashes are recorded because they are canonical anchors for each
 slice's frozen baseline; individual test line numbers are deliberately never
@@ -55,7 +55,7 @@ cited (they drift) — every row instead references a stable test **file**.
 | Guarantee | Implementation | Test evidence | Limitation | Status |
 |---|---|---|---|---|
 | Exactly the frozen 10 Phase14 models exist, unchanged since P14-C | `prisma/schema.prisma`: `PaperAccount`, `PaperExecutionPolicySnapshot`, `PaperReservation`, `PaperExecutionIntent`, `PaperOrder`, `PaperFill`, `PaperPosition`, `PaperPositionOwnershipHistory`, `PaperLedgerEntry`, `PaperReconciliationFault` | `tests/unit/prisma/phase14-schema.test.ts` | 3 unrelated pre-Phase14 models also exist (`SystemState`, `Candle1m`, `HistoricalDataset`) — not part of this count | PROVEN |
-| P14-J made zero schema/migration changes | n/a (proof-only phase) | `npx prisma validate` (see §14 validation), `git diff prisma/` empty | — | PROVEN |
+| P14-J made zero schema/migration changes | n/a (proof-only phase) | `npx prisma validate` (see §15 validation), `git diff prisma/` empty | — | PROVEN |
 
 ---
 
@@ -259,27 +259,60 @@ reconciliation controls current health (proven in §9's mandatory-test row).
 
 ---
 
-## 13. Final Phase14 Status
+## 13. Phase14 Final-Gate Correction Wave 1 (F14-04/05/06/07)
+
+An Astra final-milestone-gate pass found four durable-state/reconciliation/
+version/recovery defects beyond the P14-A..J proofs above. All four were
+corrected in this wave; **F14-01/F14-02/F14-03 (risk-evidence authority,
+market-evidence public ingestion, ExecutionPolicy validation/multiplier
+binding) remain open and are explicitly out of this wave's scope** — the
+overall Phase14 final milestone gate is therefore **not yet** claimed PASS
+(see §13.5 below).
+
+| Finding | Defect | Correction | Test evidence | Status |
+|---|---|---|---|---|
+| F14-04 | A RELEASED reservation's generation was forgotten across a restart (`RiskAdmissionCoordinator.restore()` only ever restored currently-`ADMITTED` rows) — a post-restart retry of the same unfilled source decision reused generation 1, upserting into the existing RELEASED row instead of allocating a fresh one | `RiskAdmissionCoordinator` now tracks `#latestGeneration` (accountId → sourceStrategyDecisionId → highest generation ever durably used), restored independently of live pending exposure from a new `AdmissionGenerationWatermark[]` computed in `restore.ts` from **every** historical reservation row regardless of status | `tests/integration/execution/paper-account-kernel.test.ts` ("F14-04 correction") — release gen 1, restart, retry, assert gen 2, gen-1 row still RELEASED, exactly one eventual fill, terminal-retry-after-fill blocked | CORRECTED |
+| F14-05 | P14-H reconciliation only walked forward from existing rows (slot → reservation, history → fill) — an ADMITTED reservation next to an EMPTY/wrongly-claimed slot, a CONSUMED reservation with neither an OPEN slot nor completed history, or a completed CLOSE missing its history row, all read HEALTHY; OPEN leverage/initial-margin were never cross-checked | Added `#reconcileReservationsReverse` (ADMITTED/CONSUMED reservation → required slot/history) and `#reconcileCompletedClosesReverse` (completed CLOSE → required history), plus exact leverage (direct fact equality) and initial-margin (re-derived from committed fill/policy-snapshot facts, same `quantizePaperPosting` boundary as P14-E) checks in `#reconcilePosition` | `tests/integration/execution/paper-account-reconciler.test.ts` ("F14-05 correction" — 5 new tests) | CORRECTED |
+| F14-06 | `PaperAccount.revision` was observed by P14-H but never enforced at mutation time — admission/release never advanced it at all, and OPEN/CLOSE checked only `ownerFence`, so durable state could change between a HEALTHY observation and the mutation it authorized, even under the same fence | `admitAndPersist`/`releaseAndPersist`/`executeOpen`/`executeClose` all accept an optional `expectedRevision` and re-verify it under the same `SELECT ... FOR UPDATE` account lock as the mutation itself (never a separate preflight read); admission and release now atomically advance `PaperAccount.revision`; P14-I's production runtime binds every OPEN to its own fresh `#assertFreshlyHealthy()` revision, and CLOSE/the post-admission OPEN fill bind to the exact new revision admission produced | `tests/integration/execution/paper-account-persistence.test.ts` ("F14-06 correction" — revision transitions, multi-account isolation, stale-OPEN-revision rejection) + `tests/integration/execution/paper-account-kernel.test.ts` ("F14-06 correction" — stale-CLOSE-revision rejection) | CORRECTED |
+| F14-07 | `PaperAccountProductionComposer.start()` trusted `PaperAccountKernel.getState()` (a diagnostic map set once at successful startup) to decide whether a cached READY facade was still valid — that map never reflects a `PaperAccountSession` faulting after startup (e.g. an outcome-ambiguous admission failure), so a stale READY facade over a FAULTED session could be returned indefinitely | `start()` now always re-verifies through `PaperAccountKernel.startPaperAccountRuntime` itself (the kernel's own recovery authority) before trusting a cached facade — a genuinely-still-READY session returns the identical cached `PaperAccountRuntime` instance with no re-reconciliation (§7's original idempotent fast path preserved); any other outcome (kernel had to recover, or recovery itself failed) discards the stale facade and requires a full fresh startup — fresh reconciliation included — before any new READY facade is produced | `tests/unit/execution/persistence/session-fault-recovery.test.ts` ("F14-07 correction" — 2 new tests: successful kernel-mediated recovery with no duplicate economics, and a failed recovery leaving the account NOT_READY) | CORRECTED |
+
+### 13.5 Conservative final-gate status (unchanged from before this wave)
+
+F14-01/F14-02/F14-03 are untouched by this wave and remain open. Phase14's
+overall final milestone gate is **NOT** claimed PASS here — only
+`PHASE14_WAVE1_COMPLETE`. The "Final Phase14 Status" table in §14 below still
+governs the mechanical-readiness claim already established through P14-J;
+this wave neither raises nor lowers it, and does not itself constitute
+`PRODUCTION PAPER MECHANICS READY`.
+
+---
+
+## 14. Final Phase14 Status
 
 | Question | Answer |
 |---|---|
 | Phase 14 implementation complete? | **YES** (A through J) |
 | Production PAPER mechanical path (dispatch → risk → durable admission → evidence → execution) | **PROVEN** |
-| Restart / fencing / reconciliation | **PROVEN** |
+| Restart / fencing / reconciliation | **PROVEN, Wave1-corrected** (§13: F14-04/05/06/07) |
 | Funding economic parity | **INTENTIONALLY UNSUPPORTED / PROVIDER-BLOCKED** (§11) |
 | Maximum lifecycle | **PAPER** |
 | Transitive paper/live import isolation | **PROVEN — strict zero, no exceptions** (§10) |
 | Live execution adapter | **NOT_IMPLEMENTED / NOT_ACTIVE** (§10) |
+| F14-01 / F14-02 / F14-03 (risk-evidence authority / market-evidence public ingestion / ExecutionPolicy validation-multiplier binding) | **OPEN — not addressed by this wave** |
+| Final Astra milestone gate | **NOT YET PASS** — pending F14-01/02/03 and a final targeted re-verify of this wave |
 | Ready for Phase 15 ranking? | Only if Phase 15 explicitly consumes funding-excluded diagnostics as diagnostics, and does **not** treat funding-excluded PnL as production-approval economics. If Phase 15's dependency on funding-excluded profitability is ever ambiguous, that ambiguity should be documented as a Phase 15 limitation — P14-J does not invent or authorize Phase 15 policy here. |
 
 **Correct one-line summary:** Phase 14 is a mechanically production-ready
 PAPER runtime with restart-safe fencing, durable admission, trusted-evidence-
 gated execution, and account-scoped reconciliation health-gating — **not** a
 full CoinDCX economic-parity paper simulation, and **not** promotion-eligible.
+Wave 1 of the final-gate correction (F14-04/05/06/07) is complete;
+F14-01/02/03 remain open, so **PRODUCTION PAPER MECHANICS READY is not yet
+claimed**.
 
 ---
 
-## 14. Validation commands run for this slice
+## 15. Validation commands run for this slice
 
 ```
 npx tsc --noEmit --project tsconfig.test.json   # typecheck
@@ -288,4 +321,12 @@ npm run build                                    # production build
 npx prisma validate                              # schema unchanged
 npx vitest run tests/architecture/phase14-import-graph.test.ts
 npm test                                          # full suite, including all P14-A..I regressions
+```
+
+Wave 1 correction (F14-04/05/06/07) additionally ran:
+
+```
+npx vitest run tests/integration/execution tests/unit/dispatch tests/unit/risk \
+  tests/unit/coin-runtime tests/unit/execution tests/architecture
+npx vitest run   # full suite — 159 files / 1947 tests passed
 ```

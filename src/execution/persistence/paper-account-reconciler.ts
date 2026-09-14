@@ -1,6 +1,7 @@
 import { Prisma, type PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../persistence/prisma';
 import { sha256CanonicalJson } from '../../risk';
+import { quantizePaperPosting } from '../accounting';
 import { paperDecimal } from '../decimal';
 import { computePositionInstanceId } from '../identity';
 import { PAPER_FUNDING_CAPABILITY, type PaperFundingDisclosure } from '../funding-capability';
@@ -152,20 +153,30 @@ export class PaperAccountReconciler {
         tx.paperLedgerEntry.findMany({ where: { accountId } }),
         tx.paperPositionOwnershipHistory.findMany({ where: { accountId } }),
       ]);
+      // [F14-05] Execution-policy snapshots are a global, content-addressed table
+      // (never account-scoped) — fetched only for the specific ids this
+      // account's own OPEN intents reference, to recompute leverage/initial-margin
+      // facts without any market/network dependency.
+      const policySnapshotIds = [...new Set(intents.filter((i) => i.action === 'OPEN').map((i) => i.executionPolicySnapshotId))];
+      const policySnapshots = policySnapshotIds.length === 0 ? [] : await tx.paperExecutionPolicySnapshot.findMany({ where: { executionPolicySnapshotId: { in: policySnapshotIds } } });
+      const policySnapshotById = new Map(policySnapshots.map((p) => [p.executionPolicySnapshotId, p]));
 
       const reservationByAdmissionId = new Map(reservations.map((r) => [r.admissionId, r]));
       const intentByAdmissionId = new Map(intents.filter((i) => i.admissionId !== null).map((i) => [i.admissionId as string, i]));
       const orderByIntentId = new Map(orders.map((o) => [o.executionIntentId, o]));
       const fillByOrderId = new Map(fills.map((f) => [f.orderId, f]));
+      const positionByPair = new Map(positions.map((p) => [p.pair, p]));
 
       const builder: Builder = { accountId, issues: [] };
 
       this.#reconcileFunding(builder, account, positions, ledgerEntries);
       this.#reconcileAccountLedger(builder, account, ledgerEntries);
-      for (const slot of positions) this.#reconcilePosition(builder, accountId, slot, reservationByAdmissionId, intentByAdmissionId, orderByIntentId, fillByOrderId);
+      for (const slot of positions) this.#reconcilePosition(builder, accountId, slot, reservationByAdmissionId, intentByAdmissionId, orderByIntentId, fillByOrderId, policySnapshotById);
       this.#reconcileOrders(builder, orders, fillByOrderId);
       this.#reconcileTerminalDedup(builder, fills);
       for (const row of history) this.#reconcileHistory(builder, row, fillByOrderId, ledgerEntries, positions);
+      this.#reconcileReservationsReverse(builder, reservations, positionByPair, intentByAdmissionId, history);
+      this.#reconcileCompletedClosesReverse(builder, intents, orderByIntentId, fillByOrderId, history);
 
       for (const issue of builder.issues) {
         await tx.paperReconciliationFault.upsert({
@@ -252,14 +263,18 @@ export class PaperAccountReconciler {
     slot: {
       readonly pair: string; readonly status: string; readonly admissionId: string | null; readonly positionInstanceId: string | null;
       readonly side: string | null; readonly quantity: { readonly toFixed: () => string } | null; readonly averageEntryPriceInr: { readonly toFixed: () => string } | null;
-      readonly leverage: unknown; readonly initialMarginInr: unknown; readonly openedAtMs: bigint | null;
+      readonly leverage: { readonly toFixed: () => string } | null; readonly initialMarginInr: { readonly toFixed: () => string } | null; readonly openedAtMs: bigint | null;
       readonly cumulativeFeesInr: { readonly toFixed: () => string }; readonly cumulativeRealizedPnlInr: { readonly toFixed: () => string };
       readonly ownerStrategyInstanceId: string | null; readonly ownerStrategyId: string | null; readonly ownerStrategyVersion: string | null; readonly ownerParameterHash: string | null;
     },
     reservationByAdmissionId: ReadonlyMap<string, { readonly accountId: string; readonly pair: string; readonly status: string; readonly direction: string }>,
-    intentByAdmissionId: ReadonlyMap<string, { readonly executionIntentId: string; readonly action: string; readonly accountId: string; readonly strategyInstanceId: string }>,
+    intentByAdmissionId: ReadonlyMap<string, {
+      readonly executionIntentId: string; readonly action: string; readonly accountId: string; readonly strategyInstanceId: string;
+      readonly approvedLeverage: { readonly toFixed: () => string } | null; readonly executionPolicySnapshotId: string;
+    }>,
     orderByIntentId: ReadonlyMap<string, { readonly executionIntentId: string; readonly state: string }>,
     fillByOrderId: ReadonlyMap<string, { readonly quantity: { readonly toFixed: () => string }; readonly fillPrice: { readonly toFixed: () => string }; readonly feeInr: { readonly toFixed: () => string }; readonly eventTimeMs: bigint }>,
+    policySnapshotById: ReadonlyMap<string, { readonly contractMultiplier: { readonly toFixed: () => string } }>,
   ): void {
     const subject = { pair: slot.pair, positionInstanceId: slot.positionInstanceId, admissionId: slot.admissionId };
 
@@ -299,6 +314,7 @@ export class PaperAccountReconciler {
     }
     if (
       slot.positionInstanceId === null || slot.side === null || slot.quantity === null || slot.averageEntryPriceInr === null
+      || slot.leverage === null || slot.initialMarginInr === null
       || slot.openedAtMs === null || slot.ownerStrategyInstanceId === null || slot.ownerStrategyId === null
       || slot.ownerStrategyVersion === null || slot.ownerParameterHash === null
     ) {
@@ -308,6 +324,15 @@ export class PaperAccountReconciler {
     const intent = intentByAdmissionId.get(slot.admissionId);
     if (intent === undefined || intent.action !== 'OPEN' || intent.accountId !== accountId) {
       addIssue(builder, 'ORDER_FILL_MISMATCH', subject, 'OPEN_SLOT_NO_MATCHING_OPENING_INTENT', { admissionId: slot.admissionId });
+      return;
+    }
+    if (intent.approvedLeverage === null) {
+      addIssue(builder, 'ORDER_FILL_MISMATCH', subject, 'OPEN_SLOT_OPENING_INTENT_MISSING_APPROVED_LEVERAGE', { admissionId: slot.admissionId });
+      return;
+    }
+    const policySnapshot = policySnapshotById.get(intent.executionPolicySnapshotId);
+    if (policySnapshot === undefined) {
+      addIssue(builder, 'ORDER_FILL_MISMATCH', subject, 'OPEN_SLOT_OPENING_INTENT_MISSING_POLICY_SNAPSHOT', { executionPolicySnapshotId: intent.executionPolicySnapshotId });
       return;
     }
     const order = orderByIntentId.get(intent.executionIntentId);
@@ -327,6 +352,22 @@ export class PaperAccountReconciler {
     if (slot.side !== reservation.direction) mismatches.push({ field: 'side', actual: slot.side, expected: reservation.direction });
     if (!paperDecimal(slot.quantity.toFixed()).equals(paperDecimal(fill.quantity.toFixed()))) mismatches.push({ field: 'quantity', actual: slot.quantity.toFixed(), expected: fill.quantity.toFixed() });
     if (!paperDecimal(slot.averageEntryPriceInr.toFixed()).equals(paperDecimal(fill.fillPrice.toFixed()))) mismatches.push({ field: 'averageEntryPriceInr', actual: slot.averageEntryPriceInr.toFixed(), expected: fill.fillPrice.toFixed() });
+    // [F14-05] Leverage is a direct, unrounded copy of `decision.approved.approvedLeverage`
+    // on BOTH the slot and the opening intent (execution-engine.ts never rounds
+    // it) — an exact equality check, zero rounding risk. Initial margin is
+    // re-derived from the same committed facts and frozen P14-E formula
+    // (`notionalInr / leverage`, quantized at the same `quantizePaperPosting`
+    // boundary execution-engine itself uses) — no market/live price is used.
+    if (!paperDecimal(slot.leverage.toFixed()).equals(paperDecimal(intent.approvedLeverage.toFixed()))) {
+      mismatches.push({ field: 'leverage', actual: slot.leverage.toFixed(), expected: intent.approvedLeverage.toFixed() });
+    } else {
+      const contractMultiplier = paperDecimal(policySnapshot.contractMultiplier.toFixed());
+      const notionalInr = paperDecimal(fill.fillPrice.toFixed()).times(paperDecimal(fill.quantity.toFixed())).times(contractMultiplier);
+      const expectedInitialMarginInr = quantizePaperPosting(notionalInr.dividedBy(paperDecimal(intent.approvedLeverage.toFixed()))).value;
+      if (!paperDecimal(slot.initialMarginInr.toFixed()).equals(paperDecimal(expectedInitialMarginInr))) {
+        mismatches.push({ field: 'initialMarginInr', actual: slot.initialMarginInr.toFixed(), expected: expectedInitialMarginInr });
+      }
+    }
     if (!paperDecimal(slot.cumulativeFeesInr.toFixed()).equals(paperDecimal(fill.feeInr.toFixed()))) mismatches.push({ field: 'cumulativeFeesInr', actual: slot.cumulativeFeesInr.toFixed(), expected: fill.feeInr.toFixed() });
     if (!paperDecimal(slot.cumulativeRealizedPnlInr.toFixed()).equals(paperDecimal('0'))) mismatches.push({ field: 'cumulativeRealizedPnlInr', actual: slot.cumulativeRealizedPnlInr.toFixed(), expected: '0' });
     if (slot.openedAtMs !== fill.eventTimeMs) mismatches.push({ field: 'openedAtMs', actual: slot.openedAtMs.toString(), expected: fill.eventTimeMs.toString() });
@@ -422,6 +463,74 @@ export class PaperAccountReconciler {
     const currentSlot = positions.find((p) => p.pair === row.pair);
     if (currentSlot !== undefined && currentSlot.status === 'OPEN' && currentSlot.positionInstanceId === row.positionInstanceId) {
       addIssue(builder, 'OWNERSHIP_HISTORY_MISMATCH', subject, 'SLOT_STILL_OPEN_FOR_COMPLETED_HISTORY', { pair: row.pair, positionInstanceId: row.positionInstanceId });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // [F14-05] Reverse reservation -> slot binding. `#reconcilePosition` above
+  // only walks FORWARD from each slot to its claimed reservation, so a
+  // reservation that durably claims live capacity but has NO slot reflecting
+  // it (or a slot reflecting a DIFFERENT admission) is invisible to it — the
+  // exact defect an ADMITTED reservation next to an EMPTY, unclaimed slot
+  // previously produced a false HEALTHY for. RELEASED-masquerading-as-PENDING
+  // is already caught by the forward check (`PENDING_SLOT_RESERVATION_NOT_ADMITTED`)
+  // and is not duplicated here.
+  // -------------------------------------------------------------------------
+  #reconcileReservationsReverse(
+    builder: Builder,
+    reservations: readonly { readonly admissionId: string; readonly pair: string; readonly status: string }[],
+    positionByPair: ReadonlyMap<string, { readonly status: string; readonly admissionId: string | null; readonly positionInstanceId: string | null }>,
+    intentByAdmissionId: ReadonlyMap<string, { readonly executionIntentId: string }>,
+    history: readonly { readonly openingExecutionIntentId: string }[],
+  ): void {
+    for (const reservation of reservations) {
+      const subject = { pair: reservation.pair, admissionId: reservation.admissionId };
+      if (reservation.status === 'ADMITTED') {
+        const slot = positionByPair.get(reservation.pair);
+        if (slot === undefined || slot.status !== 'PENDING' || slot.admissionId !== reservation.admissionId) {
+          addIssue(builder, 'RESERVATION_STATE_MISMATCH', subject, 'ADMITTED_RESERVATION_NOT_REFLECTED_IN_PENDING_SLOT', {
+            slotStatus: slot?.status ?? null, slotAdmissionId: slot?.admissionId ?? null,
+          });
+        }
+        continue;
+      }
+      if (reservation.status === 'CONSUMED') {
+        const slot = positionByPair.get(reservation.pair);
+        const isCurrentOpen = slot !== undefined && slot.status === 'OPEN' && slot.admissionId === reservation.admissionId;
+        const openingIntent = intentByAdmissionId.get(reservation.admissionId);
+        const historicallyClosed = openingIntent !== undefined && history.some((h) => h.openingExecutionIntentId === openingIntent.executionIntentId);
+        if (!isCurrentOpen && !historicallyClosed) {
+          addIssue(builder, 'RESERVATION_STATE_MISMATCH', subject, 'CONSUMED_RESERVATION_WITHOUT_OPEN_OR_COMPLETED_LIFECYCLE', {
+            slotStatus: slot?.status ?? null, slotAdmissionId: slot?.admissionId ?? null,
+          });
+        }
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // [F14-05] Reverse completed-CLOSE -> ownership-history binding.
+  // `#reconcileHistory` above only walks FORWARD from each EXISTING history
+  // row — a completed CLOSE (a FILLED CLOSE order with a terminal fill) that
+  // is missing its required `PaperPositionOwnershipHistory` row entirely
+  // would otherwise never be detected.
+  // -------------------------------------------------------------------------
+  #reconcileCompletedClosesReverse(
+    builder: Builder,
+    intents: readonly { readonly executionIntentId: string; readonly action: string; readonly pair: string }[],
+    orderByIntentId: ReadonlyMap<string, { readonly state: string }>,
+    fillByOrderId: ReadonlyMap<string, unknown>,
+    history: readonly { readonly closingExecutionIntentId: string }[],
+  ): void {
+    const historyByClosingIntentId = new Set(history.map((h) => h.closingExecutionIntentId));
+    for (const intent of intents) {
+      if (intent.action !== 'CLOSE') continue;
+      const order = orderByIntentId.get(intent.executionIntentId);
+      if (order === undefined || order.state !== 'FILLED') continue; // not a completed close
+      if (!fillByOrderId.has(intent.executionIntentId)) continue; // already reported by #reconcileOrders' FILLED_ORDER_HAS_NO_FILL
+      if (!historyByClosingIntentId.has(intent.executionIntentId)) {
+        addIssue(builder, 'OWNERSHIP_HISTORY_MISMATCH', { pair: intent.pair }, 'COMPLETED_CLOSE_MISSING_OWNERSHIP_HISTORY', { closingExecutionIntentId: intent.executionIntentId });
+      }
     }
   }
 }

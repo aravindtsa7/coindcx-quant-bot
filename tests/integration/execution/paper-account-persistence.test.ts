@@ -379,6 +379,89 @@ describe('P14-D live-DB — durable admission generation semantics', () => {
   });
 });
 
+describe('F14-06 correction — PaperAccount.revision version binding', () => {
+  it('admission advances PaperAccount.revision, and release advances it again', async () => {
+    if (skip()) return;
+    const repository = new PaperAccountRepository(prisma);
+    const coordinator = new RiskAdmissionCoordinator();
+    const accountId = freshAccountId();
+    const pair = 'B-BTC_USDT';
+    await initAccount(repository, accountId);
+    await provisionPairSlot(accountId, pair);
+
+    const session = await openPaperAccountSession({ accountId, coordinator, prisma });
+    const revisionAfterOpen = session.snapshot.revision; // acquireOwnership already bumped it once
+    const request = await buildRequest(accountId, pair, 1_200_000);
+    const admitted = await session.admitAndPersist(pair, request, coordinator);
+    if (admitted.outcome !== 'ADMITTED') throw new Error('setup failed');
+    expect(admitted.accountRevision).toBe(revisionAfterOpen + 1n);
+    const accountAfterAdmit = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    expect(accountAfterAdmit.revision).toBe(admitted.accountRevision);
+
+    const released = await session.releaseAndPersist(admitted.admission.admissionId, coordinator);
+    expect(released).toBe('RELEASED');
+    const accountAfterRelease = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    expect(accountAfterRelease.revision).toBe(admitted.accountRevision + 1n);
+  });
+
+  it('multi-account revision isolation — mutating account A never advances account B revision', async () => {
+    if (skip()) return;
+    const repository = new PaperAccountRepository(prisma);
+    const coordinatorA = new RiskAdmissionCoordinator();
+    const coordinatorB = new RiskAdmissionCoordinator();
+    const accountA = freshAccountId();
+    const accountB = freshAccountId();
+    const pair = 'B-BTC_USDT';
+    await initAccount(repository, accountA);
+    await initAccount(repository, accountB);
+    await provisionPairSlot(accountA, pair);
+    await provisionPairSlot(accountB, pair);
+
+    const sessionA = await openPaperAccountSession({ accountId: accountA, coordinator: coordinatorA, prisma });
+    await openPaperAccountSession({ accountId: accountB, coordinator: coordinatorB, prisma });
+    const accountBBefore = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId: accountB } });
+
+    const request = await buildRequest(accountA, pair, 1_200_000);
+    const admitted = await sessionA.admitAndPersist(pair, request, coordinatorA);
+    expect(admitted.outcome).toBe('ADMITTED');
+
+    const accountBAfter = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId: accountB } });
+    expect(accountBAfter.revision).toBe(accountBBefore.revision); // untouched by account A's mutation
+  });
+
+  it('a stale expectedRevision rejects admission before any economic/admission mutation (same ownerFence — revision alone protects)', async () => {
+    if (skip()) return;
+    const repository = new PaperAccountRepository(prisma);
+    const coordinator = new RiskAdmissionCoordinator();
+    const accountId = freshAccountId();
+    const pairA = 'B-BTC_USDT';
+    const pairB = 'B-ETH_USDT';
+    await initAccount(repository, accountId);
+    await provisionPairSlot(accountId, pairA);
+    await provisionPairSlot(accountId, pairB);
+
+    const session = await openPaperAccountSession({ accountId, coordinator, prisma });
+    const staleRevision = session.snapshot.revision; // "HEALTHY observed at revision R"
+
+    // A legitimate, unrelated same-account mutation (same ownerFence) advances revision to R+1.
+    const requestA = await buildRequest(accountId, pairA, 1_200_000);
+    const admittedA = await session.admitAndPersist(pairA, requestA, coordinator);
+    if (admittedA.outcome !== 'ADMITTED') throw new Error('setup failed');
+    expect(admittedA.accountRevision).toBe(staleRevision + 1n);
+
+    // Attempting a DIFFERENT operation still bound to the OLD revision R must be rejected before any mutation.
+    const requestB = await buildRequest(accountId, pairB, 1_200_000);
+    await expect(session.admitAndPersist(pairB, requestB, coordinator, staleRevision)).rejects.toMatchObject({ code: 'STALE_ACCOUNT_REVISION' });
+
+    expect(await prisma.paperReservation.count({ where: { accountId, pair: pairB } })).toBe(0);
+    const slotB = await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: pairB } } });
+    expect(slotB.status).toBe('EMPTY');
+    const accountAfter = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    expect(accountAfter.revision).toBe(admittedA.accountRevision); // the rejected attempt did not itself advance revision
+  });
+
+});
+
 describe('P14-D live-DB — restart / C3 restore', () => {
   it('a durable ADMITTED reservation survives a fresh RiskAdmissionCoordinator and is restored before new admissions', async () => {
     if (skip()) return;

@@ -25,7 +25,11 @@ function assertSessionProof(proof: unknown): void {
 }
 
 export type AdmitAndPersistResult =
-  | { readonly outcome: 'ADMITTED'; readonly admission: AdmissionRecord }
+  // [F14-06] `accountRevision` is the `PaperAccount.revision` AFTER this
+  // admission's own atomic increment — the next trusted step (P14-E OPEN
+  // execution) must bind to THIS value, never the caller's original
+  // pre-admission health observation, since admission itself just advanced it.
+  | { readonly outcome: 'ADMITTED'; readonly admission: AdmissionRecord; readonly accountRevision: bigint }
   | { readonly outcome: 'SOURCE_DECISION_ALREADY_EXECUTED' }
   | { readonly outcome: 'PAIR_SLOT_UNAVAILABLE' }
   | { readonly outcome: 'RISK_REJECTED' }
@@ -112,6 +116,7 @@ export class PaperAdmissionBridge {
     pair: string,
     request: AdmissionRequest,
     coordinator: RiskAdmissionCoordinator,
+    expectedRevision?: bigint,
   ): Promise<AdmitAndPersistResult> {
     assertSessionProof(sessionProof);
     const held = PaperAccountOwnership.read(ownership);
@@ -127,6 +132,14 @@ export class PaperAdmissionBridge {
         const account = await tx.paperAccount.findUnique({ where: { accountId: held.accountId } });
         if (account === null) throw new PaperPersistenceError('ACCOUNT_NOT_FOUND', `No paper_account row for ${held.accountId}`);
         if (account.ownerFence !== held.fence) throw new PaperPersistenceError('STALE_FENCE', `Held fence ${held.fence} no longer matches current ${account.ownerFence}`);
+        // [F14-06] Atomic version check, under the SAME lock as the mutation —
+        // never a separate preflight SELECT. Checked BEFORE any read that could
+        // itself change behavior (terminal-fill/self-retry), so a stale caller
+        // is rejected before any economic/admission mutation, exactly like a
+        // fence mismatch.
+        if (expectedRevision !== undefined && account.revision !== expectedRevision) {
+          throw new PaperPersistenceError('STALE_ACCOUNT_REVISION', `Expected account revision ${expectedRevision} for ${held.accountId} but current revision is ${account.revision}`);
+        }
 
         await tx.$executeRaw`SELECT account_id FROM paper_position WHERE account_id = ${held.accountId} AND pair = ${pair} FOR UPDATE`;
         const slot = await tx.paperPosition.findUnique({ where: { accountId_pair: { accountId: held.accountId, pair } } });
@@ -180,7 +193,15 @@ export class PaperAdmissionBridge {
           },
         });
 
-        return { outcome: 'ADMITTED' as const, admission };
+        // [F14-06] Admission mutates durable admission/slot state and must
+        // therefore advance PaperAccount.revision atomically with it — a prior
+        // P14-H HEALTHY observation must not remain valid across this mutation.
+        // `account.revision` was already read fresh under this same account-row
+        // lock above, so the post-increment value is deterministically known
+        // without a second read.
+        await tx.paperAccount.update({ where: { accountId: held.accountId }, data: { revision: { increment: 1n } } });
+
+        return { outcome: 'ADMITTED' as const, admission, accountRevision: account.revision + 1n };
       }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted });
     } catch (cause) {
       if (coordinatorMutated) {
@@ -243,6 +264,10 @@ export class PaperAdmissionBridge {
             data: { status: 'EMPTY', admissionId: null, ownerStrategyInstanceId: null, ownerStrategyId: null, ownerStrategyVersion: null, ownerParameterHash: null, revision: { increment: 1 } },
           });
         }
+        // [F14-06] Release changes durable admission/slot state and must
+        // invalidate any older health/version observation exactly like
+        // admission does.
+        await tx.paperAccount.update({ where: { accountId: held.accountId }, data: { revision: { increment: 1n } } });
         return 'RELEASED' as const;
       }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted });
     } catch (cause) {

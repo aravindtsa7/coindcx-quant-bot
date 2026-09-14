@@ -23,6 +23,18 @@ export interface AdmissionSequenceWatermark {
   readonly latestDecisionSequence: number;
 }
 
+/** [F14-04] The highest `AdmissionRecord.generation` ever durably used for one
+ * `sourceStrategyDecisionId`, independent of that attempt's current status —
+ * a RELEASED or CONSUMED row still occupies its generation number forever
+ * (V2.1's own frozen `@@unique([accountId, riskDecisionId, generation])`
+ * constraint already assumes this). Restoring only currently-ADMITTED rows
+ * (as `admittedRecords` does) would silently forget a released/consumed
+ * generation and let a fresh retry after restart reuse it. */
+export interface AdmissionGenerationWatermark {
+  readonly sourceStrategyDecisionId: string;
+  readonly highestGeneration: number;
+}
+
 /**
  * [P14-D BLK-01] Internal-only capability gating account-fault marking and
  * authoritative fault-recovery replacement. Deliberately NOT exported from
@@ -68,6 +80,10 @@ export class RiskAdmissionCoordinator {
   readonly #byAccountAndDecision = new Map<string, Map<string, Entry>>();
   readonly #byAdmissionId = new Map<string, Entry>();
   readonly #latestAdmittedSequence = new Map<string, Map<string, number>>();
+  /** [F14-04] accountId -> sourceStrategyDecisionId -> highest generation ever
+   * durably used, restored independently of any live pending-exposure entry
+   * (see `AdmissionGenerationWatermark`). */
+  readonly #latestGeneration = new Map<string, Map<string, number>>();
   readonly #faultedAccounts = new Set<string>();
 
   public admit(request: AdmissionRequest): Promise<AdmissionOutcome> {
@@ -113,9 +129,10 @@ export class RiskAdmissionCoordinator {
   public restoreAuthoritative(
     capability: unknown, accountId: string,
     admittedRecords: readonly AdmissionRecord[], sequenceWatermarks: readonly AdmissionSequenceWatermark[],
+    generationWatermarks: readonly AdmissionGenerationWatermark[] = [],
   ): Promise<void> {
     assertFaultRecoveryCapability(capability);
-    return this.#queues.enqueue(accountId, () => this.#restoreAuthoritativeLocked(accountId, admittedRecords, sequenceWatermarks));
+    return this.#queues.enqueue(accountId, () => this.#restoreAuthoritativeLocked(accountId, admittedRecords, sequenceWatermarks, generationWatermarks));
   }
 
   /**
@@ -132,22 +149,29 @@ export class RiskAdmissionCoordinator {
    * admission's capacity. Callers (P14-D) must complete this before this
    * account may accept any new `admit()` call.
    */
-  public restore(accountId: string, admittedRecords: readonly AdmissionRecord[], sequenceWatermarks: readonly AdmissionSequenceWatermark[]): Promise<void> {
-    return this.#queues.enqueue(accountId, () => this.#restoreLocked(accountId, admittedRecords, sequenceWatermarks));
+  public restore(
+    accountId: string, admittedRecords: readonly AdmissionRecord[], sequenceWatermarks: readonly AdmissionSequenceWatermark[],
+    generationWatermarks: readonly AdmissionGenerationWatermark[] = [],
+  ): Promise<void> {
+    return this.#queues.enqueue(accountId, () => this.#restoreLocked(accountId, admittedRecords, sequenceWatermarks, generationWatermarks));
   }
 
-  #restoreLocked(accountId: string, admittedRecords: readonly AdmissionRecord[], sequenceWatermarks: readonly AdmissionSequenceWatermark[]): void {
+  #restoreLocked(
+    accountId: string, admittedRecords: readonly AdmissionRecord[], sequenceWatermarks: readonly AdmissionSequenceWatermark[],
+    generationWatermarks: readonly AdmissionGenerationWatermark[],
+  ): void {
     if (this.#faultedAccounts.has(accountId)) {
       throw new Error(`RiskAdmissionCoordinator.restore: account ${accountId} is FAULTED — use authoritative recovery restore, not ordinary restore`);
     }
     if (this.#byAccountAndDecision.has(accountId) || this.#latestAdmittedSequence.has(accountId)) {
       throw new Error(`RiskAdmissionCoordinator.restore: account ${accountId} already has in-memory admission state — restore is startup-only`);
     }
-    const { byDecision, byAdmissionIdEntries, bySequence } = this.#validateRestoreBatch(accountId, admittedRecords, sequenceWatermarks);
+    const { byDecision, byAdmissionIdEntries, bySequence, byGeneration } = this.#validateRestoreBatch(accountId, admittedRecords, sequenceWatermarks, generationWatermarks);
     // All-or-nothing: only commit into the live maps after every record/watermark has validated.
     this.#byAccountAndDecision.set(accountId, byDecision);
     for (const [admissionId, entry] of byAdmissionIdEntries) this.#byAdmissionId.set(admissionId, entry);
     this.#latestAdmittedSequence.set(accountId, bySequence);
+    this.#latestGeneration.set(accountId, byGeneration);
   }
 
   /**
@@ -158,8 +182,11 @@ export class RiskAdmissionCoordinator {
    * `#byAdmissionId` before the replacement batch is inserted, so a stale
    * pre-fault admissionId can never linger as a phantom live entry.
    */
-  #restoreAuthoritativeLocked(accountId: string, admittedRecords: readonly AdmissionRecord[], sequenceWatermarks: readonly AdmissionSequenceWatermark[]): void {
-    const { byDecision, byAdmissionIdEntries, bySequence } = this.#validateRestoreBatch(accountId, admittedRecords, sequenceWatermarks);
+  #restoreAuthoritativeLocked(
+    accountId: string, admittedRecords: readonly AdmissionRecord[], sequenceWatermarks: readonly AdmissionSequenceWatermark[],
+    generationWatermarks: readonly AdmissionGenerationWatermark[],
+  ): void {
+    const { byDecision, byAdmissionIdEntries, bySequence, byGeneration } = this.#validateRestoreBatch(accountId, admittedRecords, sequenceWatermarks, generationWatermarks);
     const previous = this.#byAccountAndDecision.get(accountId);
     if (previous !== undefined) {
       for (const entry of previous.values()) this.#byAdmissionId.delete(entry.record.admissionId);
@@ -167,15 +194,27 @@ export class RiskAdmissionCoordinator {
     this.#byAccountAndDecision.set(accountId, byDecision);
     for (const [admissionId, entry] of byAdmissionIdEntries) this.#byAdmissionId.set(admissionId, entry);
     this.#latestAdmittedSequence.set(accountId, bySequence);
+    this.#latestGeneration.set(accountId, byGeneration);
     this.#faultedAccounts.delete(accountId);
   }
 
   /** Shared validation for `restore`/`restoreAuthoritative` — builds a fully-validated replacement batch without mutating any live map. */
   #validateRestoreBatch(
     accountId: string, admittedRecords: readonly AdmissionRecord[], sequenceWatermarks: readonly AdmissionSequenceWatermark[],
-  ): { readonly byDecision: Map<string, Entry>; readonly byAdmissionIdEntries: Array<readonly [string, Entry]>; readonly bySequence: Map<string, number> } {
+    generationWatermarks: readonly AdmissionGenerationWatermark[],
+  ): {
+    readonly byDecision: Map<string, Entry>; readonly byAdmissionIdEntries: Array<readonly [string, Entry]>;
+    readonly bySequence: Map<string, number>; readonly byGeneration: Map<string, number>;
+  } {
     const byDecision = new Map<string, Entry>();
     const byAdmissionIdEntries: Array<readonly [string, Entry]> = [];
+    // [F14-04] Every historically-durable generation for a sourceStrategyDecisionId
+    // must be known before any fresh admit() is allowed to allocate the next one —
+    // seeded first from every currently-ADMITTED record's own generation (still
+    // live pending exposure), then raised further by the explicit historical
+    // watermarks below (RELEASED/CONSUMED rows, which restore no pending exposure
+    // but must still be known so a retry never reuses their generation number).
+    const byGeneration = new Map<string, number>();
     for (const record of admittedRecords) {
       if (record.accountId !== accountId) {
         throw new Error(`RiskAdmissionCoordinator.restore: record accountId ${record.accountId} does not match ${accountId}`);
@@ -189,6 +228,7 @@ export class RiskAdmissionCoordinator {
       const entry: Entry = { record, decision: null };
       byDecision.set(record.sourceStrategyDecisionId, entry);
       byAdmissionIdEntries.push([record.admissionId, entry]);
+      byGeneration.set(record.sourceStrategyDecisionId, record.generation);
     }
     const bySequence = new Map<string, number>();
     for (const watermark of sequenceWatermarks) {
@@ -200,7 +240,14 @@ export class RiskAdmissionCoordinator {
       }
       bySequence.set(watermark.strategyInstanceId, watermark.latestDecisionSequence);
     }
-    return { byDecision, byAdmissionIdEntries, bySequence };
+    for (const watermark of generationWatermarks) {
+      if (!Number.isSafeInteger(watermark.highestGeneration) || watermark.highestGeneration < 1) {
+        throw new Error(`RiskAdmissionCoordinator.restore: malformed generation watermark for ${watermark.sourceStrategyDecisionId}`);
+      }
+      const current = byGeneration.get(watermark.sourceStrategyDecisionId) ?? 0;
+      if (watermark.highestGeneration > current) byGeneration.set(watermark.sourceStrategyDecisionId, watermark.highestGeneration);
+    }
+    return { byDecision, byAdmissionIdEntries, bySequence, byGeneration };
   }
 
   #admitLocked(request: AdmissionRequest): AdmissionOutcome {
@@ -261,7 +308,16 @@ export class RiskAdmissionCoordinator {
 
     const direction = decision.targetExposure;
     if (direction !== 'LONG' && direction !== 'SHORT') throw new Error('Accepted OPEN decision requires a directional targetExposure');
-    const generation = (this.#byAccountAndDecision.get(accountId)?.get(decision.decisionId)?.record.generation ?? 0) + 1;
+    // [F14-04] The next generation must exceed every generation this exact
+    // sourceStrategyDecisionId has EVER durably used — not merely the current
+    // live (in-memory) entry's generation, which restore() never repopulates
+    // for a RELEASED/CONSUMED attempt (only ADMITTED rows restore a live
+    // entry). `#latestGeneration` is restored independently of live pending
+    // exposure precisely so a post-restart retry can never reuse a released
+    // generation's number.
+    const priorLiveGeneration = this.#byAccountAndDecision.get(accountId)?.get(decision.decisionId)?.record.generation ?? 0;
+    const priorHistoricalGeneration = this.#latestGeneration.get(accountId)?.get(decision.decisionId) ?? 0;
+    const generation = Math.max(priorLiveGeneration, priorHistoricalGeneration) + 1;
     const record: AdmissionRecord = Object.freeze({
       admissionId: sha256CanonicalJson({
         accountId, riskDecisionId: riskDecision.riskDecisionId, strategyInstanceId: instanceId, pair: decision.pair,
@@ -281,6 +337,9 @@ export class RiskAdmissionCoordinator {
     let bySequence = this.#latestAdmittedSequence.get(accountId);
     if (bySequence === undefined) { bySequence = new Map(); this.#latestAdmittedSequence.set(accountId, bySequence); }
     bySequence.set(instanceId, decision.decisionSequence);
+    let byGeneration = this.#latestGeneration.get(accountId);
+    if (byGeneration === undefined) { byGeneration = new Map(); this.#latestGeneration.set(accountId, byGeneration); }
+    byGeneration.set(decision.decisionId, generation);
 
     return { status: 'ADMITTED', decision: riskDecision, admission: record };
   }

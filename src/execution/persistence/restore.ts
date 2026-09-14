@@ -1,6 +1,6 @@
 import { Prisma, PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../persistence/prisma';
-import { RiskAdmissionCoordinator, type AdmissionSequenceWatermark } from '../../dispatch';
+import { RiskAdmissionCoordinator, type AdmissionGenerationWatermark, type AdmissionSequenceWatermark } from '../../dispatch';
 // [P14-D BLK-01] Internal, non-barrel import — deliberately not re-exported
 // from `src/dispatch/index.ts` (see admission.ts). Only this file needs it,
 // to route a FAULTED account's session-open through the authoritative
@@ -50,7 +50,10 @@ export async function restoreAccountAdmissionState(
       throw new PaperPersistenceError('STALE_FENCE', `Held fence ${held.fence} no longer matches current ${account.ownerFence} for ${held.accountId}`);
     }
     const admitted = await tx.paperReservation.findMany({ where: { accountId: held.accountId, status: 'ADMITTED' } });
-    const all = await tx.paperReservation.findMany({ where: { accountId: held.accountId }, select: { strategyInstanceId: true, decisionSequence: true } });
+    const all = await tx.paperReservation.findMany({
+      where: { accountId: held.accountId },
+      select: { strategyInstanceId: true, decisionSequence: true, sourceStrategyDecisionId: true, generation: true },
+    });
     return { admittedRows: admitted, allRows: all };
   }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted });
 
@@ -61,12 +64,25 @@ export async function restoreAccountAdmissionState(
   });
 
   const watermarkByInstance = new Map<string, number>();
+  // [F14-04] Highest durable generation per sourceStrategyDecisionId,
+  // computed from EVERY historical row regardless of status (ADMITTED,
+  // RELEASED, CONSUMED) — a released/consumed attempt still permanently
+  // occupies its generation number (V2.1's own
+  // `@@unique([accountId, riskDecisionId, generation])` constraint already
+  // assumes this), so it must not be forgotten across a restart merely
+  // because it no longer holds live pending exposure.
+  const generationByDecision = new Map<string, number>();
   for (const row of allRows) {
     const current = watermarkByInstance.get(row.strategyInstanceId) ?? 0;
     if (row.decisionSequence > current) watermarkByInstance.set(row.strategyInstanceId, row.decisionSequence);
+    const currentGeneration = generationByDecision.get(row.sourceStrategyDecisionId) ?? 0;
+    if (row.generation > currentGeneration) generationByDecision.set(row.sourceStrategyDecisionId, row.generation);
   }
   const sequenceWatermarks: readonly AdmissionSequenceWatermark[] = Object.freeze(
     [...watermarkByInstance].map(([strategyInstanceId, latestDecisionSequence]) => Object.freeze({ strategyInstanceId, latestDecisionSequence })),
+  );
+  const generationWatermarks: readonly AdmissionGenerationWatermark[] = Object.freeze(
+    [...generationByDecision].map(([sourceStrategyDecisionId, highestGeneration]) => Object.freeze({ sourceStrategyDecisionId, highestGeneration })),
   );
 
   // [P14-D BLK-01] A FAULTED account (see PaperAdmissionBridge/PaperAccountSession)
@@ -79,9 +95,9 @@ export async function restoreAccountAdmissionState(
   const isRecovery = coordinator.isAccountFaulted(held.accountId);
   try {
     if (isRecovery) {
-      await coordinator.restoreAuthoritative(ACCOUNT_FAULT_RECOVERY_CAPABILITY, held.accountId, admittedRecords, sequenceWatermarks);
+      await coordinator.restoreAuthoritative(ACCOUNT_FAULT_RECOVERY_CAPABILITY, held.accountId, admittedRecords, sequenceWatermarks, generationWatermarks);
     } else {
-      await coordinator.restore(held.accountId, admittedRecords, sequenceWatermarks);
+      await coordinator.restore(held.accountId, admittedRecords, sequenceWatermarks, generationWatermarks);
     }
   } catch (cause) {
     throw new PaperPersistenceError('DURABLE_CONFLICT', `C3 restore rejected the durable admission state for ${held.accountId}`, { cause });

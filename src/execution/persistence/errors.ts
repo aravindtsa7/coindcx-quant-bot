@@ -10,6 +10,14 @@ export type PaperPersistenceFailureCode =
   | 'ACCOUNT_NOT_FOUND'
   | 'NOT_OWNER'
   | 'STALE_FENCE'
+  // [F14-06] A caller-supplied expected `PaperAccount.revision` (observed by a
+  // prior fresh P14-H reconciliation) no longer matches the current durable
+  // revision under the SAME account-row lock protecting this mutation — some
+  // other durable mutation committed in between. Distinct from `STALE_FENCE`
+  // (ownership/lease identity): this is about economic/admission state having
+  // moved since the last trusted health observation, even under the SAME
+  // fence.
+  | 'STALE_ACCOUNT_REVISION'
   | 'ACCOUNT_NOT_READY'
   | 'PAIR_SLOT_UNAVAILABLE'
   | 'DURABLE_CONFLICT'

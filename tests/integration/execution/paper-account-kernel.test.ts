@@ -414,6 +414,71 @@ describe('P14-G live-DB — released reservation restart (§39)', () => {
   });
 });
 
+describe('F14-04 correction — released generation history survives restart (§4)', () => {
+  it('a retry of the same unfilled source decision after restart allocates generation 2, leaves the generation-1 row RELEASED, and proceeds to exactly one eventual fill', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const { result: planResult } = await genuineResearchApproval();
+    const kernel = makeKernel(PAIR);
+    const decision = evaluateDecision(kernel, T0);
+    const request: AdmissionRequest = { accountId, policy: policyFor(PAIR), context: buildContext(kernel, decision) };
+
+    // --- Process 1: admit generation 1, release without fill ---
+    const coordinator1 = new RiskAdmissionCoordinator();
+    const session1 = await openPaperAccountSession({ accountId, coordinator: coordinator1, prisma });
+    const admittedGen1 = await session1.admitAndPersist(PAIR, request, coordinator1);
+    if (admittedGen1.outcome !== 'ADMITTED') throw new Error('setup failed');
+    expect(admittedGen1.admission.generation).toBe(1);
+    const releasedGen1 = await session1.releaseAndPersist(admittedGen1.admission.admissionId, coordinator1);
+    expect(releasedGen1).toBe('RELEASED');
+
+    // --- Destroy all process-local coordinator/session state; fresh coordinator/kernel restore ---
+    const coordinator2 = new RiskAdmissionCoordinator();
+    const kernelProcess2 = new PaperAccountKernel(prisma);
+    const runtime2 = await kernelProcess2.startPaperAccountRuntime({ accountId, coordinator: coordinator2, prisma });
+    expect(runtime2.position(PAIR)).toMatchObject({ status: 'EMPTY', pair: PAIR });
+
+    // --- Retry the SAME (unfilled) source decision through the restored runtime ---
+    const admittedGen2 = await runtime2.session.admitAndPersist(PAIR, request, coordinator2);
+    if (admittedGen2.outcome !== 'ADMITTED') throw new Error('retry admission failed');
+    expect(admittedGen2.admission.generation).toBe(2); // never reuses generation 1, even though restore() never restores a RELEASED row as pending exposure
+    expect(admittedGen2.admission.sourceStrategyDecisionId).toBe(admittedGen1.admission.sourceStrategyDecisionId);
+    expect(admittedGen2.admission.admissionId).not.toBe(admittedGen1.admission.admissionId);
+
+    const slotAfterRetryAdmission = await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } });
+    expect(slotAfterRetryAdmission.status).toBe('PENDING');
+    expect(slotAfterRetryAdmission.admissionId).toBe(admittedGen2.admission.admissionId);
+
+    const gen1RowAfterRetry = await prisma.paperReservation.findUniqueOrThrow({ where: { admissionId: admittedGen1.admission.admissionId } });
+    expect(gen1RowAfterRetry.status).toBe('RELEASED');
+    expect(gen1RowAfterRetry.generation).toBe(1);
+
+    // --- OPEN may proceed through the normal path; exactly one eventual fill ---
+    const openAuthority = await mintPaperOpenExecutionAuthority({
+      coordinator: coordinator2, accountId, kernel, decision, instrumentSpecSnapshotId: INSTRUMENT_SPEC_SNAPSHOT_ID,
+      planResult, policy: policyFor(PAIR), evidence: evidenceFrom(request.context),
+    });
+    expect(openAuthority).not.toBeNull();
+    if (openAuthority === null) return;
+    const openNowMs = T0 + 500;
+    const openQuote = buildQuote(PAIR, '99', '99.5', openNowMs - 100);
+    const openDepth = buildDepth(openQuote, '1000000', '1000000');
+    const openResult = await runtime2.session.executeOpen(openAuthority, {
+      evidence: trust(openQuote, openDepth, buildConversion('80', openNowMs)), priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT,
+      executionPolicy: EXECUTION_POLICY, nowMs: openNowMs,
+    }, coordinator2);
+    expect(openResult.outcome).toBe('FILLED');
+    expect(await prisma.paperFill.count({ where: { accountId } })).toBe(1);
+
+    // --- Terminal retry after fill can never generate a second economic fill ---
+    const retryAfterFill = await runtime2.session.admitAndPersist(PAIR, request, coordinator2);
+    expect(retryAfterFill.outcome).toBe('SOURCE_DECISION_ALREADY_EXECUTED');
+    expect(await prisma.paperFill.count({ where: { accountId } })).toBe(1);
+  }, 60_000);
+});
+
 describe('P14-G live-DB — funding invariant restart (§45/§68)', () => {
   it('startup fails before READY when durable funding facts are non-zero, and never repairs them', async () => {
     if (skip()) return;
@@ -813,4 +878,73 @@ describe('P14-G live-DB — P14-F promotion guard regression (§55)', () => {
     const { isPaperFundingProductionPromotionEvidence } = await import('../../../src/execution/funding-capability');
     expect(isPaperFundingProductionPromotionEvidence()).toBe(false);
   });
+});
+
+describe('F14-06 correction — CLOSE stale account revision race', () => {
+  it('a stale expectedRevision rejects CLOSE before any economic mutation (same ownerFence — revision alone protects)', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    const PAIR2 = 'B-ETH_USDT';
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    await provisionPairSlot(accountId, PAIR2);
+    const { result: planResult } = await genuineResearchApproval();
+
+    const coordinator = new RiskAdmissionCoordinator();
+    const session = (await new PaperAccountKernel(prisma).startPaperAccountRuntime({ accountId, coordinator, prisma })).session;
+
+    // --- Genuine OPEN on PAIR ---
+    const kernel = makeKernel(PAIR);
+    const openDecision = evaluateDecision(kernel, T0);
+    const openContext = buildContext(kernel, openDecision);
+    const admitted = await session.admitAndPersist(PAIR, { accountId, policy: policyFor(PAIR), context: openContext }, coordinator);
+    if (admitted.outcome !== 'ADMITTED') throw new Error('setup failed');
+    const openAuthority = await mintPaperOpenExecutionAuthority({
+      coordinator, accountId, kernel, decision: openDecision, instrumentSpecSnapshotId: INSTRUMENT_SPEC_SNAPSHOT_ID,
+      planResult, policy: policyFor(PAIR), evidence: evidenceFrom(openContext),
+    });
+    if (openAuthority === null) throw new Error('setup failed');
+    const openNowMs = T0 + 500;
+    const openQuote = buildQuote(PAIR, '99', '99.5', openNowMs - 100);
+    const openResult = await session.executeOpen(openAuthority, {
+      evidence: trust(openQuote, buildDepth(openQuote, '1000000', '1000000'), buildConversion('80', openNowMs)),
+      priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: openNowMs,
+    }, coordinator);
+    if (openResult.outcome !== 'FILLED') throw new Error('setup failed');
+
+    const staleRevision = (await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).revision; // "HEALTHY observed at revision R"
+
+    // A second, unrelated same-account mutation (same ownerFence) advances revision to R+1.
+    const kernel2 = makeKernel(PAIR2);
+    const decision2 = evaluateDecision(kernel2, T0);
+    const admitted2 = await session.admitAndPersist(PAIR2, { accountId, policy: policyFor(PAIR2), context: buildContext(kernel2, decision2) }, coordinator);
+    if (admitted2.outcome !== 'ADMITTED') throw new Error('setup failed');
+    expect(admitted2.accountRevision).toBe(staleRevision + 1n);
+
+    // Genuine fresh CLOSE authority for the OPEN position, deliberately bound to the STALE revision.
+    const closeDecision = evaluateDecision(kernel, T0 + MINUTE, 'FLAT');
+    const closeContext = buildContext(kernel, closeDecision, { pairSnapshot: openPairSnapshotFor(kernel, openResult.quantity, closeDecision.evaluationTimeMs) });
+    const positionAfterOpen = await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } });
+    const positionBinding: PaperClosePositionBinding = {
+      positionInstanceId: openResult.positionInstanceId, positionRevision: positionAfterOpen.revision,
+      ownerStrategyInstanceId: kernel.strategyInstanceId, ownerStrategyId: kernel.strategyId,
+      ownerStrategyVersion: kernel.strategyVersion, ownerParameterHash: kernel.parameterHash, ownedQuantity: openResult.quantity,
+    };
+    const closeAuthority = await mintPaperCloseExecutionAuthority({
+      coordinator, accountId, kernel, decision: closeDecision, instrumentSpecSnapshotId: INSTRUMENT_SPEC_SNAPSHOT_ID,
+      policy: policyFor(PAIR), evidence: evidenceFrom(closeContext), position: positionBinding,
+    });
+    if (closeAuthority === null) throw new Error('setup failed');
+    const closeNowMs = T0 + MINUTE + 500;
+    const closeQuote = buildQuote(PAIR, '110', '112', closeNowMs - 100);
+
+    await expect(session.executeClose(closeAuthority, {
+      evidence: trust(closeQuote, buildDepth(closeQuote, '1000000', '1000000'), buildConversion('80', closeNowMs)),
+      priceIncrement: PRICE_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: closeNowMs,
+    }, staleRevision)).rejects.toMatchObject({ code: 'STALE_ACCOUNT_REVISION' });
+
+    const positionAfterRejectedClose = await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } });
+    expect(positionAfterRejectedClose.status).toBe('OPEN'); // no economic mutation occurred
+    expect(await prisma.paperFill.count({ where: { accountId, pair: PAIR } })).toBe(1); // only the original OPEN fill
+  }, 60_000);
 });

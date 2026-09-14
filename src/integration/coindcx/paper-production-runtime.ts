@@ -216,7 +216,7 @@ export class PaperAccountProductionRuntime {
   }
 
   async #executeOpenLocked(params: ProductionOpenParams): Promise<PaperOpenExecutionResult> {
-    await this.#assertFreshlyHealthy();
+    const health = await this.#assertFreshlyHealthy();
 
     const researchApproval = issueResearchApprovalOrigin(params.planResult, {
       pair: params.kernel.pair, strategyId: params.kernel.strategyId, strategyVersion: params.kernel.strategyVersion, parameterHash: params.kernel.parameterHash,
@@ -227,7 +227,10 @@ export class PaperAccountProductionRuntime {
 
     const admissionContext: RiskEvaluationContext = { ...params.riskEvidence, strategyOrigin: authorized.strategyOrigin, candidate: authorized.candidate };
     const admissionRequest: AdmissionRequest = { accountId: this.accountId, policy: params.policy, context: admissionContext };
-    const admitted = await this.#kernelRuntime.session.admitAndPersist(params.kernel.pair, admissionRequest, this.#coordinator);
+    // [F14-06] Bind admission to the exact revision this call's own fresh
+    // health observation just saw, atomically re-verified under the account
+    // lock inside admitAndPersist itself — never a separate preflight check.
+    const admitted = await this.#kernelRuntime.session.admitAndPersist(params.kernel.pair, admissionRequest, this.#coordinator, health.revision);
     if (admitted.outcome === 'SOURCE_DECISION_ALREADY_EXECUTED') {
       // §22 terminal retry idempotency — nothing left to admit/mint/execute; the durable terminal fact already exists.
       return disclosePaperFundingExcluded({ outcome: 'SOURCE_DECISION_ALREADY_EXECUTED' as const });
@@ -246,14 +249,17 @@ export class PaperAccountProductionRuntime {
     });
     if (authority === null) throw new PaperProductionRuntimeError('AUTHORITY_REJECTED', 'OPEN execution authority was not granted');
 
+    // [F14-06] Admission itself just atomically advanced the account revision
+    // to `admitted.accountRevision` — the OPEN fill transaction must bind to
+    // THAT new value, never the pre-admission `health.revision`.
     return this.#kernelRuntime.session.executeOpen(authority, {
       evidence: evidenceRead.evidence, priceIncrement: params.priceIncrement, quantityIncrement: params.quantityIncrement,
       executionPolicy: params.executionPolicy, nowMs: this.#clock.nowMs(),
-    }, this.#coordinator);
+    }, this.#coordinator, admitted.accountRevision);
   }
 
   async #executeCloseLocked(params: ProductionCloseParams): Promise<PaperCloseExecutionResult> {
-    await this.#assertFreshlyHealthy();
+    const health = await this.#assertFreshlyHealthy();
     const pair = params.kernel.pair;
 
     // Fresh durable read (never the P14-G rehydration snapshot taken at
@@ -282,9 +288,12 @@ export class PaperAccountProductionRuntime {
     });
     if (authority === null) throw new PaperProductionRuntimeError('AUTHORITY_REJECTED', 'CLOSE execution authority was not granted');
 
+    // [F14-06] CLOSE has no admission step of its own — bind directly to this
+    // call's own fresh health observation, atomically re-verified under the
+    // account lock inside executeClose itself.
     return this.#kernelRuntime.session.executeClose(authority, {
       evidence: evidenceRead.evidence, priceIncrement: params.priceIncrement, executionPolicy: params.executionPolicy, nowMs: this.#clock.nowMs(),
-    });
+    }, health.revision);
   }
 }
 Object.freeze(PaperAccountProductionRuntime.prototype);
@@ -308,13 +317,19 @@ Object.freeze(PaperAccountProductionRuntime);
  * itself, retryable via a later `start()` call once external correction makes
  * reconciliation HEALTHY, with no new fence acquisition required.
  */
+/** [F14-07] A cached READY facade paired with the exact P14-G kernel runtime it was built from — the only reliable way to detect that the kernel has since had to recover a FAULTED session underneath it (a brand-new `PaperAccountRuntime` instance), since the kernel's own diagnostic `getState()` never reflects a post-startup session fault. */
+interface CachedProductionEntry {
+  readonly runtime: PaperAccountProductionRuntime;
+  readonly kernelRuntime: PaperAccountRuntime;
+}
+
 export class PaperAccountProductionComposer {
   readonly #prisma: PrismaClient;
   readonly #clock: Clock;
   readonly #kernel: PaperAccountKernel;
   readonly #reconciler: PaperAccountReconciler;
   readonly #states = new Map<string, PaperAccountProductionState>();
-  readonly #readyRuntimes = new Map<string, PaperAccountProductionRuntime>();
+  readonly #readyRuntimes = new Map<string, CachedProductionEntry>();
   readonly #inFlight = new Map<string, Promise<PaperAccountProductionRuntime>>();
 
   public constructor(params?: { readonly prisma?: PrismaClient; readonly clock?: Clock; readonly kernel?: PaperAccountKernel; readonly reconciler?: PaperAccountReconciler }) {
@@ -344,23 +359,61 @@ export class PaperAccountProductionComposer {
   public start(params: StartPaperAccountProductionRuntimeParams): Promise<PaperAccountProductionRuntime> {
     const { accountId } = params;
 
-    const cached = this.#readyRuntimes.get(accountId);
-    if (cached !== undefined) {
-      if (this.#kernel.getState(accountId) === 'READY') return Promise.resolve(cached);
-      this.#readyRuntimes.delete(accountId);
-      this.#states.set(accountId, 'NOT_READY');
-    }
-
     const existingFlight = this.#inFlight.get(accountId);
     if (existingFlight !== undefined) return existingFlight;
 
-    const promise = this.#startFresh(params);
+    const promise = this.#startOrReuse(params);
     this.#inFlight.set(accountId, promise);
     const clearInFlight = (): void => {
       if (this.#inFlight.get(accountId) === promise) this.#inFlight.delete(accountId);
     };
     promise.then(clearInFlight, clearInFlight);
     return promise;
+  }
+
+  /**
+   * [F14-07] Never trusts a cached READY facade on the strength of the
+   * kernel's own diagnostic `getState()` alone — that map is set once at the
+   * end of a successful `PaperAccountKernel#start()` and is never updated
+   * when the underlying `PaperAccountSession` later faults (e.g. an
+   * outcome-ambiguous admission/execution failure), so it can read `'READY'`
+   * long after the session genuinely is not. The kernel itself remains the
+   * sole recovery authority (§19): every `start()` call re-verifies through
+   * `PaperAccountKernel.startPaperAccountRuntime` itself, which (a) is a
+   * cheap, no-DB-I/O no-op when the cached session is genuinely still READY
+   * (P14-G-MAJ-02's own idempotent cache), and (b) transparently performs
+   * genuine kernel-level fault recovery — a fresh ownership/restore sequence
+   * producing a brand-new `PaperAccountRuntime` instance — when it is not.
+   * Only when the kernel hands back the EXACT SAME runtime instance this
+   * facade was built from is the cached facade still valid and returned with
+   * no re-reconciliation; any other outcome (a new instance, or a thrown
+   * failure) discards the stale facade and falls through to a full
+   * `#startFresh` — fresh P14-H reconciliation included — before any new
+   * READY facade can ever be produced.
+   */
+  async #startOrReuse(params: StartPaperAccountProductionRuntimeParams): Promise<PaperAccountProductionRuntime> {
+    const { accountId, coordinator } = params;
+    const cachedEntry = this.#readyRuntimes.get(accountId);
+    if (cachedEntry !== undefined) {
+      let kernelRuntime: PaperAccountRuntime;
+      try {
+        kernelRuntime = await this.#kernel.startPaperAccountRuntime({ accountId, coordinator, prisma: this.#prisma, clock: this.#clock });
+      } catch {
+        // Kernel-level recovery itself failed — the stale facade is
+        // definitely no longer valid; fall through to #startFresh, whose own
+        // try/catch reports the real failure and leaves the account NOT_READY.
+        this.#readyRuntimes.delete(accountId);
+        this.#states.set(accountId, 'NOT_READY');
+        return this.#startFresh(params);
+      }
+      if (kernelRuntime === cachedEntry.kernelRuntime) return cachedEntry.runtime;
+      // The kernel had to recover (a genuinely new PaperAccountRuntime) —
+      // the cached production facade wraps the OLD, now-discarded session
+      // and must never be returned as READY again.
+      this.#readyRuntimes.delete(accountId);
+      this.#states.set(accountId, 'NOT_READY');
+    }
+    return this.#startFresh(params);
   }
 
   async #startFresh(params: StartPaperAccountProductionRuntimeParams): Promise<PaperAccountProductionRuntime> {
@@ -390,7 +443,7 @@ export class PaperAccountProductionComposer {
       }
 
       const runtime = new PaperAccountProductionRuntime(PRODUCTION_ISSUER, accountId, kernelRuntime, this.#reconciler, provider, coordinator, this.#prisma, this.#clock);
-      this.#readyRuntimes.set(accountId, runtime);
+      this.#readyRuntimes.set(accountId, { runtime, kernelRuntime });
       this.#states.set(accountId, 'READY');
       return runtime;
     } catch (cause) {
