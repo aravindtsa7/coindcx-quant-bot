@@ -9,22 +9,13 @@ import {
   TrustedProductionInstrumentBinding,
   type TrustedProductionInstrumentBindingRecord,
 } from '../../../src/integration/coindcx/instrument-authority';
-import { CoinDcxTransport } from '../../../src/integration/coindcx/transport';
+import { interceptProductionInstrumentAcquisition } from '../../helpers/production-instrument-acquisition-harness';
 import { instrument, wire } from './audit-a2-helpers';
 
 const PAIR = 'B-BTC_USDT';
 
 function mockInstrumentReads(...responses: readonly Record<string, unknown>[]): void {
-  let index = 0;
-  vi.spyOn(CoinDcxTransport.prototype, 'executeRead').mockImplementation(async options => {
-    expect(options).toMatchObject({
-      endpoint: 'INSTRUMENT',
-      queryParams: { pair: PAIR, margin_currency_short_name: 'INR' },
-    });
-    const response = responses[index] ?? responses.at(-1);
-    index += 1;
-    return { status: 200, headers: {}, durationMs: 0, data: { instrument: response } };
-  });
+  interceptProductionInstrumentAcquisition(...responses);
 }
 
 function read(binding: TrustedProductionInstrumentBinding): TrustedProductionInstrumentBindingRecord {

@@ -481,6 +481,47 @@ describe('P14-J capability export safety (§18/§19/§52)', () => {
     }
   });
 
+  /**
+   * [F14-03] Instrument trust must close directly over a module-private native
+   * acquisition primitive. Exported transports/readers remain useful to public
+   * clients, but neither may sit on the production issuer's privileged path.
+   */
+  it('production instrument authority uses an unexported primitive with no transport/reader injection', () => {
+    const authorityFile = 'src/integration/coindcx/instrument-authority.ts';
+    const authorityPath = path.join(REPO_ROOT, authorityFile);
+    const source = readFileSync(authorityPath, 'utf8');
+    const primitive = 'privilegedAcquireProductionInstrument';
+
+    expect(source).toContain(`async function ${primitive}(pair: string)`);
+    expect(source).toContain(`const instrument = await ${primitive}(pair);`);
+    expect(source).not.toMatch(/import[^;]+CoinDcxTransport[^;]+from ['"]\.\/transport['"]/s);
+    expect(source).not.toMatch(/import[^;]+readInrFuturesInstrument[^;]+from ['"]\.\/instrument-reader['"]/s);
+    expect(source).not.toContain('.executeRead(');
+
+    const acquireStart = source.indexOf('export async function acquireProductionInstrumentBinding(');
+    expect(acquireStart).toBeGreaterThan(-1);
+    const acquireSignature = source.slice(acquireStart, source.indexOf('{', acquireStart));
+    expect(acquireSignature).toBe('export async function acquireProductionInstrumentBinding(pair: string): Promise<TrustedProductionInstrumentBinding> ');
+    for (const seam of ['transport', 'reader', 'client', 'callback', 'http', 'token', 'issuer']) {
+      expect(acquireSignature.toLowerCase()).not.toContain(seam);
+    }
+
+    const readFile = (file: string): string => readFileSync(file, 'utf8');
+    const ownExports = collectPublicExportNames(authorityPath, readFile, () => null);
+    expect(ownExports.has(primitive), `${primitive} must stay private even to deep import`).toBe(false);
+
+    const exportOffenders: string[] = [];
+    for (const absFile of listSourceFiles(SRC_ROOT)) {
+      const code = readFileSync(absFile, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+      for (const line of code.split(/\r?\n/)) {
+        if (line.includes('export') && line.includes(primitive)) {
+          exportOffenders.push(`${path.relative(REPO_ROOT, absFile).split(path.sep).join('/')}: ${line.trim()}`);
+        }
+      }
+    }
+    expect(exportOffenders, 'the privileged instrument primitive must have zero runtime exports').toEqual([]);
+  });
+
   it('normal production barrels do not expose Wave3-A trust minting or binding internals', () => {
     const forbiddenExports = [
       'acquireProductionInstrumentBinding',
@@ -497,6 +538,8 @@ describe('P14-J capability export safety (§18/§19/§52)', () => {
       // [F14-02 4A.1] The privileged acquisition implementation.
       'privilegedGetJson',
       'PrivilegedProductionSocket',
+      // [F14-03] The privileged instrument acquisition implementation.
+      'privilegedAcquireProductionInstrument',
     ];
     const readFile = (f: string): string => readFileSync(f, 'utf8');
     const allFiles = new Set(listSourceFiles(SRC_ROOT));

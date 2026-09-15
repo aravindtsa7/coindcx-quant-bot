@@ -65,9 +65,8 @@ let prisma: PrismaClient;
  * authority instead: `https.request` for the privileged GET and the
  * `socket.io-client` package for the privileged socket.
  *
- * The `executeRead` mock that remains below is unrelated: it serves Wave3-A's
- * `acquireProductionInstrumentBinding`, which is a different capability and
- * legitimately uses the exported transport.
+ * F14-03 routes production instrument acquisition through the same lower I/O
+ * boundary, while keeping market-evidence and instrument trust distinct.
  */
 let conversionResponse: unknown = null;
 
@@ -80,28 +79,27 @@ function latestProductionSocket(): FakeIoSocket {
 function installSuiteMocks(): void {
   vi.spyOn(https, 'request').mockImplementation(((url: string | URL, _options: unknown, callback?: (response: unknown) => void): unknown => {
     const request = new EventEmitter() as EventEmitter & { end(): void; destroy(): void };
-    const isConversion = new URL(String(url)).pathname.includes('/conversions');
+    const requestUrl = new URL(String(url));
+    const isConversion = requestUrl.pathname.includes('/conversions');
+    const isInstrument = requestUrl.pathname === '/exchange/v1/derivatives/futures/data/instrument';
+    const pair = requestUrl.searchParams.get('pair') ?? PAIR;
+    const underlying = pair === PAIR_B ? 'ETH' : 'BTC';
+    const responseBody = isInstrument
+      ? { instrument: instrumentWire(underlying, { unit_contract_value: '0.001', price_increment: '1', quantity_increment: '1' }) }
+      : conversionResponse;
     request.end = (): void => {
       setImmediate(() => {
         const response = new EventEmitter() as EventEmitter & { statusCode: number; destroy(): void };
-        response.statusCode = isConversion && conversionResponse !== null ? 200 : 502;
+        response.statusCode = (isInstrument || (isConversion && conversionResponse !== null)) ? 200 : 502;
         response.destroy = (): void => { /* no underlying socket */ };
         callback?.(response);
-        if (response.statusCode === 200) response.emit('data', Buffer.from(JSON.stringify(conversionResponse), 'utf8'));
+        if (response.statusCode === 200) response.emit('data', Buffer.from(JSON.stringify(responseBody), 'utf8'));
         response.emit('end');
       });
     };
     request.destroy = (): void => { /* no underlying socket */ };
     return request;
   }) as unknown as typeof https.request);
-  vi.spyOn(CoinDcxTransport.prototype, 'executeRead').mockImplementation(async (options) => {
-    const pair = String(options.queryParams?.['pair'] ?? PAIR);
-    const underlying = pair === PAIR_B ? 'ETH' : 'BTC';
-    return {
-      status: 200, headers: {}, durationMs: 0,
-      data: { instrument: instrumentWire(underlying, { unit_contract_value: '0.001', price_increment: '1', quantity_increment: '1' }) },
-    } as never;
-  });
 }
 
 beforeAll(async () => {
@@ -154,6 +152,10 @@ const EXECUTION_POLICY: ExecutionPolicySnapshot = buildExecutionPolicySnapshot({
   takerFeeRate: '0.001', slippageBps: '5', spreadSemantics: 'BID_ASK_DIRECT', tickRoundingPolicy: 'BUY_CEIL_SELL_FLOOR_V1',
   quantityPolicy: 'REJECT_NOT_RESIZE_V1', contractMultiplier: '0.001', currencyConversionPolicy: 'P14_INR_CONVERSION_V1',
   accountingPolicy: 'P14_INR_CASH_SETTLED_V1', executionSemanticsVersion: 'P14_EXECUTION_V1',
+});
+const MULTIPLIER_ATTACK_POLICY: ExecutionPolicySnapshot = buildExecutionPolicySnapshot({
+  ...EXECUTION_POLICY.content,
+  contractMultiplier: '1',
 });
 
 const WALL_CLOCK = { nowMs: () => Date.now() };
@@ -810,6 +812,86 @@ describe('P14-I live-DB â€” restart composition (Â§77)', () => {
   }, 30_000);
 });
 
+describe('F14-03 live-DB - authoritative economics survives attacks and restart', () => {
+  it('rejects caller OPEN/CLOSE multiplier 1 while genuine 0.001 drives OPEN, restart MTM, and CLOSE', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    await provisionPairSlot(accountId, PAIR_B);
+
+    const provider1 = makeProvider();
+    await feedFreshEvidence(provider1, '99', '99.5');
+    const runtime1 = await new PaperAccountProductionComposer({ prisma }).start({
+      accountId, coordinator: new RiskAdmissionCoordinator(), provider: provider1,
+    });
+    const openParams = await buildOpenParams(accountId);
+    const economicsCountBeforeAttack = await prisma.paperInstrumentEconomicsSnapshot.count();
+
+    await expect(runtime1.executeOpen({ ...openParams, executionPolicy: MULTIPLIER_ATTACK_POLICY }))
+      .rejects.toMatchObject({ code: 'AUTHORITY_REJECTED' });
+    expect(await prisma.paperExecutionIntent.count({ where: { accountId } })).toBe(0);
+    expect(await prisma.paperFill.count({ where: { accountId } })).toBe(0);
+    expect(await prisma.paperInstrumentEconomicsSnapshot.count()).toBe(economicsCountBeforeAttack);
+
+    const opened = await runtime1.executeOpen(openParams);
+    if (opened.outcome !== 'FILLED') throw new Error(`genuine OPEN did not fill (${opened.outcome})`);
+    const openingIntent = await prisma.paperExecutionIntent.findUniqueOrThrow({
+      where: { executionIntentId: opened.executionIntentId },
+      include: { instrumentEconomics: true },
+    });
+    expect(openingIntent.instrumentEconomics?.contractMultiplier.toFixed()).toBe('0.001');
+    expect(openingIntent.instrumentEconomics?.priceIncrement.toFixed()).toBe('1');
+    expect(openingIntent.instrumentEconomics?.quantityIncrement.toFixed()).toBe('1');
+    const economicsId = openingIntent.instrumentEconomicsSnapshotId;
+
+    const provider2 = makeProvider();
+    await feedFreshEvidence(provider2, '99', '99.5');
+    const runtime2 = await new PaperAccountProductionComposer({ prisma }).start({
+      accountId, coordinator: new RiskAdmissionCoordinator(), provider: provider2,
+    });
+    expect(runtime2.readSnapshot().positions.find(position => position.pair === PAIR)).toMatchObject({ status: 'OPEN' });
+
+    // The invalid decision fails only after authoritative MTM succeeds for the
+    // restored BTC position; unavailable/untrusted MTM fails with another code.
+    const mtmProbe = await buildOpenParamsForPair(accountId, PAIR_B, {}, T0 + MINUTE);
+    await expect(runtime2.executeOpen({
+      ...mtmProbe,
+      decision: { ...mtmProbe.decision, decisionId: 'f14-03-post-mtm-intentional-rejection' },
+    })).rejects.toMatchObject({ code: 'RISK_SOURCE_INVALID' });
+    expect(await prisma.paperFill.count({ where: { accountId } })).toBe(1);
+    expect(await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR_B } } }))
+      .toMatchObject({ status: 'EMPTY' });
+
+    const fillsBeforeCloseAttack = await prisma.paperFill.count({ where: { accountId } });
+    await expect(runtime2.executeClose(buildCloseParams(
+      openParams.kernel,
+      accountId,
+      opened.quantity,
+      { executionPolicy: MULTIPLIER_ATTACK_POLICY },
+    ))).rejects.toMatchObject({ code: 'AUTHORITY_REJECTED' });
+    expect(await prisma.paperFill.count({ where: { accountId } })).toBe(fillsBeforeCloseAttack);
+    expect(await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } }))
+      .toMatchObject({ status: 'OPEN' });
+    expect((await prisma.paperInstrumentEconomicsSnapshot.findUniqueOrThrow({
+      where: { instrumentEconomicsSnapshotId: economicsId! },
+    })).contractMultiplier.toFixed()).toBe('0.001');
+
+    const closed = await runtime2.executeClose(buildCloseParams(
+      openParams.kernel,
+      accountId,
+      opened.quantity,
+      {},
+      T0 + 2 * MINUTE,
+    ));
+    expect(closed.outcome).toBe('CLOSED');
+    expect(await prisma.paperFill.count({ where: { accountId } })).toBe(2);
+    expect((await prisma.paperInstrumentEconomicsSnapshot.findUniqueOrThrow({
+      where: { instrumentEconomicsSnapshotId: economicsId! },
+    })).contractMultiplier.toFixed()).toBe('0.001');
+  }, 30_000);
+});
+
 describe('P14-I live-DB â€” funding disclosure regression (Â§56)', () => {
   it('OPEN and CLOSE results always disclose FUNDING_UNSUPPORTED/FUNDING_EXCLUDED with no FUNDING ledger row', async () => {
     if (skip()) return;
@@ -1444,8 +1526,6 @@ function prototypePatchedProductionProvider(bid = '99', ask = '99.5', conversion
       transportCalls += 1;
       return { status: 200, headers: {}, durationMs: 0, data: conversionPayload(conversionRate, nowMs) } as never;
     }
-    // Leave Wave3-A instrument acquisition working so the OPEN reaches the
-    // market-evidence gate rather than failing earlier for an unrelated reason.
     return previousExecuteRead?.(options) as never;
   });
   vi.spyOn(ProductionCoinDcxSocketFactory.prototype, 'createSocket').mockImplementation(() => {
