@@ -725,6 +725,46 @@ wave changes that.
 
 ---
 
+## 13F. Final Correction Wave 5B — partial-CLOSE peak proof
+
+Wave 5B corrects only the reconciliation lower-bound derivation. The prior
+implementation replayed completed lifecycles but omitted positions that were
+still OPEN, so cash after a partial CLOSE could be mistaken for exact equity.
+That produced the false `PEAK_EQUITY_BELOW_PROVABLE_MINIMUM` fault even though
+the remaining position's historical unrealized PnL was not durably known.
+
+The reconciler now replays deterministic lifecycle events by durable
+`eventTimeMs`/`positionInstanceId`: OPEN adds the active instance, CLOSE removes
+it, and instance-set membership makes duplicate terminal facts idempotent. A
+post-CLOSE cash observation contributes to the provable peak minimum only when
+the active-position set is exactly empty at that durable economic point.
+
+| Proof point | Wave 5B result |
+|---|---|
+| Starting capital | Always remains a provable peak minimum, including while positions are OPEN |
+| Partial profitable/losing CLOSE | Cash is not treated as equity while another position remains OPEN; reconciliation stays HEALTHY |
+| Multiple partial CLOSEs | No intermediate cash observation is used while one lifecycle remains active |
+| Final flat CLOSE / current flat account | Cash equals equity and remains a valid peak lower bound; a tampered lower peak is UNHEALTHY |
+| Historical MTM while OPEN | Remains explicitly unverifiable; no mark is fabricated and no fault arises from unverifiability alone |
+| Restart / remaining CLOSE | Fresh composition reconciles HEALTHY and the remaining legitimate CLOSE succeeds |
+| Isolation / deterministic fault | Account-local replay only; a true flat-account mismatch retains deterministic fault identity |
+
+The live-DB regression covers profitable and losing two-position partial
+CLOSEs, an A/B/C sequence with two intermediate partial CLOSEs, the final-flat
+transition, restart, the remaining CLOSE, starting-capital preservation,
+account isolation, and deterministic true-fault identity. Existing loss-count,
+cooldown, MTM peak-persistence, F14-02, and F14-03 suites remain unchanged.
+
+Status:
+`PARTIAL_CLOSE_RECONCILIATION_CORRECTED`;
+`ALL_KNOWN_PHASE14_DEFECTS_IMPLEMENTED`;
+`AWAITING_FINAL_TARGETED_VERIFY`;
+`AWAITING_FINAL_ASTRA_REGATE`.
+
+This is not a final Phase14 PASS claim.
+
+---
+
 ## 14. Final Phase14 Status
 
 | Question | Answer |
@@ -741,6 +781,7 @@ wave changes that.
 | Drawdown gate sensitivity to unrealized PnL | **FULL MTM FOR OPEN ADMISSION** — every durable OPEN position valued from production-acquired fresh mark/conversion evidence (§13B.1) |
 | F14-02 public market-evidence trust bypass | **CORRECTION IMPLEMENTED, awaiting targeted verify** (§13D/§13D.1 — getter TOCTOU, deep-imported token, and prototype-patch bypass all closed and re-probed) |
 | F14-01 durable loss/cooldown/peak-equity state | **CORRECTION IMPLEMENTED, awaiting targeted verify** (§13E — maintained atomically on CLOSE, advanced from authoritative MTM on OPEN, and reconciled against committed history) |
+| Partial-CLOSE peak reconciliation | **WAVE 5B CORRECTION IMPLEMENTED, awaiting final targeted verify** (§13F — cash proves equity only at a durably flat lifecycle point) |
 | F14-03 instrument acquisition authority prerequisite | **IMPLEMENTED in Wave3-A** — genuine pair-only CoinDCX acquisition produces an opaque binding; no caller metadata can mint it |
 | F14-03 durable economics/policy correction | **IMPLEMENTED in Wave3-B** — immutable pair-bound economics, canonical policy validation, OPEN→MTM→CLOSE lifecycle authority, restart, and legacy fail-closed reconciliation |
 | Final Astra milestone gate | **NOT PASS** — `ALL_KNOWN_F14_01_TO_F14_07_CORRECTIONS_IMPLEMENTED`, `AWAITING_FINAL_ASTRA_REGATE` |
@@ -755,12 +796,14 @@ correction are complete; Wave3-A establishes the production instrument
 authority prerequisite and Wave3-B implements the durable F14-03 correction;
 Wave4A closes the two F14-02 market-evidence trust bypasses a later Astra pass
 reproduced against Wave 2 (§13D), Wave4A.1 closes the prototype-patch bypass an
-independent verifier then found against Wave4A (§13D.1), and §13E closes the
-last blocker — durable `consecutiveLossCount`, `cooldownActiveUntilMs` and
-`peakEquityInr` maintenance. **ALL_KNOWN_F14_01_TO_F14_07_CORRECTIONS_IMPLEMENTED**;
-final acceptance remains **AWAITING_FINAL_ASTRA_REGATE**, and Phase 14 is not
-PASS. Funding remains unsupported/excluded and the maximum lifecycle remains
-PAPER.
+independent verifier then found against Wave4A (§13D.1), §13E implements durable
+`consecutiveLossCount`, `cooldownActiveUntilMs` and `peakEquityInr`
+maintenance, and §13F corrects the partial-CLOSE peak-proof false positive.
+**PARTIAL_CLOSE_RECONCILIATION_CORRECTED**;
+**ALL_KNOWN_PHASE14_DEFECTS_IMPLEMENTED**;
+**AWAITING_FINAL_TARGETED_VERIFY**; **AWAITING_FINAL_ASTRA_REGATE**. Phase 14
+is not PASS. Funding remains unsupported/excluded and the maximum lifecycle
+remains PAPER.
 
 ---
 

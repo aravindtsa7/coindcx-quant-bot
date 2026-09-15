@@ -83,7 +83,7 @@ function installSuiteMocks(): void {
     const isConversion = requestUrl.pathname.includes('/conversions');
     const isInstrument = requestUrl.pathname === '/exchange/v1/derivatives/futures/data/instrument';
     const pair = requestUrl.searchParams.get('pair') ?? PAIR;
-    const underlying = pair === PAIR_B ? 'ETH' : 'BTC';
+    const underlying = pair === PAIR_B ? 'ETH' : pair === PAIR_C ? 'XRP' : 'BTC';
     const responseBody = isInstrument
       ? { instrument: instrumentWire(underlying, { unit_contract_value: '0.001', price_increment: '1', quantity_increment: '1' }) }
       : conversionResponse;
@@ -163,11 +163,14 @@ const PROVIDER_SYMBOL = 'BTCUSDT';
 /** [F14-01] A second genuinely research-approved pair — a multi-pair account is the only way to hold an OPEN position while opening elsewhere. */
 const PAIR_B = 'B-ETH_USDT';
 const PROVIDER_SYMBOL_B = 'ETHUSDT';
+const PAIR_C = 'B-XRP_USDT';
+const PROVIDER_SYMBOL_C = 'XRPUSDT';
 /** The conversion rate every fixture feeds, so `markPriceInr = markPriceUsdt × 80` exactly mirrors P14-E's own `fillPriceInr`. */
 const CONVERSION_RATE = '80';
 const PROVIDER_INSTRUMENTS: readonly PaperEvidenceInstrument[] = Object.freeze([
   Object.freeze({ pair: PAIR, underlying: 'BTC', quoteCurrency: 'USDT', instrumentSpecSnapshotId: INSTRUMENT_SPEC_SNAPSHOT_ID }),
   Object.freeze({ pair: PAIR_B, underlying: 'ETH', quoteCurrency: 'USDT', instrumentSpecSnapshotId: INSTRUMENT_SPEC_SNAPSHOT_ID }),
+  Object.freeze({ pair: PAIR_C, underlying: 'XRP', quoteCurrency: 'USDT', instrumentSpecSnapshotId: INSTRUMENT_SPEC_SNAPSHOT_ID }),
 ]);
 
 /**
@@ -191,13 +194,14 @@ function conversionPayload(rate: string, nowMs: number) {
   return [{ symbol: 'USDTINR', margin_currency_short_name: 'INR', target_currency_short_name: 'USDT', conversion_price: rate, last_updated_at: String(nowMs) }];
 }
 
-function markPayload(nowMs: number, btcMark: string, ethMark = '50') {
+function markPayload(nowMs: number, btcMark: string, ethMark = '50', xrpMark = '1') {
   return {
     event: 'currentPrices@futures#update',
     data: JSON.stringify({
       ts: String(nowMs), vs: '1',
       [PROVIDER_SYMBOL]: { mp: btcMark, bmST: String(nowMs) },
       [PROVIDER_SYMBOL_B]: { mp: ethMark, bmST: String(nowMs) },
+      [PROVIDER_SYMBOL_C]: { mp: xrpMark, bmST: String(nowMs) },
     }),
   };
 }
@@ -212,16 +216,16 @@ function markPayload(nowMs: number, btcMark: string, ethMark = '50') {
  */
 async function feedFreshEvidenceForPair(
   provider: CoinDcxPaperEvidence, pair: string, bid: string, ask: string,
-  conversionRate = '80', nowMs = Date.now(), btcMark = bid, ethMark = bid,
+  conversionRate = '80', nowMs = Date.now(), btcMark = bid, ethMark = bid, xrpMark = bid,
 ): Promise<void> {
-  const symbol = pair === PAIR_B ? PROVIDER_SYMBOL_B : PROVIDER_SYMBOL;
+  const symbol = pair === PAIR_B ? PROVIDER_SYMBOL_B : pair === PAIR_C ? PROVIDER_SYMBOL_C : PROVIDER_SYMBOL;
   provider.startOrderbookWebSocket();
   latestProductionSocket().trigger('depth-snapshot', bookPayload(nowMs, bid, ask, '1', symbol));
   conversionResponse = conversionPayload(conversionRate, nowMs);
   const conversionResult = await provider.readConversion();
   if (!conversionResult.accepted) throw new Error(`test setup: conversion acquisition rejected: ${conversionResult.reason}`);
   provider.startMarkWebSocket();
-  latestProductionSocket().trigger('currentPrices@futures#update', markPayload(nowMs, btcMark, ethMark));
+  latestProductionSocket().trigger('currentPrices@futures#update', markPayload(nowMs, btcMark, ethMark, xrpMark));
 }
 
 /** Feeds fresh production-provenance BTC execution evidence plus both configured marks and conversion. */
@@ -1296,9 +1300,9 @@ describe('F14-01 live-DB — the derived snapshot can never drift from the state
 
 describe('F14-01 live-DB — production MTM equity drives OPEN risk (§12.3/§12.4)', () => {
   async function openSmallShort(
-    runtime: Awaited<ReturnType<PaperAccountProductionComposer['start']>>, accountId: string,
+    runtime: Awaited<ReturnType<PaperAccountProductionComposer['start']>>, accountId: string, evaluationTimeMs = T0,
   ): Promise<{ readonly params: ProductionOpenParams; readonly quantity: string }> {
-    const baseParams = await buildOpenParamsForPair(accountId, PAIR, {}, T0, 'SHORT');
+    const baseParams = await buildOpenParamsForPair(accountId, PAIR, {}, evaluationTimeMs, 'SHORT');
     const params: ProductionOpenParams = {
       ...baseParams,
       riskRequest: {
@@ -1308,7 +1312,7 @@ describe('F14-01 live-DB — production MTM equity drives OPEN risk (§12.3/§12
           : seal({ ...baseParams.riskRequest.entryStopProposal, stopPriceUsdt: '110' }),
         // Keep durable entry exposure small enough that it cannot mask the
         // subsequent MTM-equity assertion through an exposure ceiling.
-        override: { overrideId: 'mtm-fixture-small-open', overrideRiskPerTradePercent: null, overrideMaxLeverage: null, overrideMaxNotionalInr: '80' },
+        override: { overrideId: `mtm-fixture-small-open-${evaluationTimeMs}`, overrideRiskPerTradePercent: null, overrideMaxLeverage: null, overrideMaxNotionalInr: '80' },
       },
     };
     let result: Awaited<ReturnType<typeof runtime.executeOpen>>;
@@ -1477,6 +1481,202 @@ describe('F14-01 live-DB — production MTM equity drives OPEN risk (§12.3/§12
     expect(await prisma.paperFill.count({ where: { accountId, pair: PAIR_B } })).toBe(0);
     valuationRead.mockRestore();
   }, 30_000);
+
+  it('Wave5B: profitable partial CLOSE stays healthy across restart, remaining CLOSE succeeds, and final flat cash proves the peak', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    await provisionPairSlot(accountId, PAIR_B);
+    const provider = makeProvider();
+    await feedFreshEvidence(provider);
+    const runtime = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+
+    const openedA = await openSmallShort(runtime, accountId);
+    const breakEvenA = await shortMarkForTargetEquity(accountId, '999999');
+    await feedFreshEvidenceForPair(provider, PAIR_B, '49', '49.5', CONVERSION_RATE, Date.now(), breakEvenA, '49');
+    const paramsB = await buildOpenParamsForPair(accountId, PAIR_B, {}, T0 + MINUTE);
+    const openedB = await runtime.executeOpen(paramsB);
+    if (openedB.outcome !== 'FILLED') throw new Error(`second OPEN setup failed (${openedB.outcome})`);
+
+    await feedFreshEvidence(provider, '1', '2');
+    const closeAShape = buildCloseParams(openedA.params.kernel, accountId, openedA.quantity, {}, T0 + 2 * MINUTE);
+    const closedA = await runtime.executeClose({
+      ...closeAShape,
+      riskRequest: {
+        ...closeAShape.riskRequest,
+        pairSnapshot: openPairSnapshotFor(
+          openedA.params.kernel, accountId, openedA.quantity, closeAShape.decision.evaluationTimeMs, 'SHORT',
+        ),
+      },
+    });
+    if (closedA.outcome !== 'CLOSED') throw new Error(`partial CLOSE setup failed (${closedA.outcome})`);
+
+    const account = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    const cash = paperDecimal(account.startingCapitalInr.toFixed())
+      .plus(account.cumulativeRealizedPnlInr.toFixed())
+      .minus(account.cumulativeFeesInr.toFixed())
+      .plus(account.cumulativeFundingInr.toFixed());
+    const remaining = await prisma.paperPosition.findMany({ where: { accountId, status: 'OPEN' }, orderBy: { pair: 'asc' } });
+    const reconciliation = await new PaperAccountReconciler(prisma).reconcile(accountId);
+    const peakFault = reconciliation.issues.find(issue => issue.message === 'PEAK_EQUITY_BELOW_PROVABLE_MINIMUM');
+
+    expect(remaining.map(position => position.pair)).toEqual([PAIR_B]);
+    expect(cash.greaterThan(account.peakEquityInr.toFixed())).toBe(true);
+    expect(peakFault).toBeUndefined();
+    expect(reconciliation.status).toBe('HEALTHY');
+
+    const providerAfterRestart = makeProvider();
+    await feedFreshEvidenceForPair(providerAfterRestart, PAIR_B, '60', '61', CONVERSION_RATE, Date.now(), '2', '60');
+    const runtimeAfterRestart = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider: providerAfterRestart });
+    expect((await runtimeAfterRestart.refreshHealth()).status).toBe('HEALTHY');
+
+    const closedB = await runtimeAfterRestart.executeClose(buildCloseParams(
+      paramsB.kernel, accountId, openedB.quantity, { policy: policyFor(PAIR_B) }, T0 + 3 * MINUTE,
+    ));
+    expect(closedB.outcome).toBe('CLOSED');
+    const finalHealth = await runtimeAfterRestart.refreshHealth();
+    expect(finalHealth.status).toBe('HEALTHY');
+
+    const flatAccount = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    const flatCash = paperDecimal(flatAccount.startingCapitalInr.toFixed())
+      .plus(flatAccount.cumulativeRealizedPnlInr.toFixed())
+      .minus(flatAccount.cumulativeFeesInr.toFixed())
+      .plus(flatAccount.cumulativeFundingInr.toFixed());
+    expect(paperDecimal(flatAccount.peakEquityInr.toFixed()).greaterThanOrEqualTo(flatCash)).toBe(true);
+
+    await prisma.paperAccount.update({ where: { accountId }, data: { peakEquityInr: '1000000' } });
+    const firstFaulted = await new PaperAccountReconciler(prisma).reconcile(accountId);
+    const secondFaulted = await new PaperAccountReconciler(prisma).reconcile(accountId);
+    const firstPeakFault = firstFaulted.issues.find(issue => issue.message === 'PEAK_EQUITY_BELOW_PROVABLE_MINIMUM');
+    const secondPeakFault = secondFaulted.issues.find(issue => issue.message === 'PEAK_EQUITY_BELOW_PROVABLE_MINIMUM');
+    expect(firstPeakFault).toMatchObject({
+      faultType: 'RISK_STATE_MISMATCH',
+      evidence: expect.objectContaining({ provableMinimumPeakEquityInr: flatCash.toFixed() }),
+    });
+    expect(secondPeakFault?.faultId).toBe(firstPeakFault?.faultId);
+
+    const isolatedAccountId = freshAccountId();
+    await initAccount(isolatedAccountId);
+    await provisionPairSlot(isolatedAccountId, PAIR);
+    expect((await new PaperAccountReconciler(prisma).reconcile(isolatedAccountId)).status).toBe('HEALTHY');
+  }, 60_000);
+
+  it('Wave5B: losing partial CLOSE leaves the other position OPEN without fabricating a peak fault', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    await provisionPairSlot(accountId, PAIR_B);
+    const provider = makeProvider();
+    await feedFreshEvidence(provider);
+    const runtime = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+
+    const openedA = await openSmallShort(runtime, accountId);
+    const breakEvenA = await shortMarkForTargetEquity(accountId, '999999');
+    await feedFreshEvidenceForPair(provider, PAIR_B, '49', '49.5', CONVERSION_RATE, Date.now(), breakEvenA, '49');
+    const openedB = await runtime.executeOpen(await buildOpenParamsForPair(accountId, PAIR_B, {}, T0 + MINUTE));
+    if (openedB.outcome !== 'FILLED') throw new Error(`second OPEN setup failed (${openedB.outcome})`);
+
+    await feedFreshEvidence(provider, '120', '121');
+    const closeAShape = buildCloseParams(openedA.params.kernel, accountId, openedA.quantity, {}, T0 + 2 * MINUTE);
+    const closedA = await runtime.executeClose({
+      ...closeAShape,
+      riskRequest: {
+        ...closeAShape.riskRequest,
+        pairSnapshot: openPairSnapshotFor(
+          openedA.params.kernel, accountId, openedA.quantity, closeAShape.decision.evaluationTimeMs, 'SHORT',
+        ),
+      },
+    });
+    expect(closedA.outcome).toBe('CLOSED');
+
+    const result = await new PaperAccountReconciler(prisma).reconcile(accountId);
+    expect(result.status).toBe('HEALTHY');
+    expect(result.issues.filter(issue => issue.message === 'PEAK_EQUITY_BELOW_PROVABLE_MINIMUM')).toEqual([]);
+    expect(await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR_B } } }))
+      .toMatchObject({ status: 'OPEN' });
+  }, 60_000);
+
+  it('Wave5B: repeated partial CLOSEs never prove cash until the last active position closes', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    await provisionPairSlot(accountId, PAIR_B);
+    await provisionPairSlot(accountId, PAIR_C);
+    const provider = makeProvider();
+    await feedFreshEvidence(provider);
+    const runtime = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+
+    const firstA = await openSmallShort(runtime, accountId);
+    const breakEvenA = await shortMarkForTargetEquity(accountId, '999999');
+    await feedFreshEvidenceForPair(provider, PAIR_B, '49', '49.5', CONVERSION_RATE, Date.now(), breakEvenA, '49');
+    const baseParamsB = await buildOpenParamsForPair(accountId, PAIR_B, {}, T0 + MINUTE);
+    const paramsB: ProductionOpenParams = {
+      ...baseParamsB,
+      riskRequest: {
+        ...baseParamsB.riskRequest,
+        override: { overrideId: 'wave5b-small-open-b', overrideRiskPerTradePercent: null, overrideMaxLeverage: null, overrideMaxNotionalInr: '80' },
+      },
+    };
+    const openedB = await runtime.executeOpen(paramsB);
+    if (openedB.outcome !== 'FILLED') throw new Error(`second OPEN setup failed (${openedB.outcome})`);
+
+    await feedFreshEvidenceForPair(provider, PAIR_C, '1', '1.1', CONVERSION_RATE, Date.now(), breakEvenA, '49', '1');
+    const baseParamsC = await buildOpenParamsForPair(accountId, PAIR_C, {}, T0 + 2 * MINUTE);
+    const paramsC: ProductionOpenParams = {
+      ...baseParamsC,
+      riskRequest: {
+        ...baseParamsC.riskRequest,
+        override: { overrideId: 'wave5b-small-open-c', overrideRiskPerTradePercent: null, overrideMaxLeverage: null, overrideMaxNotionalInr: '80' },
+      },
+    };
+    const openedC = await runtime.executeOpen(paramsC);
+    if (openedC.outcome !== 'FILLED') throw new Error(`third OPEN setup failed (${openedC.outcome})`);
+
+    await feedFreshEvidence(provider, '1', '2');
+    const firstCloseShape = buildCloseParams(firstA.params.kernel, accountId, firstA.quantity, {}, T0 + 3 * MINUTE);
+    if ((await runtime.executeClose({
+      ...firstCloseShape,
+      riskRequest: {
+        ...firstCloseShape.riskRequest,
+        pairSnapshot: openPairSnapshotFor(
+          firstA.params.kernel, accountId, firstA.quantity, firstCloseShape.decision.evaluationTimeMs, 'SHORT',
+        ),
+      },
+    })).outcome !== 'CLOSED') throw new Error('first partial CLOSE failed');
+    expect((await runtime.refreshHealth()).status).toBe('HEALTHY');
+
+    await feedFreshEvidenceForPair(provider, PAIR_B, '60', '61', CONVERSION_RATE, Date.now(), '2', '60', '1');
+    const closedB = await runtime.executeClose(buildCloseParams(
+      paramsB.kernel, accountId, openedB.quantity, { policy: policyFor(PAIR_B) }, T0 + 4 * MINUTE,
+    ));
+    expect(closedB.outcome).toBe('CLOSED');
+    const afterSecondPartial = await runtime.refreshHealth();
+    expect(afterSecondPartial.status).toBe('HEALTHY');
+    expect(afterSecondPartial.issues.filter(issue => issue.message === 'PEAK_EQUITY_BELOW_PROVABLE_MINIMUM')).toEqual([]);
+    expect(await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR_C } } }))
+      .toMatchObject({ status: 'OPEN' });
+
+    await feedFreshEvidenceForPair(provider, PAIR_C, '2', '2.1', CONVERSION_RATE, Date.now(), '2', '60', '2');
+    const finalClose = await runtime.executeClose(buildCloseParams(
+      paramsC.kernel, accountId, openedC.quantity, { policy: policyFor(PAIR_C) }, T0 + 5 * MINUTE,
+    ));
+    expect(finalClose.outcome).toBe('CLOSED');
+    expect((await runtime.refreshHealth()).status).toBe('HEALTHY');
+
+    const flat = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    const flatCash = paperDecimal(flat.startingCapitalInr.toFixed())
+      .plus(flat.cumulativeRealizedPnlInr.toFixed())
+      .minus(flat.cumulativeFeesInr.toFixed())
+      .plus(flat.cumulativeFundingInr.toFixed());
+    expect(paperDecimal(flat.peakEquityInr.toFixed()).greaterThanOrEqualTo(flatCash)).toBe(true);
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -2289,6 +2489,30 @@ describe('F14-01 live-DB — reconciliation of durable risk state (§22)', () =>
     // MTM peak is NOT durably recoverable and must not be fabricated.
     const result = await new PaperAccountReconciler(prisma).reconcile(accountId);
     expect(result.issues.filter((issue) => issue.message === 'PEAK_EQUITY_BELOW_PROVABLE_MINIMUM')).toEqual([]);
+  }, 60_000);
+
+  it('Wave5B preserves starting capital as a provable peak minimum while an account is OPEN', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId, '100000');
+    await provisionPairSlot(accountId, PAIR);
+    const provider = makeProvider();
+    const runtime = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+    await feedFreshEvidence(provider, '99', '99.5');
+    if ((await runtime.executeOpen(await buildOpenParams(accountId, {}, T0))).outcome !== 'FILLED') throw new Error('setup failed');
+
+    await prisma.paperAccount.update({ where: { accountId }, data: { peakEquityInr: '99999' } });
+    const result = await new PaperAccountReconciler(prisma).reconcile(accountId);
+    expect(result.status).toBe('UNHEALTHY');
+    expect(result.issues).toContainEqual(expect.objectContaining({
+      faultType: 'RISK_STATE_MISMATCH',
+      message: 'PEAK_EQUITY_BELOW_PROVABLE_MINIMUM',
+      evidence: expect.objectContaining({
+        storedPeakEquityInr: '99999',
+        provableMinimumPeakEquityInr: '100000',
+      }),
+    }));
   }, 60_000);
 
   it('§33.22 the same defect always produces the same faultId, and a healthy account produces none', async () => {

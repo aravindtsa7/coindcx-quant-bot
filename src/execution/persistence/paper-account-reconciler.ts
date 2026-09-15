@@ -584,8 +584,8 @@ export class PaperAccountReconciler {
     builder: Builder,
     account: { readonly startingCapitalInr: Prisma.Decimal; readonly peakEquityInr: Prisma.Decimal; readonly consecutiveLossCount: number; readonly cooldownActiveUntilMs: bigint | null },
     history: readonly { readonly realizedPnlInr: Prisma.Decimal; readonly closedAtMs: bigint; readonly openedAtMs: bigint; readonly closingExecutionIntentId: string; readonly positionInstanceId: string }[],
-    fills: readonly { readonly action: string; readonly realizedPnlInr: Prisma.Decimal | null; readonly feeInr: Prisma.Decimal; readonly eventTimeMs: bigint }[],
-    positions: readonly { readonly status: string }[],
+    fills: readonly { readonly orderId: string; readonly action: string; readonly realizedPnlInr: Prisma.Decimal | null; readonly feeInr: Prisma.Decimal; readonly eventTimeMs: bigint }[],
+    positions: readonly { readonly pair: string; readonly status: string; readonly positionInstanceId: string | null; readonly openedAtMs: bigint | null }[],
     lossStatePolicy: PaperLossStatePolicy | undefined,
   ): void {
     const closes = [...history]
@@ -623,19 +623,68 @@ export class PaperAccountReconciler {
     // already owned by FUNDING_INVARIANT_VIOLATION, and folding it in here
     // would report the same corruption twice under a second fault type.
     const startingCapital = paperDecimal(account.startingCapitalInr.toFixed());
-    const openIntervals = history.map((row) => ({ from: Number(row.openedAtMs), to: Number(row.closedAtMs) }));
-    const orderedFills = [...fills].sort((left, right) => Number(left.eventTimeMs - right.eventTimeMs));
+    type LifecycleEvent = Readonly<{ at: bigint; action: 'OPEN' | 'CLOSE'; positionInstanceId: string }>;
+    const lifecycleEvents: LifecycleEvent[] = history.flatMap((row) => [
+      { at: row.openedAtMs, action: 'OPEN' as const, positionInstanceId: row.positionInstanceId },
+      { at: row.closedAtMs, action: 'CLOSE' as const, positionInstanceId: row.positionInstanceId },
+    ]);
+    let lifecycleUnverifiable = false;
+    for (const position of positions) {
+      if (position.status !== 'OPEN') continue;
+      if (position.positionInstanceId === null || position.openedAtMs === null) {
+        // Another reconciliation check owns the malformed OPEN projection. For
+        // peak proof, fail conservatively: an unplaceable active lifecycle means
+        // no post-inception historical flat moment is mathematically provable.
+        lifecycleUnverifiable = true;
+        continue;
+      }
+      lifecycleEvents.push({
+        at: position.openedAtMs,
+        action: 'OPEN',
+        positionInstanceId: position.positionInstanceId,
+      });
+    }
+
+    const eventsByTime = new Map<bigint, LifecycleEvent[]>();
+    for (const event of lifecycleEvents) {
+      const atTime = eventsByTime.get(event.at);
+      if (atTime === undefined) eventsByTime.set(event.at, [event]);
+      else atTime.push(event);
+    }
+    const fillsByTime = new Map<bigint, typeof fills[number][]>();
+    for (const fill of fills) {
+      const atTime = fillsByTime.get(fill.eventTimeMs);
+      if (atTime === undefined) fillsByTime.set(fill.eventTimeMs, [fill]);
+      else atTime.push(fill);
+    }
+    const orderedTimes = [...new Set([...eventsByTime.keys(), ...fillsByTime.keys()])]
+      .sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+    const completedCloseIntentIds = new Set(history.map((row) => row.closingExecutionIntentId));
+    const activePositions = new Set<string>();
 
     let provableMinimum = startingCapital;
     let cash = startingCapital;
-    for (const fill of orderedFills) {
-      cash = cash.plus(fill.realizedPnlInr === null ? '0' : fill.realizedPnlInr.toFixed()).minus(fill.feeInr.toFixed());
-      if (fill.action !== 'CLOSE') continue;
-      const at = Number(fill.eventTimeMs);
-      // Flat iff no OTHER lifecycle was open strictly across this instant.
-      const stillOpen = openIntervals.some((interval) => interval.from < at && interval.to > at);
-      if (stillOpen) continue;
-      if (cash.greaterThan(provableMinimum)) provableMinimum = cash;
+    for (const at of orderedTimes) {
+      // Same-time events form one durable economic point. OPENs precede CLOSEs
+      // within the group, and instance identity makes duplicate terminal facts
+      // idempotent: Set.add/delete can never double-change cardinality.
+      const events = [...(eventsByTime.get(at) ?? [])].sort((left, right) => {
+        if (left.action !== right.action) return left.action === 'OPEN' ? -1 : 1;
+        return left.positionInstanceId.localeCompare(right.positionInstanceId);
+      });
+      for (const event of events) {
+        if (event.action === 'OPEN') activePositions.add(event.positionInstanceId);
+        else activePositions.delete(event.positionInstanceId);
+      }
+
+      const atFills = [...(fillsByTime.get(at) ?? [])].sort((left, right) => left.orderId.localeCompare(right.orderId));
+      for (const fill of atFills) {
+        cash = cash.plus(fill.realizedPnlInr === null ? '0' : fill.realizedPnlInr.toFixed()).minus(fill.feeInr.toFixed());
+      }
+      const hasVerifiedClose = atFills.some((fill) => fill.action === 'CLOSE' && completedCloseIntentIds.has(fill.orderId));
+      if (!lifecycleUnverifiable && hasVerifiedClose && activePositions.size === 0 && cash.greaterThan(provableMinimum)) {
+        provableMinimum = cash;
+      }
     }
     // The account's CURRENT state is the same kind of proof when it is flat.
     if (!positions.some((slot) => slot.status === 'OPEN') && cash.greaterThan(provableMinimum)) provableMinimum = cash;
