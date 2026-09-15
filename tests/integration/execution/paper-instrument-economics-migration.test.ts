@@ -100,4 +100,15 @@ describe('F14-03 Wave3-B additive migration from an existing Phase14 database', 
       schemaObjectsVerified: true,
     }));
   });
+
+  it('adds nullable unique account mutation order without guessing legacy order', () => {
+    expect(available, unavailableReason).toBe(true);
+    query("INSERT INTO paper_order(execution_intent_id,account_id,action,state,updated_at) VALUES(REPEAT('b',64),'legacy-account','CLOSE','FILLED',NOW(3))");
+    query("INSERT INTO paper_fill(order_id,account_id,source_strategy_decision_id,source_execution_key,pair,action,side,fill_price,quantity,fee_inr,realized_pnl_inr,quote_snapshot_content_sha256,event_time_ms) VALUES(REPEAT('b',64),'legacy-account',REPEAT('f',64),REPEAT('g',64),'B-BTC_USDT','CLOSE','SELL',1,1,0,0,REPEAT('h',64),2)");
+    sourceMigration('20260916000000_phase14_account_mutation_order');
+    expect(query('SELECT COUNT(*), SUM(account_mutation_revision IS NULL) FROM paper_fill')).toEqual(['1\t1']);
+    expect(query("SELECT CONCAT(is_nullable, ',', column_type) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='paper_fill' AND column_name='account_mutation_revision'")).toEqual(['YES,bigint']);
+    expect(query("SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index SEPARATOR ',') FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='paper_fill' AND index_name='paper_fill_account_mutation_revision_unique' AND non_unique=0")).toEqual(['account_id,account_mutation_revision']);
+    console.info('ACCOUNT_MUTATION_ORDER_MIGRATION_EVIDENCE', { legacyFills: 1, nullOrdering: 1, inventedOrdering: 0, uniqueAccountRevision: true });
+  });
 });

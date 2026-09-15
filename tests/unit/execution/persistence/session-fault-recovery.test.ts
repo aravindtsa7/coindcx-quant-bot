@@ -318,7 +318,7 @@ describe('P14-D-BLK-01 â€” post-admit durable-persistence failure is treate
     // The same session cannot be used again for anything mutating.
     const retryRequest = buildRequest(accountId, pair, 1_260_000);
     await expect(session.admitAndPersist(pair, retryRequest, coordinator)).rejects.toMatchObject({ code: 'ACCOUNT_NOT_READY' });
-    await expect(session.releaseAndPersist('whatever', coordinator)).rejects.toMatchObject({ code: 'ACCOUNT_NOT_READY' });
+    await expect(session.releaseAndPersist('whatever', coordinator, 0n)).rejects.toMatchObject({ code: 'ACCOUNT_NOT_READY' });
   });
 
   it('a failure at paperReservation.upsert (an earlier post-admit write) triggers the identical fail-closed path', async () => {
@@ -439,7 +439,7 @@ describe('P14-D-MAJ-01 â€” production durable admission requires a READY Pa
     session.release();
     expect(session.state).toBe('RELEASED');
     await expect(session.admitAndPersist(pair, buildRequest(accountId, pair, 1_200_000), coordinator)).rejects.toMatchObject({ code: 'ACCOUNT_NOT_READY' });
-    await expect(session.releaseAndPersist('whatever', coordinator)).rejects.toMatchObject({ code: 'ACCOUNT_NOT_READY' });
+    await expect(session.releaseAndPersist('whatever', coordinator, 0n)).rejects.toMatchObject({ code: 'ACCOUNT_NOT_READY' });
   });
 
   it('a stale session after a fence takeover by a new process/coordinator fails closed on STALE_FENCE without faulting the account or mutating any row', async () => {

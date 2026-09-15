@@ -227,7 +227,7 @@ export class PaperAdmissionBridge {
    * `ADMISSION_OUTCOME_AMBIGUOUS` rather than assumed rolled back.
    */
   public async releaseAndPersist(
-    sessionProof: symbol, ownership: PaperAccountOwnership, admissionId: string, coordinator: RiskAdmissionCoordinator,
+    sessionProof: symbol, ownership: PaperAccountOwnership, admissionId: string, coordinator: RiskAdmissionCoordinator, expectedRevision: bigint,
   ): Promise<'RELEASED' | 'ALREADY_RELEASED' | 'UNKNOWN_ADMISSION'> {
     assertSessionProof(sessionProof);
     const held = PaperAccountOwnership.read(ownership);
@@ -241,6 +241,10 @@ export class PaperAdmissionBridge {
         if (account === null) throw new PaperPersistenceError('ACCOUNT_NOT_FOUND', `No paper_account row for ${held.accountId}`);
         if (account.ownerFence !== held.fence) throw new PaperPersistenceError('STALE_FENCE', `Held fence ${held.fence} no longer matches current ${account.ownerFence}`);
 
+        // Mandatory even for JS callers: omission must never disable the guard.
+        if (account.revision !== expectedRevision) {
+          throw new PaperPersistenceError('STALE_ACCOUNT_REVISION', `Expected account revision ${String(expectedRevision)} for ${held.accountId} but current revision is ${account.revision}`);
+        }
         const reservation = await tx.paperReservation.findUnique({ where: { admissionId } });
         if (reservation === null || reservation.accountId !== held.accountId) return 'UNKNOWN_ADMISSION' as const;
         if (reservation.status === 'RELEASED') return 'ALREADY_RELEASED' as const;

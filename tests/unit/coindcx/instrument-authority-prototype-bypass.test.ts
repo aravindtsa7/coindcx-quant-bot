@@ -28,6 +28,33 @@ afterEach(() => {
   vi.resetModules();
 });
 
+describe('Combined correction: private instrument transformation pipeline', () => {
+  it.each(['pre-import', 'post-import'])('%s exported mapper/normalizer/schema/hash replacement cannot forge economics', async timing => {
+    vi.resetModules();
+    const before = timing === 'post-import' ? await import('../../../src/integration/coindcx/instrument-authority') : null;
+    const mapper = await import('../../../src/coin-runtime/instrument-mapper');
+    const normalizers = await import('../../../src/integration/coindcx/normalizers');
+    const schemas = await import('../../../src/integration/coindcx/schemas');
+    const hash = await import('../../../src/backtest/canonical-json');
+    const originalMapper = mapper.mapInstrumentToMetadata;
+    const mapperPatch = vi.spyOn(mapper, 'mapInstrumentToMetadata').mockImplementation((...args) => {
+      const m = originalMapper(...args);
+      return Object.freeze({ ...m, unitContractValue: m.unitContractValue.times('777000'), priceIncrement: m.priceIncrement.times('90'), quantityIncrement: m.quantityIncrement.times('8000') });
+    });
+    const normalizePatch = vi.spyOn(normalizers, 'normalizeInstrument').mockImplementation(() => { throw new Error('exported normalizer reached'); });
+    const numericPatch = vi.spyOn(normalizers, 'toLosslessDecimal').mockImplementation(() => { throw new Error('exported numeric transformer reached'); });
+    const schemaPatch = vi.spyOn(schemas.InstrumentDetailsResponseSchema, 'safeParse').mockImplementation(() => ({ success: true, data: { instrument: FABRICATED_WIRE } }) as never);
+    const hashPatch = vi.spyOn(hash, 'sha256CanonicalJson').mockReturnValue('forged-hash');
+    const authority = before ?? await import('../../../src/integration/coindcx/instrument-authority');
+    const interception = interceptProductionInstrumentAcquisition(GENUINE_WIRE);
+    const record = authority.TrustedProductionInstrumentBinding.read(await authority.acquireProductionInstrumentBinding(PAIR));
+    expect(record).toMatchObject({ contractMultiplier: '0.001', priceIncrement: '0.1', quantityIncrement: '0.001' });
+    expect(record?.instrumentSpecSnapshotId).toMatch(/^[a-f0-9]{64}$/);
+    expect(interception.calls).toBe(1);
+    for (const patch of [mapperPatch, normalizePatch, numericPatch, schemaPatch, hashPatch]) expect(patch).not.toHaveBeenCalled();
+  });
+});
+
 describe('F14-03 trusted instrument authority prototype bypass', () => {
   it('post-import prototype patch cannot mint fabricated metadata', async () => {
     vi.resetModules();

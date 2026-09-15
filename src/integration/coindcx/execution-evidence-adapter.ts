@@ -82,3 +82,10 @@ export function getTrustedPaperExecutionEvidence(
     return Object.freeze({ state: 'UNAVAILABLE', reason: 'EVIDENCE_BUNDLE_VALIDATION_FAILED' });
   }
 }
+
+// Pin CommonJS authority entry points to lexical implementations. This also
+// prevents pre-import replacement through an already-loaded repo namespace.
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  if (Object.getOwnPropertyDescriptor(module.exports, 'getTrustedPaperExecutionEvidence')?.configurable !== false) Object.defineProperty(module.exports, 'getTrustedPaperExecutionEvidence', { get: () => getTrustedPaperExecutionEvidence, configurable: false });
+  Object.freeze(module.exports);
+}

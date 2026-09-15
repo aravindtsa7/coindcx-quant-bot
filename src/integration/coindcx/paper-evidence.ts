@@ -2,17 +2,70 @@ import https from 'node:https';
 import ioClient from 'socket.io-client';
 import { isLosslessNumber, parse as parseLosslessJson } from 'lossless-json';
 import { CoinDcxProviderError, CoinDcxResponseValidationError, CoinDcxTimeoutError } from '../../core/errors/app-error';
-import { sha256CanonicalJson } from '../../backtest/canonical-json';
+import { createHash } from 'node:crypto';
+import Decimal from 'decimal.js';
 import { InstrumentMetadata } from '../../coin-runtime/types';
 import { PaperExecutionQuoteSnapshot } from '../../execution/evidence';
 import { PaperMarkSnapshot } from '../../execution/mark';
-import { canonicalPaperDecimalString, PaperCalcDecimal } from '../../execution/decimal';
+
 import { type PaperEvidenceAcquisition } from './acquisition-capability';
-import { Clock, SystemClock } from './clock';
+import type { Clock } from './clock';
 import { CoinDcxTransport } from './transport';
-import { COINDCX_DEFAULT_SOCKET_ENDPOINT, ProductionCoinDcxSocketFactory } from './websocket/socket-adapter';
-import { EXACT_CANDLE_SOCKET_PARSER } from './websocket/candle-json';
+import { ProductionCoinDcxSocketFactory } from './websocket/socket-adapter';
+import { createRequire } from 'node:module';
+const COINDCX_DEFAULT_SOCKET_ENDPOINT = 'wss://stream.coindcx.com';
 import { CoinDcxSocket, CoinDcxSocketFactory, CoinDcxSocketOptions, SocketEventListener } from './websocket/types';
+
+// Private copy of the protocol adapter: package framing is unchanged; no repo export can replace the decoder.
+function parseExactJson(text: string): unknown { return parseLosslessJson(text, undefined, token => token); }
+interface Decoder {
+  add(packet: unknown): void;
+  destroy(): void;
+}
+const stockParser = createRequire(__filename)('socket.io-parser') as {
+  Encoder: new () => unknown;
+  Decoder: new () => Decoder;
+};
+
+class ExactCandleDecoder extends stockParser.Decoder {
+  public override add(packet: unknown): void {
+    if (typeof packet === 'string') {
+      // EVENT/BINARY_EVENT, optional attachments, namespace and acknowledgment id.
+      const frame = /^([25](?:\d+-)?(?:\/[^,]*,)?\d*)(\[.*)$/s.exec(packet);
+      if (frame) {
+        let payload: unknown;
+        try { payload = parseExactJson(frame[2]!); }
+        catch { super.add('4"Malformed event JSON"'); return; }
+        if (Array.isArray(payload) && payload[0] === 'candlestick') {
+          if (packet[0] === '5') { super.add('4"Binary candlestick evidence is unsupported"'); return; }
+          packet = frame[1]! + JSON.stringify(payload);
+        }
+      }
+    }
+    super.add(packet);
+  }
+}
+
+/** Installed after caller options so exact candle decoding cannot be overridden. */
+const EXACT_CANDLE_SOCKET_PARSER = Object.freeze({ Encoder: stockParser.Encoder, Decoder: ExactCandleDecoder });
+
+const PaperCalcDecimal = Decimal.clone({ precision: 128, rounding: Decimal.ROUND_HALF_UP, toExpNeg: -160, toExpPos: 160 });
+
+// Canonical JSON for private, already-normalized plain-data preimages. Kept
+// byte-compatible with the repository identity policy; no exported hasher dispatch.
+function privateCanonicalJson(value: unknown): string {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return JSON.stringify(value);
+  if (Array.isArray(value)) return '[' + value.map(privateCanonicalJson).join(',') + ']';
+  if (typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype) {
+    const record = value as Record<string, unknown>;
+    return '{' + Object.keys(record).sort().map(key => JSON.stringify(key) + ':' + privateCanonicalJson(record[key])).join(',') + '}';
+  }
+  throw new Error('Invalid private canonical identity preimage');
+}
+function sha256CanonicalJson(value: unknown): string {
+  return createHash('sha256').update(privateCanonicalJson(value), 'utf8').digest('hex');
+}
 
 /** Frozen source and policy identifiers. They intentionally form part of all identities. */
 export const P14_B_ORDERBOOK_SOURCE_ID = 'COINDCX_FUTURES_ORDERBOOK_WS_V1' as const;
@@ -150,6 +203,12 @@ const GENUINE_PROVIDERS = new WeakSet<object>();
  * is what closes Astra's F14-02 deep-import exploit.
  */
 const PRODUCTION_PROVIDERS = new WeakSet<object>();
+// Constructor-installed lexical friends close over #private fields. Neither
+// these callbacks nor their registry is exposed through a provider property.
+const PRIVATE_READERS = new WeakMap<object, Readonly<{
+  execution: (pair: string) => EvidenceReadResult<ProductionAcquiredExecutionEvidence>;
+  valuation: (pairs: readonly string[]) => EvidenceReadResult<ProductionAcquiredValuationEvidence>;
+}>>();
 
 /* -------------------------------------------------------------------------
  * [F14-02 4A.1] PRIVILEGED PRODUCTION ACQUISITION PRIMITIVES.
@@ -337,7 +396,8 @@ function decimal(value: unknown): string | null {
   const text = losslessNumericText(value);
   if (text === null) return null;
   try {
-    const canonical = canonicalPaperDecimalString(text);
+    if (!/^-?\d+(?:\.\d+)?$/.test(text)) return null;
+    const canonical = new PaperCalcDecimal(text).toFixed();
     const parsed = new PaperCalcDecimal(canonical);
     return parsed.isFinite() && !parsed.isNaN() ? canonical : null;
   } catch { return null; }
@@ -503,7 +563,7 @@ export class CoinDcxPaperEvidence {
     // TOCTOU has no second read to exploit.
     const captured = captureOptions(options);
     this.#policy = validPolicy(captured.policy ?? DEFAULT_PAPER_EVIDENCE_POLICY);
-    this.#clock = captured.clock ?? new SystemClock();
+    this.#clock = captured.clock ?? Object.freeze({ nowMs: () => Date.now() });
     this.#socketFactory = captured.socketFactory ?? new ProductionCoinDcxSocketFactory();
     this.#orderbookRestTransport = captured.orderbookRestTransport ?? new CoinDcxTransport({ baseUrl: 'https://public.coindcx.com' });
     this.#markRestTransport = captured.markRestTransport ?? new CoinDcxTransport({ baseUrl: 'https://public.coindcx.com' });
@@ -523,7 +583,13 @@ export class CoinDcxPaperEvidence {
     // Note what this constructor deliberately does NOT do: it never adds the
     // instance to `PRODUCTION_PROVIDERS`. Public construction cannot produce a
     // production-trusted provider under ANY option combination.
-    if (new.target === CoinDcxPaperEvidence) GENUINE_PROVIDERS.add(this);
+    if (new.target === CoinDcxPaperEvidence) {
+      GENUINE_PROVIDERS.add(this);
+      PRIVATE_READERS.set(this, Object.freeze({
+        execution: (pair: string) => this.#readProductionAcquiredExecutionEvidence(pair),
+        valuation: (pairs: readonly string[]) => this.#readProductionAcquiredValuationEvidence(pairs),
+      }));
+    }
   }
 
   /**
@@ -778,8 +844,8 @@ export class CoinDcxPaperEvidence {
   }
 
   /**
-   * [F14-02] The ONLY read surface the production trusted-evidence issuer may
-   * mint from. Reuses the exact existing P14-B gates (current-generation
+   * [F14-02] Public diagnostic wrapper; trusted issuance bypasses this method
+   * and reads private state through constructor-installed private callbacks. Reuses the exact existing P14-B gates (current-generation
    * WS-actionable orderbook, quote/depth agreement, conversion local-poll
    * freshness, clock-fault rejection) and then additionally requires that
    * every constituent datum carry production acquisition provenance. Reading
@@ -798,6 +864,10 @@ export class CoinDcxPaperEvidence {
    * exists anywhere on this path.
    */
   public readProductionAcquiredValuationEvidence(pairs: readonly string[]): EvidenceReadResult<ProductionAcquiredValuationEvidence> {
+    return this.#readProductionAcquiredValuationEvidence(pairs);
+  }
+
+  #readProductionAcquiredValuationEvidence(pairs: readonly string[]): EvidenceReadResult<ProductionAcquiredValuationEvidence> {
     const conversionState = this.#conversion;
     const conversionResult = this.#latestConversion();
     if (conversionResult.state !== 'AVAILABLE') return unavailable(conversionResult.reason);
@@ -816,6 +886,10 @@ export class CoinDcxPaperEvidence {
   }
 
   public readProductionAcquiredExecutionEvidence(pair: string): EvidenceReadResult<ProductionAcquiredExecutionEvidence> {
+    return this.#readProductionAcquiredExecutionEvidence(pair);
+  }
+
+  #readProductionAcquiredExecutionEvidence(pair: string): EvidenceReadResult<ProductionAcquiredExecutionEvidence> {
     const quoteResult = this.#latestExecutionQuote(pair);
     if (quoteResult.state !== 'AVAILABLE') return unavailable(quoteResult.reason);
     const book = this.#books.get(pair);
@@ -919,19 +993,14 @@ export interface ProductionPaperEvidenceOptions {
  * authority — the P14-B counterpart of Wave3-A's
  * `acquireProductionInstrumentBinding`.
  *
- * It selects the real `ProductionCoinDcxSocketFactory`, the real
- * `CoinDcxTransport`s and the real `SystemClock` itself, then registers the
- * resulting instance in the module-private `PRODUCTION_PROVIDERS` set. Trust
- * therefore originates from THIS construction path, never from "some option
- * happened to be `undefined`" — the inference Astra's getter TOCTOU abused.
+ * The registered production path uses private native HTTPS acquisition,
+ * private package socket construction/decoding and the native clock. Public
+ * transports and provider methods are reusable but never privileged read stages.
+ * Tests intercept native/package boundaries; repository prototype replacement
+ * is an attack, not an acquisition fixture. Arbitrary process compromise below
+ * those boundaries is outside the accepted repository authority threat model.
  *
- * Zero-network testing of this genuine path does not go through any production
- * API: tests intercept `CoinDcxTransport.prototype.executeRead` and
- * `ProductionCoinDcxSocketFactory.prototype.createSocket` with the test
- * runner's own mocking, exactly as Wave3-A's accepted instrument-authority
- * tests already do. That seam is a property of the test runner, not an export,
- * so it hands normal callers no trust-minting authority.
- *
+
  * [F14-02 §16] This mints market-evidence acquisition trust ONLY. It cannot
  * produce a `TrustedProductionInstrumentBinding`, and instrument authority
  * cannot produce a production provider; the two capabilities stay disjoint.
@@ -966,24 +1035,33 @@ export function createProductionPaperEvidenceProvider(options: ProductionPaperEv
  *     datum must itself carry `PRODUCTION_ACQUISITION`, which only this
  *     module's own internal acquisition callbacks assign.
  *
- * The reader is additionally invoked as the PROTOTYPE method, never as
+ * The reader uses constructor-installed private callbacks, never
  * `provider.read…`, so an own-property shadow installed on a provider instance
  * cannot substitute its own result.
  */
 export function readProductionAcquiredPaperExecutionEvidence(provider: unknown, pair: string): EvidenceReadResult<ProductionAcquiredExecutionEvidence> {
   if (!(provider instanceof CoinDcxPaperEvidence) || !GENUINE_PROVIDERS.has(provider)) return unavailable('UNTRUSTED_EVIDENCE_PROVIDER');
   if (!PRODUCTION_PROVIDERS.has(provider)) return unavailable('PROVIDER_NOT_PRODUCTION_ACQUIRED');
-  return CoinDcxPaperEvidence.prototype.readProductionAcquiredExecutionEvidence.call(provider, pair);
+  return PRIVATE_READERS.get(provider)!.execution(pair);
 }
 
 /**
  * [F14-01] The valuation counterpart of the guard above, with the three
  * identical, non-caller-controllable proofs (genuine registered instance,
- * PROTOTYPE reader, production acquisition provenance on every datum). This is
+ * private state reader, production acquisition provenance on every datum). This is
  * the ONLY route by which Phase13 mark-to-market equity may obtain a mark.
  */
 export function readProductionAcquiredPaperValuationEvidence(provider: unknown, pairs: readonly string[]): EvidenceReadResult<ProductionAcquiredValuationEvidence> {
   if (!(provider instanceof CoinDcxPaperEvidence) || !GENUINE_PROVIDERS.has(provider)) return unavailable('UNTRUSTED_EVIDENCE_PROVIDER');
   if (!PRODUCTION_PROVIDERS.has(provider)) return unavailable('PROVIDER_NOT_PRODUCTION_ACQUIRED');
-  return CoinDcxPaperEvidence.prototype.readProductionAcquiredValuationEvidence.call(provider, pairs);
+  return PRIVATE_READERS.get(provider)!.valuation(pairs);
+}
+
+// CommonJS authority exports retain their lexical identity under repository patches.
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  if (Object.getOwnPropertyDescriptor(module.exports, 'CoinDcxPaperEvidence')?.configurable !== false) Object.defineProperty(module.exports, 'CoinDcxPaperEvidence', { get: () => CoinDcxPaperEvidence, configurable: false });
+  if (Object.getOwnPropertyDescriptor(module.exports, 'createProductionPaperEvidenceProvider')?.configurable !== false) Object.defineProperty(module.exports, 'createProductionPaperEvidenceProvider', { get: () => createProductionPaperEvidenceProvider, configurable: false });
+  if (Object.getOwnPropertyDescriptor(module.exports, 'readProductionAcquiredPaperExecutionEvidence')?.configurable !== false) Object.defineProperty(module.exports, 'readProductionAcquiredPaperExecutionEvidence', { get: () => readProductionAcquiredPaperExecutionEvidence, configurable: false });
+  if (Object.getOwnPropertyDescriptor(module.exports, 'readProductionAcquiredPaperValuationEvidence')?.configurable !== false) Object.defineProperty(module.exports, 'readProductionAcquiredPaperValuationEvidence', { get: () => readProductionAcquiredPaperValuationEvidence, configurable: false });
+  Object.freeze(module.exports);
 }

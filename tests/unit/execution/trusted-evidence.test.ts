@@ -81,6 +81,40 @@ beforeEach(() => {
 });
 afterEach(() => vi.restoreAllMocks());
 
+describe('Combined correction: no exported provider method participates in trusted reading', () => {
+  it.each(['prototype-before-adapter', 'prototype-after-adapter', 'own-property'])('%s replacement cannot bless manual data', async placement => {
+    const genuine = productionAcquiredProvider();
+    feedManually(genuine);
+    const quote = genuine.getLatestExecutionQuote(PAIR);
+    const depth = genuine.getLatestOrderbookEvidence(PAIR);
+    const conversion = genuine.getLatestConversion();
+    if (quote.state !== 'AVAILABLE' || depth.state !== 'AVAILABLE' || conversion.state !== 'AVAILABLE') throw new Error('fixture missing manual evidence');
+    const forged = { state: 'AVAILABLE', snapshot: { quote: quote.snapshot, depth: depth.snapshot, conversion: conversion.snapshot, orderbookGenerationId: genuine.orderbookGenerationId, conversionLocalPollFreshnessMs: genuine.conversionLocalPollFreshnessMs } };
+    const target = placement === 'own-property' ? genuine : CoinDcxPaperEvidence.prototype;
+    const descriptors = Object.getOwnPropertyDescriptors(CoinDcxPaperEvidence.prototype);
+    const installed: string[] = [];
+    try {
+      // Patch every exported method/getter, not just the two known bypasses.
+      for (const [name, descriptor] of Object.entries(descriptors)) {
+        if (name === 'constructor') continue;
+        if (typeof descriptor.value !== 'function' && descriptor.get === undefined) continue;
+        Object.defineProperty(target, name, descriptor.get === undefined
+          ? { value: () => forged, configurable: true }
+          : { get: () => forged, configurable: true });
+        installed.push(name);
+      }
+      const adapter = placement === 'prototype-before-adapter' ? await import('../../../src/integration/coindcx/execution-evidence-adapter') : { getTrustedPaperExecutionEvidence };
+      expect(adapter.getTrustedPaperExecutionEvidence(genuine, PAIR).state).toBe('UNAVAILABLE');
+      expect(readProductionAcquiredPaperValuationEvidence(genuine, [PAIR]).state).toBe('UNAVAILABLE');
+    } finally {
+      for (const name of installed) {
+        if (placement === 'own-property') Reflect.deleteProperty(target, name);
+        else Object.defineProperty(target, name, descriptors[name]!);
+      }
+    }
+  });
+});
+
 /** [F14-02] A provider built by the ONE approved production path. */
 function productionAcquiredProvider(): CoinDcxPaperEvidence {
   return createInterceptedProductionProvider(INSTRUMENTS, EVIDENCE_POLICY);

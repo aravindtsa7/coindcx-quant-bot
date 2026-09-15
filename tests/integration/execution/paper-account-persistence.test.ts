@@ -1,3 +1,4 @@
+import { paperDecimal } from '../../../src/execution/decimal';
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { URL } from 'node:url';
@@ -317,7 +318,7 @@ describe('P14-D live-DB — durable admission generation semantics', () => {
     if (first.outcome !== 'ADMITTED') return;
     expect(first.admission.generation).toBe(1);
 
-    const released = await session.releaseAndPersist(first.admission.admissionId, coordinator);
+    const released = await session.releaseAndPersist(first.admission.admissionId, coordinator, first.accountRevision);
     expect(released).toBe('RELEASED');
 
     const second = await session.admitAndPersist(pair, request, coordinator);
@@ -398,7 +399,7 @@ describe('F14-06 correction — PaperAccount.revision version binding', () => {
     const accountAfterAdmit = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
     expect(accountAfterAdmit.revision).toBe(admitted.accountRevision);
 
-    const released = await session.releaseAndPersist(admitted.admission.admissionId, coordinator);
+    const released = await session.releaseAndPersist(admitted.admission.admissionId, coordinator, admitted.accountRevision);
     expect(released).toBe('RELEASED');
     const accountAfterRelease = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
     expect(accountAfterRelease.revision).toBe(admitted.accountRevision + 1n);
@@ -661,5 +662,62 @@ describe('P14-F live-DB — unsupported funding restore invariants', () => {
     expect(session.state).toBe('READY');
     expect(session.snapshot.cumulativeFundingInr).toBe('0');
     expect(await prisma.paperLedgerEntry.count({ where: { accountId, type: 'FUNDING' } })).toBe(0);
+  });
+});
+
+describe('Combined correction: mandatory durable release revision', () => {
+  async function setupRelease() {
+    expect(dbAvailable).toBe(true);
+    const repository = new PaperAccountRepository(prisma), coordinator = new RiskAdmissionCoordinator();
+    const accountId = freshAccountId(), pair = 'B-BTC_USDT';
+    await initAccount(repository, accountId); await provisionPairSlot(accountId, pair);
+    const session = await openPaperAccountSession({ accountId, coordinator, prisma });
+    const admitted = await session.admitAndPersist(pair, await buildRequest(accountId, pair, 1_200_000), coordinator, session.snapshot.revision);
+    if (admitted.outcome !== 'ADMITTED') throw new Error('setup admission failed');
+    return { accountId, pair, session, coordinator, admitted };
+  }
+  it('rejects stale and omitted revisions without changing reservation, slot, exposure or revision', async () => {
+    const { accountId, pair, session, coordinator, admitted } = await setupRelease();
+    const { advanceDurablePeakEquity } = await import('../../../src/execution/persistence/authoritative-risk-input');
+    const before = await session.refreshSnapshot();
+    await advanceDurablePeakEquity({ prisma, accountId, expectedRevision: admitted.accountRevision, observedEquityInr: paperDecimal(before.peakEquityInr).plus('1').toFixed() });
+    const advanced = await session.refreshSnapshot();
+    for (const expected of [admitted.accountRevision, undefined as unknown as bigint]) {
+      await expect(session.releaseAndPersist(admitted.admission.admissionId, coordinator, expected)).rejects.toMatchObject({ code: 'STALE_ACCOUNT_REVISION' });
+    }
+    const after = await session.refreshSnapshot();
+    expect(after.revision).toBe(advanced.revision);
+    expect(after.admittedReservations).toEqual(advanced.admittedReservations);
+    expect(after.pairSlots).toEqual(advanced.pairSlots);
+    expect(await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair } } })).toMatchObject({ status: 'PENDING' });
+  });
+  it('two release attempts with one observation produce exactly one transition', async () => {
+    const { session, coordinator, admitted } = await setupRelease();
+    const results = await Promise.allSettled([
+      session.releaseAndPersist(admitted.admission.admissionId, coordinator, admitted.accountRevision),
+      session.releaseAndPersist(admitted.admission.admissionId, coordinator, admitted.accountRevision),
+    ]);
+    expect(results.filter(r => r.status === 'fulfilled' && r.value === 'RELEASED')).toHaveLength(1);
+    const rejected = results.find(r => r.status === 'rejected');
+    expect(rejected).toMatchObject({ status: 'rejected', reason: { code: 'STALE_ACCOUNT_REVISION' } });
+    const after = await session.refreshSnapshot();
+    expect(after.revision).toBe(admitted.accountRevision + 1n);
+    expect(after.admittedReservations).toHaveLength(0);
+  });
+  it('restart authorizes release from the restored revision, never the old observation', async () => {
+    const { accountId, session, coordinator, admitted } = await setupRelease();
+    session.release();
+    const restoredCoordinator = new RiskAdmissionCoordinator();
+    const restored = await openPaperAccountSession({ accountId, coordinator: restoredCoordinator, prisma });
+    await expect(restored.releaseAndPersist(admitted.admission.admissionId, restoredCoordinator, admitted.accountRevision)).rejects.toMatchObject({ code: 'STALE_ACCOUNT_REVISION' });
+    expect(await restored.releaseAndPersist(admitted.admission.admissionId, restoredCoordinator, restored.snapshot.revision)).toBe('RELEASED');
+    expect((await restored.refreshSnapshot()).revision).toBe(restored.snapshot.revision + 1n);
+    await expect(session.releaseAndPersist(admitted.admission.admissionId, coordinator, admitted.accountRevision)).rejects.toMatchObject({ code: 'ACCOUNT_NOT_READY' });
+  });
+  it('a consumed reservation cannot be released even at the current revision', async () => {
+    const { session, coordinator, admitted } = await setupRelease();
+    await prisma.paperReservation.update({ where: { admissionId: admitted.admission.admissionId }, data: { status: 'CONSUMED' } });
+    await expect(session.releaseAndPersist(admitted.admission.admissionId, coordinator, admitted.accountRevision)).rejects.toMatchObject({ code: 'DURABLE_CONFLICT' });
+    expect((await session.refreshSnapshot()).revision).toBe(admitted.accountRevision);
   });
 });

@@ -369,6 +369,8 @@ model PaperFill {
   markSnapshotContentSha256  String?              @map("mark_snapshot_content_sha256") @db.VarChar(64)
   /// Causal observation/evidence time, never historical bar time (V2 §7).
   eventTimeMs                BigInt               @map("event_time_ms")
+  /// Account revision committed by this fill's transaction. NULL means legacy order is unverifiable.
+  accountMutationRevision    BigInt?              @map("account_mutation_revision")
   createdAt                  DateTime             @default(now()) @map("created_at")
 
   order              PaperOrder         @relation(fields: [orderId], references: [executionIntentId], onDelete: Restrict, onUpdate: Restrict)
@@ -377,6 +379,7 @@ model PaperFill {
 
   /// V2.3 §6 frozen terminal source-execution dedup: one genuine source `StrategyDecision` → at most one economic fill per account, across every admission generation and process restart. Deliberately NOT placed on `paper_reservation`/`paper_execution_intent` — a released/unfilled source decision may legitimately retry there.
   @@unique([accountId, sourceStrategyDecisionId], map: "paper_fill_account_source_decision_terminal_unique")
+  @@unique([accountId, accountMutationRevision], map: "paper_fill_account_mutation_revision_unique")
   @@map("paper_fill")
 }
 

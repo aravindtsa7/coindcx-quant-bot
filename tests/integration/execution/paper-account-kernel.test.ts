@@ -407,7 +407,7 @@ describe('P14-G live-DB — released reservation restart (§39)', () => {
     const session1 = await openPaperAccountSession({ accountId, coordinator: coordinator1, prisma });
     const admitted = await session1.admitAndPersist(PAIR, request, coordinator1);
     if (admitted.outcome !== 'ADMITTED') throw new Error('setup failed');
-    const released = await session1.releaseAndPersist(admitted.admission.admissionId, coordinator1);
+    const released = await session1.releaseAndPersist(admitted.admission.admissionId, coordinator1, admitted.accountRevision);
     expect(released).toBe('RELEASED');
 
     const coordinator2 = new RiskAdmissionCoordinator();
@@ -436,7 +436,7 @@ describe('F14-04 correction — released generation history survives restart (§
     const admittedGen1 = await session1.admitAndPersist(PAIR, request, coordinator1);
     if (admittedGen1.outcome !== 'ADMITTED') throw new Error('setup failed');
     expect(admittedGen1.admission.generation).toBe(1);
-    const releasedGen1 = await session1.releaseAndPersist(admittedGen1.admission.admissionId, coordinator1);
+    const releasedGen1 = await session1.releaseAndPersist(admittedGen1.admission.admissionId, coordinator1, admittedGen1.accountRevision);
     expect(releasedGen1).toBe('RELEASED');
 
     // --- Destroy all process-local coordinator/session state; fresh coordinator/kernel restore ---

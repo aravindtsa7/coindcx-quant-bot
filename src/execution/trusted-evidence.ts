@@ -1,4 +1,12 @@
-import { canonicalPaperDecimalString, paperDecimal } from './decimal';
+import Decimal from 'decimal.js';
+const EvidenceDecimal = Decimal.clone({ precision: 128, rounding: Decimal.ROUND_HALF_UP });
+function paperDecimal(value: string): Decimal { return new EvidenceDecimal(value); }
+function canonicalPaperDecimalString(value: string, label: string): string {
+  if (typeof value !== 'string' || !/^-?\d+(?:\.\d+)?$/.test(value)) throw new Error(`Invalid evidence decimal: ${label}`);
+  const d = paperDecimal(value);
+  if (!d.isFinite()) throw new Error(`Non-finite evidence decimal: ${label}`);
+  return d.isZero() ? '0' : d.toFixed();
+}
 import type { PaperExecutionQuoteSnapshot } from './evidence';
 
 export interface TrustedPaperOrderbookDepth {
@@ -127,4 +135,12 @@ export function issueTrustedPaperExecutionEvidence(input: TrustedPaperExecutionE
 /** @internal Runtime authenticity check for the execution engine. */
 export function readTrustedPaperExecutionEvidence(value: unknown): TrustedPaperExecutionEvidenceRecord | null {
   return typeof value === 'object' && value !== null ? registry.get(value) ?? null : null;
+}
+
+// Pin CommonJS authority entry points to lexical implementations. This also
+// prevents pre-import replacement through an already-loaded repo namespace.
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  if (Object.getOwnPropertyDescriptor(module.exports, 'issueTrustedPaperExecutionEvidence')?.configurable !== false) Object.defineProperty(module.exports, 'issueTrustedPaperExecutionEvidence', { get: () => issueTrustedPaperExecutionEvidence, configurable: false });
+  if (Object.getOwnPropertyDescriptor(module.exports, 'readTrustedPaperExecutionEvidence')?.configurable !== false) Object.defineProperty(module.exports, 'readTrustedPaperExecutionEvidence', { get: () => readTrustedPaperExecutionEvidence, configurable: false });
+  Object.freeze(module.exports);
 }

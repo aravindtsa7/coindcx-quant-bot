@@ -449,8 +449,8 @@ describe('P14-I live-DB â€” OPEN provider failure (Â§49)', () => {
     expect(await prisma.paperFill.count({ where: { accountId } })).toBe(0);
     // The durable admission reservation IS created before the evidence check (existing, unweakened P14-D contract) â€” the pair slot is legitimately PENDING, not repaired/rolled back by P14-I.
     const position = await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } });
-    expect(position.status).toBe('PENDING');
-    expect(await prisma.paperReservation.count({ where: { accountId, status: 'ADMITTED' } })).toBe(1);
+    expect(position.status).toBe('EMPTY');
+    expect(await prisma.paperReservation.count({ where: { accountId, status: 'RELEASED' } })).toBe(1);
   }, 30_000);
 });
 
@@ -978,6 +978,29 @@ function racingPrisma(real: PrismaClient, index: number, effect: () => Promise<v
 }
 
 describe('F14-01 live-DB — authoritative account/exposure derivation (§3)', () => {
+  it('combined cleanup preserves admission R when another mutation commits R+1', async () => {
+    expect(dbAvailable).toBe(true);
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    let committedRevision: bigint | null = null;
+    const racing = racingPrisma(prisma, 4, async () => {
+      const account = await prisma.paperAccount.update({ where: { accountId }, data: { revision: { increment: 1n } } });
+      committedRevision = account.revision;
+    });
+    const runtime = await new PaperAccountProductionComposer({ prisma: racing.client }).start({
+      accountId, coordinator: new RiskAdmissionCoordinator(), provider: makeProvider(),
+    });
+    racing.arm();
+    await expect(runtime.executeOpen(await buildOpenParams(accountId))).rejects.toMatchObject({ code: 'STALE_ACCOUNT_REVISION' });
+    expect(committedRevision).not.toBeNull();
+    expect((await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).revision).toBe(committedRevision);
+    expect(await prisma.paperReservation.count({ where: { accountId, status: 'ADMITTED' } })).toBe(1);
+    expect((await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } })).status).toBe('PENDING');
+    expect(await prisma.paperFill.count({ where: { accountId } })).toBe(0);
+    expect(await prisma.paperLedgerEntry.count({ where: { accountId } })).toBe(0);
+  }, 30_000);
+
   it('derives capital, equity, peak, locked margin and daily PnL from durable facts alone, bound to the current fence/revision', async () => {
     if (skip()) return;
     const accountId = freshAccountId();
@@ -1040,10 +1063,14 @@ describe('F14-01 live-DB — authoritative account/exposure derivation (§3)', (
     const accountId = freshAccountId();
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
-    const provider = makeProvider(); // never fed: the OPEN admits durably, then fails closed at the evidence read
-    const composer = new PaperAccountProductionComposer({ prisma });
+    const provider = makeProvider();
+    // Lose the transaction acknowledgement after admission commits: recovery
+    // must retain the durable pending exposure until the outcome is resolved.
+    const racing = racingPrisma(prisma, 4, async () => { throw new Error('lost admission acknowledgement'); });
+    const composer = new PaperAccountProductionComposer({ prisma: racing.client });
     const runtime = await composer.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
-    await expect(runtime.executeOpen(await buildOpenParams(accountId))).rejects.toMatchObject({ code: 'EVIDENCE_UNAVAILABLE' });
+    racing.arm();
+    await expect(runtime.executeOpen(await buildOpenParams(accountId))).rejects.toMatchObject({ code: 'ADMISSION_OUTCOME_AMBIGUOUS' });
 
     const reservation = await prisma.paperReservation.findFirstOrThrow({ where: { accountId, status: 'ADMITTED' } });
     const derived = deriveWithMarks(await deriveBase(accountId));
@@ -1475,12 +1502,188 @@ describe('F14-01 live-DB — production MTM equity drives OPEN risk (§12.3/§12
     await expect(runtime.executeOpen(await buildOpenParamsForPair(accountId, PAIR_B, {}, T0 + MINUTE)))
       .rejects.toMatchObject({ code: 'STALE_ACCOUNT_REVISION' });
 
-    expect(valuationRead).toHaveBeenCalledTimes(1);
+    expect(valuationRead).not.toHaveBeenCalled(); // private reader must bypass exported methods
     expect(bumps).toBe(1);
     expect(await prisma.paperReservation.count({ where: { accountId, pair: PAIR_B } })).toBe(0);
     expect(await prisma.paperFill.count({ where: { accountId, pair: PAIR_B } })).toBe(0);
     valuationRead.mockRestore();
   }, 30_000);
+
+
+  it('Combined correction provider close ordering', async () => {
+    expect(dbAvailable).toBe(true);
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    await provisionPairSlot(accountId, PAIR_B);
+    const provider = makeProvider();
+    await feedFreshEvidence(provider);
+    const runtime = await new PaperAccountProductionComposer({ prisma }).start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+    const openedA = await openSmallShort(runtime, accountId);
+    const breakEvenA = await shortMarkForTargetEquity(accountId, '999999');
+    await feedFreshEvidenceForPair(provider, PAIR_B, '49', '49.5', CONVERSION_RATE, Date.now(), breakEvenA, '49');
+    const baseB = await buildOpenParamsForPair(accountId, PAIR_B, {}, T0 + MINUTE);
+    const paramsB = { ...baseB, riskRequest: { ...baseB.riskRequest, override: { overrideId: 'review-small-b', overrideRiskPerTradePercent: null, overrideMaxLeverage: null, overrideMaxNotionalInr: '80' } } };
+    const openedB = await runtime.executeOpen(paramsB);
+    if (openedB.outcome !== 'FILLED') throw new Error('second OPEN failed');
+    const closeAtA = Date.now();
+    await feedFreshEvidence(provider, '1', '2', CONVERSION_RATE, closeAtA);
+    const shapeA = buildCloseParams(openedA.params.kernel, accountId, openedA.quantity, {}, T0 + 2 * MINUTE);
+    const closedA = await runtime.executeClose({ ...shapeA, riskRequest: { ...shapeA.riskRequest, pairSnapshot: openPairSnapshotFor(openedA.params.kernel, accountId, openedA.quantity, shapeA.decision.evaluationTimeMs, 'SHORT') } });
+    if (closedA.outcome !== 'CLOSED') throw new Error('first CLOSE failed');
+    expect(paperDecimal(closedA.realizedPnlInr).greaterThan(0)).toBe(true);
+    provider.startOrderbookWebSocket();
+    latestProductionSocket().trigger('depth-snapshot', bookPayload(closeAtA - 1, '40', '41', '1', PROVIDER_SYMBOL_B));
+    const closedB = await runtime.executeClose(buildCloseParams(paramsB.kernel, accountId, openedB.quantity, { policy: policyFor(PAIR_B) }, T0 + 3 * MINUTE));
+    if (closedB.outcome !== 'CLOSED') throw new Error('second CLOSE failed');
+    expect(paperDecimal(closedB.realizedPnlInr).lessThan(0)).toBe(true);
+    const account = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    const health = await runtime.refreshHealth();
+    const history = await prisma.paperPositionOwnershipHistory.findMany({ where: { accountId }, select: { pair: true, openedAtMs: true, closedAtMs: true } });
+    let restart = 'READY';
+    try { await new PaperAccountProductionComposer({ prisma }).start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider: makeProvider() }); } catch (error) { restart = error instanceof PaperProductionRuntimeError ? error.code : String(error); }
+    console.info('FINAL_REVIEW_ORDERING_EVIDENCE', JSON.stringify({ closes: [closedA.realizedPnlInr, closedB.realizedPnlInr], history, storedCount: account.consecutiveLossCount, health, restart }, (_, value) => typeof value === 'bigint' ? value.toString() : value));
+    expect(health.status).toBe('HEALTHY');
+    expect(account.consecutiveLossCount).toBe(1);
+    expect(restart).toBe('READY');
+  }, 60000);
+
+  it.each([-1, 0])('Combined correction partial close provider time offset %i', async (offset) => {
+    expect(dbAvailable).toBe(true);
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    await provisionPairSlot(accountId, PAIR_B);
+    const provider = makeProvider();
+    await feedFreshEvidence(provider);
+    const runtime = await new PaperAccountProductionComposer({ prisma }).start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+    const openedA = await openSmallShort(runtime, accountId);
+    const breakEvenA = await shortMarkForTargetEquity(accountId, '999999');
+    await feedFreshEvidenceForPair(provider, PAIR_B, '49', '49.5', CONVERSION_RATE, Date.now(), breakEvenA, '49');
+    const baseB = await buildOpenParamsForPair(accountId, PAIR_B, {}, T0 + MINUTE);
+    const paramsB = { ...baseB, riskRequest: { ...baseB.riskRequest, override: { overrideId: 'review-small-b', overrideRiskPerTradePercent: null, overrideMaxLeverage: null, overrideMaxNotionalInr: '80' } } };
+    const openedB = await runtime.executeOpen(paramsB);
+    if (openedB.outcome !== 'FILLED') throw new Error('second OPEN failed');
+    const beforeB = await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR_B } } });
+    const closeAtA = Number(beforeB.openedAtMs) + offset;
+    provider.startOrderbookWebSocket();
+    latestProductionSocket().trigger('depth-snapshot', bookPayload(closeAtA, '1', '2', '1', PROVIDER_SYMBOL));
+    const shapeA = buildCloseParams(openedA.params.kernel, accountId, openedA.quantity, {}, T0 + 2 * MINUTE);
+    const closedA = await runtime.executeClose({ ...shapeA, riskRequest: { ...shapeA.riskRequest, pairSnapshot: openPairSnapshotFor(openedA.params.kernel, accountId, openedA.quantity, shapeA.decision.evaluationTimeMs, 'SHORT') } });
+    if (closedA.outcome !== 'CLOSED') throw new Error('first CLOSE failed');
+    expect(paperDecimal(closedA.realizedPnlInr).greaterThan(0)).toBe(true);
+
+    const account = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    const health = await runtime.refreshHealth();
+    await feedFreshEvidenceForPair(provider, PAIR_B, '60', '61');
+    let remainingClose = 'CLOSED';
+    try { await runtime.executeClose(buildCloseParams(paramsB.kernel, accountId, openedB.quantity, { policy: policyFor(PAIR_B) }, T0 + 3 * MINUTE)); } catch(error) { remainingClose = error instanceof PaperProductionRuntimeError ? error.code : String(error); }
+    console.info('FINAL_REVIEW_PARTIAL_PEAK', JSON.stringify({ closeAtA, openedAtB: beforeB.openedAtMs, storedPeak: account.peakEquityInr.toFixed(), remainingClose, health }, (_, value) => typeof value === 'bigint' ? value.toString() : value));
+    expect(health.status).toBe('HEALTHY');
+    expect(remainingClose).toBe('CLOSED');
+    expect((await runtime.refreshHealth()).status).toBe('HEALTHY');
+  }, 60000);
+
+  it('combined durable order preserves a historical flat point across same-pair reopen and backward timestamps', async () => {
+    expect(dbAvailable).toBe(true);
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const provider = makeProvider();
+    await feedFreshEvidence(provider);
+    const runtime = await new PaperAccountProductionComposer({ prisma }).start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+    const opened = await openSmallShort(runtime, accountId);
+    const closeTime = Date.now();
+    await feedFreshEvidence(provider, '1', '2', CONVERSION_RATE, closeTime);
+    const shape = buildCloseParams(opened.params.kernel, accountId, opened.quantity, {}, T0 + MINUTE);
+    const close = { ...shape, riskRequest: { ...shape.riskRequest, pairSnapshot: openPairSnapshotFor(opened.params.kernel, accountId, opened.quantity, shape.decision.evaluationTimeMs, 'SHORT') } };
+    expect((await runtime.executeClose(close)).outcome).toBe('CLOSED');
+    const flat = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    expect(flat.peakEquityInr.greaterThan('1000000')).toBe(true);
+    // Invert only the orderbook market time. Conversion retains its separate
+    // monotonic provider timestamp contract.
+    provider.startOrderbookWebSocket();
+    latestProductionSocket().trigger('depth-snapshot', bookPayload(closeTime - 1, '99', '99.5'));
+    await openSmallShort(runtime, accountId, T0 + 2 * MINUTE);
+    const slot = await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } });
+    const history = await prisma.paperPositionOwnershipHistory.findFirstOrThrow({ where: { accountId } });
+    expect(slot.positionInstanceId).not.toBe(history.positionInstanceId);
+    const fills = await prisma.paperFill.findMany({ where: { accountId }, orderBy: { accountMutationRevision: 'asc' } });
+    expect(fills.map(fill => fill.action)).toEqual(['OPEN', 'CLOSE', 'OPEN']);
+    expect(fills[2]!.eventTimeMs).toBeLessThan(fills[1]!.eventTimeMs);
+    expect(fills.every(fill => fill.accountMutationRevision !== null)).toBe(true);
+    expect((await runtime.refreshHealth()).status).toBe('HEALTHY');
+    const beforeRetry = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    expect((await runtime.executeClose(close)).outcome).toBe('SOURCE_DECISION_ALREADY_EXECUTED');
+    expect((await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).revision).toBe(beforeRetry.revision);
+    expect(await prisma.paperFill.count({ where: { accountId } })).toBe(3);
+    const restarted = await new PaperAccountProductionComposer({ prisma }).start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+    expect((await restarted.refreshHealth()).status).toBe('HEALTHY');
+    // The earlier real flat moment remains provable even with a new instance OPEN.
+    await prisma.paperAccount.update({ where: { accountId }, data: { peakEquityInr: '1000000' } });
+    const fault = await restarted.refreshHealth();
+    expect(fault.issues.some(issue => issue.message === 'PEAK_EQUITY_BELOW_PROVABLE_MINIMUM')).toBe(true);
+  }, 60_000);
+
+  it('Combined correction concurrent losing CLOSEs', async () => {
+    expect(dbAvailable).toBe(true);
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    await provisionPairSlot(accountId, PAIR_B);
+    const provider = makeProvider();
+    const runtime = await new PaperAccountProductionComposer({ prisma }).start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+    await losingLifecycle(runtime, provider, accountId, 0);
+    await feedFreshEvidence(provider);
+    const openedA = await openSmallShort(runtime, accountId, T0 + 10 * MINUTE);
+    const cashRow = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    const cashTarget = paperDecimal(cashRow.startingCapitalInr.toFixed()).plus(cashRow.cumulativeRealizedPnlInr.toFixed()).minus(cashRow.cumulativeFeesInr.toFixed()).minus('1').toFixed();
+    const breakEvenA = await shortMarkForTargetEquity(accountId, cashTarget);
+    await feedFreshEvidenceForPair(provider, PAIR_B, '49', '49.5', CONVERSION_RATE, Date.now(), breakEvenA, '49');
+    const baseB = await buildOpenParamsForPair(accountId, PAIR_B, {}, T0 + 11 * MINUTE);
+    const paramsB = { ...baseB, riskRequest: { ...baseB.riskRequest, override: { overrideId: 'review-small-b', overrideRiskPerTradePercent: null, overrideMaxLeverage: null, overrideMaxNotionalInr: '80' } } };
+    const openedB = await runtime.executeOpen(paramsB);
+    if (openedB.outcome !== 'FILLED') throw new Error('second OPEN failed');
+    const closeTime = Date.now();
+    await feedFreshEvidence(provider, '120', '121', CONVERSION_RATE, closeTime);
+    provider.startOrderbookWebSocket();
+    latestProductionSocket().trigger('depth-snapshot', bookPayload(closeTime, '120', '121', '1', PROVIDER_SYMBOL));
+    latestProductionSocket().trigger('depth-snapshot', bookPayload(closeTime, '40', '41', '1', PROVIDER_SYMBOL_B));
+    const shapeA = buildCloseParams(openedA.params.kernel, accountId, openedA.quantity, {}, T0 + 12 * MINUTE);
+    const before = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    const results = await Promise.all([
+      runtime.executeClose({ ...shapeA, riskRequest: { ...shapeA.riskRequest, pairSnapshot: openPairSnapshotFor(openedA.params.kernel, accountId, openedA.quantity, shapeA.decision.evaluationTimeMs, 'SHORT') } }),
+      runtime.executeClose(buildCloseParams(paramsB.kernel, accountId, openedB.quantity, { policy: policyFor(PAIR_B) }, T0 + 13 * MINUTE))
+    ]);
+    for (const result of results) { if (result.outcome !== 'CLOSED') throw new Error('CLOSE failed'); expect(paperDecimal(result.realizedPnlInr).isNegative()).toBe(true); }
+    const account = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    expect(account.consecutiveLossCount).toBe(3);
+    expect(account.cooldownActiveUntilMs).toBe(BigInt(closeTime + 60000));
+    expect(account.revision).toBe(before.revision + 2n);
+    expect((await runtime.refreshHealth()).status).toBe('HEALTHY');
+    console.info('FINAL_REVIEW_CONCURRENCY', JSON.stringify({ count: account.consecutiveLossCount, cooldownExact: account.cooldownActiveUntilMs === BigInt(closeTime + 60000), revisionDelta: Number(account.revision - before.revision) }));
+  }, 60000);
+  it('Combined correction durable breakeven resets count', async () => {
+    expect(dbAvailable).toBe(true);
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const provider = makeProvider();
+    const runtime = await new PaperAccountProductionComposer({ prisma }).start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+    await losingLifecycle(runtime, provider, accountId, 0);
+    await feedFreshEvidence(provider);
+    const params = await buildOpenParams(accountId, {}, T0 + 10 * MINUTE);
+    const opened = await runtime.executeOpen(params);
+    if (opened.outcome !== 'FILLED') throw new Error('OPEN failed');
+    await feedFreshEvidence(provider, '100.1', '100.5');
+    const closed = await runtime.executeClose(buildCloseParams(params.kernel, accountId, opened.quantity, {}, T0 + 11 * MINUTE));
+    if (closed.outcome !== 'CLOSED') throw new Error('CLOSE failed');
+    expect(closed.realizedPnlInr).toBe('0');
+    const account = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    expect(account.consecutiveLossCount).toBe(0);
+    expect((await runtime.refreshHealth()).status).toBe('HEALTHY');
+    console.info('FINAL_REVIEW_BREAKEVEN', JSON.stringify({ realizedPnlInr: closed.realizedPnlInr, count: account.consecutiveLossCount }));
+  }, 60000);
 
   it('Wave5B: profitable partial CLOSE stays healthy across restart, remaining CLOSE succeeds, and final flat cash proves the peak', async () => {
     if (skip()) return;
@@ -1799,9 +2002,8 @@ describe('F14-02 live-DB — production OPEN/CLOSE reject caller-fabricated mark
     await expect(runtime.executeOpen(await buildOpenParams(accountId))).rejects.toMatchObject({ code: 'EVIDENCE_UNAVAILABLE' });
     expect(await prisma.paperFill.count({ where: { accountId } })).toBe(0);
     expect(await prisma.paperLedgerEntry.count({ where: { accountId } })).toBe(0);
-    // The durable admission reservation IS created before the evidence check
-    // (unchanged, unweakened P14-D contract) — but no economics follow it.
-    expect((await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } })).status).toBe('PENDING');
+    // Evidence failure releases using the exact post-admission revision.
+    expect((await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } })).status).toBe('EMPTY');
   }, 30_000);
 
   it('CLOSE: a fabricated-evidence provider cannot close a genuinely OPEN position', async () => {
@@ -2544,4 +2746,54 @@ describe('P14-I sanity â€” PaperProductionRuntimeError shape', () => {
     expect(error.code).toBe('EVIDENCE_UNAVAILABLE');
     expect(error.name).toBe('PaperProductionRuntimeError');
   });
+});
+
+describe('Combined correction: exported trusted-reader attacks against production economics', () => {
+  it.each(['OPEN', 'CLOSE'] as const)('%s refuses fabricated provider reader results without economics', async action => {
+    expect(dbAvailable).toBe(true);
+    const accountId = freshAccountId();
+    await initAccount(accountId); await provisionPairSlot(accountId, PAIR);
+    const provider = makeProvider();
+    const runtime = await new PaperAccountProductionComposer({ prisma }).start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+    const params = await buildOpenParams(accountId);
+    let quantity = '0';
+    if (action === 'CLOSE') {
+      await feedFreshEvidence(provider);
+      const opened = await runtime.executeOpen(params);
+      if (opened.outcome !== 'FILLED') throw new Error('genuine OPEN failed');
+      quantity = opened.quantity;
+    }
+    // New genuine identity, but no production market acquisition whatsoever.
+    const emptyProvider = makeProvider();
+    const attackedRuntime = await new PaperAccountProductionComposer({ prisma }).start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider: emptyProvider });
+    const fabricated = callerFabricatedProvider();
+    const quote = fabricated.getLatestExecutionQuote(PAIR), depth = fabricated.getLatestOrderbookEvidence(PAIR), conversion = fabricated.getLatestConversion();
+    if (quote.state !== 'AVAILABLE' || depth.state !== 'AVAILABLE' || conversion.state !== 'AVAILABLE') throw new Error('missing manual fixture');
+    const executionPatch = vi.spyOn(CoinDcxPaperEvidence.prototype, 'readProductionAcquiredExecutionEvidence').mockReturnValue({ state: 'AVAILABLE', snapshot: { quote: quote.snapshot, depth: depth.snapshot, conversion: conversion.snapshot, orderbookGenerationId: fabricated.orderbookGenerationId, conversionLocalPollFreshnessMs: fabricated.conversionLocalPollFreshnessMs } });
+    const valuationPatch = vi.spyOn(CoinDcxPaperEvidence.prototype, 'readProductionAcquiredValuationEvidence').mockImplementation(() => { throw new Error('exported valuation reached'); });
+    try {
+      const before = { fills: await prisma.paperFill.count({ where: { accountId } }), ledger: await prisma.paperLedgerEntry.count({ where: { accountId } }) };
+      await expect(action === 'OPEN' ? attackedRuntime.executeOpen(params) : attackedRuntime.executeClose(buildCloseParams(params.kernel, accountId, quantity))).rejects.toMatchObject({ code: 'EVIDENCE_UNAVAILABLE' });
+      expect(await prisma.paperFill.count({ where: { accountId } })).toBe(before.fills);
+      expect(await prisma.paperLedgerEntry.count({ where: { accountId } })).toBe(before.ledger);
+      expect(executionPatch).not.toHaveBeenCalled(); expect(valuationPatch).not.toHaveBeenCalled();
+    } finally { executionPatch.mockRestore(); valuationPatch.mockRestore(); }
+  }, 60000);
+
+  it('diagnoses legacy NULL mutation ordering deterministically without guessing or repair', async () => {
+    expect(dbAvailable).toBe(true);
+    const accountId = freshAccountId(); await initAccount(accountId); await provisionPairSlot(accountId, PAIR);
+    const provider = makeProvider();
+    const runtime = await new PaperAccountProductionComposer({ prisma }).start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+    await losingLifecycle(runtime, provider, accountId, 0);
+    await prisma.paperFill.updateMany({ where: { accountId }, data: { accountMutationRevision: null } });
+    const first = await runtime.refreshHealth(), second = await runtime.refreshHealth();
+    expect(first.status).toBe('UNHEALTHY');
+    const issue = first.issues.find(i => i.message === 'LEGACY_UNVERIFIABLE_ACCOUNT_MUTATION_ORDER');
+    expect(issue).toBeDefined();
+    expect(second.issues.find(i => i.message === issue?.message)?.faultId).toBe(issue?.faultId);
+    expect(first.issues.some(i => i.message === 'DURABLE_CONSECUTIVE_LOSS_COUNT_MISMATCH')).toBe(false);
+    expect(await prisma.paperFill.count({ where: { accountId, accountMutationRevision: null } })).toBe(2);
+    await expect(new PaperAccountProductionComposer({ prisma }).start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider: makeProvider() })).rejects.toMatchObject({ code: 'RECONCILIATION_UNHEALTHY' });
+  }, 60000);
 });

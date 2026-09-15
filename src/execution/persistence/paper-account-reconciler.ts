@@ -209,7 +209,17 @@ export class PaperAccountReconciler {
       this.#reconcileOrders(builder, orders, fillByOrderId);
       this.#reconcileTerminalDedup(builder, fills);
       for (const row of history) this.#reconcileHistory(builder, row, fillByOrderId, ledgerEntries, positions);
-      this.#reconcileDurableRiskState(builder, account, history, fills, positions, options.lossStatePolicy);
+      const lifecycleByIntentId = new Map<string, string>();
+      for (const row of history) {
+        lifecycleByIntentId.set(row.openingExecutionIntentId, row.positionInstanceId);
+        lifecycleByIntentId.set(row.closingExecutionIntentId, row.positionInstanceId);
+      }
+      for (const slot of positions) {
+        if (slot.status !== 'OPEN' || slot.admissionId === null || slot.positionInstanceId === null) continue;
+        const opening = intentByAdmissionId.get(slot.admissionId);
+        if (opening !== undefined) lifecycleByIntentId.set(opening.executionIntentId, slot.positionInstanceId);
+      }
+      this.#reconcileDurableRiskState(builder, account, fills, positions, lifecycleByIntentId, options.lossStatePolicy);
       this.#reconcileReservationsReverse(builder, reservations, positionByPair, intentByAdmissionId, history);
       this.#reconcileCompletedClosesReverse(builder, intents, orderByIntentId, fillByOrderId, history);
 
@@ -567,7 +577,7 @@ export class PaperAccountReconciler {
    *
    *  - CONSECUTIVE LOSS COUNT is fully derivable: every closed lifecycle carries
    *    its own canonical realized PnL and close time, and §12.5's rules are a
-   *    pure fold over them. Replayed exactly, no policy required.
+   *    pure fold in that order. Legacy missing order is explicitly unverifiable.
    *  - COOLDOWN is derivable only against the configured limit/duration, which
    *    are policy rather than durable facts — checked when supplied, otherwise
    *    deliberately left unverified.
@@ -582,121 +592,76 @@ export class PaperAccountReconciler {
    */
   #reconcileDurableRiskState(
     builder: Builder,
-    account: { readonly startingCapitalInr: Prisma.Decimal; readonly peakEquityInr: Prisma.Decimal; readonly consecutiveLossCount: number; readonly cooldownActiveUntilMs: bigint | null },
-    history: readonly { readonly realizedPnlInr: Prisma.Decimal; readonly closedAtMs: bigint; readonly openedAtMs: bigint; readonly closingExecutionIntentId: string; readonly positionInstanceId: string }[],
-    fills: readonly { readonly orderId: string; readonly action: string; readonly realizedPnlInr: Prisma.Decimal | null; readonly feeInr: Prisma.Decimal; readonly eventTimeMs: bigint }[],
-    positions: readonly { readonly pair: string; readonly status: string; readonly positionInstanceId: string | null; readonly openedAtMs: bigint | null }[],
+    account: { readonly revision: bigint; readonly startingCapitalInr: Prisma.Decimal; readonly peakEquityInr: Prisma.Decimal; readonly consecutiveLossCount: number; readonly cooldownActiveUntilMs: bigint | null },
+    fills: readonly { readonly orderId: string; readonly action: string; readonly realizedPnlInr: Prisma.Decimal | null; readonly feeInr: Prisma.Decimal; readonly eventTimeMs: bigint; readonly accountMutationRevision: bigint | null }[],
+    positions: readonly { readonly status: string }[],
+    lifecycleByIntentId: ReadonlyMap<string, string>,
     lossStatePolicy: PaperLossStatePolicy | undefined,
   ): void {
-    const closes = [...history]
-      .sort((left, right) => {
-        const byTime = Number(left.closedAtMs - right.closedAtMs);
-        return byTime !== 0 ? byTime : left.closingExecutionIntentId.localeCompare(right.closingExecutionIntentId);
-      })
-      .map((row) => ({ realizedPnlInr: row.realizedPnlInr.toFixed(), closeTimeMs: Number(row.closedAtMs) }));
-
-    // --- §12.5 consecutive loss count (always derivable) --------------------
-    const derivedCount = replayLossState(closes, { consecutiveLossLimit: null, cooldownMs: null }).consecutiveLossCount;
-    if (derivedCount !== account.consecutiveLossCount) {
-      addIssue(builder, 'RISK_STATE_MISMATCH', {}, 'DURABLE_CONSECUTIVE_LOSS_COUNT_MISMATCH', {
-        storedConsecutiveLossCount: account.consecutiveLossCount, derivedConsecutiveLossCount: derivedCount, closedLifecycles: closes.length,
+    // Market time is NEVER account order. The fill records the revision its
+    // economic transaction committed under the account row lock. Gaps (fence,
+    // admission, release and peak-only mutations) are valid; duplicates aren't.
+    const legacy = fills.filter(fill => fill.accountMutationRevision === null);
+    const revisions = fills.map(fill => fill.accountMutationRevision).filter((r): r is bigint => r !== null);
+    const invalid = revisions.some(r => r <= 0n || r > account.revision) || new Set(revisions).size !== revisions.length;
+    const orderVerified = legacy.length === 0 && !invalid;
+    if (!orderVerified) {
+      addIssue(builder, 'RISK_STATE_MISMATCH', {}, legacy.length > 0
+        ? 'LEGACY_UNVERIFIABLE_ACCOUNT_MUTATION_ORDER' : 'INVALID_ACCOUNT_MUTATION_ORDER', {
+        fillIds: (legacy.length > 0 ? legacy : fills).map(fill => fill.orderId).sort(),
       });
     }
-
-    // --- §12.5 cooldown (derivable only against configured policy) ----------
-    if (lossStatePolicy !== undefined && lossStatePolicy.consecutiveLossLimit !== null) {
-      const derived = replayLossState(closes, lossStatePolicy);
-      const stored = account.cooldownActiveUntilMs === null ? null : Number(account.cooldownActiveUntilMs);
-      if (derived.cooldownActiveUntilMs !== stored) {
-        addIssue(builder, 'RISK_STATE_MISMATCH', {}, 'DURABLE_COOLDOWN_BOUNDARY_MISMATCH', {
-          storedCooldownActiveUntilMs: stored, derivedCooldownActiveUntilMs: derived.cooldownActiveUntilMs,
-          consecutiveLossLimit: lossStatePolicy.consecutiveLossLimit, cooldownMs: lossStatePolicy.cooldownMs,
+    const ordered = orderVerified ? [...fills].sort((a, b) => a.accountMutationRevision! < b.accountMutationRevision! ? -1 : 1) : [];
+    const closes = ordered.filter(fill => fill.action === 'CLOSE' && fill.realizedPnlInr !== null)
+      .map(fill => ({ realizedPnlInr: fill.realizedPnlInr!.toFixed(), closeTimeMs: Number(fill.eventTimeMs) }));
+    if (orderVerified) {
+      const derivedCount = replayLossState(closes, { consecutiveLossLimit: null, cooldownMs: null }).consecutiveLossCount;
+      if (derivedCount !== account.consecutiveLossCount) {
+        addIssue(builder, 'RISK_STATE_MISMATCH', {}, 'DURABLE_CONSECUTIVE_LOSS_COUNT_MISMATCH', {
+          storedConsecutiveLossCount: account.consecutiveLossCount, derivedConsecutiveLossCount: derivedCount, closedLifecycles: closes.length,
         });
       }
-    }
-
-    // --- §12.4 peak equity, lower bound only --------------------------------
-    // Cash replayed over committed fills, sampled at each moment the account
-    // demonstrably held no open position (so equity === cash exactly there).
-    // Funding is deliberately excluded from this bound. It is unsupported in
-    // Phase14 and is always exactly 0 in valid state; a nonzero value is
-    // already owned by FUNDING_INVARIANT_VIOLATION, and folding it in here
-    // would report the same corruption twice under a second fault type.
-    const startingCapital = paperDecimal(account.startingCapitalInr.toFixed());
-    type LifecycleEvent = Readonly<{ at: bigint; action: 'OPEN' | 'CLOSE'; positionInstanceId: string }>;
-    const lifecycleEvents: LifecycleEvent[] = history.flatMap((row) => [
-      { at: row.openedAtMs, action: 'OPEN' as const, positionInstanceId: row.positionInstanceId },
-      { at: row.closedAtMs, action: 'CLOSE' as const, positionInstanceId: row.positionInstanceId },
-    ]);
-    let lifecycleUnverifiable = false;
-    for (const position of positions) {
-      if (position.status !== 'OPEN') continue;
-      if (position.positionInstanceId === null || position.openedAtMs === null) {
-        // Another reconciliation check owns the malformed OPEN projection. For
-        // peak proof, fail conservatively: an unplaceable active lifecycle means
-        // no post-inception historical flat moment is mathematically provable.
-        lifecycleUnverifiable = true;
-        continue;
+      if (lossStatePolicy !== undefined && lossStatePolicy.consecutiveLossLimit !== null) {
+        const derived = replayLossState(closes, lossStatePolicy);
+        const stored = account.cooldownActiveUntilMs === null ? null : Number(account.cooldownActiveUntilMs);
+        if (derived.cooldownActiveUntilMs !== stored) {
+          addIssue(builder, 'RISK_STATE_MISMATCH', {}, 'DURABLE_COOLDOWN_BOUNDARY_MISMATCH', {
+            storedCooldownActiveUntilMs: stored, derivedCooldownActiveUntilMs: derived.cooldownActiveUntilMs,
+            consecutiveLossLimit: lossStatePolicy.consecutiveLossLimit, cooldownMs: lossStatePolicy.cooldownMs,
+          });
+        }
       }
-      lifecycleEvents.push({
-        at: position.openedAtMs,
-        action: 'OPEN',
-        positionInstanceId: position.positionInstanceId,
-      });
     }
 
-    const eventsByTime = new Map<bigint, LifecycleEvent[]>();
-    for (const event of lifecycleEvents) {
-      const atTime = eventsByTime.get(event.at);
-      if (atTime === undefined) eventsByTime.set(event.at, [event]);
-      else atTime.push(event);
-    }
-    const fillsByTime = new Map<bigint, typeof fills[number][]>();
-    for (const fill of fills) {
-      const atTime = fillsByTime.get(fill.eventTimeMs);
-      if (atTime === undefined) fillsByTime.set(fill.eventTimeMs, [fill]);
-      else atTime.push(fill);
-    }
-    const orderedTimes = [...new Set([...eventsByTime.keys(), ...fillsByTime.keys()])]
-      .sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
-    const completedCloseIntentIds = new Set(history.map((row) => row.closingExecutionIntentId));
-    const activePositions = new Set<string>();
-
+    const startingCapital = paperDecimal(account.startingCapitalInr.toFixed());
     let provableMinimum = startingCapital;
     let cash = startingCapital;
-    for (const at of orderedTimes) {
-      // Same-time events form one durable economic point. OPENs precede CLOSEs
-      // within the group, and instance identity makes duplicate terminal facts
-      // idempotent: Set.add/delete can never double-change cardinality.
-      const events = [...(eventsByTime.get(at) ?? [])].sort((left, right) => {
-        if (left.action !== right.action) return left.action === 'OPEN' ? -1 : 1;
-        return left.positionInstanceId.localeCompare(right.positionInstanceId);
-      });
-      for (const event of events) {
-        if (event.action === 'OPEN') activePositions.add(event.positionInstanceId);
-        else activePositions.delete(event.positionInstanceId);
-      }
-
-      const atFills = [...(fillsByTime.get(at) ?? [])].sort((left, right) => left.orderId.localeCompare(right.orderId));
-      for (const fill of atFills) {
-        cash = cash.plus(fill.realizedPnlInr === null ? '0' : fill.realizedPnlInr.toFixed()).minus(fill.feeInr.toFixed());
-      }
-      const hasVerifiedClose = atFills.some((fill) => fill.action === 'CLOSE' && completedCloseIntentIds.has(fill.orderId));
-      if (!lifecycleUnverifiable && hasVerifiedClose && activePositions.size === 0 && cash.greaterThan(provableMinimum)) {
-        provableMinimum = cash;
+    const activePositions = new Set<string>();
+    let lifecycleVerified = orderVerified && fills.every(fill => lifecycleByIntentId.has(fill.orderId));
+    for (const fill of ordered) {
+      cash = cash.plus(fill.realizedPnlInr?.toFixed() ?? '0').minus(fill.feeInr.toFixed());
+      const instance = lifecycleByIntentId.get(fill.orderId);
+      if (instance === undefined) { lifecycleVerified = false; continue; }
+      if (fill.action === 'OPEN') {
+        if (activePositions.has(instance)) lifecycleVerified = false;
+        activePositions.add(instance);
+      } else {
+        if (!activePositions.delete(instance)) lifecycleVerified = false;
+        if (lifecycleVerified && activePositions.size === 0 && cash.greaterThan(provableMinimum)) provableMinimum = cash;
       }
     }
-    // The account's CURRENT state is the same kind of proof when it is flat.
-    if (!positions.some((slot) => slot.status === 'OPEN') && cash.greaterThan(provableMinimum)) provableMinimum = cash;
-
+    if (orderVerified && !lifecycleVerified) {
+      addIssue(builder, 'RISK_STATE_MISMATCH', {}, 'INVALID_ACCOUNT_LIFECYCLE_MUTATION_ORDER', {
+        fillIds: fills.map(fill => fill.orderId).sort(),
+      });
+    }
+    // Current flat cash and inception capital do not require historical order.
+    const currentCash = fills.reduce((sum, fill) => sum.plus(fill.realizedPnlInr?.toFixed() ?? '0').minus(fill.feeInr.toFixed()), startingCapital);
+    if (!positions.some(slot => slot.status === 'OPEN') && currentCash.greaterThan(provableMinimum)) provableMinimum = currentCash;
     const storedPeak = paperDecimal(account.peakEquityInr.toFixed());
     if (storedPeak.lessThan(provableMinimum)) {
       addIssue(builder, 'RISK_STATE_MISMATCH', {}, 'PEAK_EQUITY_BELOW_PROVABLE_MINIMUM', {
         storedPeakEquityInr: storedPeak.toFixed(), provableMinimumPeakEquityInr: provableMinimum.toFixed(),
-        // Stated explicitly: this is a lower bound from realized, flat-account
-        // observations only. An account that held open positions may have had a
-        // genuinely higher historical MTM peak that is not durably recoverable,
-        // and its absence is NOT treated as a fault.
         derivation: 'REALIZED_FLAT_ACCOUNT_CASH_LOWER_BOUND_V1',
       });
     }

@@ -807,6 +807,83 @@ remains PAPER.
 
 ---
 
+## 14A. Final combined correction — all five Astra findings
+
+This section supersedes earlier correction-status statements above. The accepted
+threat model includes caller replacement of repository exports, functions,
+methods and prototypes, before or after consumer import. Replacing native
+`node:https`, third-party package internals, `require.cache`, or global/V8
+primitives is arbitrary process compromise outside this boundary. Native/package
+interception in tests supplies controlled CoinDCX responses; it is not a public
+production injection option.
+
+| Finding | Root cause | Combined correction and executable evidence |
+| --- | --- | --- |
+| 1 — market reader authority | Provenance guards dynamically invoked exported provider methods; those methods could return manually fabricated trusted snapshots. | Constructor-installed module-private WeakMap callbacks read private fields and private methods directly. Identity, per-datum provenance, generation, freshness and clock checks precede issuance. Regressions replace every public provider method/getter, including own-property shadows; real MySQL OPEN/CLOSE attacks produce no fill/close or economic ledger mutation. |
+| 2 — instrument mapper authority | Native acquisition passed through the writable exported instrument mapper. | Private canonical wire schema, numeric normalization, mapping, identity hashing and issuance form one lexical pipeline. Exported mapper/normalizer/schema/hash patches cannot mint 777/9/8; genuine acquisition retains 0.001 economics. Authority module namespaces are immutable under CommonJS, including fresh pre-consumer-import replacement attempts. |
+| 3 — loss replay | Provider timestamps were sorted as though they represented transaction serialization. | Every OPEN/CLOSE fill records the revision committed by its account-locked economic transaction. Both risk and lifecycle replay use that account-local durable order. Profit +76 at T followed by loss -8.8 at T-1 derives the stored streak of 1 and reconciles HEALTHY after restart. |
+| 4 — peak replay | Provider-time lifecycle sorting could invent an earlier flat point. | The same fill revision sequence orders position-instance OPEN/CLOSE transitions. OPEN A, OPEN B, CLOSE A remains non-flat even when A's closing provider timestamp precedes B's opening timestamp. Same timestamps, same-pair reopen, concurrent closes and remaining CLOSE are covered. |
+| 5 — release revision | Durable release lacked an expected account revision. | Required `expectedRevision: bigint` is checked under the account lock before any release. Production cleanup carries exactly `admitted.accountRevision`; it never reads a newer revision merely to force release. Valid, stale, concurrent, terminal and restored-session releases are tested against MySQL. |
+
+### Durable mutation order and legacy behavior
+
+`paper_fill.account_mutation_revision` is nullable BIGINT with unique
+`(account_id, account_mutation_revision)`. The additive migration performs no
+backfill. Each economic transaction allocates `PaperAccount.revision + 1` under
+the existing account row lock and commits the fill and account revision together.
+Revision gaps from fencing, admission, release or peak-only observations are
+valid. Terminal retry creates no fill, replay event or account revision.
+
+Reconciliation rejects missing legacy order with deterministic
+`LEGACY_UNVERIFIABLE_ACCOUNT_MUTATION_ORDER`. Invalid/duplicate/out-of-range
+revisions and inconsistent lifecycle ordering are explicit faults. It never
+substitutes timestamps, identifiers or a process-local counter for missing order.
+Order-independent checks still run, including starting capital and current flat
+cash as provable peak minima. Historical flat moments are reconstructed only
+from verified durable position-instance order. Historical MTM without durable
+marks remains unverifiable. Existing legacy economics diagnoses are preserved.
+
+Provider time remains the fill market timestamp and the input to freshness and
+cooldown-until arithmetic. Only event **ordering** changes: gross PnL below zero
+increments the streak; zero or profit resets it; the threshold-reaching CLOSE's
+provider event time still defines the exact cooldown boundary.
+
+### Authority, cleanup and architecture
+
+Trusted market readers traverse private state, never replaceable public provider
+methods. Private socket framing preserves the existing exact candle decoder and
+CoinDCX socket lifecycle/options within the already bounded Invariant 44
+exception. Private native acquisition and normalization do not dispatch through
+exported repository transport, parser, mapper, Decimal or hash helpers. Public
+manual APIs remain reusable and untrusted. CommonJS authority entry points are
+pinned to lexical implementations so namespace replacement cannot bypass the
+private reader or issuer.
+
+Definitive evidence/authority rejection and mutation-free OPEN outcomes release
+using the admission's revision. A racing revision rejects cleanup without
+changing reservation/exposure/revision. An ambiguous transaction acknowledgement
+retains the reservation for recovery; pending capacity remains counted once.
+Faulted/stale sessions retain their existing recovery/fence behavior. Funding has
+no new release or posting path.
+
+Mechanical architecture regressions inspect private method dispatch, repository
+imports in the instrument success path, mandatory release parameters/call sites,
+and the replay comparator. Fresh-process probes also exercise actual CommonJS
+namespace protection. The strict transitive paper/live graph has no violation
+allowlist.
+
+### Combined verification status
+
+Implementation and adversarial verification are in progress. Final status and
+exact final gate counts will be recorded after the coherent-state quality run.
+No commit or push is part of this correction.
+
+Funding disclosure is unchanged: `FUNDING_UNSUPPORTED`,
+`COINDCX_PROVIDER_EVIDENCE_INCOMPLETE`, `fundingApplied=false`,
+`FUNDING_EXCLUDED`, `PAPER_NOT_ECONOMICALLY_COMPLETE`,
+`FUNDING_EXCLUDED_PNL`, `MAX_LIFECYCLE=PAPER`. Mechanical PAPER correctness does
+not imply economic completeness or authorize Phase15/promotion.
+
 ## 15. Validation commands run for this slice
 
 ```

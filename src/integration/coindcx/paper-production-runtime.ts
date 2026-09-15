@@ -474,7 +474,13 @@ export class PaperAccountProductionRuntime {
     }
 
     const evidenceRead = getTrustedPaperExecutionEvidence(this.#provider, params.kernel.pair);
-    if (evidenceRead.state !== 'AVAILABLE') throw new PaperProductionRuntimeError('EVIDENCE_UNAVAILABLE', `Fresh P14-B trusted evidence unavailable for ${params.kernel.pair}: ${evidenceRead.reason}`);
+    if (evidenceRead.state !== 'AVAILABLE') {
+      // A definitive pre-execution failure releases only the state authorized
+      // by this admission. A competing revision must fail closed, not be re-read
+      // merely to force cleanup through.
+      await this.#kernelRuntime.session.releaseAndPersist(admitted.admission.admissionId, this.#coordinator, admitted.accountRevision);
+      throw new PaperProductionRuntimeError('EVIDENCE_UNAVAILABLE', `Fresh P14-B trusted evidence unavailable for ${params.kernel.pair}: ${evidenceRead.reason}`);
+    }
 
     const authority = await mintPaperOpenExecutionAuthority({
       coordinator: this.#coordinator, accountId: this.accountId, kernel: params.kernel, decision: params.decision,
@@ -486,15 +492,24 @@ export class PaperAccountProductionRuntime {
         ...riskRequest, accountSnapshot: authoritative.accountSnapshot, exposureSnapshot: authoritative.exposureSnapshot,
       } satisfies PaperOpenRiskEvidence,
     });
-    if (authority === null) throw new PaperProductionRuntimeError('AUTHORITY_REJECTED', 'OPEN execution authority was not granted');
+    if (authority === null) {
+      await this.#kernelRuntime.session.releaseAndPersist(admitted.admission.admissionId, this.#coordinator, admitted.accountRevision);
+      throw new PaperProductionRuntimeError('AUTHORITY_REJECTED', 'OPEN execution authority was not granted');
+    }
 
     // [F14-06] Admission itself just atomically advanced the account revision
     // to `admitted.accountRevision` — the OPEN fill transaction must bind to
     // THAT new value, never the pre-admission `health.revision`.
-    return this.#kernelRuntime.session.executeOpen(authority, {
+    const result = await this.#kernelRuntime.session.executeOpen(authority, {
       evidence: evidenceRead.evidence, instrumentEconomics,
       executionPolicy, nowMs: this.#clock.nowMs(),
     }, this.#coordinator, admitted.accountRevision);
+    // Only definitive, mutation-free outcomes may release. Thrown/ambiguous
+    // execution outcomes retain the reservation for authoritative recovery.
+    if (result.outcome !== 'FILLED' && result.outcome !== 'SOURCE_DECISION_ALREADY_EXECUTED') {
+      await this.#kernelRuntime.session.releaseAndPersist(admitted.admission.admissionId, this.#coordinator, admitted.accountRevision);
+    }
+    return result;
   }
 
   async #executeCloseLocked(params: ProductionCloseParams): Promise<PaperCloseExecutionResult> {

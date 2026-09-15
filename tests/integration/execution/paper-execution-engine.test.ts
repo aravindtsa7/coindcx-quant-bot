@@ -1045,7 +1045,7 @@ describe('P14-E correction proofs — terminal conflict rollback and ambiguous O
     await expect(session.executeOpen(authority, inputs, coordinator)).rejects.toMatchObject({ code: 'ACCOUNT_NOT_READY' });
     expect(() => session.executeClose({} as PaperCloseExecutionAuthority, {} as never)).toThrow(/ACCOUNT_NOT_READY/);
     await expect(session.admitAndPersist(PAIR, { accountId, policy: policyFor(PAIR), context }, coordinator)).rejects.toMatchObject({ code: 'ACCOUNT_NOT_READY' });
-    await expect(session.releaseAndPersist(admitted.admission.admissionId, coordinator)).rejects.toMatchObject({ code: 'ACCOUNT_NOT_READY' });
+    await expect(session.releaseAndPersist(admitted.admission.admissionId, coordinator, 0n)).rejects.toMatchObject({ code: 'ACCOUNT_NOT_READY' });
     await expect(coordinator.release(accountId, admitted.admission.admissionId)).rejects.toThrow(/FAULTED/);
     expect(await prisma.paperFill.count({ where: { accountId } })).toBe(0);
     expect((await prisma.paperReservation.findUniqueOrThrow({ where: { admissionId: admitted.admission.admissionId } })).status).toBe('ADMITTED');

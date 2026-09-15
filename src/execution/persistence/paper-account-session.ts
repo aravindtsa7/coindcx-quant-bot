@@ -94,10 +94,10 @@ export class PaperAccountSession {
     }
   }
 
-  public async releaseAndPersist(admissionId: string, coordinator: RiskAdmissionCoordinator): Promise<'RELEASED' | 'ALREADY_RELEASED' | 'UNKNOWN_ADMISSION'> {
+  public async releaseAndPersist(admissionId: string, coordinator: RiskAdmissionCoordinator, expectedRevision: bigint): Promise<'RELEASED' | 'ALREADY_RELEASED' | 'UNKNOWN_ADMISSION'> {
     this.#assertReady();
     try {
-      return await this.#bridge.releaseAndPersist(SESSION_PROOF, this.ownership, admissionId, coordinator);
+      return await this.#bridge.releaseAndPersist(SESSION_PROOF, this.ownership, admissionId, coordinator, expectedRevision);
     } catch (cause) {
       await this.#faultIfAmbiguous(cause, coordinator);
       throw cause;

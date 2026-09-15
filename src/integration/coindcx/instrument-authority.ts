@@ -1,17 +1,18 @@
 import https from 'node:https';
-import { parse as parseLosslessJson } from 'lossless-json';
-import type { Decimal } from '../../core/decimal/decimal';
+import { isLosslessNumber, LosslessNumber, parse as parseLosslessJson } from 'lossless-json';
+import { z } from 'zod';
+import Decimal from 'decimal.js';
+import { createHash } from 'node:crypto';
+
 import {
   CoinDcxProviderError,
   CoinDcxResponseValidationError,
   CoinDcxTimeoutError,
   ValidationError,
 } from '../../core/errors/app-error';
-import { sha256CanonicalJson } from '../../backtest/canonical-json';
-import { mapInstrumentToMetadata } from '../../coin-runtime/instrument-mapper';
-import type { InrFuturesInstrument } from './models';
-import { normalizeInstrument } from './normalizers';
-import { InstrumentDetailsResponseSchema } from './schemas';
+
+
+
 
 export const COINDCX_INR_FUTURES_INSTRUMENT_SOURCE_ID = 'COINDCX_INR_FUTURES_INSTRUMENT_REST_V1' as const;
 export const PRODUCTION_INSTRUMENT_SPEC_IDENTITY_POLICY_ID = 'P14_PRODUCTION_INSTRUMENT_SPEC_IDENTITY_V1' as const;
@@ -27,6 +28,105 @@ export interface TrustedProductionInstrumentBindingRecord {
   readonly underlying: string;
   readonly quoteCurrency: string;
   readonly marginCurrency: 'INR';
+}
+
+const WireNumericSchema = z.union([z.string(), z.number(), z.custom<LosslessNumber>(isLosslessNumber)]);
+const InstrumentWireSchema = z
+  .object({
+    pair: z.string().regex(/^B-[A-Z0-9]+_[A-Z0-9]+$/),
+    status: z.string(),
+    kind: z.string(),
+    settlement: z.string().optional().nullable(),
+    settle_currency_short_name: z.string(),
+    quote_currency_short_name: z.string(),
+    position_currency_short_name: z.string(),
+    underlying_currency_short_name: z.string(),
+    margin_currency_short_name: z.string(),
+    max_leverage_long: WireNumericSchema.optional().nullable(),
+    max_leverage_short: WireNumericSchema.optional().nullable(),
+    unit_contract_value: WireNumericSchema,
+    price_increment: WireNumericSchema,
+    quantity_increment: WireNumericSchema,
+    min_trade_size: WireNumericSchema,
+    min_price: WireNumericSchema,
+    max_price: WireNumericSchema,
+    min_quantity: WireNumericSchema,
+    max_quantity: WireNumericSchema,
+    min_notional: WireNumericSchema,
+    max_notional: WireNumericSchema.optional().nullable(),
+    max_market_order_quantity: WireNumericSchema.optional().nullable(),
+    maker_fee: WireNumericSchema,
+    taker_fee: WireNumericSchema,
+    safety_percentage: WireNumericSchema.optional().nullable(),
+    funding_frequency: z.union([z.number(), z.custom<LosslessNumber>(isLosslessNumber)]).optional().nullable(),
+    expiry_time: z.union([z.number(), z.custom<LosslessNumber>(isLosslessNumber)]).optional().nullable(),
+    exit_only: z.boolean().optional().nullable(),
+    time_in_force_options: z.array(z.string()).optional().default([]),
+    order_types: z.array(z.string()).optional().default([]),
+    dynamic_position_leverage_details: z.record(z.unknown()).optional().nullable(),
+    dynamic_safety_margin_details: z.record(z.unknown()).optional().nullable(),
+  })
+  .passthrough();
+type InstrumentWire = z.infer<typeof InstrumentWireSchema>;
+
+const InstrumentDetailsResponseSchema = z.object({
+  instrument: InstrumentWireSchema,
+});
+
+// Canonical JSON for private, already-normalized plain-data preimages. Kept
+// byte-compatible with the repository identity policy; no exported hasher dispatch.
+function privateCanonicalJson(value: unknown): string {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return JSON.stringify(value);
+  if (Array.isArray(value)) return '[' + value.map(privateCanonicalJson).join(',') + ']';
+  if (typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype) {
+    const record = value as Record<string, unknown>;
+    return '{' + Object.keys(record).sort().map(key => JSON.stringify(key) + ':' + privateCanonicalJson(record[key])).join(',') + '}';
+  }
+  throw new Error('Invalid private canonical identity preimage');
+}
+function sha256CanonicalJson(value: unknown): string {
+  return createHash('sha256').update(privateCanonicalJson(value), 'utf8').digest('hex');
+}
+
+// Canonical authority pipeline is deliberately lexical. Public schemas,
+// normalizers, mappers, Decimal configuration and hashers cannot replace it.
+const AuthorityDecimal = Decimal.clone({ precision: 128, rounding: Decimal.ROUND_HALF_UP });
+function canonicalNumeric(value: unknown, field: string): Decimal {
+  const raw = isLosslessNumber(value) ? value.value : typeof value === 'string' || typeof value === 'number' ? String(value) : '';
+  try {
+    if (raw.trim() === '') throw new Error('missing numeric value');
+    const decimal = new AuthorityDecimal(raw.trim());
+    if (!decimal.isFinite()) throw new Error('non-finite numeric value');
+    return decimal;
+  } catch { throw new CoinDcxResponseValidationError('Invalid acquired instrument numeric field: ' + field); }
+}
+function canonicalInstrumentMetadata(wire: InstrumentWire) {
+  if (wire.margin_currency_short_name.toUpperCase() !== 'INR') throw new CoinDcxResponseValidationError("Instrument margin currency must be 'INR'");
+  // Validate all numeric fields consumed by the established normalizer, even
+  // those outside the static economics identity (fees/tiers remain separate).
+  for (const field of ['unit_contract_value', 'price_increment', 'quantity_increment', 'min_trade_size', 'min_price', 'max_price', 'min_quantity', 'max_quantity', 'min_notional', 'maker_fee', 'taker_fee']) canonicalNumeric(wire[field], field);
+  for (const field of ['max_notional', 'max_market_order_quantity', 'safety_percentage', 'max_leverage_long', 'max_leverage_short']) if (wire[field] != null) canonicalNumeric(wire[field], field);
+  for (const field of ['funding_frequency', 'expiry_time']) {
+    if (wire[field] != null) {
+      const n = canonicalNumeric(wire[field], field);
+      if (!n.isInteger() || !n.abs().lessThanOrEqualTo(Number.MAX_SAFE_INTEGER)) throw new CoinDcxResponseValidationError('Invalid instrument integer: ' + field);
+    }
+  }
+  for (const details of [wire.dynamic_position_leverage_details, wire.dynamic_safety_margin_details]) {
+    for (const [key, value] of Object.entries(details ?? {})) if (value != null) { canonicalNumeric(key, 'tier key'); canonicalNumeric(value, 'tier value'); }
+  }
+  return Object.freeze({
+    pair: wire.pair, kind: wire.kind, underlying: wire.underlying_currency_short_name.toUpperCase(),
+    quoteCurrency: wire.quote_currency_short_name, settleCurrency: wire.settle_currency_short_name,
+    positionCurrency: wire.position_currency_short_name, marginCurrency: 'INR' as const, settlement: wire.settlement ?? null,
+    unitContractValue: canonicalNumeric(wire.unit_contract_value, 'unit_contract_value'),
+    priceIncrement: canonicalNumeric(wire.price_increment, 'price_increment'), quantityIncrement: canonicalNumeric(wire.quantity_increment, 'quantity_increment'),
+    minTradeSize: canonicalNumeric(wire.min_trade_size, 'min_trade_size'), minPrice: canonicalNumeric(wire.min_price, 'min_price'),
+    maxPrice: canonicalNumeric(wire.max_price, 'max_price'), minQuantity: canonicalNumeric(wire.min_quantity, 'min_quantity'),
+    maxQuantity: canonicalNumeric(wire.max_quantity, 'max_quantity'), minNotional: canonicalNumeric(wire.min_notional, 'min_notional'),
+    maxMarketOrderQuantity: wire.max_market_order_quantity == null ? null : canonicalNumeric(wire.max_market_order_quantity, 'max_market_order_quantity'),
+  });
 }
 
 const INSTRUMENT_BINDING_ISSUER = Symbol('CoinDCX production instrument binding issuer');
@@ -65,7 +165,7 @@ function canonicalProductionPair(pair: string): string {
  * native HTTPS GET, then applies the same schema and normalization pipeline as
  * the reusable public reader. It has no runtime export or injectable callback.
  */
-async function privilegedAcquireProductionInstrument(pair: string): Promise<InrFuturesInstrument> {
+async function privilegedAcquireProductionInstrument(pair: string): Promise<InstrumentWire> {
   const requestedPair = canonicalProductionPair(pair);
   const url = new URL(PRODUCTION_INSTRUMENT_PATH, PRODUCTION_INSTRUMENT_BASE_URL);
   url.searchParams.set('pair', requestedPair);
@@ -146,7 +246,7 @@ async function privilegedAcquireProductionInstrument(pair: string): Promise<InrF
       { pair: requestedPair },
     );
   }
-  return normalizeInstrument(parsed.data.instrument);
+  return parsed.data.instrument;
 }
 
 /** Opaque provenance capability. Shape, prototype, subclassing, or a caller-created Symbol cannot issue one. */
@@ -190,7 +290,7 @@ function requiredSourceString(value: string, field: string): string {
  * state (status/exit-only), fees, leverage tiers, and funding are intentionally
  * outside this namespace and remain governed by their existing policies.
  */
-function issueBinding(requestedPair: string, instrument: InrFuturesInstrument): TrustedProductionInstrumentBinding {
+function issueBinding(requestedPair: string, instrument: InstrumentWire): TrustedProductionInstrumentBinding {
   if (instrument.pair !== requestedPair) {
     throw new CoinDcxResponseValidationError('Acquired instrument pair does not match requested pair', { pair: requestedPair });
   }
@@ -198,7 +298,7 @@ function issueBinding(requestedPair: string, instrument: InrFuturesInstrument): 
     throw new CoinDcxResponseValidationError(`Acquired instrument '${requestedPair}' is not a perpetual Futures product`, { pair: requestedPair });
   }
 
-  const metadata = mapInstrumentToMetadata(instrument, instrument.underlyingCurrency);
+  const metadata = canonicalInstrumentMetadata(instrument);
   const contractMultiplier = positiveExactDecimal(metadata.unitContractValue, 'contractMultiplier');
   const priceIncrement = positiveExactDecimal(metadata.priceIncrement, 'priceIncrement');
   const quantityIncrement = positiveExactDecimal(metadata.quantityIncrement, 'quantityIncrement');
@@ -256,4 +356,12 @@ function issueBinding(requestedPair: string, instrument: InrFuturesInstrument): 
 export async function acquireProductionInstrumentBinding(pair: string): Promise<TrustedProductionInstrumentBinding> {
   const instrument = await privilegedAcquireProductionInstrument(pair);
   return issueBinding(pair, instrument);
+}
+
+// Pin CommonJS authority entry points to lexical implementations. This also
+// prevents pre-import replacement through an already-loaded repo namespace.
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  if (Object.getOwnPropertyDescriptor(module.exports, 'TrustedProductionInstrumentBinding')?.configurable !== false) Object.defineProperty(module.exports, 'TrustedProductionInstrumentBinding', { get: () => TrustedProductionInstrumentBinding, configurable: false });
+  if (Object.getOwnPropertyDescriptor(module.exports, 'acquireProductionInstrumentBinding')?.configurable !== false) Object.defineProperty(module.exports, 'acquireProductionInstrumentBinding', { get: () => acquireProductionInstrumentBinding, configurable: false });
+  Object.freeze(module.exports);
 }

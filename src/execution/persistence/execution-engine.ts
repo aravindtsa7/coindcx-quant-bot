@@ -399,6 +399,7 @@ export class PaperExecutionEngine {
               orderId: executionIntentId, accountId: held.accountId, sourceStrategyDecisionId: decision.sourceStrategyDecisionId, sourceExecutionKey,
               pair, action: 'OPEN', side, fillPrice: post(fillPriceInr), quantity: toPrismaDecimal(decision.approved.approvedQuantity), feeInr: post(feeInr),
               quoteSnapshotContentSha256: quote.contentSha256, eventTimeMs: quote.providerEventTimeMs,
+              accountMutationRevision: account.revision + 1n,
             },
           });
         } catch (fillError) {
@@ -605,6 +606,7 @@ export class PaperExecutionEngine {
             orderId: executionIntentId, accountId: held.accountId, sourceStrategyDecisionId: decision.sourceStrategyDecisionId, sourceExecutionKey,
             pair, action: 'CLOSE', side: actualSide, fillPrice: post(fillPriceInr), quantity: toPrismaDecimal(record.reduceOnlyQuantity), feeInr: post(feeInr),
             realizedPnlInr: post(realizedPnlInr), quoteSnapshotContentSha256: quote.contentSha256, eventTimeMs: quote.providerEventTimeMs,
+            accountMutationRevision: account.revision + 1n,
           },
         });
       } catch (fillError) {
