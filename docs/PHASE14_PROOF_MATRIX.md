@@ -332,6 +332,39 @@ the maximum lifecycle remains `PAPER`.
 
 ---
 
+## 13C. Phase14 Wave3-A — production instrument acquisition authority
+
+Wave3-A closes only the acquisition-authority prerequisite for F14-03. The
+production composition can now request a canonical pair and receive an opaque,
+immutable binding issued only after the real CoinDCX Futures instrument REST
+pipeline performs request/response pair binding, runtime schema validation,
+lossless Decimal normalization, INR-margin validation, and perpetual-product
+validation. The production mint constructs the default CoinDCX transport
+internally; it accepts no caller client, transport, callback, metadata, brand,
+or factory flag. Structural `InstrumentMetadata` and caller-computed hashes do
+not carry the binding's private-field provenance.
+
+The new `P14_PRODUCTION_INSTRUMENT_SPEC_IDENTITY_V1` namespace is separate
+from both the older P14-B evidence-routing identity and the future
+`P14_INSTRUMENT_ECONOMICS_SNAPSHOT_V1`. Its canonical preimage binds source,
+pair, static product/currency identity, exact multiplier/tick/step economics,
+and the static minimum/maximum order constraints obtained from the same
+normalized response. Mutable tradeability, fee, leverage-tier, and funding
+policies remain outside this identity and retain their existing owners.
+
+No instrument cache or TTL exists on this reader, so Wave3-A invents none: each
+authority request performs a fresh read. P14-I exposes the pair-only authority
+request outside its economic mutation queue and outside every account DB
+transaction. No OPEN/CLOSE economic input or formula changes in this wave.
+
+**Conservative status:** the F14-03 acquisition prerequisite is implemented,
+but F14-03 remains **OPEN**. `PaperInstrumentEconomicsSnapshot`, schema/durable
+binding, execution-policy identity/domain validation, immutable policy conflict
+handling, and the CLOSE lifecycle-multiplier correction are not implemented.
+Status: **AWAITING_F14_03_SCHEMA_IMPLEMENTATION**.
+
+---
+
 ## 14. Final Phase14 Status
 
 | Question | Answer |
@@ -347,8 +380,9 @@ the maximum lifecycle remains `PAPER`.
 | Live execution adapter | **NOT_IMPLEMENTED / NOT_ACTIVE** (§10) |
 | Drawdown gate sensitivity to unrealized PnL | **FULL MTM FOR OPEN ADMISSION** — every durable OPEN position valued from production-acquired fresh mark/conversion evidence (§13B.1) |
 | F14-01 / F14-02 | **CORRECTED** (§13B) |
-| F14-03 (ExecutionPolicy content/hash validation, fee/slippage domains, zero multiplier, authoritative instrument-multiplier binding) | **OPEN — deliberately out of Wave 2 scope** |
-| Final Astra milestone gate | **NOT YET PASS** — pending F14-03; Waves 1–2 targeted re-verification is complete |
+| F14-03 instrument acquisition authority prerequisite | **IMPLEMENTED in Wave3-A** — genuine pair-only CoinDCX acquisition produces an opaque binding; no caller metadata can mint it |
+| F14-03 durable economics/policy correction | **OPEN** — awaiting `PaperInstrumentEconomicsSnapshot`, schema binding, policy validation/conflict handling, and CLOSE lifecycle multiplier correction |
+| Final Astra milestone gate | **NOT YET PASS** — `AWAITING_F14_03_SCHEMA_IMPLEMENTATION` |
 | Ready for Phase 15 ranking? | Only if Phase 15 explicitly consumes funding-excluded diagnostics as diagnostics, and does **not** treat funding-excluded PnL as production-approval economics. If Phase 15's dependency on funding-excluded profitability is ever ambiguous, that ambiguity should be documented as a Phase 15 limitation — P14-J does not invent or authorize Phase 15 policy here. |
 
 **Correct one-line summary:** Phase 14 is a mechanically production-ready
@@ -356,7 +390,8 @@ PAPER runtime with restart-safe fencing, durable admission, trusted-evidence-
 gated execution, and account-scoped reconciliation health-gating — **not** a
 full CoinDCX economic-parity paper simulation, and **not** promotion-eligible.
 Wave 1 (F14-04/05/06/07) and Wave 2 (F14-01/F14-02) of the final-gate
-correction are complete; **F14-03 remains open**, so **PRODUCTION PAPER
+correction are complete; Wave3-A establishes the production instrument
+authority prerequisite, but **F14-03 remains open**, so **PRODUCTION PAPER
 MECHANICS READY is not yet claimed**.
 
 ---
@@ -396,3 +431,8 @@ npx vitest run tests/integration/execution tests/unit/dispatch tests/unit/risk \
                                                   # 48 files / 779 tests passed
 npm test   # full suite — 160 files / 1998 tests passed, 0 failures (+51 vs Wave 1)
 ```
+
+Wave3-A adds focused production instrument-authority, CoinDCX reader/
+normalizer, trusted-evidence, P14-I composition, and architecture regressions.
+Its exact command counts are recorded in the Wave3-A correction report; Prisma
+schema and migrations remain unchanged.

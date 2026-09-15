@@ -19,6 +19,7 @@ import type { RiskEvaluationContext, RiskPolicy } from '../../risk';
 import type { StrategyDecision, StrategyKernel } from '../../strategies';
 import { getTrustedPaperExecutionEvidence } from './execution-evidence-adapter';
 import { CoinDcxPaperEvidence, readProductionAcquiredPaperValuationEvidence } from './paper-evidence';
+import { acquireProductionInstrumentBinding, type TrustedProductionInstrumentBinding } from './instrument-authority';
 
 /**
  * [P14-I] Production PAPER runtime composition.
@@ -196,6 +197,16 @@ export class PaperAccountProductionRuntime {
   /** Read-only diagnostic re-run of P14-H reconciliation — no gating side effect beyond the reconciler's own idempotent fault persistence (§69). */
   public refreshHealth(): Promise<PaperAccountReconciliationResult> {
     return this.#reconciler.reconcile(this.accountId);
+  }
+
+  /**
+   * [Wave3-A] Acquisition-backed CoinDCX instrument authority for a requested
+   * pair. The caller cannot inject metadata or an alternate reader. This read
+   * is deliberately outside the economic mutation queue/DB transactions;
+   * Wave3-B will consume the resulting capability before entering OPEN.
+   */
+  public acquireInstrumentBinding(pair: string): Promise<TrustedProductionInstrumentBinding> {
+    return acquireProductionInstrumentBinding(pair);
   }
 
   /**

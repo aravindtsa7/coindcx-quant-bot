@@ -17,7 +17,6 @@ import {
   InrFuturesWallet,
 } from './models';
 import {
-  normalizeInstrument,
   normalizeOrder,
   normalizePosition,
   normalizePositionTransaction,
@@ -34,7 +33,6 @@ import {
   FuturesTradesResponseSchema,
   FuturesWalletTransactionsResponseSchema,
   FuturesWalletsResponseSchema,
-  InstrumentDetailsResponseSchema,
   ListInrOrdersRequest,
   ListInrOrdersRequestSchema,
   ListInrPositionTransactionsRequest,
@@ -49,6 +47,7 @@ import {
 } from './schemas';
 import { HmacSha256Signer, RequestSigner } from './signer';
 import { CoinDcxTransport, TransportOptions } from './transport';
+import { readInrFuturesInstrument } from './instrument-reader';
 
 const logger = createChildLogger('coindcx:client');
 
@@ -146,31 +145,8 @@ export class CoinDcxClient {
    * Fetches detailed specifications and trading constraints for a discovered pair in INR margin mode.
    */
   public async getInrFuturesInstrument(pair: string): Promise<InrFuturesInstrument> {
-    if (typeof pair !== 'string' || !/^B-[A-Z0-9]+_[A-Z0-9]+$/.test(pair.trim())) {
-      throw new ValidationError('Pair must use canonical uppercase B-<BASE>_<QUOTE> format');
-    }
-
     logger.debug({ pair }, 'Fetching INR Futures instrument specifications');
-    const response = await this.#transport.executeRead<unknown>({
-      endpoint: 'INSTRUMENT',
-      queryParams: {
-        pair: pair.trim(),
-        margin_currency_short_name: 'INR',
-      },
-    });
-
-    const parsed = InstrumentDetailsResponseSchema.safeParse(response.data);
-    if (!parsed.success) {
-      throw new CoinDcxResponseValidationError(
-        `Failed to parse instrument specifications for ${pair}: ${parsed.error.message}`,
-        { issues: parsed.error.issues, pair }
-      );
-    }
-
-    if (parsed.data.instrument.pair !== pair.trim()) {
-      throw new CoinDcxResponseValidationError('Instrument response pair does not match requested pair', { pair: pair.trim() });
-    }
-    return normalizeInstrument(parsed.data.instrument);
+    return readInrFuturesInstrument(this.#transport, pair);
   }
 
   /**

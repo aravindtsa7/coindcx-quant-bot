@@ -16,6 +16,7 @@ const REPO_ROOT = path.resolve(__dirname, '../..');
 const SRC_ROOT = path.join(REPO_ROOT, 'src');
 const PAPER_PRODUCTION_ROOT = 'src/integration/coindcx/paper-production-runtime.ts';
 const PRIVATE_ECONOMIC_SOURCE_FILE = 'src/integration/coindcx/client.ts';
+const PRODUCTION_INSTRUMENT_AUTHORITY_FILE = 'src/integration/coindcx/instrument-authority.ts';
 
 /**
  * [P14-J-MAJ-01/MAJ-02 correction] There is no allowlist here. The two
@@ -183,6 +184,14 @@ describe('P14-J real repository graph (§9/§32)', () => {
     expect([...reachable].some((n) => n.startsWith('src/execution/'))).toBe(true);
   });
 
+  it('Wave3-A instrument authority is reachable only in the allowed integration-to-core direction', () => {
+    expect(files).toContain(PRODUCTION_INSTRUMENT_AUTHORITY_FILE);
+    expect(computeReachable(graph, PAPER_PRODUCTION_ROOT).has(PRODUCTION_INSTRUMENT_AUTHORITY_FILE)).toBe(true);
+    const forbiddenRoots = files.filter((f) => ['src/execution/', 'src/dispatch/', 'src/risk/', 'src/research/', 'src/strategies/'].some((prefix) => f.startsWith(prefix)));
+    const violations = findViolations(graph, forbiddenRoots, (n) => n === PRODUCTION_INSTRUMENT_AUTHORITY_FILE);
+    expect(violations, `forbidden deep import of instrument authority:\n${violations.map((v) => v.path.join(' -> ')).join('\n')}`).toEqual([]);
+  });
+
   it('dispatch/risk/research/strategies core layers reach no integration/** file (strict zero, no exceptions)', () => {
     const coreRoots = ['src/dispatch/', 'src/risk/', 'src/research/', 'src/strategies/'];
     const roots = files.filter((f) => coreRoots.some((prefix) => f.startsWith(prefix)));
@@ -275,6 +284,7 @@ describe('P14-J capability export safety (§18/§19/§52)', () => {
     // zero-network test harnesses can import it directly) but must never be
     // reachable through the public CoinDCX barrel.
     PRODUCTION_ACQUISITION_CAPABILITY: 'src/integration/coindcx/acquisition-capability.ts',
+    INSTRUMENT_BINDING_ISSUER: 'src/integration/coindcx/instrument-authority.ts',
   };
 
   const PUBLIC_BARRELS = [
@@ -286,6 +296,8 @@ describe('P14-J capability export safety (§18/§19/§52)', () => {
     'src/research/research-validation/index.ts',
     'src/strategies/index.ts',
     'src/integration/coindcx/index.ts',
+    'src/coin-runtime/index.ts',
+    'src/index.ts',
   ];
 
   it('every known capability/issuer name is absent from every public barrel\'s full (recursive export *) surface', () => {
@@ -316,6 +328,22 @@ describe('P14-J capability export safety (§18/§19/§52)', () => {
       } else {
         expect(ownExports.has(name), `${definingFile} must keep ${name} module-private (not exported even from its own file)`).toBe(false);
       }
+    }
+  });
+
+  it('normal production barrels do not expose Wave3-A trust minting or binding internals', () => {
+    const forbiddenExports = [
+      'acquireProductionInstrumentBinding',
+      'TrustedProductionInstrumentBinding',
+      'INSTRUMENT_BINDING_ISSUER',
+      'issueBinding',
+    ];
+    const readFile = (f: string): string => readFileSync(f, 'utf8');
+    const allFiles = new Set(listSourceFiles(SRC_ROOT));
+    const resolveSpecifier = (fromAbsFile: string, specifier: string): string | null => resolveLocalSpecifier(fromAbsFile, specifier, allFiles);
+    for (const barrel of PUBLIC_BARRELS) {
+      const exported = collectPublicExportNames(path.join(REPO_ROOT, barrel), readFile, resolveSpecifier);
+      for (const name of forbiddenExports) expect(exported.has(name), `${barrel} must not export ${name}`).toBe(false);
     }
   });
 });

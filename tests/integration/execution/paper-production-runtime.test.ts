@@ -20,7 +20,10 @@ import { assertProductionLifecycleTransitionAuthorized } from '../../../src/coin
 import { CoinLifecycleError } from '../../../src/core/errors/app-error';
 import { evaluateDecision, genuineResearchApproval, makeKernel, PAIR, policyFor, productionRiskRequest } from '../../unit/dispatch/helpers';
 import { PRODUCTION_ACQUISITION_CAPABILITY } from '../../../src/integration/coindcx/acquisition-capability';
+import { TrustedProductionInstrumentBinding } from '../../../src/integration/coindcx/instrument-authority';
+import { CoinDcxTransport } from '../../../src/integration/coindcx/transport';
 import { makeAccount, makePair, seal } from '../../unit/risk/helpers';
+import { wire as instrumentWire } from '../../unit/coindcx/audit-a2-helpers';
 import type { CanonicalPositionValuation, PairRiskSnapshot } from '../../../src/risk';
 import type { StrategyKernel } from '../../../src/strategies';
 
@@ -247,6 +250,31 @@ describe('P14-I live-DB â€” clean startup (Â§74)', () => {
     expect(composer.getState(accountId)).toBe('READY');
     const account = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
     expect(account.revision).toBe(1n); // only the ownership-acquisition bump
+  });
+
+  it('the READY production composition can acquire a genuine pair-only instrument binding outside economics', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const runtime = await new PaperAccountProductionComposer({ prisma }).start({
+      accountId, coordinator: new RiskAdmissionCoordinator(), provider: makeProvider(),
+    });
+    const transportRead = vi.spyOn(CoinDcxTransport.prototype, 'executeRead').mockResolvedValue({
+      status: 200, headers: {}, durationMs: 0,
+      data: { instrument: instrumentWire('BTC', { unit_contract_value: '0.001', price_increment: '1', quantity_increment: '1' }) },
+    });
+    try {
+      const binding = await runtime.acquireInstrumentBinding(PAIR);
+      expect(TrustedProductionInstrumentBinding.read(binding)).toMatchObject({
+        pair: PAIR, contractMultiplier: '0.001', priceIncrement: '1', quantityIncrement: '1',
+      });
+      expect(await prisma.paperExecutionIntent.count({ where: { accountId } })).toBe(0);
+      expect(await prisma.paperFill.count({ where: { accountId } })).toBe(0);
+      expect(await prisma.paperLedgerEntry.count({ where: { accountId } })).toBe(0);
+    } finally {
+      transportRead.mockRestore();
+    }
   });
 });
 
