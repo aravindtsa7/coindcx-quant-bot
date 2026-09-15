@@ -10,6 +10,7 @@ import { paperDecimal, type PaperCalc } from '../decimal';
 import { PaperAccountOwnership } from './account-ownership';
 import { buildBaseExposureSnapshot } from './account-repository';
 import { PaperPersistenceError } from './errors';
+import { executionPolicySnapshotFromRow, instrumentEconomicsSnapshotFromRow } from './immutable-snapshots';
 
 /**
  * [F14-01] Authoritative, durable-state-derived risk input for ONE paper
@@ -78,13 +79,10 @@ export interface AuthoritativePairSlotFacts {
 /**
  * [F14-01] Everything mark-to-market valuation of ONE durable OPEN position
  * needs. `contractMultiplier` is read from the position's OWN opening
- * `PaperExecutionIntent` -> `PaperExecutionPolicySnapshot` — the same durably
- * bound, already-frozen source P14-H reconciliation uses to re-derive that
- * position's initial margin (`paper-account-reconciler.ts`), never a
- * caller-supplied or globally-assumed multiplier. (F14-03's separate
- * authoritative-instrument-multiplier binding remains OPEN and is untouched
- * here: this reuses what is already durably committed for an EXISTING
- * position, it does not change how a NEW position's multiplier is chosen.)
+ * `PaperExecutionIntent` -> `PaperInstrumentEconomicsSnapshot`. That immutable
+ * Wave3-B opening lineage drives initial-margin reconciliation, MTM, and CLOSE;
+ * the opening policy multiplier is revalidated only as an equality assertion,
+ * never used as independent economic authority.
  */
 export interface AuthoritativeOpenPositionValuation {
   readonly pair: string;
@@ -235,31 +233,31 @@ export async function loadAuthoritativePaperRiskBase(
     const openAdmissionIds = openSlots.map((slot) => slot.admissionId).filter((id): id is string => id !== null);
     const openingIntents = openAdmissionIds.length === 0 ? [] : await tx.paperExecutionIntent.findMany({
       where: { accountId: record.accountId, action: 'OPEN', admissionId: { in: openAdmissionIds } },
-      select: { admissionId: true, executionPolicySnapshotId: true },
+      include: { executionPolicy: true, instrumentEconomics: true },
     });
-    const policySnapshotIds = [...new Set(openingIntents.map((intent) => intent.executionPolicySnapshotId))];
-    const policySnapshots = policySnapshotIds.length === 0 ? [] : await tx.paperExecutionPolicySnapshot.findMany({
-      where: { executionPolicySnapshotId: { in: policySnapshotIds } },
-      select: { executionPolicySnapshotId: true, contractMultiplier: true },
-    });
-    const policyById = new Map(policySnapshots.map((snapshot) => [snapshot.executionPolicySnapshotId, snapshot]));
-    const policyByAdmissionId = new Map(openingIntents.map((intent) => [intent.admissionId as string, policyById.get(intent.executionPolicySnapshotId)]));
+    const intentByAdmissionId = new Map(openingIntents.map((intent) => [intent.admissionId as string, intent]));
 
     const openPositions: AuthoritativeOpenPositionValuation[] = openSlots.map((slot) => {
       const quantity = optionalDecimal(slot.quantity);
       const averageEntryPriceInr = optionalDecimal(slot.averageEntryPriceInr);
-      const multiplier = slot.admissionId === null ? undefined : policyByAdmissionId.get(slot.admissionId);
-      if (slot.positionInstanceId === null || slot.side === null || quantity === null || averageEntryPriceInr === null || multiplier === undefined) {
+      const openingIntent = slot.admissionId === null ? undefined : intentByAdmissionId.get(slot.admissionId);
+      if (slot.positionInstanceId === null || slot.side === null || quantity === null || averageEntryPriceInr === null
+        || openingIntent === undefined || openingIntent.instrumentEconomicsSnapshotId === null || openingIntent.instrumentEconomics === null) {
         // Structurally unvaluable durable state — fail closed, never value it
         // at zero or fall back to the entry price. P14-H owns diagnosis/repair.
         throw new PaperPersistenceError(
           'RECONCILIATION_REQUIRED',
-          `OPEN paper_position (${record.accountId}, ${slot.pair}) cannot be authoritatively valued: missing side/quantity/entry price or opening execution-policy multiplier lineage`,
+          `OPEN paper_position (${record.accountId}, ${slot.pair}) cannot be authoritatively valued: missing opening instrument-economics lineage (LEGACY_UNVERIFIABLE)`,
         );
+      }
+      const economics = instrumentEconomicsSnapshotFromRow(openingIntent.instrumentEconomics);
+      const policySnapshot = executionPolicySnapshotFromRow(openingIntent.executionPolicy);
+      if (economics.pair !== slot.pair || !paperDecimal(policySnapshot.content.contractMultiplier).equals(paperDecimal(economics.contractMultiplier))) {
+        throw new PaperPersistenceError('RECONCILIATION_REQUIRED', `OPEN paper_position (${record.accountId}, ${slot.pair}) has inconsistent policy/instrument economics lineage`);
       }
       return Object.freeze({
         pair: slot.pair, positionInstanceId: slot.positionInstanceId, side: slot.side,
-        quantity, averageEntryPriceInr, contractMultiplier: multiplier.contractMultiplier.toFixed(),
+        quantity, averageEntryPriceInr, contractMultiplier: economics.contractMultiplier,
       });
     });
 

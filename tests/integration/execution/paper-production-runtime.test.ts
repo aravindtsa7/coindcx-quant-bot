@@ -50,6 +50,14 @@ let dbAvailable = false;
 let prisma: PrismaClient;
 
 beforeAll(async () => {
+  vi.spyOn(CoinDcxTransport.prototype, 'executeRead').mockImplementation(async (options) => {
+    const pair = String(options.queryParams?.['pair'] ?? PAIR);
+    const underlying = pair === PAIR_B ? 'ETH' : 'BTC';
+    return {
+      status: 200, headers: {}, durationMs: 0,
+      data: { instrument: instrumentWire(underlying, { unit_contract_value: '0.001', price_increment: '1', quantity_increment: '1' }) },
+    } as never;
+  });
   if (!BASE_DATABASE_URL) { dbAvailable = false; return; }
   try {
     execFileSync('mysql', mysqlArgs(['-e', `CREATE DATABASE \`${SHADOW_DB_NAME}\`;`]), { stdio: 'pipe', timeout: 15_000 });
@@ -90,8 +98,6 @@ async function provisionPairSlot(accountId: string, pair: string): Promise<void>
 const INSTRUMENT_SPEC_SNAPSHOT_ID = 'instrument-1';
 const T0 = 1_200_000;
 const MINUTE = 60_000;
-const PRICE_INCREMENT = '1';
-const QUANTITY_INCREMENT = '1';
 
 const EXECUTION_POLICY: ExecutionPolicySnapshot = buildExecutionPolicySnapshot({
   policyVersion: EXECUTION_POLICY_VERSION,
@@ -180,11 +186,11 @@ function buildOpenParamsForPair(
     const kernel = makeKernel(pair);
     const decision = evaluateDecision(kernel, evaluationTimeMs, target);
     return {
-      kernel, decision, instrumentSpecSnapshotId: INSTRUMENT_SPEC_SNAPSHOT_ID, planResult, policy: policyFor(pair),
+      kernel, decision, planResult, policy: policyFor(pair),
       // [F14-01] Only the non-authoritative half â€” P14-I derives the account
       // and exposure snapshots from durable state under the current revision.
       riskRequest: productionRiskRequest(kernel, decision, accountId),
-      executionPolicy: EXECUTION_POLICY, priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT,
+      executionPolicy: EXECUTION_POLICY,
       ...overrides,
     };
   })();
@@ -229,9 +235,9 @@ function openPairSnapshotFor(kernel: StrategyKernel, accountId: string, ownedQua
 function buildCloseParams(kernel: StrategyKernel, accountId: string, ownedQuantity: string, overrides: Partial<ProductionCloseParams> = {}, evaluationTimeMs = T0 + MINUTE): ProductionCloseParams {
   const decision = evaluateDecision(kernel, evaluationTimeMs, 'FLAT');
   return {
-    kernel, decision, instrumentSpecSnapshotId: INSTRUMENT_SPEC_SNAPSHOT_ID, policy: policyFor(PAIR),
+    kernel, decision, policy: policyFor(PAIR),
     riskRequest: productionRiskRequest(kernel, decision, accountId, { pairSnapshot: openPairSnapshotFor(kernel, accountId, ownedQuantity, decision.evaluationTimeMs) }),
-    executionPolicy: EXECUTION_POLICY, priceIncrement: PRICE_INCREMENT,
+    executionPolicy: EXECUTION_POLICY,
     ...overrides,
   };
 }
@@ -260,21 +266,13 @@ describe('P14-I live-DB â€” clean startup (Â§74)', () => {
     const runtime = await new PaperAccountProductionComposer({ prisma }).start({
       accountId, coordinator: new RiskAdmissionCoordinator(), provider: makeProvider(),
     });
-    const transportRead = vi.spyOn(CoinDcxTransport.prototype, 'executeRead').mockResolvedValue({
-      status: 200, headers: {}, durationMs: 0,
-      data: { instrument: instrumentWire('BTC', { unit_contract_value: '0.001', price_increment: '1', quantity_increment: '1' }) },
+    const binding = await runtime.acquireInstrumentBinding(PAIR);
+    expect(TrustedProductionInstrumentBinding.read(binding)).toMatchObject({
+      pair: PAIR, contractMultiplier: '0.001', priceIncrement: '1', quantityIncrement: '1',
     });
-    try {
-      const binding = await runtime.acquireInstrumentBinding(PAIR);
-      expect(TrustedProductionInstrumentBinding.read(binding)).toMatchObject({
-        pair: PAIR, contractMultiplier: '0.001', priceIncrement: '1', quantityIncrement: '1',
-      });
-      expect(await prisma.paperExecutionIntent.count({ where: { accountId } })).toBe(0);
-      expect(await prisma.paperFill.count({ where: { accountId } })).toBe(0);
-      expect(await prisma.paperLedgerEntry.count({ where: { accountId } })).toBe(0);
-    } finally {
-      transportRead.mockRestore();
-    }
+    expect(await prisma.paperExecutionIntent.count({ where: { accountId } })).toBe(0);
+    expect(await prisma.paperFill.count({ where: { accountId } })).toBe(0);
+    expect(await prisma.paperLedgerEntry.count({ where: { accountId } })).toBe(0);
   });
 });
 
@@ -330,6 +328,14 @@ describe('P14-I live-DB â€” OPEN end-to-end (Â§47/Â§52)', () => {
     const position = await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } });
     expect(position.status).toBe('OPEN');
     expect(position.positionInstanceId).toBe(result.positionInstanceId);
+    const intent = await prisma.paperExecutionIntent.findUniqueOrThrow({ where: { executionIntentId: result.executionIntentId } });
+    expect(intent.instrumentEconomicsSnapshotId).not.toBeNull();
+    const economics = await prisma.paperInstrumentEconomicsSnapshot.findUniqueOrThrow({ where: { instrumentEconomicsSnapshotId: intent.instrumentEconomicsSnapshotId! } });
+    expect(economics.pair).toBe(PAIR);
+    expect(economics.contractMultiplier.toFixed()).toBe('0.001');
+    expect(economics.priceIncrement.toFixed()).toBe('1');
+    expect(economics.quantityIncrement.toFixed()).toBe('1');
+    expect(economics.instrumentSpecSnapshotId).not.toBe(INSTRUMENT_SPEC_SNAPSHOT_ID); // caller/provider structural id never selects authority
 
     // Â§52: retrying the exact same source decision through P14-I is idempotent.
     const retryResult = await runtime.executeOpen(openParams);
@@ -596,7 +602,7 @@ describe('P14-I-A1 mandatory test E â€” no reduce-only bypass', () => {
 
     const closeParams = buildCloseParams(openParams.kernel, accountId, openResult.quantity);
     // `ProductionCloseParams` has no reduce-only/force/bypass field at all â€” every own-enumerable key is a genuine trust-chain input.
-    expect(Object.keys(closeParams).sort()).toEqual(['decision', 'executionPolicy', 'instrumentSpecSnapshotId', 'kernel', 'policy', 'priceIncrement', 'riskRequest'].sort());
+    expect(Object.keys(closeParams).sort()).toEqual(['decision', 'executionPolicy', 'kernel', 'policy', 'riskRequest'].sort());
 
     feedFreshEvidence(provider, '110', '112');
     await expect(runtime.executeClose(closeParams)).rejects.toMatchObject({ code: 'RECONCILIATION_UNHEALTHY' });

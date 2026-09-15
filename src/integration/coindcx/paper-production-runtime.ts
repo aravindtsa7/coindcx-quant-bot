@@ -14,12 +14,15 @@ import { disclosePaperFundingExcluded } from '../../execution/funding-capability
 import { mintPaperOpenExecutionAuthority, type PaperOpenRiskEvidence } from '../../execution/open-authority';
 import { mintPaperCloseExecutionAuthority, type PaperClosePositionBinding, type PaperCloseRiskEvidence } from '../../execution/close-authority';
 import type { ExecutionPolicySnapshot } from '../../execution/policy';
+import { validateExecutionPolicySnapshot } from '../../execution/policy';
+import { buildInstrumentEconomicsSnapshot, type InstrumentEconomicsSnapshot } from '../../execution/instrument-economics';
+import { instrumentEconomicsSnapshotFromRow } from '../../execution/persistence/immutable-snapshots';
 import { issueResearchApprovalOrigin, type ResearchValidationPlanResult } from '../../research/research-validation';
-import type { RiskEvaluationContext, RiskPolicy } from '../../risk';
+import { evidenceContentSha256, type RiskEvaluationContext, type RiskPolicy } from '../../risk';
 import type { StrategyDecision, StrategyKernel } from '../../strategies';
 import { getTrustedPaperExecutionEvidence } from './execution-evidence-adapter';
 import { CoinDcxPaperEvidence, readProductionAcquiredPaperValuationEvidence } from './paper-evidence';
-import { acquireProductionInstrumentBinding, type TrustedProductionInstrumentBinding } from './instrument-authority';
+import { acquireProductionInstrumentBinding, TrustedProductionInstrumentBinding } from './instrument-authority';
 
 /**
  * [P14-I] Production PAPER runtime composition.
@@ -92,11 +95,11 @@ export class PaperProductionRuntimeError extends Error {
  * another account's capital, omit an OPEN position's exposure, understate its
  * realized loss/fee state, or replay a stale account observation.
  *
- * `pairSnapshot` remains caller-supplied because it also carries instrument
- * spec and market valuation facts this layer has no durable source for — but
- * its durable-state-dependent members (`position`, `ownership`) are strictly
- * verified against the authoritative slot before admission and REJECTED on any
- * disagreement (never silently rewritten).
+ * `pairSnapshot` remains caller-supplied for market and request context, but
+ * its instrument-owned fields are replaced from the authoritative CoinDCX
+ * economics binding and the snapshot is resealed. Its durable-state-dependent
+ * members (`position`, `ownership`) are strictly verified against the
+ * authoritative slot before admission and REJECTED on any disagreement.
  */
 export type PaperProductionRiskRequest = Omit<
   RiskEvaluationContext,
@@ -106,13 +109,10 @@ export type PaperProductionRiskRequest = Omit<
 export interface ProductionOpenParams {
   readonly kernel: StrategyKernel;
   readonly decision: StrategyDecision;
-  readonly instrumentSpecSnapshotId: string;
   readonly planResult: ResearchValidationPlanResult;
   readonly policy: RiskPolicy;
   readonly riskRequest: PaperProductionRiskRequest;
   readonly executionPolicy: ExecutionPolicySnapshot;
-  readonly priceIncrement: string;
-  readonly quantityIncrement: string;
   /** [F14-01 class F] External config, not durable account state — no per-account exchange leverage cap is persisted. Omitted/`null` = no account-level cap. */
   readonly accountMaxLeverage?: string | null;
 }
@@ -120,11 +120,9 @@ export interface ProductionOpenParams {
 export interface ProductionCloseParams {
   readonly kernel: StrategyKernel;
   readonly decision: StrategyDecision;
-  readonly instrumentSpecSnapshotId: string;
   readonly policy: RiskPolicy;
   readonly riskRequest: PaperProductionRiskRequest;
   readonly executionPolicy: ExecutionPolicySnapshot;
-  readonly priceIncrement: string;
   readonly accountMaxLeverage?: string | null;
 }
 
@@ -361,6 +359,28 @@ export class PaperAccountProductionRuntime {
     };
   }
 
+  static #authoritativeRiskRequest(
+    request: PaperProductionRiskRequest,
+    economics: InstrumentEconomicsSnapshot,
+  ): PaperProductionRiskRequest {
+    if (request.pairSnapshot.pair !== economics.pair) {
+      throw new PaperProductionRuntimeError('RISK_INPUT_NOT_AUTHORITATIVE', 'Risk pair does not match authoritative instrument economics pair');
+    }
+    const unsealed = {
+      ...request.pairSnapshot,
+      instrumentSpecSnapshotId: economics.instrumentSpecSnapshotId,
+      contractMultiplier: economics.contractMultiplier,
+      priceIncrement: economics.priceIncrement,
+      quantityIncrement: economics.quantityIncrement,
+      provenance: { ...request.pairSnapshot.provenance, contentSha256: '' },
+    };
+    const pairSnapshot = Object.freeze({
+      ...unsealed,
+      provenance: Object.freeze({ ...unsealed.provenance, contentSha256: evidenceContentSha256(unsealed) }),
+    });
+    return Object.freeze({ ...request, pairSnapshot });
+  }
+
   async #executeOpenLocked(params: ProductionOpenParams): Promise<PaperOpenExecutionResult> {
     const health = await this.#assertFreshlyHealthy();
 
@@ -380,16 +400,29 @@ export class PaperAccountProductionRuntime {
     });
     if (terminalFill !== null) return disclosePaperFundingExcluded({ outcome: 'SOURCE_DECISION_ALREADY_EXECUTED' as const });
 
-    const authoritative = await this.#openRiskInput(params, health);
+    // The only network read added by Wave3-B. It occurs before admission and
+    // before every account/economic transaction; the caller supplies only the
+    // canonical pair and cannot inject a reader or structural metadata.
+    const trustedBinding = await acquireProductionInstrumentBinding(params.kernel.pair);
+    const binding = TrustedProductionInstrumentBinding.read(trustedBinding);
+    if (binding === null) throw new PaperProductionRuntimeError('AUTHORITY_REJECTED', 'CoinDCX instrument acquisition did not issue a genuine trusted binding');
+    const instrumentEconomics = buildInstrumentEconomicsSnapshot(binding);
+    const executionPolicy = validateExecutionPolicySnapshot(params.executionPolicy);
+    if (executionPolicy.content.contractMultiplier !== instrumentEconomics.contractMultiplier) {
+      throw new PaperProductionRuntimeError('AUTHORITY_REJECTED', 'Execution policy multiplier does not equal authoritative CoinDCX instrument multiplier');
+    }
+    const riskRequest = PaperAccountProductionRuntime.#authoritativeRiskRequest(params.riskRequest, instrumentEconomics);
+
+    const authoritative = await this.#openRiskInput({ ...params, riskRequest }, health);
 
     const researchApproval = issueResearchApprovalOrigin(params.planResult, {
       pair: params.kernel.pair, strategyId: params.kernel.strategyId, strategyVersion: params.kernel.strategyVersion, parameterHash: params.kernel.parameterHash,
     });
     if (researchApproval === null) throw new PaperProductionRuntimeError('AUTHORITY_REJECTED', 'Research approval origin was rejected for the supplied plan result/kernel');
-    const authorized = authorizeStrategyDispatch(params.kernel, params.decision, params.instrumentSpecSnapshotId, researchApproval);
+    const authorized = authorizeStrategyDispatch(params.kernel, params.decision, instrumentEconomics.instrumentSpecSnapshotId, researchApproval);
     if (authorized === null) throw new PaperProductionRuntimeError('AUTHORITY_REJECTED', 'Strategy dispatch authorization was rejected');
 
-    const admissionContext = PaperAccountProductionRuntime.#riskContext(params.riskRequest, authoritative, authorized.strategyOrigin, authorized.candidate);
+    const admissionContext = PaperAccountProductionRuntime.#riskContext(riskRequest, authoritative, authorized.strategyOrigin, authorized.candidate);
     const admissionRequest: AdmissionRequest = { accountId: this.accountId, policy: params.policy, context: admissionContext };
     // [F14-06] Bind admission to the exact revision this call's own fresh
     // health observation just saw, atomically re-verified under the account
@@ -408,12 +441,12 @@ export class PaperAccountProductionRuntime {
 
     const authority = await mintPaperOpenExecutionAuthority({
       coordinator: this.#coordinator, accountId: this.accountId, kernel: params.kernel, decision: params.decision,
-      instrumentSpecSnapshotId: params.instrumentSpecSnapshotId, planResult: params.planResult, policy: params.policy,
+      instrumentSpecSnapshotId: instrumentEconomics.instrumentSpecSnapshotId, planResult: params.planResult, policy: params.policy,
       // [F14-01] The exact same authoritative evidence admission itself used —
       // the mint's own idempotent `coordinator.admit` must see byte-identical
       // account/exposure facts, never a second, differently-sourced object.
       evidence: {
-        ...params.riskRequest, accountSnapshot: authoritative.accountSnapshot, exposureSnapshot: authoritative.exposureSnapshot,
+        ...riskRequest, accountSnapshot: authoritative.accountSnapshot, exposureSnapshot: authoritative.exposureSnapshot,
       } satisfies PaperOpenRiskEvidence,
     });
     if (authority === null) throw new PaperProductionRuntimeError('AUTHORITY_REJECTED', 'OPEN execution authority was not granted');
@@ -422,8 +455,8 @@ export class PaperAccountProductionRuntime {
     // to `admitted.accountRevision` — the OPEN fill transaction must bind to
     // THAT new value, never the pre-admission `health.revision`.
     return this.#kernelRuntime.session.executeOpen(authority, {
-      evidence: evidenceRead.evidence, priceIncrement: params.priceIncrement, quantityIncrement: params.quantityIncrement,
-      executionPolicy: params.executionPolicy, nowMs: this.#clock.nowMs(),
+      evidence: evidenceRead.evidence, instrumentEconomics,
+      executionPolicy, nowMs: this.#clock.nowMs(),
     }, this.#coordinator, admitted.accountRevision);
   }
 
@@ -448,6 +481,20 @@ export class PaperAccountProductionRuntime {
       ownedQuantity: slot.quantity.toFixed(),
     };
 
+    if (slot.admissionId === null) throw new PaperPersistenceError('RECONCILIATION_REQUIRED', `OPEN position ${slot.positionInstanceId} lacks opening admission lineage`);
+    const openingIntent = await this.#prisma.paperExecutionIntent.findUnique({
+      where: { admissionId: slot.admissionId }, include: { instrumentEconomics: true },
+    });
+    if (openingIntent === null || openingIntent.instrumentEconomicsSnapshotId === null || openingIntent.instrumentEconomics === null) {
+      throw new PaperPersistenceError('RECONCILIATION_REQUIRED', `OPEN position ${slot.positionInstanceId} is LEGACY_UNVERIFIABLE`);
+    }
+    const instrumentEconomics = instrumentEconomicsSnapshotFromRow(openingIntent.instrumentEconomics);
+    const executionPolicy = validateExecutionPolicySnapshot(params.executionPolicy);
+    if (executionPolicy.content.contractMultiplier !== instrumentEconomics.contractMultiplier) {
+      throw new PaperProductionRuntimeError('AUTHORITY_REJECTED', 'CLOSE policy multiplier does not equal authoritative opening instrument multiplier');
+    }
+    const riskRequest = PaperAccountProductionRuntime.#authoritativeRiskRequest(params.riskRequest, instrumentEconomics);
+
     // [F14-01/§23] CLOSE gains no research/admission step and NO mark-to-market
     // risk gate — it simply stops trusting caller-supplied account/exposure/
     // position evidence, exactly as OPEN now does. Every equity-sensitive
@@ -457,7 +504,7 @@ export class PaperAccountProductionRuntime {
     // position read so CLOSE's own primary precondition still surfaces as
     // `POSITION_NOT_OPEN` (§46: the most meaningful lower-layer reason, never
     // masked by a generic one).
-    const base = await this.#authoritativeRiskBase(params, health);
+    const base = await this.#authoritativeRiskBase({ ...params, riskRequest }, health);
     const authoritative = deriveCloseRiskInput({ base, policy: params.policy, accountMaxLeverage: params.accountMaxLeverage ?? null });
 
     const evidenceRead = getTrustedPaperExecutionEvidence(this.#provider, pair);
@@ -465,9 +512,9 @@ export class PaperAccountProductionRuntime {
 
     const authority = await mintPaperCloseExecutionAuthority({
       coordinator: this.#coordinator, accountId: this.accountId, kernel: params.kernel, decision: params.decision,
-      instrumentSpecSnapshotId: params.instrumentSpecSnapshotId, policy: params.policy, position,
+      instrumentSpecSnapshotId: instrumentEconomics.instrumentSpecSnapshotId, policy: params.policy, position,
       evidence: {
-        ...params.riskRequest, accountSnapshot: authoritative.accountSnapshot, exposureSnapshot: authoritative.exposureSnapshot,
+        ...riskRequest, accountSnapshot: authoritative.accountSnapshot, exposureSnapshot: authoritative.exposureSnapshot,
       } satisfies PaperCloseRiskEvidence,
     });
     if (authority === null) throw new PaperProductionRuntimeError('AUTHORITY_REJECTED', 'CLOSE execution authority was not granted');
@@ -476,7 +523,7 @@ export class PaperAccountProductionRuntime {
     // call's own fresh health observation, atomically re-verified under the
     // account lock inside executeClose itself.
     return this.#kernelRuntime.session.executeClose(authority, {
-      evidence: evidenceRead.evidence, priceIncrement: params.priceIncrement, executionPolicy: params.executionPolicy, nowMs: this.#clock.nowMs(),
+      evidence: evidenceRead.evidence, executionPolicy, nowMs: this.#clock.nowMs(),
     }, health.revision);
   }
 }

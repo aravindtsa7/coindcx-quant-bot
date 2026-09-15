@@ -32,11 +32,13 @@ function enumValues(name: string): readonly string[] {
 
 const MIGRATION_DIR = path.resolve(__dirname, '../../../prisma/migrations/20260910050818_phase14_paper_persistence');
 const MIGRATION_SQL = readFileSync(path.join(MIGRATION_DIR, 'migration.sql'), 'utf8');
+const WAVE3B_MIGRATION_SQL = readFileSync(path.resolve(__dirname, '../../../prisma/migrations/20260915000000_phase14_wave3b_instrument_economics/migration.sql'), 'utf8');
 
 const PHASE0_13_MODELS = ['SystemState', 'Candle1m', 'HistoricalDataset'] as const;
 const PHASE14_MODELS = [
   'PaperAccount',
   'PaperExecutionPolicySnapshot',
+  'PaperInstrumentEconomicsSnapshot',
   'PaperReservation',
   'PaperExecutionIntent',
   'PaperOrder',
@@ -47,12 +49,12 @@ const PHASE14_MODELS = [
   'PaperReconciliationFault',
 ] as const;
 
-describe('P14-C — final Phase14 model set (V2 §26, frozen at 10 models across V2.1/V2.2/V2.3)', () => {
-  it('defines exactly the 10 frozen Phase14 models, no more, no fewer', () => {
+describe('P14-C plus Wave3-B — final Phase14 model set', () => {
+  it('defines the 10 frozen P14-C models plus the selected Wave3-B economics model', () => {
     const names = dm.models.map((m) => m.name);
     for (const expected of PHASE14_MODELS) expect(names).toContain(expected);
     const phase14Present = names.filter((n) => PHASE14_MODELS.includes(n as (typeof PHASE14_MODELS)[number]));
-    expect(phase14Present).toHaveLength(10);
+    expect(phase14Present).toHaveLength(11);
   });
 
   it('preserves all pre-Phase14 (Phase0-13) models unchanged in presence', () => {
@@ -219,6 +221,35 @@ describe('P14-C — execution policy snapshot (V2 §6, content-addressed)', () =
   });
 });
 
+describe('F14-03 Wave3-B — durable instrument economics binding', () => {
+  it('has the exact immutable content fields and application-computed primary key', () => {
+    const id = field('PaperInstrumentEconomicsSnapshot', 'instrumentEconomicsSnapshotId');
+    expect(id.isId).toBe(true);
+    expect(id.hasDefaultValue).toBe(false);
+    const names = model('PaperInstrumentEconomicsSnapshot').fields.map((f) => f.name);
+    for (const expected of ['identityPolicyId', 'sourceId', 'instrumentSpecIdentityPolicyId', 'instrumentSpecSnapshotId', 'pair', 'contractMultiplier', 'priceIncrement', 'quantityIncrement']) {
+      expect(names).toContain(expected);
+    }
+  });
+
+  it('retains nullable legacy compatibility while defining the pair-bound relation', () => {
+    expect(field('PaperExecutionIntent', 'instrumentEconomicsSnapshotId').isRequired).toBe(false);
+    const relation = field('PaperExecutionIntent', 'instrumentEconomics');
+    expect(relation.relationFromFields).toEqual(['instrumentEconomicsSnapshotId', 'pair']);
+    expect(relation.relationToFields).toEqual(['instrumentEconomicsSnapshotId', 'pair']);
+    const uniques = model('PaperInstrumentEconomicsSnapshot').uniqueIndexes.map((u) => u.fields.join(','));
+    expect(uniques).toContain('instrumentEconomicsSnapshotId,pair');
+  });
+
+  it('migration is additive, has the composite RESTRICT FK, and performs no backfill', () => {
+    expect(WAVE3B_MIGRATION_SQL).toMatch(/FOREIGN KEY \(`instrument_economics_snapshot_id`, `pair`\)/);
+    expect(WAVE3B_MIGRATION_SQL).toMatch(/ON DELETE RESTRICT ON UPDATE RESTRICT/);
+    expect(WAVE3B_MIGRATION_SQL).toMatch(/ADD COLUMN `instrument_economics_snapshot_id` VARCHAR\(64\) NULL/);
+    expect(WAVE3B_MIGRATION_SQL).not.toMatch(/^\s*UPDATE\s+/im);
+    expect(WAVE3B_MIGRATION_SQL).not.toMatch(/DROP|TRUNCATE/i);
+  });
+});
+
 describe('P14-C — account owner/fencing storage (V2 §16/§18, storage only)', () => {
   it('PaperAccount carries ownerFence and revision as monotonic, overflow-safe (BigInt) fields', () => {
     expect(field('PaperAccount', 'ownerFence').type).toBe('BigInt');
@@ -230,6 +261,7 @@ describe('P14-C — Q18 Decimal storage (V2 §19/§21, matching src/execution/de
   const decimalFieldsByModel: Record<string, readonly string[]> = {
     PaperAccount: ['startingCapitalInr', 'cumulativeRealizedPnlInr', 'cumulativeFeesInr', 'cumulativeFundingInr', 'peakEquityInr'],
     PaperExecutionPolicySnapshot: ['takerFeeRate', 'slippageBps', 'contractMultiplier'],
+    PaperInstrumentEconomicsSnapshot: ['contractMultiplier', 'priceIncrement', 'quantityIncrement'],
     PaperReservation: ['approvedNotionalInr', 'approvedMarginInr'],
     PaperExecutionIntent: ['approvedQuantity', 'approvedLeverage', 'approvedNotionalInr', 'approvedMarginInr', 'reduceOnlyQuantity'],
     PaperFill: ['fillPrice', 'quantity', 'feeInr', 'realizedPnlInr'],

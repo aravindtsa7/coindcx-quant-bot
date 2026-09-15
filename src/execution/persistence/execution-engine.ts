@@ -4,7 +4,8 @@ import { RiskAdmissionCoordinator } from '../../dispatch/admission';
 import { assertQuantityAligned, ceilToTick, floorToTick, paperDecimal, PaperCalcDecimal, PAPER_ONE, type PaperCalc } from '../decimal';
 import { computeFeeInr, computeRealizedPnlInr, quantizePaperPosting } from '../accounting';
 import { computeOpenExecutionIntentId, computeCloseExecutionIntentId, computePositionInstanceId, computeSourceExecutionKey } from '../identity';
-import type { ExecutionPolicySnapshot } from '../policy';
+import { validateExecutionPolicySnapshot, type ExecutionPolicySnapshot } from '../policy';
+import { validateInstrumentEconomicsSnapshot, type InstrumentEconomicsSnapshot } from '../instrument-economics';
 import type { PaperExecutionQuoteSnapshot } from '../evidence';
 import {
   readTrustedPaperExecutionEvidence,
@@ -18,6 +19,11 @@ import { sha256CanonicalJson } from '../../risk';
 import { PaperAccountOwnership, type PaperAccountOwnershipRecord } from './account-ownership';
 import { SESSION_PROOF } from './admission-bridge';
 import { PaperPersistenceError } from './errors';
+import {
+  instrumentEconomicsSnapshotFromRow,
+  persistImmutableExecutionPolicySnapshot,
+  persistImmutableInstrumentEconomicsSnapshot,
+} from './immutable-snapshots';
 
 /** Execution stays provider-independent; runtime provenance arrives through the opaque trusted-evidence capability. */
 export type PaperExecutionSide = 'BUY' | 'SELL';
@@ -176,8 +182,7 @@ export function executionApprovedRiskIssue(
 
 export interface PaperOpenExecutionInputs {
   readonly evidence: TrustedPaperExecutionEvidence;
-  readonly priceIncrement: string;
-  readonly quantityIncrement: string;
+  readonly instrumentEconomics: InstrumentEconomicsSnapshot;
   readonly executionPolicy: ExecutionPolicySnapshot;
   /** Caller-supplied "now" for the network-free freshness re-check (V2 §35) — never `Date.now()` internally. */
   readonly nowMs: number;
@@ -206,7 +211,6 @@ export type PaperOpenExecutionOutcome =
 
 export interface PaperCloseExecutionInputs {
   readonly evidence: TrustedPaperExecutionEvidence;
-  readonly priceIncrement: string;
   readonly executionPolicy: ExecutionPolicySnapshot;
   readonly nowMs: number;
 }
@@ -276,23 +280,30 @@ export class PaperExecutionEngine {
     const { admission, decision } = record;
     const pair = admission.pair;
 
+    const executionPolicy = validateExecutionPolicySnapshot(inputs.executionPolicy);
+    const instrumentEconomics = validateInstrumentEconomicsSnapshot(inputs.instrumentEconomics);
+    if (instrumentEconomics.pair !== pair) throw new PaperPersistenceError('DURABLE_CONFLICT', 'OPEN instrument economics pair does not match admission pair');
+    if (!paperDecimal(executionPolicy.content.contractMultiplier).equals(paperDecimal(instrumentEconomics.contractMultiplier))) {
+      throw new PaperPersistenceError('DURABLE_CONFLICT', 'OPEN execution policy multiplier does not equal authoritative instrument economics');
+    }
+
     const evidence = readTrustedPaperExecutionEvidence(inputs.evidence);
     if (evidence === null) return { outcome: 'EVIDENCE_INVALID', reason: 'UNTRUSTED_EXECUTION_EVIDENCE' };
     const { quote, orderbookDepth, conversion, conversionLocalPollFreshnessMs } = evidence;
     const causalityIssue = assertEvidenceCausality(quote, orderbookDepth, pair);
-    const staleIssue = evidenceStaleAtUse(quote, inputs.executionPolicy, inputs.nowMs);
+    const staleIssue = evidenceStaleAtUse(quote, executionPolicy, inputs.nowMs);
     const conversionStaleIssue = conversionStaleAtUse(conversion, conversionLocalPollFreshnessMs, inputs.nowMs);
 
     const side = sideForOpenDirection(admission.direction);
     const approvedQuantity = paperDecimal(decision.approved.approvedQuantity);
-    assertQuantityAligned(approvedQuantity, paperDecimal(inputs.quantityIncrement));
+    assertQuantityAligned(approvedQuantity, paperDecimal(instrumentEconomics.quantityIncrement));
 
     const executionIntentId = computeOpenExecutionIntentId({
       admissionId: admission.admissionId, riskDecisionId: admission.riskDecisionId, accountId: held.accountId, pair,
       strategyInstanceId: admission.strategyInstanceId, strategyId: admission.strategyId, strategyVersion: admission.strategyVersion,
       parameterHash: admission.parameterHash, approvedQuantity: decision.approved.approvedQuantity, approvedLeverage: decision.approved.approvedLeverage,
       approvedNotionalInr: admission.approvedNotionalInr, approvedMarginInr: admission.approvedMarginInr,
-      evaluationTimeMs: decision.evaluationTimeMs, executionPolicySnapshotId: inputs.executionPolicy.executionPolicySnapshotId,
+      evaluationTimeMs: decision.evaluationTimeMs, executionPolicySnapshotId: executionPolicy.executionPolicySnapshotId,
     });
     const sourceExecutionKey = computeSourceExecutionKey({ accountId: held.accountId, sourceStrategyDecisionId: decision.sourceStrategyDecisionId });
     const positionInstanceId = computePositionInstanceId({
@@ -332,13 +343,13 @@ export class PaperExecutionEngine {
         const available = availableExecutableQuantity(side, orderbookDepth);
         if (available.lessThan(approvedQuantity)) return { outcome: 'INSUFFICIENT_LIQUIDITY' as const };
         const rawPrice = rawReferencePrice(side, quote);
-        const fillPriceUsdt = computeExecutionPrice(side, rawPrice, inputs.executionPolicy.content.slippageBps, paperDecimal(inputs.priceIncrement));
-        const contractMultiplier = paperDecimal(inputs.executionPolicy.content.contractMultiplier);
+        const fillPriceUsdt = computeExecutionPrice(side, rawPrice, executionPolicy.content.slippageBps, paperDecimal(instrumentEconomics.priceIncrement));
+        const contractMultiplier = paperDecimal(instrumentEconomics.contractMultiplier);
         const notionalUsdt = fillPriceUsdt.times(approvedQuantity).times(contractMultiplier);
         const conversionRate = paperDecimal(conversion.conversionPriceInrPerUsdt);
         const notionalInr = notionalUsdt.times(conversionRate);
         const fillPriceInr = fillPriceUsdt.times(conversionRate);
-        const feeInr = computeFeeInr(notionalInr, paperDecimal(inputs.executionPolicy.content.takerFeeRate));
+        const feeInr = computeFeeInr(notionalInr, paperDecimal(executionPolicy.content.takerFeeRate));
         const initialMarginInr = notionalInr.dividedBy(paperDecimal(decision.approved.approvedLeverage));
         const approvedRiskIssue = executionApprovedRiskIssue(
           notionalInr, initialMarginInr, admission.approvedNotionalInr, admission.approvedMarginInr,
@@ -356,25 +367,15 @@ export class PaperExecutionEngine {
           return { outcome: 'RESERVATION_NOT_READY' as const, reason: 'RESERVATION_NOT_ADMITTED' };
         }
 
-        await tx.paperExecutionPolicySnapshot.upsert({
-          where: { executionPolicySnapshotId: inputs.executionPolicy.executionPolicySnapshotId },
-          create: {
-            executionPolicySnapshotId: inputs.executionPolicy.executionPolicySnapshotId, policyVersion: inputs.executionPolicy.content.policyVersion,
-            fillSelectionPolicy: inputs.executionPolicy.content.fillSelectionPolicy, maxEvidenceAgeMs: inputs.executionPolicy.content.marketEvidenceEligibilityPolicy.maxEvidenceAgeMs,
-            requiredHealthState: inputs.executionPolicy.content.marketEvidenceEligibilityPolicy.requiredHealthState, takerFeeRate: toPrismaDecimal(inputs.executionPolicy.content.takerFeeRate),
-            slippageBps: toPrismaDecimal(inputs.executionPolicy.content.slippageBps), spreadSemantics: inputs.executionPolicy.content.spreadSemantics,
-            tickRoundingPolicy: inputs.executionPolicy.content.tickRoundingPolicy, quantityPolicy: inputs.executionPolicy.content.quantityPolicy,
-            contractMultiplier: toPrismaDecimal(inputs.executionPolicy.content.contractMultiplier), currencyConversionPolicy: inputs.executionPolicy.content.currencyConversionPolicy,
-            accountingPolicy: inputs.executionPolicy.content.accountingPolicy, executionSemanticsVersion: inputs.executionPolicy.content.executionSemanticsVersion,
-          },
-          update: {},
-        });
+        await persistImmutableInstrumentEconomicsSnapshot(tx, instrumentEconomics);
+        await persistImmutableExecutionPolicySnapshot(tx, executionPolicy);
 
         await tx.paperExecutionIntent.create({
           data: {
             executionIntentId, action: 'OPEN', accountId: held.accountId, pair, strategyInstanceId: admission.strategyInstanceId,
             strategyId: admission.strategyId, strategyVersion: admission.strategyVersion, parameterHash: admission.parameterHash,
-            riskDecisionId: admission.riskDecisionId, evaluationTimeMs: decision.evaluationTimeMs, executionPolicySnapshotId: inputs.executionPolicy.executionPolicySnapshotId,
+            riskDecisionId: admission.riskDecisionId, evaluationTimeMs: decision.evaluationTimeMs, executionPolicySnapshotId: executionPolicy.executionPolicySnapshotId,
+            instrumentEconomicsSnapshotId: instrumentEconomics.instrumentEconomicsSnapshotId,
             admissionId: admission.admissionId, approvedQuantity: toPrismaDecimal(decision.approved.approvedQuantity), approvedLeverage: toPrismaDecimal(decision.approved.approvedLeverage),
             approvedNotionalInr: toPrismaDecimal(admission.approvedNotionalInr), approvedMarginInr: toPrismaDecimal(admission.approvedMarginInr),
             validationSubjectId: record.researchApproval.validationSubjectId, validationPlanId: record.researchApproval.validationPlanId,
@@ -479,12 +480,13 @@ export class PaperExecutionEngine {
 
     const { decision, position } = record;
     const pair = decision.pair;
+    const executionPolicy = validateExecutionPolicySnapshot(inputs.executionPolicy);
 
     const evidence = readTrustedPaperExecutionEvidence(inputs.evidence);
     if (evidence === null) return { outcome: 'EVIDENCE_INVALID', reason: 'UNTRUSTED_EXECUTION_EVIDENCE' };
     const { quote, orderbookDepth, conversion, conversionLocalPollFreshnessMs } = evidence;
     const causalityIssue = assertEvidenceCausality(quote, orderbookDepth, pair);
-    const staleIssue = evidenceStaleAtUse(quote, inputs.executionPolicy, inputs.nowMs);
+    const staleIssue = evidenceStaleAtUse(quote, executionPolicy, inputs.nowMs);
     const conversionStaleIssue = conversionStaleAtUse(conversion, conversionLocalPollFreshnessMs, inputs.nowMs);
 
     // V1 frozen: full close only — `reduceOnlyQuantity` is always the position's
@@ -497,7 +499,7 @@ export class PaperExecutionEngine {
       riskDecisionId: decision.riskDecisionId, accountId: held.accountId, pair, strategyInstanceId: decision.strategyInstanceId,
       strategyId: decision.strategyId, strategyVersion: decision.strategyVersion, parameterHash: decision.parameterHash,
       positionInstanceId: position.positionInstanceId, positionRevision: position.positionRevision, reduceOnlyQuantity: record.reduceOnlyQuantity,
-      evaluationTimeMs: decision.evaluationTimeMs, executionPolicySnapshotId: inputs.executionPolicy.executionPolicySnapshotId,
+      evaluationTimeMs: decision.evaluationTimeMs, executionPolicySnapshotId: executionPolicy.executionPolicySnapshotId,
     });
     const sourceExecutionKey = computeSourceExecutionKey({ accountId: held.accountId, sourceStrategyDecisionId: decision.sourceStrategyDecisionId });
     const expectedTerminalFill: ExpectedTerminalFill = {
@@ -546,40 +548,43 @@ export class PaperExecutionEngine {
         return { outcome: 'POSITION_NOT_READY' as const, reason: 'PAIR_SLOT_STATE_OR_REVISION_MISMATCH' };
       }
 
+      if (slot.admissionId === null) throw new PaperPersistenceError('RECONCILIATION_REQUIRED', `OPEN pair slot for (${held.accountId}, ${pair}) lacks opening admission lineage`);
+      const openingIntent = await tx.paperExecutionIntent.findUnique({
+        where: { admissionId: slot.admissionId },
+        include: { instrumentEconomics: true },
+      });
+      if (openingIntent === null || openingIntent.action !== 'OPEN' || openingIntent.instrumentEconomicsSnapshotId === null || openingIntent.instrumentEconomics === null) {
+        throw new PaperPersistenceError('RECONCILIATION_REQUIRED', `OPEN lifecycle ${position.positionInstanceId} has no authoritative instrument economics binding`);
+      }
+      const instrumentEconomics = instrumentEconomicsSnapshotFromRow(openingIntent.instrumentEconomics);
+      if (instrumentEconomics.pair !== pair) throw new PaperPersistenceError('RECONCILIATION_REQUIRED', 'Opening instrument economics pair does not match CLOSE pair');
+      if (!paperDecimal(executionPolicy.content.contractMultiplier).equals(paperDecimal(instrumentEconomics.contractMultiplier))) {
+        throw new PaperPersistenceError('DURABLE_CONFLICT', 'CLOSE execution policy multiplier does not equal authoritative opening instrument economics');
+      }
+
       const actualSide = sideForClosingPosition(slot.side);
       const actualAvailable = availableExecutableQuantity(actualSide, orderbookDepth);
       if (actualAvailable.lessThan(closeQuantity)) return { outcome: 'INSUFFICIENT_LIQUIDITY' as const };
 
       const rawPrice = rawReferencePrice(actualSide, quote);
-      const fillPriceUsdt = computeExecutionPrice(actualSide, rawPrice, inputs.executionPolicy.content.slippageBps, paperDecimal(inputs.priceIncrement));
-      const contractMultiplier = paperDecimal(inputs.executionPolicy.content.contractMultiplier);
+      const fillPriceUsdt = computeExecutionPrice(actualSide, rawPrice, executionPolicy.content.slippageBps, paperDecimal(instrumentEconomics.priceIncrement));
+      const contractMultiplier = paperDecimal(instrumentEconomics.contractMultiplier);
       const conversionRate = paperDecimal(conversion.conversionPriceInrPerUsdt);
       const notionalUsdt = fillPriceUsdt.times(closeQuantity).times(contractMultiplier);
       const notionalInr = notionalUsdt.times(conversionRate);
       const fillPriceInr = fillPriceUsdt.times(conversionRate);
-      const feeInr = computeFeeInr(notionalInr, paperDecimal(inputs.executionPolicy.content.takerFeeRate));
+      const feeInr = computeFeeInr(notionalInr, paperDecimal(executionPolicy.content.takerFeeRate));
       const entryPriceInr = paperDecimal(slot.averageEntryPriceInr.toFixed());
       const realizedPnlInr = computeRealizedPnlInr({ side: slot.side, entryPriceInr, exitPriceInr: fillPriceInr, closingQuantity: closeQuantity, contractMultiplier });
 
-      await tx.paperExecutionPolicySnapshot.upsert({
-        where: { executionPolicySnapshotId: inputs.executionPolicy.executionPolicySnapshotId },
-        create: {
-          executionPolicySnapshotId: inputs.executionPolicy.executionPolicySnapshotId, policyVersion: inputs.executionPolicy.content.policyVersion,
-          fillSelectionPolicy: inputs.executionPolicy.content.fillSelectionPolicy, maxEvidenceAgeMs: inputs.executionPolicy.content.marketEvidenceEligibilityPolicy.maxEvidenceAgeMs,
-          requiredHealthState: inputs.executionPolicy.content.marketEvidenceEligibilityPolicy.requiredHealthState, takerFeeRate: toPrismaDecimal(inputs.executionPolicy.content.takerFeeRate),
-          slippageBps: toPrismaDecimal(inputs.executionPolicy.content.slippageBps), spreadSemantics: inputs.executionPolicy.content.spreadSemantics,
-          tickRoundingPolicy: inputs.executionPolicy.content.tickRoundingPolicy, quantityPolicy: inputs.executionPolicy.content.quantityPolicy,
-          contractMultiplier: toPrismaDecimal(inputs.executionPolicy.content.contractMultiplier), currencyConversionPolicy: inputs.executionPolicy.content.currencyConversionPolicy,
-          accountingPolicy: inputs.executionPolicy.content.accountingPolicy, executionSemanticsVersion: inputs.executionPolicy.content.executionSemanticsVersion,
-        },
-        update: {},
-      });
+      await persistImmutableExecutionPolicySnapshot(tx, executionPolicy);
 
       await tx.paperExecutionIntent.create({
         data: {
           executionIntentId, action: 'CLOSE', accountId: held.accountId, pair, strategyInstanceId: decision.strategyInstanceId,
           strategyId: decision.strategyId, strategyVersion: decision.strategyVersion, parameterHash: decision.parameterHash,
-          riskDecisionId: decision.riskDecisionId, evaluationTimeMs: decision.evaluationTimeMs, executionPolicySnapshotId: inputs.executionPolicy.executionPolicySnapshotId,
+          riskDecisionId: decision.riskDecisionId, evaluationTimeMs: decision.evaluationTimeMs, executionPolicySnapshotId: executionPolicy.executionPolicySnapshotId,
+          instrumentEconomicsSnapshotId: instrumentEconomics.instrumentEconomicsSnapshotId,
           positionInstanceId: position.positionInstanceId, positionRevision: position.positionRevision, reduceOnlyQuantity: toPrismaDecimal(record.reduceOnlyQuantity),
         },
       });
@@ -620,10 +625,6 @@ export class PaperExecutionEngine {
       // transition never clears `admissionId` from the slot while OPEN, and
       // `PaperExecutionIntent.admissionId` is UNIQUE (V2 §11: one reservation
       // backs at most one intent), so it is recoverable exactly, not fabricated.
-      if (slot.admissionId === null) throw new PaperPersistenceError('DURABLE_CONFLICT', `OPEN pair slot for (${held.accountId}, ${pair}) is missing its opening admissionId`);
-      const openingIntent = await tx.paperExecutionIntent.findUnique({ where: { admissionId: slot.admissionId } });
-      if (openingIntent === null) throw new PaperPersistenceError('DURABLE_CONFLICT', `No OPEN execution intent found for admission ${slot.admissionId} backing position ${position.positionInstanceId}`);
-
       const totalFeesInr = post(paperDecimal(slot.cumulativeFeesInr.toFixed()).plus(feeInr));
       await tx.paperPositionOwnershipHistory.create({
         data: {

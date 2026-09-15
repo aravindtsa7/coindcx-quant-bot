@@ -7,6 +7,7 @@ import { computePositionInstanceId } from '../identity';
 import { PAPER_FUNDING_CAPABILITY, type PaperFundingDisclosure } from '../funding-capability';
 import { SystemClock, type Clock } from './account-repository';
 import { PaperPersistenceError } from './errors';
+import { executionPolicySnapshotFromRow, instrumentEconomicsSnapshotFromRow } from './immutable-snapshots';
 
 /**
  * [P14-H] Paper durable reconciliation / account health.
@@ -157,21 +158,36 @@ export class PaperAccountReconciler {
       // (never account-scoped) — fetched only for the specific ids this
       // account's own OPEN intents reference, to recompute leverage/initial-margin
       // facts without any market/network dependency.
-      const policySnapshotIds = [...new Set(intents.filter((i) => i.action === 'OPEN').map((i) => i.executionPolicySnapshotId))];
+      const policySnapshotIds = [...new Set(intents.map((i) => i.executionPolicySnapshotId))];
       const policySnapshots = policySnapshotIds.length === 0 ? [] : await tx.paperExecutionPolicySnapshot.findMany({ where: { executionPolicySnapshotId: { in: policySnapshotIds } } });
       const policySnapshotById = new Map(policySnapshots.map((p) => [p.executionPolicySnapshotId, p]));
+      const economicsSnapshotIds = [...new Set(intents.map((i) => i.instrumentEconomicsSnapshotId).filter((id): id is string => id !== null))];
+      const economicsSnapshots = economicsSnapshotIds.length === 0 ? [] : await tx.paperInstrumentEconomicsSnapshot.findMany({ where: { instrumentEconomicsSnapshotId: { in: economicsSnapshotIds } } });
+      const economicsSnapshotById = new Map(economicsSnapshots.map((p) => [p.instrumentEconomicsSnapshotId, p]));
 
       const reservationByAdmissionId = new Map(reservations.map((r) => [r.admissionId, r]));
       const intentByAdmissionId = new Map(intents.filter((i) => i.admissionId !== null).map((i) => [i.admissionId as string, i]));
       const orderByIntentId = new Map(orders.map((o) => [o.executionIntentId, o]));
       const fillByOrderId = new Map(fills.map((f) => [f.orderId, f]));
       const positionByPair = new Map(positions.map((p) => [p.pair, p]));
+      const intentById = new Map(intents.map((i) => [i.executionIntentId, i]));
 
       const builder: Builder = { accountId, issues: [] };
 
       this.#reconcileFunding(builder, account, positions, ledgerEntries);
       this.#reconcileAccountLedger(builder, account, ledgerEntries);
-      for (const slot of positions) this.#reconcilePosition(builder, accountId, slot, reservationByAdmissionId, intentByAdmissionId, orderByIntentId, fillByOrderId, policySnapshotById);
+      this.#reconcileEconomicBindings(builder, intents, policySnapshotById, economicsSnapshotById);
+      for (const row of history) {
+        const opening = intentById.get(row.openingExecutionIntentId);
+        const closing = intentById.get(row.closingExecutionIntentId);
+        if (opening !== undefined && closing !== undefined && opening.instrumentEconomicsSnapshotId !== closing.instrumentEconomicsSnapshotId) {
+          addIssue(builder, 'ORDER_FILL_MISMATCH', { pair: row.pair, positionInstanceId: row.positionInstanceId }, 'CLOSE_INSTRUMENT_ECONOMICS_DIFFERS_FROM_OPEN', {
+            openingInstrumentEconomicsSnapshotId: opening.instrumentEconomicsSnapshotId,
+            closingInstrumentEconomicsSnapshotId: closing.instrumentEconomicsSnapshotId,
+          });
+        }
+      }
+      for (const slot of positions) this.#reconcilePosition(builder, accountId, slot, reservationByAdmissionId, intentByAdmissionId, orderByIntentId, fillByOrderId, policySnapshotById, economicsSnapshotById);
       this.#reconcileOrders(builder, orders, fillByOrderId);
       this.#reconcileTerminalDedup(builder, fills);
       for (const row of history) this.#reconcileHistory(builder, row, fillByOrderId, ledgerEntries, positions);
@@ -195,6 +211,46 @@ export class PaperAccountReconciler {
         issues: Object.freeze(builder.issues), fundingDisclosure: PAPER_FUNDING_CAPABILITY,
       });
     }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted });
+  }
+
+  #reconcileEconomicBindings(
+    builder: Builder,
+    intents: readonly { readonly executionIntentId: string; readonly action: string; readonly pair: string; readonly admissionId: string | null; readonly positionInstanceId: string | null; readonly executionPolicySnapshotId: string; readonly instrumentEconomicsSnapshotId: string | null }[],
+    policies: ReadonlyMap<string, Parameters<typeof executionPolicySnapshotFromRow>[0]>,
+    economics: ReadonlyMap<string, Parameters<typeof instrumentEconomicsSnapshotFromRow>[0]>,
+  ): void {
+    for (const intent of intents) {
+      const subject = { pair: intent.pair, admissionId: intent.admissionId, positionInstanceId: intent.positionInstanceId };
+      if (intent.instrumentEconomicsSnapshotId === null) {
+        addIssue(builder, 'ORDER_FILL_MISMATCH', subject, 'LEGACY_UNVERIFIABLE_INSTRUMENT_ECONOMICS', { executionIntentId: intent.executionIntentId, action: intent.action });
+        continue;
+      }
+      const economicsRow = economics.get(intent.instrumentEconomicsSnapshotId);
+      const policyRow = policies.get(intent.executionPolicySnapshotId);
+      if (economicsRow === undefined) {
+        addIssue(builder, 'ORDER_FILL_MISMATCH', subject, 'INSTRUMENT_ECONOMICS_SNAPSHOT_MISSING', { executionIntentId: intent.executionIntentId, instrumentEconomicsSnapshotId: intent.instrumentEconomicsSnapshotId });
+        continue;
+      }
+      if (policyRow === undefined) {
+        addIssue(builder, 'ORDER_FILL_MISMATCH', subject, 'EXECUTION_POLICY_SNAPSHOT_MISSING', { executionIntentId: intent.executionIntentId, executionPolicySnapshotId: intent.executionPolicySnapshotId });
+        continue;
+      }
+      try {
+        const economicSnapshot = instrumentEconomicsSnapshotFromRow(economicsRow);
+        const policySnapshot = executionPolicySnapshotFromRow(policyRow);
+        if (economicSnapshot.pair !== intent.pair) {
+          addIssue(builder, 'ORDER_FILL_MISMATCH', subject, 'INSTRUMENT_ECONOMICS_PAIR_MISMATCH', { executionIntentId: intent.executionIntentId, snapshotPair: economicSnapshot.pair });
+        }
+        if (!paperDecimal(policySnapshot.content.contractMultiplier).equals(paperDecimal(economicSnapshot.contractMultiplier))) {
+          addIssue(builder, 'ORDER_FILL_MISMATCH', subject, 'POLICY_MULTIPLIER_INSTRUMENT_ECONOMICS_MISMATCH', { executionIntentId: intent.executionIntentId });
+        }
+      } catch (error) {
+        addIssue(builder, 'ORDER_FILL_MISMATCH', subject, 'CANONICAL_ECONOMIC_SNAPSHOT_VALIDATION_FAILED', {
+          executionIntentId: intent.executionIntentId,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -270,11 +326,12 @@ export class PaperAccountReconciler {
     reservationByAdmissionId: ReadonlyMap<string, { readonly accountId: string; readonly pair: string; readonly status: string; readonly direction: string }>,
     intentByAdmissionId: ReadonlyMap<string, {
       readonly executionIntentId: string; readonly action: string; readonly accountId: string; readonly strategyInstanceId: string;
-      readonly approvedLeverage: { readonly toFixed: () => string } | null; readonly executionPolicySnapshotId: string;
+      readonly approvedLeverage: { readonly toFixed: () => string } | null; readonly executionPolicySnapshotId: string; readonly instrumentEconomicsSnapshotId: string | null;
     }>,
     orderByIntentId: ReadonlyMap<string, { readonly executionIntentId: string; readonly state: string }>,
     fillByOrderId: ReadonlyMap<string, { readonly quantity: { readonly toFixed: () => string }; readonly fillPrice: { readonly toFixed: () => string }; readonly feeInr: { readonly toFixed: () => string }; readonly eventTimeMs: bigint }>,
     policySnapshotById: ReadonlyMap<string, { readonly contractMultiplier: { readonly toFixed: () => string } }>,
+    economicsSnapshotById: ReadonlyMap<string, { readonly contractMultiplier: { readonly toFixed: () => string } }>,
   ): void {
     const subject = { pair: slot.pair, positionInstanceId: slot.positionInstanceId, admissionId: slot.admissionId };
 
@@ -335,6 +392,11 @@ export class PaperAccountReconciler {
       addIssue(builder, 'ORDER_FILL_MISMATCH', subject, 'OPEN_SLOT_OPENING_INTENT_MISSING_POLICY_SNAPSHOT', { executionPolicySnapshotId: intent.executionPolicySnapshotId });
       return;
     }
+    const economicsSnapshot = intent.instrumentEconomicsSnapshotId === null ? undefined : economicsSnapshotById.get(intent.instrumentEconomicsSnapshotId);
+    if (economicsSnapshot === undefined) {
+      addIssue(builder, 'ORDER_FILL_MISMATCH', subject, 'OPEN_SLOT_OPENING_INTENT_MISSING_INSTRUMENT_ECONOMICS', { instrumentEconomicsSnapshotId: intent.instrumentEconomicsSnapshotId });
+      return;
+    }
     const order = orderByIntentId.get(intent.executionIntentId);
     if (order === undefined || order.state !== 'FILLED') {
       addIssue(builder, 'ORDER_FILL_MISMATCH', subject, 'OPEN_SLOT_OPENING_ORDER_NOT_FILLED', { executionIntentId: intent.executionIntentId, orderState: order?.state ?? null });
@@ -361,7 +423,7 @@ export class PaperAccountReconciler {
     if (!paperDecimal(slot.leverage.toFixed()).equals(paperDecimal(intent.approvedLeverage.toFixed()))) {
       mismatches.push({ field: 'leverage', actual: slot.leverage.toFixed(), expected: intent.approvedLeverage.toFixed() });
     } else {
-      const contractMultiplier = paperDecimal(policySnapshot.contractMultiplier.toFixed());
+      const contractMultiplier = paperDecimal(economicsSnapshot.contractMultiplier.toFixed());
       const notionalInr = paperDecimal(fill.fillPrice.toFixed()).times(paperDecimal(fill.quantity.toFixed())).times(contractMultiplier);
       const expectedInitialMarginInr = quantizePaperPosting(notionalInr.dividedBy(paperDecimal(intent.approvedLeverage.toFixed()))).value;
       if (!paperDecimal(slot.initialMarginInr.toFixed()).equals(paperDecimal(expectedInitialMarginInr))) {

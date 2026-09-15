@@ -365,6 +365,40 @@ Status: **AWAITING_F14_03_SCHEMA_IMPLEMENTATION**.
 
 ---
 
+## 13D. Phase14 Wave3-B — durable instrument economics and policy authority
+
+Wave3-B adds the immutable, content-addressed
+`PaperInstrumentEconomicsSnapshot` and binds every newly created OPEN/CLOSE
+`PaperExecutionIntent` through the pair-scoped composite foreign key. Existing
+intent rows remain nullable by migration design and are never backfilled:
+reconciliation deterministically reports every such historical or active row
+as `LEGACY_UNVERIFIABLE_INSTRUMENT_ECONOMICS`.
+
+Production OPEN acquires the genuine Wave3-A pair-only CoinDCX binding outside
+every database transaction, derives RiskEngine instrument fields from that
+binding, validates exact positive `DECIMAL(36,18)` economics, and requires the
+retained policy multiplier to match. The canonical policy hash is recomputed
+at consumption; fees are non-negative, slippage is in `[0,10000)`, and the
+multiplier is positive. Both snapshot tables use create-or-compare semantics:
+an identical row is reused, while any same-ID content conflict fails closed
+without mutation.
+
+MTM resolves multiplier only through the opening intent's durable instrument-
+economics snapshot. CLOSE loads the same opening binding, uses its multiplier
+and tick, persists the same economics ID on the close intent, and rejects a
+policy multiplier mismatch. Restart requires no process-local instrument
+capability. P14-H recomputes both hashes, validates domains/pair and multiplier
+equality, checks OPEN/CLOSE lifecycle equality, and diagnoses legacy NULL
+bindings without repair.
+
+`ALL_ASTRA_F14_01_TO_F14_07_CORRECTIONS_IMPLEMENTED`
+
+Status: **AWAITING_FINAL_ASTRA_REGATE**. This is not an independent final gate
+PASS. Funding remains unsupported/excluded and the maximum lifecycle remains
+PAPER.
+
+---
+
 ## 14. Final Phase14 Status
 
 | Question | Answer |
@@ -381,8 +415,8 @@ Status: **AWAITING_F14_03_SCHEMA_IMPLEMENTATION**.
 | Drawdown gate sensitivity to unrealized PnL | **FULL MTM FOR OPEN ADMISSION** — every durable OPEN position valued from production-acquired fresh mark/conversion evidence (§13B.1) |
 | F14-01 / F14-02 | **CORRECTED** (§13B) |
 | F14-03 instrument acquisition authority prerequisite | **IMPLEMENTED in Wave3-A** — genuine pair-only CoinDCX acquisition produces an opaque binding; no caller metadata can mint it |
-| F14-03 durable economics/policy correction | **OPEN** — awaiting `PaperInstrumentEconomicsSnapshot`, schema binding, policy validation/conflict handling, and CLOSE lifecycle multiplier correction |
-| Final Astra milestone gate | **NOT YET PASS** — `AWAITING_F14_03_SCHEMA_IMPLEMENTATION` |
+| F14-03 durable economics/policy correction | **IMPLEMENTED in Wave3-B** — immutable pair-bound economics, canonical policy validation, OPEN→MTM→CLOSE lifecycle authority, restart, and legacy fail-closed reconciliation |
+| Final Astra milestone gate | **NOT YET PASS** — `AWAITING_FINAL_ASTRA_REGATE` |
 | Ready for Phase 15 ranking? | Only if Phase 15 explicitly consumes funding-excluded diagnostics as diagnostics, and does **not** treat funding-excluded PnL as production-approval economics. If Phase 15's dependency on funding-excluded profitability is ever ambiguous, that ambiguity should be documented as a Phase 15 limitation — P14-J does not invent or authorize Phase 15 policy here. |
 
 **Correct one-line summary:** Phase 14 is a mechanically production-ready
@@ -391,8 +425,9 @@ gated execution, and account-scoped reconciliation health-gating — **not** a
 full CoinDCX economic-parity paper simulation, and **not** promotion-eligible.
 Wave 1 (F14-04/05/06/07) and Wave 2 (F14-01/F14-02) of the final-gate
 correction are complete; Wave3-A establishes the production instrument
-authority prerequisite, but **F14-03 remains open**, so **PRODUCTION PAPER
-MECHANICS READY is not yet claimed**.
+authority prerequisite and Wave3-B implements the durable F14-03 correction.
+All Astra F14-01 through F14-07 corrections are implemented; final acceptance
+remains **AWAITING_FINAL_ASTRA_REGATE**.
 
 ---
 

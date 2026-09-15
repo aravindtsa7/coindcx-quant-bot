@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RiskAdmissionCoordinator } from '../../../src/dispatch/admission';
 import type { AdmissionRequest } from '../../../src/dispatch';
 import {
-  buildExecutionPolicySnapshot, EXECUTION_POLICY_VERSION, PAPER_FUNDING_CAPABILITY, paperDecimal,
+  buildExecutionPolicySnapshot, buildInstrumentEconomicsSnapshot, EXECUTION_POLICY_VERSION, PAPER_FUNDING_CAPABILITY, paperDecimal,
   type ExecutionPolicySnapshot, type PaperExecutionQuoteSnapshot,
 } from '../../../src/execution';
 import { mintPaperOpenExecutionAuthority } from '../../../src/execution/open-authority';
@@ -96,6 +96,11 @@ const EXECUTION_POLICY: ExecutionPolicySnapshot = buildExecutionPolicySnapshot({
   takerFeeRate: '0.001', slippageBps: '5', spreadSemantics: 'BID_ASK_DIRECT', tickRoundingPolicy: 'BUY_CEIL_SELL_FLOOR_V1',
   quantityPolicy: 'REJECT_NOT_RESIZE_V1', contractMultiplier: '0.001', currencyConversionPolicy: 'P14_INR_CONVERSION_V1',
   accountingPolicy: 'P14_INR_CASH_SETTLED_V1', executionSemanticsVersion: 'P14_EXECUTION_V1',
+});
+const INSTRUMENT_ECONOMICS = buildInstrumentEconomicsSnapshot({
+  sourceId: 'TEST_COINDCX_INSTRUMENT_SOURCE', instrumentSpecIdentityPolicyId: 'TEST_INSTRUMENT_SPEC_IDENTITY_V1',
+  instrumentSpecSnapshotId: 'instrument-1', pair: PAIR, contractMultiplier: EXECUTION_POLICY.content.contractMultiplier,
+  priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT,
 });
 
 function evidenceFrom(context: RiskEvaluationContext) {
@@ -224,7 +229,7 @@ describe('P14-G live-DB — OPEN position restart (§41/§63/§64/§65)', () => 
     const openConversion = buildConversion('80', openNowMs);
 
     const openResult = await session1.executeOpen(openAuthority, {
-      evidence: trust(openQuote, openDepth, openConversion), priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT,
+      evidence: trust(openQuote, openDepth, openConversion), instrumentEconomics: INSTRUMENT_ECONOMICS,
       executionPolicy: EXECUTION_POLICY, nowMs: openNowMs,
     }, coordinator1);
     expect(openResult.outcome).toBe('FILLED');
@@ -280,7 +285,7 @@ describe('P14-G live-DB — OPEN position restart (§41/§63/§64/§65)', () => 
     const closeQuote = buildQuote(PAIR, '110', '112', closeNowMs - 100);
     const closeDepth = buildDepth(closeQuote, '1000000', '1000000');
     const closeResult = await runtime2.session.executeClose(closeAuthority, {
-      evidence: trust(closeQuote, closeDepth, buildConversion('80', closeNowMs)), priceIncrement: PRICE_INCREMENT,
+      evidence: trust(closeQuote, closeDepth, buildConversion('80', closeNowMs)),
       executionPolicy: EXECUTION_POLICY, nowMs: closeNowMs,
     });
     expect(closeResult.outcome).toBe('CLOSED');
@@ -349,7 +354,7 @@ describe('P14-G live-DB — closed lifecycle restart (§43)', () => {
     const openNowMs = T0 + 500;
     const openResult = await session1.executeOpen(openAuthority, {
       evidence: trust(buildQuote(PAIR, '99', '99.5', openNowMs - 100), buildDepth(buildQuote(PAIR, '99', '99.5', openNowMs - 100), '1000000', '1000000'), buildConversion('80', openNowMs)),
-      priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: openNowMs,
+      instrumentEconomics: INSTRUMENT_ECONOMICS, executionPolicy: EXECUTION_POLICY, nowMs: openNowMs,
     }, coordinator1);
     if (openResult.outcome !== 'FILLED') throw new Error('setup failed');
 
@@ -370,7 +375,7 @@ describe('P14-G live-DB — closed lifecycle restart (§43)', () => {
     const closeQuote = buildQuote(PAIR, '110', '112', closeNowMs - 100);
     const closeResult = await session1.executeClose(closeAuthority, {
       evidence: trust(closeQuote, buildDepth(closeQuote, '1000000', '1000000'), buildConversion('80', closeNowMs)),
-      priceIncrement: PRICE_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: closeNowMs,
+       executionPolicy: EXECUTION_POLICY, nowMs: closeNowMs,
     });
     if (closeResult.outcome !== 'CLOSED') throw new Error('setup failed');
 
@@ -466,7 +471,7 @@ describe('F14-04 correction — released generation history survives restart (§
     const openQuote = buildQuote(PAIR, '99', '99.5', openNowMs - 100);
     const openDepth = buildDepth(openQuote, '1000000', '1000000');
     const openResult = await runtime2.session.executeOpen(openAuthority, {
-      evidence: trust(openQuote, openDepth, buildConversion('80', openNowMs)), priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT,
+      evidence: trust(openQuote, openDepth, buildConversion('80', openNowMs)), instrumentEconomics: INSTRUMENT_ECONOMICS,
       executionPolicy: EXECUTION_POLICY, nowMs: openNowMs,
     }, coordinator2);
     expect(openResult.outcome).toBe('FILLED');
@@ -908,7 +913,7 @@ describe('F14-06 correction — CLOSE stale account revision race', () => {
     const openQuote = buildQuote(PAIR, '99', '99.5', openNowMs - 100);
     const openResult = await session.executeOpen(openAuthority, {
       evidence: trust(openQuote, buildDepth(openQuote, '1000000', '1000000'), buildConversion('80', openNowMs)),
-      priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: openNowMs,
+      instrumentEconomics: INSTRUMENT_ECONOMICS, executionPolicy: EXECUTION_POLICY, nowMs: openNowMs,
     }, coordinator);
     if (openResult.outcome !== 'FILLED') throw new Error('setup failed');
 
@@ -940,7 +945,7 @@ describe('F14-06 correction — CLOSE stale account revision race', () => {
 
     await expect(session.executeClose(closeAuthority, {
       evidence: trust(closeQuote, buildDepth(closeQuote, '1000000', '1000000'), buildConversion('80', closeNowMs)),
-      priceIncrement: PRICE_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: closeNowMs,
+       executionPolicy: EXECUTION_POLICY, nowMs: closeNowMs,
     }, staleRevision)).rejects.toMatchObject({ code: 'STALE_ACCOUNT_REVISION' });
 
     const positionAfterRejectedClose = await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } });

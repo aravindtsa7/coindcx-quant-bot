@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RiskAdmissionCoordinator } from '../../../src/dispatch/admission';
 import type { AdmissionRequest } from '../../../src/dispatch';
 import {
-  buildExecutionPolicySnapshot, EXECUTION_POLICY_VERSION, paperDecimal,
+  buildExecutionPolicySnapshot, buildInstrumentEconomicsSnapshot, EXECUTION_POLICY_VERSION, paperDecimal,
   type ExecutionPolicySnapshot, type PaperExecutionQuoteSnapshot,
 } from '../../../src/execution';
 import { mintPaperOpenExecutionAuthority } from '../../../src/execution/open-authority';
@@ -97,6 +97,11 @@ const EXECUTION_POLICY: ExecutionPolicySnapshot = buildExecutionPolicySnapshot({
   quantityPolicy: 'REJECT_NOT_RESIZE_V1', contractMultiplier: '0.001', currencyConversionPolicy: 'P14_INR_CONVERSION_V1',
   accountingPolicy: 'P14_INR_CASH_SETTLED_V1', executionSemanticsVersion: 'P14_EXECUTION_V1',
 });
+const INSTRUMENT_ECONOMICS = buildInstrumentEconomicsSnapshot({
+  sourceId: 'TEST_COINDCX_INSTRUMENT_SOURCE', instrumentSpecIdentityPolicyId: 'TEST_INSTRUMENT_SPEC_IDENTITY_V1',
+  instrumentSpecSnapshotId: 'instrument-1', pair: PAIR, contractMultiplier: EXECUTION_POLICY.content.contractMultiplier,
+  priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT,
+});
 
 function evidenceFrom(context: RiskEvaluationContext) {
   const { strategyOrigin: _strategyOrigin, candidate: _candidate, ...evidence } = context;
@@ -175,7 +180,7 @@ async function setupGenuineOpen(accountId: string, pair: string) {
   const openDepth = buildDepth(openQuote, '1000000', '1000000');
   const conversion = buildConversion('80', openNowMs);
   const openResult = await session.executeOpen(openAuthority, {
-    evidence: trust(openQuote, openDepth, conversion), priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT,
+    evidence: trust(openQuote, openDepth, conversion), instrumentEconomics: INSTRUMENT_ECONOMICS,
     executionPolicy: EXECUTION_POLICY, nowMs: openNowMs,
   }, coordinator);
   if (openResult.outcome !== 'FILLED') throw new Error(`setup: open execution failed (${openResult.outcome})`);
@@ -201,7 +206,7 @@ async function setupGenuineClosed(accountId: string, pair: string) {
   const closeQuote = buildQuote(pair, '110', '112', closeNowMs - 100);
   const closeResult = await opened.session.executeClose(closeAuthority, {
     evidence: trust(closeQuote, buildDepth(closeQuote, '1000000', '1000000'), buildConversion('80', closeNowMs)),
-    priceIncrement: PRICE_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: closeNowMs,
+     executionPolicy: EXECUTION_POLICY, nowMs: closeNowMs,
   });
   if (closeResult.outcome !== 'CLOSED') throw new Error(`setup: close execution failed (${closeResult.outcome})`);
   return { ...opened, closeResult };
@@ -263,6 +268,40 @@ describe('P14-H live-DB — healthy accounts (§37-§40)', () => {
     expect(result.issues).toHaveLength(0);
     expect(await prisma.paperReconciliationFault.count({ where: { accountId } })).toBe(0);
   }, 30_000);
+});
+
+describe('F14-03 legacy instrument-economics reconciliation', () => {
+  it('diagnoses an active legacy NULL binding deterministically and never backfills it', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const opened = await setupGenuineOpen(accountId, PAIR);
+    await prisma.paperExecutionIntent.update({ where: { executionIntentId: opened.openResult.executionIntentId }, data: { instrumentEconomicsSnapshotId: null } });
+
+    const first = await new PaperAccountReconciler(prisma).reconcile(accountId);
+    const second = await new PaperAccountReconciler(prisma).reconcile(accountId);
+    expect(first.status).toBe('UNHEALTHY');
+    expect(first.issues).toContainEqual(expect.objectContaining({ message: 'LEGACY_UNVERIFIABLE_INSTRUMENT_ECONOMICS' }));
+    expect(second.issues.find((issue) => issue.message === 'LEGACY_UNVERIFIABLE_INSTRUMENT_ECONOMICS')?.faultId)
+      .toBe(first.issues.find((issue) => issue.message === 'LEGACY_UNVERIFIABLE_INSTRUMENT_ECONOMICS')?.faultId);
+    expect((await prisma.paperExecutionIntent.findUniqueOrThrow({ where: { executionIntentId: opened.openResult.executionIntentId } })).instrumentEconomicsSnapshotId).toBeNull();
+  });
+
+  it('preserves and diagnoses closed historical legacy NULL bindings', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const closed = await setupGenuineClosed(accountId, PAIR);
+    await prisma.paperExecutionIntent.updateMany({ where: { accountId }, data: { instrumentEconomicsSnapshotId: null } });
+
+    const result = await new PaperAccountReconciler(prisma).reconcile(accountId);
+    expect(result.status).toBe('UNHEALTHY');
+    expect(result.issues.filter((issue) => issue.message === 'LEGACY_UNVERIFIABLE_INSTRUMENT_ECONOMICS')).toHaveLength(2);
+    expect(await prisma.paperExecutionIntent.count({ where: { accountId, instrumentEconomicsSnapshotId: null } })).toBe(2);
+    expect(await prisma.paperPositionOwnershipHistory.findUnique({ where: { positionInstanceId: closed.openResult.positionInstanceId } })).not.toBeNull();
+  });
 });
 
 describe('P14-H live-DB — account ledger mismatch (§41/§42/§50)', () => {

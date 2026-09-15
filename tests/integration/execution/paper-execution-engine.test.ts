@@ -6,13 +6,14 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { RiskAdmissionCoordinator } from '../../../src/dispatch/admission';
 import type { AdmissionRequest } from '../../../src/dispatch';
 import {
-  buildExecutionPolicySnapshot, computeOpenExecutionIntentId, computeSourceExecutionKey, EXECUTION_POLICY_VERSION,
+  buildExecutionPolicySnapshot, buildInstrumentEconomicsSnapshot, computeOpenExecutionIntentId, computeSourceExecutionKey, EXECUTION_POLICY_VERSION,
   PAPER_FUNDING_CAPABILITY, paperDecimal, type ExecutionPolicySnapshot, type PaperExecutionQuoteSnapshot,
 } from '../../../src/execution';
 import { mintPaperOpenExecutionAuthority, PaperOpenExecutionAuthority } from '../../../src/execution/open-authority';
 import { mintPaperCloseExecutionAuthority, PaperCloseExecutionAuthority, type PaperClosePositionBinding } from '../../../src/execution/close-authority';
 import { PaperAccountRepository } from '../../../src/execution/persistence/account-repository';
 import { openPaperAccountSession } from '../../../src/execution/persistence';
+import { persistImmutableExecutionPolicySnapshot, persistImmutableInstrumentEconomicsSnapshot } from '../../../src/execution/persistence/immutable-snapshots';
 import {
   issueTrustedPaperExecutionEvidence,
   type TrustedPaperConversionEvidence,
@@ -118,6 +119,11 @@ const EXECUTION_POLICY: ExecutionPolicySnapshot = buildExecutionPolicySnapshot({
 // so RiskEngine's own internally-floored `approvedQuantity` is guaranteed aligned to it.
 const PRICE_INCREMENT = '1';
 const QUANTITY_INCREMENT = '1';
+const INSTRUMENT_ECONOMICS = buildInstrumentEconomicsSnapshot({
+  sourceId: 'TEST_COINDCX_INSTRUMENT_SOURCE', instrumentSpecIdentityPolicyId: 'TEST_INSTRUMENT_SPEC_IDENTITY_V1',
+  instrumentSpecSnapshotId: 'instrument-1', pair: PAIR, contractMultiplier: EXECUTION_POLICY.content.contractMultiplier,
+  priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT,
+});
 
 function buildQuote(pair: string, bid: string, ask: string, providerEventTimeMs: number): PaperExecutionQuoteSnapshot {
   const contentSha256 = sha256CanonicalJson({ contentPolicyId: 'TEST_ORDERBOOK_CONTENT_V1', pair, bid, ask, providerEventTimeMs });
@@ -235,8 +241,16 @@ describe('P14-E live-DB — OPEN then CLOSE happy path', () => {
     const openDepth = buildDepth(openQuote, '1000000', '1000000');
     const conversion = buildConversion('80', openNowMs);
 
+    const multiplierAttackPolicy = buildExecutionPolicySnapshot({ ...EXECUTION_POLICY.content, contractMultiplier: '1' });
+    await expect(session.executeOpen(openAuthority, {
+      evidence: trust(openQuote, openDepth, conversion), instrumentEconomics: INSTRUMENT_ECONOMICS,
+      executionPolicy: multiplierAttackPolicy, nowMs: openNowMs,
+    }, coordinator)).rejects.toMatchObject({ code: 'DURABLE_CONFLICT' });
+    expect(await prisma.paperExecutionIntent.count({ where: { accountId } })).toBe(0);
+    expect(await prisma.paperFill.count({ where: { accountId } })).toBe(0);
+
     const openResult = await session.executeOpen(openAuthority, {
-      evidence: trust(openQuote, openDepth, conversion), priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT,
+      evidence: trust(openQuote, openDepth, conversion), instrumentEconomics: INSTRUMENT_ECONOMICS,
       executionPolicy: EXECUTION_POLICY, nowMs: openNowMs,
     }, coordinator);
     expect(openResult.outcome).toBe('FILLED');
@@ -247,6 +261,12 @@ describe('P14-E live-DB — OPEN then CLOSE happy path', () => {
     const intent = await prisma.paperExecutionIntent.findUnique({ where: { executionIntentId: openResult.executionIntentId } });
     expect(intent?.action).toBe('OPEN');
     expect(intent?.admissionId).toBe(admitted.admission.admissionId);
+    expect(intent?.instrumentEconomicsSnapshotId).toBe(INSTRUMENT_ECONOMICS.instrumentEconomicsSnapshotId);
+    expect(await prisma.paperInstrumentEconomicsSnapshot.count({ where: { instrumentEconomicsSnapshotId: INSTRUMENT_ECONOMICS.instrumentEconomicsSnapshotId } })).toBe(1);
+    await expect(prisma.paperInstrumentEconomicsSnapshot.delete({ where: { instrumentEconomicsSnapshotId: INSTRUMENT_ECONOMICS.instrumentEconomicsSnapshotId } })).rejects.toThrow();
+    await expect(prisma.paperInstrumentEconomicsSnapshot.update({
+      where: { instrumentEconomicsSnapshotId: INSTRUMENT_ECONOMICS.instrumentEconomicsSnapshotId }, data: { pair: 'B-ETH_USDT' },
+    })).rejects.toThrow();
     const order = await prisma.paperOrder.findUnique({ where: { executionIntentId: openResult.executionIntentId } });
     expect(order?.state).toBe('FILLED');
     const fill = await prisma.paperFill.findUnique({ where: { orderId: openResult.executionIntentId } });
@@ -293,8 +313,14 @@ describe('P14-E live-DB — OPEN then CLOSE happy path', () => {
     const closeQuote = buildQuote(PAIR, '110', '112', closeNowMs - 100);
     const closeDepth = buildDepth(closeQuote, '1000000', '1000000');
 
+    await expect(session.executeClose(closeAuthority, {
+      evidence: trust(closeQuote, closeDepth, buildConversion('80', closeNowMs)),
+      executionPolicy: multiplierAttackPolicy, nowMs: closeNowMs,
+    })).rejects.toMatchObject({ code: 'DURABLE_CONFLICT' });
+    expect(await prisma.paperFill.count({ where: { accountId, action: 'CLOSE' } })).toBe(0);
+
     const closeResult = await session.executeClose(closeAuthority, {
-      evidence: trust(closeQuote, closeDepth, buildConversion('80', closeNowMs)), priceIncrement: PRICE_INCREMENT,
+      evidence: trust(closeQuote, closeDepth, buildConversion('80', closeNowMs)),
       executionPolicy: EXECUTION_POLICY, nowMs: closeNowMs,
     });
     expect(closeResult.outcome).toBe('CLOSED');
@@ -302,6 +328,8 @@ describe('P14-E live-DB — OPEN then CLOSE happy path', () => {
     if (closeResult.outcome !== 'CLOSED') return;
     expect(closeResult.side).toBe('SELL');
     expect(closeResult.realizedPnlInr).toBe('900');
+    const closeIntent = await prisma.paperExecutionIntent.findUniqueOrThrow({ where: { executionIntentId: closeResult.executionIntentId } });
+    expect(closeIntent.instrumentEconomicsSnapshotId).toBe(intent!.instrumentEconomicsSnapshotId);
 
     const closeFill = await prisma.paperFill.findUnique({ where: { orderId: closeResult.executionIntentId } });
     expect(closeFill?.realizedPnlInr?.toFixed()).toBe(closeResult.realizedPnlInr);
@@ -356,7 +384,7 @@ describe('P14-F live-DB — long-held restored position remains mechanically clo
     const openQuote = buildQuote(PAIR, '99', '99.5', T0);
     const openResult = await firstSession.executeOpen(openAuthority, {
       evidence: trust(openQuote, buildDepth(openQuote, '1000000', '1000000'), buildConversion('80', T0)),
-      priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT,
+      instrumentEconomics: INSTRUMENT_ECONOMICS,
       executionPolicy: EXECUTION_POLICY, nowMs: T0,
     }, firstCoordinator);
     if (openResult.outcome !== 'FILLED') throw new Error('fixture');
@@ -386,7 +414,7 @@ describe('P14-F live-DB — long-held restored position remains mechanically clo
     const closeQuote = buildQuote(PAIR, '110', '112', closeTimeMs);
     const closeResult = await restoredSession.executeClose(closeAuthority, {
       evidence: trust(closeQuote, buildDepth(closeQuote, '1000000', '1000000'), buildConversion('80', closeTimeMs)),
-      priceIncrement: PRICE_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: closeTimeMs,
+       executionPolicy: EXECUTION_POLICY, nowMs: closeTimeMs,
     });
 
     expect(closeResult.outcome).toBe('CLOSED');
@@ -415,7 +443,7 @@ describe('P14-E live-DB — OPEN safety', () => {
     const quote = buildQuote(PAIR, '99', '99.5', T0);
     await expect(session.executeOpen(forged, {
       evidence: trust(quote, buildDepth(quote, '1000', '1000'), buildConversion('80', T0)),
-      priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: T0,
+      instrumentEconomics: INSTRUMENT_ECONOMICS, executionPolicy: EXECUTION_POLICY, nowMs: T0,
     }, coordinator)).rejects.toMatchObject({ code: 'NOT_OWNER' });
 
     expect(await prisma.paperFill.count({ where: { accountId, pair: PAIR } })).toBe(0);
@@ -445,7 +473,7 @@ describe('P14-E live-DB — OPEN safety', () => {
     const quote = buildQuote(PAIR, '99', '99.5', T0);
     const result = await session.executeOpen(authority, {
       evidence: trust(quote, buildDepth(quote, '1000000', '0.0000001'), buildConversion('80', T0)),
-      priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: T0,
+      instrumentEconomics: INSTRUMENT_ECONOMICS, executionPolicy: EXECUTION_POLICY, nowMs: T0,
     }, coordinator);
     expect(result.outcome).toBe('INSUFFICIENT_LIQUIDITY');
     expect(await prisma.paperFill.count({ where: { accountId, pair: PAIR } })).toBe(0);
@@ -479,7 +507,7 @@ describe('P14-E live-DB — OPEN safety', () => {
     const quote = buildQuote(PAIR, '99', '99.5', T0);
     const inputs = {
       evidence: trust(quote, buildDepth(quote, '1000000', '1000000'), buildConversion('80', T0)),
-      priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: T0,
+      instrumentEconomics: INSTRUMENT_ECONOMICS, executionPolicy: EXECUTION_POLICY, nowMs: T0,
     };
     const first = await session.executeOpen(authority, inputs, coordinator);
     expect(first.outcome).toBe('FILLED');
@@ -528,7 +556,7 @@ describe('P14-E live-DB — OPEN safety', () => {
     const quote = buildQuote(PAIR, '99', '99.5', T0);
     await expect(staleSession.executeOpen(authority, {
       evidence: trust(quote, buildDepth(quote, '1000000', '1000000'), buildConversion('80', T0)),
-      priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: T0,
+      instrumentEconomics: INSTRUMENT_ECONOMICS, executionPolicy: EXECUTION_POLICY, nowMs: T0,
     }, coordinator)).rejects.toMatchObject({ code: 'STALE_FENCE' });
 
     expect(staleSession.state).toBe('READY');
@@ -549,7 +577,7 @@ describe('P14-E live-DB — CLOSE safety', () => {
     const quote = buildQuote(PAIR, '99', '99.5', T0);
     await expect(session.executeClose(forged, {
       evidence: trust(quote, buildDepth(quote, '1000', '1000'), buildConversion('80', T0)),
-      priceIncrement: PRICE_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: T0,
+       executionPolicy: EXECUTION_POLICY, nowMs: T0,
     })).rejects.toMatchObject({ code: 'NOT_OWNER' });
   }, 30_000);
 
@@ -575,7 +603,7 @@ describe('P14-E live-DB — CLOSE safety', () => {
     const openQuote = buildQuote(PAIR, '99', '99.5', T0);
     const openResult = await session.executeOpen(openAuthority, {
       evidence: trust(openQuote, buildDepth(openQuote, '1000000', '1000000'), buildConversion('80', T0)),
-      priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: T0,
+      instrumentEconomics: INSTRUMENT_ECONOMICS, executionPolicy: EXECUTION_POLICY, nowMs: T0,
     }, coordinator);
     if (openResult.outcome !== 'FILLED') throw new Error('fixture');
 
@@ -596,7 +624,7 @@ describe('P14-E live-DB — CLOSE safety', () => {
     const closeQuote = buildQuote(PAIR, '110', '112', T0 + MINUTE + 500);
     const result = await session.executeClose(closeAuthority, {
       evidence: trust(closeQuote, buildDepth(closeQuote, '1000000', '1000000'), buildConversion('80', T0 + MINUTE + 500)),
-      priceIncrement: PRICE_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: T0 + MINUTE + 500,
+       executionPolicy: EXECUTION_POLICY, nowMs: T0 + MINUTE + 500,
     });
     expect(result.outcome).toBe('POSITION_NOT_READY');
     const position = await prisma.paperPosition.findUnique({ where: { accountId_pair: { accountId, pair: PAIR } } });
@@ -625,7 +653,7 @@ describe('P14-E live-DB — CLOSE safety', () => {
     const openQuote = buildQuote(PAIR, '99', '99.5', T0);
     const openResult = await session.executeOpen(openAuthority, {
       evidence: trust(openQuote, buildDepth(openQuote, '1000000', '1000000'), buildConversion('80', T0)),
-      priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: T0,
+      instrumentEconomics: INSTRUMENT_ECONOMICS, executionPolicy: EXECUTION_POLICY, nowMs: T0,
     }, coordinator);
     if (openResult.outcome !== 'FILLED') throw new Error('fixture');
     const positionAfterOpen = await prisma.paperPosition.findUnique({ where: { accountId_pair: { accountId, pair: PAIR } } });
@@ -645,7 +673,7 @@ describe('P14-E live-DB — CLOSE safety', () => {
     const closeQuote = buildQuote(PAIR, '110', '112', T0 + MINUTE + 500);
     const closeInputs = {
       evidence: trust(closeQuote, buildDepth(closeQuote, '1000000', '1000000'), buildConversion('80', T0 + MINUTE + 500)),
-      priceIncrement: PRICE_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: T0 + MINUTE + 500,
+       executionPolicy: EXECUTION_POLICY, nowMs: T0 + MINUTE + 500,
     };
     const firstClose = await session.executeClose(closeAuthority, closeInputs);
     expect(firstClose.outcome).toBe('CLOSED');
@@ -671,6 +699,36 @@ describe('P14-E live-DB — CLOSE safety', () => {
     expect(await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } })).toEqual(beforeRetry.position);
     expect(firstClose.outcome === 'CLOSED' ? accountFinal?.cumulativeRealizedPnlInr.toFixed() : null).toBe(firstClose.outcome === 'CLOSED' ? firstClose.realizedPnlInr : null);
   }, 30_000);
+});
+
+describe('F14-03 immutable snapshot persistence', () => {
+  it('reuses identical snapshots and rejects same-ID/different-content without repair', async () => {
+    if (skip()) return;
+    const policy = buildExecutionPolicySnapshot({ ...EXECUTION_POLICY.content, fillSelectionPolicy: 'F14_03_CONFLICT_TEST' });
+    const economics = buildInstrumentEconomicsSnapshot({
+      ...INSTRUMENT_ECONOMICS,
+      instrumentSpecSnapshotId: 'f14-03-conflict-spec',
+    });
+
+    await prisma.$transaction(async (tx) => {
+      await persistImmutableExecutionPolicySnapshot(tx, policy);
+      await persistImmutableExecutionPolicySnapshot(tx, policy);
+      await persistImmutableInstrumentEconomicsSnapshot(tx, economics);
+      await persistImmutableInstrumentEconomicsSnapshot(tx, economics);
+    });
+    expect(await prisma.paperExecutionPolicySnapshot.count({ where: { executionPolicySnapshotId: policy.executionPolicySnapshotId } })).toBe(1);
+    expect(await prisma.paperInstrumentEconomicsSnapshot.count({ where: { instrumentEconomicsSnapshotId: economics.instrumentEconomicsSnapshotId } })).toBe(1);
+
+    await prisma.paperExecutionPolicySnapshot.update({ where: { executionPolicySnapshotId: policy.executionPolicySnapshotId }, data: { takerFeeRate: '0.123' } });
+    await expect(prisma.$transaction((tx) => persistImmutableExecutionPolicySnapshot(tx, policy)))
+      .rejects.toMatchObject({ code: 'POLICY_SNAPSHOT_CONTENT_MISMATCH' });
+    expect((await prisma.paperExecutionPolicySnapshot.findUniqueOrThrow({ where: { executionPolicySnapshotId: policy.executionPolicySnapshotId } })).takerFeeRate.toFixed()).toBe('0.123');
+
+    await prisma.paperInstrumentEconomicsSnapshot.update({ where: { instrumentEconomicsSnapshotId: economics.instrumentEconomicsSnapshotId }, data: { contractMultiplier: '0.123' } });
+    await expect(prisma.$transaction((tx) => persistImmutableInstrumentEconomicsSnapshot(tx, economics)))
+      .rejects.toMatchObject({ code: 'INSTRUMENT_ECONOMICS_SNAPSHOT_CONTENT_MISMATCH' });
+    expect((await prisma.paperInstrumentEconomicsSnapshot.findUniqueOrThrow({ where: { instrumentEconomicsSnapshotId: economics.instrumentEconomicsSnapshotId } })).contractMultiplier.toFixed()).toBe('0.123');
+  });
 });
 
 describe('P14-E correction proofs — evidence freshness and approved economics', () => {
@@ -703,7 +761,7 @@ describe('P14-E correction proofs — evidence freshness and approved economics'
     };
     const run = (conversion: TrustedPaperConversionEvidence, localFreshnessMs = 60_000) => session.executeOpen(authority, {
       evidence: trust(quote, buildDepth(quote, '1000000', '1000000'), conversion, localFreshnessMs),
-      priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs,
+      instrumentEconomics: INSTRUMENT_ECONOMICS, executionPolicy: EXECUTION_POLICY, nowMs,
     }, coordinator);
 
     await expect(run(buildConversion('80', nowMs - 60_001))).resolves.toMatchObject({ outcome: 'EVIDENCE_INVALID', reason: 'CONVERSION_STALE_AT_USE', fundingDisclosure: PAPER_FUNDING_CAPABILITY });
@@ -734,7 +792,7 @@ describe('P14-E correction proofs — evidence freshness and approved economics'
     expect(trusted.state).toBe('AVAILABLE');
     if (trusted.state !== 'AVAILABLE') return;
     const freshWithOldProviderTime = await session.executeOpen(authority, {
-      evidence: trusted.evidence, priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT,
+      evidence: trusted.evidence, instrumentEconomics: INSTRUMENT_ECONOMICS,
       executionPolicy: EXECUTION_POLICY, nowMs,
     }, coordinator);
     expect(freshWithOldProviderTime.outcome).toBe('FILLED');
@@ -763,7 +821,7 @@ describe('P14-E correction proofs — evidence freshness and approved economics'
     const quote = buildQuote(PAIR, '100', '101', T0);
     const result = await session.executeOpen(authority, {
       evidence: trust(quote, buildDepth(quote, '1000000', '1000000'), buildConversion('80', T0)),
-      priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: T0,
+      instrumentEconomics: INSTRUMENT_ECONOMICS, executionPolicy: EXECUTION_POLICY, nowMs: T0,
     }, coordinator);
     expect(result).toMatchObject({ outcome: 'APPROVED_RISK_EXCEEDED', reason: 'EXECUTION_EXCEEDS_APPROVED_NOTIONAL', fundingDisclosure: PAPER_FUNDING_CAPABILITY });
     expect(await prisma.paperExecutionIntent.count({ where: { accountId } })).toBe(0);
@@ -794,7 +852,7 @@ describe('P14-E correction proofs — evidence freshness and approved economics'
     if (authority === null) throw new Error('fixture');
     const result = await session.executeOpen(authority, {
       evidence: { __trustedPaperExecutionEvidence: undefined } as never,
-      priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: T0,
+      instrumentEconomics: INSTRUMENT_ECONOMICS, executionPolicy: EXECUTION_POLICY, nowMs: T0,
     }, coordinator);
     expect(result).toMatchObject({ outcome: 'EVIDENCE_INVALID', reason: 'UNTRUSTED_EXECUTION_EVIDENCE', fundingDisclosure: PAPER_FUNDING_CAPABILITY });
     expect(await prisma.paperFill.count({ where: { accountId } })).toBe(0);
@@ -853,7 +911,7 @@ describe('P14-E correction proofs — terminal conflict rollback and ambiguous O
     const quote = buildQuote(PAIR, '99', '99.5', T0);
     await expect(session.executeOpen(authority, {
       evidence: trust(quote, buildDepth(quote, '1000000', '1000000'), buildConversion('80', T0)),
-      priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: T0,
+      instrumentEconomics: INSTRUMENT_ECONOMICS, executionPolicy: EXECUTION_POLICY, nowMs: T0,
     }, coordinator)).rejects.toMatchObject({ code: 'P2002' });
     expect(await prisma.paperExecutionIntent.count({ where: { accountId } })).toBe(1);
     expect(await prisma.paperOrder.count({ where: { accountId } })).toBe(0);
@@ -927,7 +985,7 @@ describe('P14-E correction proofs — terminal conflict rollback and ambiguous O
     const quote = buildQuote(PAIR, '99', '99.5', T0);
     const result = await session.executeOpen(authority, {
       evidence: trust(quote, buildDepth(quote, '1000000', '1000000'), buildConversion('80', T0)),
-      priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: T0,
+      instrumentEconomics: INSTRUMENT_ECONOMICS, executionPolicy: EXECUTION_POLICY, nowMs: T0,
     }, coordinator);
     expect(result.outcome).toBe('SOURCE_DECISION_ALREADY_EXECUTED');
     expect(terminalReads).toBeGreaterThanOrEqual(2);
@@ -972,7 +1030,7 @@ describe('P14-E correction proofs — terminal conflict rollback and ambiguous O
     const quote = buildQuote(PAIR, '99', '99.5', T0);
     const inputs = {
       evidence: trust(quote, buildDepth(quote, '1000000', '1000000'), buildConversion('80', T0)),
-      priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: T0,
+      instrumentEconomics: INSTRUMENT_ECONOMICS, executionPolicy: EXECUTION_POLICY, nowMs: T0,
     };
     await expect(session.executeOpen(authority, inputs, coordinator)).rejects.toMatchObject({ code: 'ADMISSION_OUTCOME_AMBIGUOUS' });
     expect(releaseSpy).toHaveBeenCalledWith(accountId, admitted.admission.admissionId);
@@ -1030,7 +1088,7 @@ describe('P14-E correction proof — exact integrated accounting matrix', () => 
         : buildQuote(PAIR, '100.5', '101', T0);
       const openResult = await session.executeOpen(openAuthority, {
         evidence: trust(openQuote, buildDepth(openQuote, '1000000', '1000000'), buildConversion('80', T0)),
-        priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: T0,
+        instrumentEconomics: INSTRUMENT_ECONOMICS, executionPolicy: EXECUTION_POLICY, nowMs: T0,
       }, coordinator);
       expect(openResult.outcome).toBe('FILLED');
       if (openResult.outcome !== 'FILLED') continue;
@@ -1054,7 +1112,7 @@ describe('P14-E correction proof — exact integrated accounting matrix', () => 
       const closeQuote = buildQuote(PAIR, testCase.closeBid, testCase.closeAsk, closeNow);
       const closeResult = await session.executeClose(closeAuthority, {
         evidence: trust(closeQuote, buildDepth(closeQuote, '1000000', '1000000'), buildConversion('80', closeNow)),
-        priceIncrement: PRICE_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: closeNow,
+         executionPolicy: EXECUTION_POLICY, nowMs: closeNow,
       });
       expect(closeResult.outcome).toBe('CLOSED');
       if (closeResult.outcome !== 'CLOSED') continue;
@@ -1102,7 +1160,7 @@ describe('P14-E correction proof — late CLOSE rollback', () => {
     const openQuote = buildQuote(PAIR, '99', '99.5', T0);
     const openResult = await session.executeOpen(openAuthority, {
       evidence: trust(openQuote, buildDepth(openQuote, '1000000', '1000000'), buildConversion('80', T0)),
-      priceIncrement: PRICE_INCREMENT, quantityIncrement: QUANTITY_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: T0,
+      instrumentEconomics: INSTRUMENT_ECONOMICS, executionPolicy: EXECUTION_POLICY, nowMs: T0,
     }, coordinator);
     if (openResult.outcome !== 'FILLED') throw new Error('fixture');
     const slot = await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } });
@@ -1125,7 +1183,7 @@ describe('P14-E correction proof — late CLOSE rollback', () => {
     const closeQuote = buildQuote(PAIR, '110', '110.5', closeNow);
     await expect(session.executeClose(closeAuthority, {
       evidence: trust(closeQuote, buildDepth(closeQuote, '1000000', '1000000'), buildConversion('80', closeNow)),
-      priceIncrement: PRICE_INCREMENT, executionPolicy: EXECUTION_POLICY, nowMs: closeNow,
+       executionPolicy: EXECUTION_POLICY, nowMs: closeNow,
     })).rejects.toThrow(/INJECTED_LATE_CLOSE_LEDGER_FAILURE/);
     expect(session.state).toBe('READY');
     expect(await prisma.paperFill.count({ where: { accountId, action: 'CLOSE' } })).toBe(0);

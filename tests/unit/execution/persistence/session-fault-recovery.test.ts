@@ -1,5 +1,5 @@
 ﻿import { Prisma, type PrismaClient } from '@prisma/client';
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { RiskAdmissionCoordinator } from '../../../../src/dispatch/admission';
 import type { AdmissionRequest } from '../../../../src/dispatch';
 import * as persistenceBarrel from '../../../../src/execution/persistence';
@@ -12,6 +12,8 @@ import { CoinDcxPaperEvidence, type PaperEvidenceInstrument } from '../../../../
 import { FakeCoinDcxSocketFactory } from '../../../../src/integration/coindcx/websocket/socket-adapter';
 import { PaperAccountProductionComposer, type ProductionOpenParams } from '../../../../src/integration/coindcx/paper-production-runtime';
 import { buildExecutionPolicySnapshot, EXECUTION_POLICY_VERSION, type ExecutionPolicySnapshot } from '../../../../src/execution';
+import { CoinDcxTransport } from '../../../../src/integration/coindcx/transport';
+import { wire as instrumentWire } from '../../coindcx/audit-a2-helpers';
 import { buildContext, evaluateDecision, genuineResearchApproval, makeKernel, policyFor, productionRiskRequest } from '../../dispatch/helpers';
 
 // P14-D-BLK-01/MAJ-01 correction tests (Antigravity targeted-verify findings).
@@ -209,12 +211,19 @@ async function f1407OpenParams(accountId: string, pair: string, evaluationTimeMs
   const kernel = makeKernel(pair);
   const decision = evaluateDecision(kernel, evaluationTimeMs);
   return {
-    kernel, decision, instrumentSpecSnapshotId: F14_07_INSTRUMENT_SPEC_SNAPSHOT_ID, planResult, policy: policyFor(pair),
+    kernel, decision, planResult, policy: policyFor(pair),
     // [F14-01] account/exposure evidence is no longer caller-supplied at all.
     riskRequest: productionRiskRequest(kernel, decision, accountId),
-    executionPolicy: F14_07_EXECUTION_POLICY, priceIncrement: '1', quantityIncrement: '1',
+    executionPolicy: F14_07_EXECUTION_POLICY,
   };
 }
+
+beforeAll(() => {
+  vi.spyOn(CoinDcxTransport.prototype, 'executeRead').mockResolvedValue({
+    status: 200, headers: {}, durationMs: 0,
+    data: { instrument: instrumentWire('BTC', { unit_contract_value: '0.001', price_increment: '1', quantity_increment: '1' }) },
+  } as never);
+});
 
 describe('F14-07 correction â€” production composer never returns a cached READY facade over a FAULTED session', () => {
   it('a genuine ambiguous OPEN admission failure faults the session; the next composer.start() discards the stale facade, recovers through the kernel, and returns a fresh, usable READY facade with no duplicate economics', async () => {

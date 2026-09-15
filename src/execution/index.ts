@@ -13,9 +13,14 @@ export {
   type PaperCalc, type PaperDecimalInput,
 } from './decimal';
 export {
-  buildExecutionPolicySnapshot, EXECUTION_POLICY_VERSION,
+  buildExecutionPolicySnapshot, normalizeExecutionPolicySnapshotContent, validateExecutionPolicySnapshot, EXECUTION_POLICY_VERSION,
   type ExecutionPolicySnapshot, type ExecutionPolicySnapshotContent, type MarketEvidenceEligibilityPolicy,
 } from './policy';
+export {
+  buildInstrumentEconomicsSnapshot, normalizeInstrumentEconomicsSnapshotContent, validateInstrumentEconomicsSnapshot,
+  INSTRUMENT_ECONOMICS_IDENTITY_POLICY_ID,
+  type InstrumentEconomicsSnapshot, type InstrumentEconomicsSnapshotContent,
+} from './instrument-economics';
 export {
   computeCloseExecutionIntentId, computeOpenExecutionIntentId, computePositionInstanceId, computeSourceExecutionKey,
   CLOSE_EXECUTION_INTENT_IDENTITY_POLICY_ID, OPEN_EXECUTION_INTENT_IDENTITY_POLICY_ID,

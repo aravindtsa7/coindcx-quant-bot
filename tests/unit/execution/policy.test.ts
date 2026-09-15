@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildExecutionPolicySnapshot, EXECUTION_POLICY_VERSION, type ExecutionPolicySnapshotContent } from '../../../src/execution/policy';
+import { buildExecutionPolicySnapshot, validateExecutionPolicySnapshot, EXECUTION_POLICY_VERSION, type ExecutionPolicySnapshotContent } from '../../../src/execution/policy';
 import { PaperEngineError } from '../../../src/execution/errors';
 
 function baseContent(overrides: Partial<ExecutionPolicySnapshotContent> = {}): ExecutionPolicySnapshotContent {
@@ -49,5 +49,42 @@ describe('P14-A ExecutionPolicySnapshot identity', () => {
     expect(() => buildExecutionPolicySnapshot(baseContent({ fillSelectionPolicy: '' }))).toThrow(PaperEngineError);
     expect(() => buildExecutionPolicySnapshot(baseContent({ takerFeeRate: 'not-a-decimal' }))).toThrow(PaperEngineError);
     expect(() => buildExecutionPolicySnapshot(baseContent({ marketEvidenceEligibilityPolicy: { maxEvidenceAgeMs: -1, requiredHealthState: 'HEALTHY' } }))).toThrow(PaperEngineError);
+  });
+
+  it('recomputes and accepts the canonical ID/content pair', () => {
+    const snapshot = buildExecutionPolicySnapshot(baseContent());
+    expect(validateExecutionPolicySnapshot(snapshot)).toEqual(snapshot);
+  });
+
+  it('rejects an ID(A) + content(B) spoof', () => {
+    const a = buildExecutionPolicySnapshot(baseContent());
+    const b = buildExecutionPolicySnapshot(baseContent({ takerFeeRate: '0.002' }));
+    expect(() => validateExecutionPolicySnapshot({ executionPolicySnapshotId: a.executionPolicySnapshotId, content: b.content }))
+      .toThrow(/POLICY_IDENTITY_MISMATCH/);
+  });
+
+  it.each([
+    ['negative fee', { takerFeeRate: '-0.001' }],
+    ['negative slippage', { slippageBps: '-0.001' }],
+    ['10000 bps slippage', { slippageBps: '10000' }],
+    ['over-10000 bps slippage', { slippageBps: '10000.0001' }],
+    ['zero multiplier', { contractMultiplier: '0' }],
+    ['negative multiplier', { contractMultiplier: '-0.001' }],
+    ['excess scale fee', { takerFeeRate: '0.0000000000000000001' }],
+    ['overflow multiplier', { contractMultiplier: '1000000000000000000' }],
+  ] satisfies readonly [string, Partial<ExecutionPolicySnapshotContent>][])('rejects %s before use', (_label, overrides) => {
+    expect(() => buildExecutionPolicySnapshot(baseContent(overrides))).toThrow(PaperEngineError);
+  });
+
+  it('allows exact zero fee and zero slippage', () => {
+    const snapshot = buildExecutionPolicySnapshot(baseContent({ takerFeeRate: '0', slippageBps: '0' }));
+    expect(snapshot.content.takerFeeRate).toBe('0');
+    expect(snapshot.content.slippageBps).toBe('0');
+  });
+
+  it('rejects maxEvidenceAgeMs outside the persisted 32-bit integer domain', () => {
+    expect(() => buildExecutionPolicySnapshot(baseContent({
+      marketEvidenceEligibilityPolicy: { maxEvidenceAgeMs: 2_147_483_648, requiredHealthState: 'HEALTHY' },
+    }))).toThrow(PaperEngineError);
   });
 });

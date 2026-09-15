@@ -196,6 +196,29 @@ model PaperExecutionPolicySnapshot {
   @@map("paper_execution_policy_snapshot")
 }
 
+/// Immutable, content-addressed authoritative instrument economics acquired
+/// through the CoinDCX INR-futures production authority. Execution intents
+/// bind this historical fact; current exchange metadata never reinterprets an
+/// existing paper lifecycle.
+model PaperInstrumentEconomicsSnapshot {
+  instrumentEconomicsSnapshotId  String   @id @map("instrument_economics_snapshot_id") @db.VarChar(64)
+  identityPolicyId                String   @map("identity_policy_id") @db.VarChar(64)
+  sourceId                        String   @map("source_id") @db.VarChar(64)
+  instrumentSpecIdentityPolicyId  String   @map("instrument_spec_identity_policy_id") @db.VarChar(64)
+  instrumentSpecSnapshotId        String   @map("instrument_spec_snapshot_id") @db.VarChar(64)
+  pair                            String   @map("pair") @db.VarChar(64)
+  contractMultiplier              Decimal  @map("contract_multiplier") @db.Decimal(36, 18)
+  priceIncrement                  Decimal  @map("price_increment") @db.Decimal(36, 18)
+  quantityIncrement               Decimal  @map("quantity_increment") @db.Decimal(36, 18)
+  createdAt                       DateTime @default(now()) @map("created_at")
+
+  executionIntents PaperExecutionIntent[]
+
+  @@unique([instrumentEconomicsSnapshotId, pair], map: "paper_instrument_economics_snapshot_id_pair_unique")
+  @@index([pair, instrumentSpecIdentityPolicyId, instrumentSpecSnapshotId], map: "paper_instrument_economics_pair_spec_idx")
+  @@map("paper_instrument_economics_snapshot")
+}
+
 /// Order-side, distinct from `PaperPositionSide` (position direction). V2 §7 fill model: BUY ceils to tick, SELL floors to tick.
 enum PaperOrderSide {
   BUY
@@ -260,6 +283,10 @@ model PaperExecutionIntent {
   riskDecisionId            String               @map("risk_decision_id") @db.VarChar(64)
   evaluationTimeMs          BigInt               @map("evaluation_time_ms")
   executionPolicySnapshotId String               @map("execution_policy_snapshot_id") @db.VarChar(64)
+  /// Nullable only for migration compatibility. Every newly-created economic
+  /// intent must bind authoritative lifecycle economics; NULL is legacy and
+  /// unverifiable, never a default or backfill candidate.
+  instrumentEconomicsSnapshotId String?          @map("instrument_economics_snapshot_id") @db.VarChar(64)
 
   /// OPEN-only (NULL for CLOSE — CLOSE is never capacity-tracked).
   admissionId         String?  @map("admission_id") @db.VarChar(64)
@@ -284,6 +311,7 @@ model PaperExecutionIntent {
 
   account         PaperAccount                 @relation(fields: [accountId], references: [accountId], onDelete: Restrict, onUpdate: Restrict)
   executionPolicy PaperExecutionPolicySnapshot @relation(fields: [executionPolicySnapshotId], references: [executionPolicySnapshotId], onDelete: Restrict, onUpdate: Restrict)
+  instrumentEconomics PaperInstrumentEconomicsSnapshot? @relation(fields: [instrumentEconomicsSnapshotId, pair], references: [instrumentEconomicsSnapshotId, pair], onDelete: Restrict, onUpdate: Restrict)
   reservation     PaperReservation?            @relation(fields: [admissionId], references: [admissionId], onDelete: Restrict, onUpdate: Restrict)
   order           PaperOrder?
 
@@ -291,6 +319,7 @@ model PaperExecutionIntent {
   @@unique([admissionId], map: "paper_execution_intent_admission_unique")
   @@index([accountId, pair], map: "paper_execution_intent_account_pair_idx")
   @@index([positionInstanceId], map: "paper_execution_intent_position_instance_idx")
+  @@index([instrumentEconomicsSnapshotId, pair], map: "paper_execution_intent_economics_pair_idx")
   @@map("paper_execution_intent")
 }
 
