@@ -20,10 +20,13 @@ export type TrustedExecutionEvidenceReadResult =
  * trusted bundle. It now delegates the read to
  * `readProductionAcquiredPaperExecutionEvidence`, which releases data only
  * when the provider is a genuine, non-subclassed instance registered by the
- * real constructor AND every constituent datum was acquired through the
- * approved CoinDCX acquisition path (module-private capability in
- * `./acquisition-capability`). A manual/test/caller-fed provider yields
- * `EVIDENCE_NOT_PRODUCTION_ACQUIRED` and no branded bundle is ever minted.
+ * real constructor, AND that provider was built by the approved production
+ * factory (`createProductionPaperEvidenceProvider` — object identity in a
+ * module-private registry, not a token any caller could obtain), AND every
+ * constituent datum was acquired through the provider's own internal CoinDCX
+ * acquisition path. A caller-constructed provider yields
+ * `PROVIDER_NOT_PRODUCTION_ACQUIRED`; a production provider fed by hand yields
+ * `EVIDENCE_NOT_PRODUCTION_ACQUIRED`. No branded bundle is ever minted.
  *
  * Every pre-existing P14-B gate is preserved unchanged and still evaluated
  * FIRST (current-generation WS-actionable orderbook, orderbook/conversion

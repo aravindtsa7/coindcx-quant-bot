@@ -3,6 +3,8 @@ import { randomBytes } from 'node:crypto';
 import { URL } from 'node:url';
 import { PrismaClient } from '@prisma/client';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+
+vi.mock('socket.io-client', async () => (await import('../../helpers/fake-socket-io')).socketIoClientMock());
 import { RiskAdmissionCoordinator } from '../../../src/dispatch/admission';
 import type { AdmissionRequest } from '../../../src/dispatch';
 import {
@@ -19,11 +21,11 @@ import {
   type TrustedPaperConversionEvidence,
   type TrustedPaperOrderbookDepth,
 } from '../../../src/execution/trusted-evidence';
-import { PRODUCTION_ACQUISITION_CAPABILITY } from '../../../src/integration/coindcx/acquisition-capability';
-import { FakeClock } from '../../../src/integration/coindcx/clock';
 import { getTrustedPaperExecutionEvidence } from '../../../src/integration/coindcx/execution-evidence-adapter';
-import { CoinDcxPaperEvidence } from '../../../src/integration/coindcx/paper-evidence';
-import { FakeCoinDcxSocketFactory } from '../../../src/integration/coindcx/websocket/socket-adapter';
+import { createProductionPaperEvidenceProvider } from '../../../src/integration/coindcx/paper-evidence';
+import {
+  acquireConversionOverRest, acquireOrderbookOverWebSocket, interceptProductionAcquisition,
+} from '../../helpers/production-acquisition-harness';
 import { sha256CanonicalJson } from '../../../src/risk';
 import type { CanonicalPositionValuation, PairRiskSnapshot, RiskEvaluationContext } from '../../../src/risk';
 import type { StrategyKernel } from '../../../src/strategies';
@@ -771,24 +773,27 @@ describe('P14-E correction proofs — evidence freshness and approved economics'
     expect(await prisma.paperFill.count({ where: { accountId } })).toBe(baseCounts.fills);
     expect(await prisma.paperLedgerEntry.count({ where: { accountId } })).toBe(baseCounts.ledger);
 
-    // [F14-02] Production-usable trusted evidence now additionally requires
-    // approved CoinDCX acquisition provenance, so this zero-network fixture
-    // reaches the genuine acquisition path through the module-private,
-    // non-barrel capability (the sanctioned internal test harness route).
-    const provider = new CoinDcxPaperEvidence({
+    // [F14-02] Production-usable trusted evidence additionally requires approved
+    // CoinDCX acquisition provenance, and the production factory now exposes NO
+    // injectable clock/socket/transport. This zero-network fixture therefore
+    // drives the GENUINE acquisition path and intercepts the real primitives
+    // (socket factory, REST transport, system clock) from the test runner —
+    // the same seam Wave3-A's instrument-authority tests use.
+    const interception = interceptProductionAcquisition();
+    vi.spyOn(Date, 'now').mockReturnValue(nowMs);
+    const provider = createProductionPaperEvidenceProvider({
       instruments: [{ pair: PAIR, underlying: 'BTC', quoteCurrency: 'USDT', instrumentSpecSnapshotId: INSTRUMENT_SPEC_SNAPSHOT_ID }],
-      clock: new FakeClock(nowMs), socketFactory: new FakeCoinDcxSocketFactory(),
       policy: { orderbookFreshnessMs: 5_000, markFreshnessMs: 5_000, conversionLocalPollFreshnessMs: 60_000, allowedProviderFutureSkewMs: 1_000 },
-      acquisitionCapability: PRODUCTION_ACQUISITION_CAPABILITY,
     });
-    const generation = provider.startOrderbookWebSocket();
-    expect(provider.ingestOrderbookWebSocket({
+    acquireOrderbookOverWebSocket(provider, interception, {
       data: JSON.stringify({ type: 'depth-snapshot', pr: 'futures', s: 'BTCUSDT', ts: String(nowMs), vs: '1', bids: [['99', '1000000']], asks: [['99.5', '1000000']] }),
-    }, generation, undefined, PRODUCTION_ACQUISITION_CAPABILITY)).toMatchObject({ accepted: true });
-    expect(provider.ingestConversionRest([{
+    });
+    await acquireConversionOverRest(provider, interception, [{
       symbol: 'USDTINR', margin_currency_short_name: 'INR', target_currency_short_name: 'USDT', conversion_price: '80', last_updated_at: '1',
-    }], PRODUCTION_ACQUISITION_CAPABILITY)).toMatchObject({ accepted: true });
+    }]);
     const trusted = getTrustedPaperExecutionEvidence(provider, PAIR);
+    // Restore the real clock/transport/socket before any further DB work.
+    vi.restoreAllMocks();
     expect(trusted.state).toBe('AVAILABLE');
     if (trusted.state !== 'AVAILABLE') return;
     const freshWithOldProviderTime = await session.executeOpen(authority, {

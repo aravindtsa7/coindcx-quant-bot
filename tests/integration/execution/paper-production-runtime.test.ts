@@ -2,7 +2,11 @@
 import { randomBytes } from 'node:crypto';
 import { URL } from 'node:url';
 import { PrismaClient } from '@prisma/client';
+import https from 'node:https';
+import { EventEmitter } from 'node:events';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+
+vi.mock('socket.io-client', async () => (await import('../../helpers/fake-socket-io')).socketIoClientMock());
 import { RiskAdmissionCoordinator } from '../../../src/dispatch/admission';
 import { buildExecutionPolicySnapshot, EXECUTION_POLICY_VERSION, paperDecimal, type ExecutionPolicySnapshot } from '../../../src/execution';
 import { PaperAccountReconciler } from '../../../src/execution/persistence/paper-account-reconciler';
@@ -11,15 +15,17 @@ import {
   deriveMarkToMarketRiskInput, loadAuthoritativePaperRiskBase,
   type AuthoritativePaperRiskBase, type AuthoritativePaperRiskInput,
 } from '../../../src/execution/persistence/authoritative-risk-input';
-import { CoinDcxPaperEvidence, type PaperEvidenceInstrument } from '../../../src/integration/coindcx/paper-evidence';
-import { FakeCoinDcxSocketFactory } from '../../../src/integration/coindcx/websocket/socket-adapter';
+import {
+  CoinDcxPaperEvidence, createProductionPaperEvidenceProvider, type PaperEvidenceInstrument,
+} from '../../../src/integration/coindcx/paper-evidence';
+import { FakeCoinDcxSocketFactory, ProductionCoinDcxSocketFactory } from '../../../src/integration/coindcx/websocket/socket-adapter';
+import { createdFakeSockets, type FakeIoSocket } from '../../helpers/fake-socket-io';
 import {
   PaperAccountProductionComposer, PaperProductionRuntimeError, type ProductionCloseParams, type ProductionOpenParams,
 } from '../../../src/integration/coindcx/paper-production-runtime';
 import { assertProductionLifecycleTransitionAuthorized } from '../../../src/coin-runtime/lifecycle';
 import { CoinLifecycleError } from '../../../src/core/errors/app-error';
 import { evaluateDecision, genuineResearchApproval, makeKernel, PAIR, policyFor, productionRiskRequest } from '../../unit/dispatch/helpers';
-import { PRODUCTION_ACQUISITION_CAPABILITY } from '../../../src/integration/coindcx/acquisition-capability';
 import { TrustedProductionInstrumentBinding } from '../../../src/integration/coindcx/instrument-authority';
 import { CoinDcxTransport } from '../../../src/integration/coindcx/transport';
 import { makeAccount, makePair, seal } from '../../unit/risk/helpers';
@@ -49,7 +55,44 @@ function shadowDatabaseUrl(): string {
 let dbAvailable = false;
 let prisma: PrismaClient;
 
-beforeAll(async () => {
+/**
+ * [F14-02 4A.1 §9] The production provider's acquisition implementation is
+ * module-private: it never touches `CoinDcxTransport.prototype.executeRead` or
+ * `ProductionCoinDcxSocketFactory.prototype.createSocket`, so patching those
+ * (the previous technique — and the exploit) proves nothing and achieves
+ * nothing. Zero-network fixtures intercept strictly BELOW the production
+ * authority instead: `https.request` for the privileged GET and the
+ * `socket.io-client` package for the privileged socket.
+ *
+ * The `executeRead` mock that remains below is unrelated: it serves Wave3-A's
+ * `acquireProductionInstrumentBinding`, which is a different capability and
+ * legitimately uses the exported transport.
+ */
+let conversionResponse: unknown = null;
+
+function latestProductionSocket(): FakeIoSocket {
+  const socket = createdFakeSockets[createdFakeSockets.length - 1];
+  if (socket === undefined) throw new Error('test setup: no production socket has been created');
+  return socket;
+}
+
+function installSuiteMocks(): void {
+  vi.spyOn(https, 'request').mockImplementation(((url: string | URL, _options: unknown, callback?: (response: unknown) => void): unknown => {
+    const request = new EventEmitter() as EventEmitter & { end(): void; destroy(): void };
+    const isConversion = new URL(String(url)).pathname.includes('/conversions');
+    request.end = (): void => {
+      setImmediate(() => {
+        const response = new EventEmitter() as EventEmitter & { statusCode: number; destroy(): void };
+        response.statusCode = isConversion && conversionResponse !== null ? 200 : 502;
+        response.destroy = (): void => { /* no underlying socket */ };
+        callback?.(response);
+        if (response.statusCode === 200) response.emit('data', Buffer.from(JSON.stringify(conversionResponse), 'utf8'));
+        response.emit('end');
+      });
+    };
+    request.destroy = (): void => { /* no underlying socket */ };
+    return request;
+  }) as unknown as typeof https.request);
   vi.spyOn(CoinDcxTransport.prototype, 'executeRead').mockImplementation(async (options) => {
     const pair = String(options.queryParams?.['pair'] ?? PAIR);
     const underlying = pair === PAIR_B ? 'ETH' : 'BTC';
@@ -58,6 +101,10 @@ beforeAll(async () => {
       data: { instrument: instrumentWire(underlying, { unit_contract_value: '0.001', price_increment: '1', quantity_increment: '1' }) },
     } as never;
   });
+}
+
+beforeAll(async () => {
+  installSuiteMocks();
   if (!BASE_DATABASE_URL) { dbAvailable = false; return; }
   try {
     execFileSync('mysql', mysqlArgs(['-e', `CREATE DATABASE \`${SHADOW_DB_NAME}\`;`]), { stdio: 'pipe', timeout: 15_000 });
@@ -121,18 +168,16 @@ const PROVIDER_INSTRUMENTS: readonly PaperEvidenceInstrument[] = Object.freeze([
 ]);
 
 /**
- * [F14-02] A provider whose injected clock/socket seams are re-blessed as an
- * approved acquisition path by the module-private, non-barrel
- * `PRODUCTION_ACQUISITION_CAPABILITY` â€” the sanctioned zero-network
- * "internal acquisition harness" route (Â§15/Â§20). A production caller going
- * through the public barrel cannot obtain this capability, so it cannot
- * reproduce this provider.
+ * [F14-02] A provider built by the ONE approved production path. It takes no
+ * clock, socket factory or transport — the factory has no parameter for them —
+ * and its acquisition provenance comes from that construction path alone, which
+ * is why no caller can reproduce it. Its `SystemClock` is the real wall clock,
+ * matching the wall-clock timestamps every fixture below already feeds.
  */
 function makeProvider(): CoinDcxPaperEvidence {
-  return new CoinDcxPaperEvidence({
-    instruments: PROVIDER_INSTRUMENTS, clock: WALL_CLOCK, socketFactory: new FakeCoinDcxSocketFactory(),
+  return createProductionPaperEvidenceProvider({
+    instruments: PROVIDER_INSTRUMENTS,
     policy: { orderbookFreshnessMs: 30_000, markFreshnessMs: 30_000, conversionLocalPollFreshnessMs: 60_000, allowedProviderFutureSkewMs: 5_000 },
-    acquisitionCapability: PRODUCTION_ACQUISITION_CAPABILITY,
   });
 }
 
@@ -154,27 +199,31 @@ function markPayload(nowMs: number, btcMark: string, ethMark = '50') {
   };
 }
 
-function feedFreshEvidenceForPair(
+/**
+ * [F14-02] Drives the provider's OWN internal CoinDCX acquisition path: frames
+ * are delivered through the real (intercepted) socket's `depth-snapshot` /
+ * `currentPrices@futures#update` callbacks, and conversion through the
+ * provider's own `readConversion()` REST read. Nothing here calls a public
+ * `ingest*` method — which is precisely why this yields production provenance
+ * and an identical public ingest does not.
+ */
+async function feedFreshEvidenceForPair(
   provider: CoinDcxPaperEvidence, pair: string, bid: string, ask: string,
   conversionRate = '80', nowMs = Date.now(), btcMark = bid, ethMark = bid,
-): void {
-  const generation = provider.startOrderbookWebSocket();
-  // [F14-02] Supplying the acquisition capability is what makes this stand in
-  // for the approved CoinDCX WS/conversion acquisition path; the identical
-  // calls WITHOUT it produce caller-supplied data that can never be minted.
+): Promise<void> {
   const symbol = pair === PAIR_B ? PROVIDER_SYMBOL_B : PROVIDER_SYMBOL;
-  const bookResult = provider.ingestOrderbookWebSocket(bookPayload(nowMs, bid, ask, '1', symbol), generation, pair, PRODUCTION_ACQUISITION_CAPABILITY);
-  if (!bookResult.accepted) throw new Error(`test setup: orderbook ingest rejected: ${bookResult.reason}`);
-  const conversionResult = provider.ingestConversionRest(conversionPayload(conversionRate, nowMs), PRODUCTION_ACQUISITION_CAPABILITY);
-  if (!conversionResult.accepted) throw new Error(`test setup: conversion ingest rejected: ${conversionResult.reason}`);
-  const markGeneration = provider.startMarkWebSocket();
-  const markResult = provider.ingestMarkWebSocket(markPayload(nowMs, btcMark, ethMark), markGeneration, PRODUCTION_ACQUISITION_CAPABILITY);
-  if (!markResult.accepted) throw new Error(`test setup: mark ingest rejected: ${markResult.reason}`);
+  provider.startOrderbookWebSocket();
+  latestProductionSocket().trigger('depth-snapshot', bookPayload(nowMs, bid, ask, '1', symbol));
+  conversionResponse = conversionPayload(conversionRate, nowMs);
+  const conversionResult = await provider.readConversion();
+  if (!conversionResult.accepted) throw new Error(`test setup: conversion acquisition rejected: ${conversionResult.reason}`);
+  provider.startMarkWebSocket();
+  latestProductionSocket().trigger('currentPrices@futures#update', markPayload(nowMs, btcMark, ethMark));
 }
 
 /** Feeds fresh production-provenance BTC execution evidence plus both configured marks and conversion. */
-function feedFreshEvidence(provider: CoinDcxPaperEvidence, bid = '99', ask = '99.5', conversionRate = '80', nowMs = Date.now()): void {
-  feedFreshEvidenceForPair(provider, PAIR, bid, ask, conversionRate, nowMs, bid, '50');
+async function feedFreshEvidence(provider: CoinDcxPaperEvidence, bid = '99', ask = '99.5', conversionRate = '80', nowMs = Date.now()): Promise<void> {
+  await feedFreshEvidenceForPair(provider, PAIR, bid, ask, conversionRate, nowMs, bid, '50');
 }
 
 function buildOpenParamsForPair(
@@ -313,7 +362,7 @@ describe('P14-I live-DB â€” OPEN end-to-end (Â§47/Â§52)', () => {
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider);
+    await feedFreshEvidence(provider);
 
     const composer = new PaperAccountProductionComposer({ prisma });
     const runtime = await composer.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
@@ -354,7 +403,7 @@ describe('P14-I live-DB â€” forged OPEN input (Â§48)', () => {
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider);
+    await feedFreshEvidence(provider);
 
     const composer = new PaperAccountProductionComposer({ prisma });
     const runtime = await composer.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
@@ -405,7 +454,7 @@ describe('P14-I live-DB â€” OPEN health failure / P14-I-A1 mandatory test A
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider);
+    await feedFreshEvidence(provider);
 
     const composer = new PaperAccountProductionComposer({ prisma });
     const runtime = await composer.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
@@ -429,7 +478,7 @@ describe('P14-I live-DB â€” OPEN stale health race (Â§51)', () => {
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider);
+    await feedFreshEvidence(provider);
 
     const composerA = new PaperAccountProductionComposer({ prisma });
     const runtimeA = await composerA.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
@@ -452,7 +501,7 @@ describe('P14-I live-DB â€” CLOSE end-to-end (Â§53)', () => {
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider, '99', '99.5');
+    await feedFreshEvidence(provider, '99', '99.5');
 
     const composer = new PaperAccountProductionComposer({ prisma });
     const runtime = await composer.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
@@ -462,7 +511,7 @@ describe('P14-I live-DB â€” CLOSE end-to-end (Â§53)', () => {
     expect(openResult.outcome).toBe('FILLED');
     if (openResult.outcome !== 'FILLED') return;
 
-    feedFreshEvidence(provider, '110', '112'); // fresh CLOSE-side evidence â€” never reused from OPEN
+    await feedFreshEvidence(provider, '110', '112'); // fresh CLOSE-side evidence â€” never reused from OPEN
     const closeResult = await runtime.executeClose(buildCloseParams(openParams.kernel, accountId, openResult.quantity));
     expect(closeResult.outcome).toBe('CLOSED');
     expect(closeResult).toMatchObject({ fundingDisclosure: { fundingCapability: 'FUNDING_UNSUPPORTED', economicCompleteness: 'FUNDING_EXCLUDED', paperEconomicStatus: 'PAPER_NOT_ECONOMICALLY_COMPLETE', pnlLabel: 'FUNDING_EXCLUDED_PNL' } });
@@ -492,18 +541,18 @@ describe('P14-I live-DB â€” CLOSE cannot be replayed after the position is 
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider, '99', '99.5');
+    await feedFreshEvidence(provider, '99', '99.5');
     const composer = new PaperAccountProductionComposer({ prisma });
     const runtime = await composer.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
 
     const openParams = await buildOpenParams(accountId);
     const openResult = await runtime.executeOpen(openParams);
     if (openResult.outcome !== 'FILLED') throw new Error('setup failed');
-    feedFreshEvidence(provider, '110', '112');
+    await feedFreshEvidence(provider, '110', '112');
     const closeResult = await runtime.executeClose(buildCloseParams(openParams.kernel, accountId, openResult.quantity));
     if (closeResult.outcome !== 'CLOSED') throw new Error('setup failed');
 
-    feedFreshEvidence(provider, '111', '113');
+    await feedFreshEvidence(provider, '111', '113');
     await expect(runtime.executeClose(buildCloseParams(openParams.kernel, accountId, openResult.quantity, {}, T0 + 2 * MINUTE))).rejects.toMatchObject({ code: 'POSITION_NOT_OPEN' });
     expect(await prisma.paperFill.count({ where: { accountId } })).toBe(2); // still exactly OPEN + one CLOSE
   }, 30_000);
@@ -516,7 +565,7 @@ describe('P14-I live-DB â€” CLOSE provider failure (Â§55)', () => {
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider, '99', '99.5');
+    await feedFreshEvidence(provider, '99', '99.5');
     const composer = new PaperAccountProductionComposer({ prisma });
     const runtime = await composer.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
 
@@ -548,7 +597,7 @@ describe('P14-I-A1 mandatory test B/C/D â€” UNHEALTHY blocks CLOSE, then re
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider, '99', '99.5');
+    await feedFreshEvidence(provider, '99', '99.5');
     const composer = new PaperAccountProductionComposer({ prisma });
     const runtime = await composer.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
 
@@ -560,7 +609,7 @@ describe('P14-I-A1 mandatory test B/C/D â€” UNHEALTHY blocks CLOSE, then re
     const beforeTamper = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
     await prisma.paperAccount.update({ where: { accountId }, data: { cumulativeFeesInr: beforeTamper.cumulativeFeesInr.plus('1') } });
 
-    feedFreshEvidence(provider, '110', '112');
+    await feedFreshEvidence(provider, '110', '112');
     await expect(runtime.executeClose(buildCloseParams(openParams.kernel, accountId, openResult.quantity))).rejects.toMatchObject({ code: 'RECONCILIATION_UNHEALTHY' });
 
     const positionStillOpen = await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } });
@@ -573,7 +622,7 @@ describe('P14-I-A1 mandatory test B/C/D â€” UNHEALTHY blocks CLOSE, then re
     const health = await new PaperAccountReconciler(prisma).reconcile(accountId);
     expect(health.status).toBe('HEALTHY');
 
-    feedFreshEvidence(provider, '111', '113');
+    await feedFreshEvidence(provider, '111', '113');
     const closeResult = await runtime.executeClose(buildCloseParams(openParams.kernel, accountId, openResult.quantity, {}, T0 + 2 * MINUTE));
     expect(closeResult.outcome).toBe('CLOSED');
     expect(await prisma.paperFill.count({ where: { accountId } })).toBe(2);
@@ -591,7 +640,7 @@ describe('P14-I-A1 mandatory test E â€” no reduce-only bypass', () => {
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider, '99', '99.5');
+    await feedFreshEvidence(provider, '99', '99.5');
     const composer = new PaperAccountProductionComposer({ prisma });
     const runtime = await composer.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
     const openParams = await buildOpenParams(accountId);
@@ -604,7 +653,7 @@ describe('P14-I-A1 mandatory test E â€” no reduce-only bypass', () => {
     // `ProductionCloseParams` has no reduce-only/force/bypass field at all â€” every own-enumerable key is a genuine trust-chain input.
     expect(Object.keys(closeParams).sort()).toEqual(['decision', 'executionPolicy', 'kernel', 'policy', 'riskRequest'].sort());
 
-    feedFreshEvidence(provider, '110', '112');
+    await feedFreshEvidence(provider, '110', '112');
     await expect(runtime.executeClose(closeParams)).rejects.toMatchObject({ code: 'RECONCILIATION_UNHEALTHY' });
     const position = await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } });
     expect(position.status).toBe('OPEN');
@@ -618,7 +667,7 @@ describe('P14-I live-DB â€” concurrency (Â§58/Â§59/Â§60)', () => {
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider);
+    await feedFreshEvidence(provider);
     const composer = new PaperAccountProductionComposer({ prisma });
     const coordinator = new RiskAdmissionCoordinator();
     const runtime = await composer.start({ accountId, coordinator, provider });
@@ -644,8 +693,8 @@ describe('P14-I live-DB â€” concurrency (Â§58/Â§59/Â§60)', () => {
     await provisionPairSlot(accountB, PAIR);
     const providerA = makeProvider();
     const providerB = makeProvider();
-    feedFreshEvidence(providerA);
-    feedFreshEvidence(providerB);
+    await feedFreshEvidence(providerA);
+    await feedFreshEvidence(providerB);
     const composer = new PaperAccountProductionComposer({ prisma });
 
     const [runtimeA, runtimeB] = await Promise.all([
@@ -668,12 +717,12 @@ describe('P14-I live-DB â€” cross-runtime stale owner (Â§61)', () => {
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const providerA = makeProvider();
-    feedFreshEvidence(providerA);
+    await feedFreshEvidence(providerA);
     const composerA = new PaperAccountProductionComposer({ prisma });
     const runtimeA = await composerA.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider: providerA });
 
     const providerB = makeProvider();
-    feedFreshEvidence(providerB);
+    await feedFreshEvidence(providerB);
     const composerB = new PaperAccountProductionComposer({ prisma });
     await composerB.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider: providerB });
 
@@ -689,7 +738,7 @@ describe('P14-I live-DB â€” reconciliation after mutation (Â§62)', () => 
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider, '99', '99.5');
+    await feedFreshEvidence(provider, '99', '99.5');
     const composer = new PaperAccountProductionComposer({ prisma });
     const runtime = await composer.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
 
@@ -699,7 +748,7 @@ describe('P14-I live-DB â€” reconciliation after mutation (Â§62)', () => 
     const healthAfterOpen = await new PaperAccountReconciler(prisma).reconcile(accountId);
     expect(healthAfterOpen.status).toBe('HEALTHY');
 
-    feedFreshEvidence(provider, '110', '112');
+    await feedFreshEvidence(provider, '110', '112');
     const closeResult = await runtime.executeClose(buildCloseParams(openParams.kernel, accountId, openResult.quantity));
     if (closeResult.outcome !== 'CLOSED') throw new Error('setup failed');
     const healthAfterClose = await new PaperAccountReconciler(prisma).reconcile(accountId);
@@ -714,7 +763,7 @@ describe('P14-I live-DB â€” promotion remains blocked (Â§57)', () => {
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider);
+    await feedFreshEvidence(provider);
     const composer = new PaperAccountProductionComposer({ prisma });
     const runtime = await composer.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
     const openResult = await runtime.executeOpen(await buildOpenParams(accountId));
@@ -737,7 +786,7 @@ describe('P14-I live-DB â€” restart composition (Â§77)', () => {
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider1 = makeProvider();
-    feedFreshEvidence(provider1, '99', '99.5');
+    await feedFreshEvidence(provider1, '99', '99.5');
     const composer1 = new PaperAccountProductionComposer({ prisma });
     const runtime1 = await composer1.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider: provider1 });
     const openParams = await buildOpenParams(accountId);
@@ -746,7 +795,7 @@ describe('P14-I live-DB â€” restart composition (Â§77)', () => {
 
     // Discard every process-local object and rebuild composition from scratch.
     const provider2 = makeProvider();
-    feedFreshEvidence(provider2, '110', '112');
+    await feedFreshEvidence(provider2, '110', '112');
     const composer2 = new PaperAccountProductionComposer({ prisma });
     const runtime2 = await composer2.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider: provider2 });
     expect(runtime2.state).toBe('READY');
@@ -767,7 +816,7 @@ describe('P14-I live-DB â€” funding disclosure regression (Â§56)', () => 
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider, '99', '99.5');
+    await feedFreshEvidence(provider, '99', '99.5');
     const composer = new PaperAccountProductionComposer({ prisma });
     const runtime = await composer.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
     const openResult = await runtime.executeOpen(await buildOpenParams(accountId));
@@ -878,7 +927,7 @@ describe('F14-01 live-DB — authoritative account/exposure derivation (§3)', (
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider);
+    await feedFreshEvidence(provider);
     const composer = new PaperAccountProductionComposer({ prisma });
     const runtime = await composer.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
     const openResult = await runtime.executeOpen(await buildOpenParams(accountId));
@@ -929,7 +978,7 @@ describe('F14-01 live-DB — authoritative account/exposure derivation (§3)', (
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider);
+    await feedFreshEvidence(provider);
     const composer = new PaperAccountProductionComposer({ prisma });
     const runtime = await composer.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
     const openResult = await runtime.executeOpen(await buildOpenParams(accountId));
@@ -939,7 +988,7 @@ describe('F14-01 live-DB — authoritative account/exposure derivation (§3)', (
     // Fresh composition, as a real restart would have — the derivation is a
     // pure durable read, so it is unchanged by losing all in-process state.
     const provider2 = makeProvider();
-    feedFreshEvidence(provider2);
+    await feedFreshEvidence(provider2);
     const composer2 = new PaperAccountProductionComposer({ prisma });
     await composer2.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider: provider2 });
     const after = deriveAtBreakEven(await deriveBase(accountId));
@@ -959,7 +1008,7 @@ describe('F14-01 live-DB — authoritative account/exposure derivation (§3)', (
 
     // Give A a genuine OPEN position and a pending reservation; leave B flat.
     const providerA = makeProvider();
-    feedFreshEvidence(providerA);
+    await feedFreshEvidence(providerA);
     const composerA = new PaperAccountProductionComposer({ prisma });
     const runtimeA = await composerA.start({ accountId: accountA, coordinator: new RiskAdmissionCoordinator(), provider: providerA });
     const openA = await runtimeA.executeOpen(await buildOpenParams(accountA));
@@ -987,7 +1036,7 @@ describe('F14-01 live-DB — caller-supplied authoritative evidence is impossibl
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider);
+    await feedFreshEvidence(provider);
     const composer = new PaperAccountProductionComposer({ prisma });
     const runtime = await composer.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
 
@@ -1023,7 +1072,7 @@ describe('F14-01 live-DB — caller-supplied authoritative evidence is impossibl
     await provisionPairSlot(accountA, PAIR);
     await provisionPairSlot(accountB, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider);
+    await feedFreshEvidence(provider);
     const composer = new PaperAccountProductionComposer({ prisma });
     const runtime = await composer.start({ accountId: accountA, coordinator: new RiskAdmissionCoordinator(), provider });
 
@@ -1057,7 +1106,7 @@ describe('F14-01 live-DB — caller-supplied authoritative evidence is impossibl
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider);
+    await feedFreshEvidence(provider);
     const composer = new PaperAccountProductionComposer({ prisma });
     const runtime = await composer.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
     const openResult = await runtime.executeOpen(await buildOpenParams(accountId));
@@ -1090,14 +1139,14 @@ describe('F14-01 live-DB — caller-supplied authoritative evidence is impossibl
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider, '99', '99.5');
+    await feedFreshEvidence(provider, '99', '99.5');
     const composer = new PaperAccountProductionComposer({ prisma });
     const runtime = await composer.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
     const openParams = await buildOpenParams(accountId);
     const openResult = await runtime.executeOpen(openParams);
     if (openResult.outcome !== 'FILLED') throw new Error('setup failed');
 
-    feedFreshEvidence(provider, '110', '112');
+    await feedFreshEvidence(provider, '110', '112');
     const understated = paperDecimal(openResult.quantity).div(2).toFixed();
     await expect(runtime.executeClose(buildCloseParams(openParams.kernel, accountId, understated)))
       .rejects.toMatchObject({ code: 'RISK_INPUT_NOT_AUTHORITATIVE' });
@@ -1113,7 +1162,7 @@ describe('F14-01 live-DB — the derived snapshot can never drift from the state
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider);
+    await feedFreshEvidence(provider);
 
     // Transaction 1 of an OPEN is the fresh P14-H reconciliation; transaction 2
     // is the authoritative durable derivation. Bumping right after #2 commits
@@ -1143,7 +1192,7 @@ describe('F14-01 live-DB — the derived snapshot can never drift from the state
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const provider = makeProvider();
-    feedFreshEvidence(provider);
+    await feedFreshEvidence(provider);
 
     let bumps = 0;
     const racing = racingPrisma(prisma, 1, async () => { // #1 = the fresh reconciliation
@@ -1214,14 +1263,14 @@ describe('F14-01 live-DB — production MTM equity drives OPEN risk (§12.3/§12
     await provisionPairSlot(accountId, PAIR);
     await provisionPairSlot(accountId, PAIR_B);
     const provider = makeProvider();
-    feedFreshEvidence(provider);
+    await feedFreshEvidence(provider);
     const runtime = await new PaperAccountProductionComposer({ prisma })
       .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
     await openSmallShort(runtime, accountId);
 
     const targetEquity = '800000';
     const btcMark = await shortMarkForTargetEquity(accountId, targetEquity);
-    feedFreshEvidenceForPair(provider, PAIR_B, '99', '99.5', CONVERSION_RATE, Date.now(), btcMark, '99');
+    await feedFreshEvidenceForPair(provider, PAIR_B, '99', '99.5', CONVERSION_RATE, Date.now(), btcMark, '99');
     const result = await runtime.executeOpen(await buildOpenParamsForPair(accountId, PAIR_B, {}, T0 + MINUTE));
     if (result.outcome !== 'FILLED') throw new Error(`expected second OPEN fill, got ${result.outcome}`);
 
@@ -1245,14 +1294,14 @@ describe('F14-01 live-DB — production MTM equity drives OPEN risk (§12.3/§12
     await provisionPairSlot(accountId, PAIR);
     await provisionPairSlot(accountId, PAIR_B);
     const provider = makeProvider();
-    feedFreshEvidence(provider);
+    await feedFreshEvidence(provider);
     const coordinator = new RiskAdmissionCoordinator();
     const runtime = await new PaperAccountProductionComposer({ prisma })
       .start({ accountId, coordinator, provider });
     await openSmallShort(runtime, accountId);
 
     const btcMark = await shortMarkForTargetEquity(accountId, '600000');
-    feedFreshEvidenceForPair(provider, PAIR_B, '99', '99.5', CONVERSION_RATE, Date.now(), btcMark, '99');
+    await feedFreshEvidenceForPair(provider, PAIR_B, '99', '99.5', CONVERSION_RATE, Date.now(), btcMark, '99');
     const realAdmit = coordinator.admit.bind(coordinator);
     let observedAdmission: Awaited<ReturnType<typeof coordinator.admit>> | null = null;
     const admitSpy = vi.spyOn(coordinator, 'admit').mockImplementation(async (request) => {
@@ -1277,27 +1326,26 @@ describe('F14-01 live-DB — production MTM equity drives OPEN risk (§12.3/§12
     await provisionPairSlot(accountId, PAIR);
     await provisionPairSlot(accountId, PAIR_B);
     const provider = makeProvider();
-    feedFreshEvidence(provider);
+    await feedFreshEvidence(provider);
     const runtime = await new PaperAccountProductionComposer({ prisma })
       .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
     const openedA = await openSmallShort(runtime, accountId);
 
     const breakEvenA = await shortMarkForTargetEquity(accountId, '999999');
-    feedFreshEvidenceForPair(provider, PAIR_B, '49', '49.5', CONVERSION_RATE, Date.now(), breakEvenA, '49');
+    await feedFreshEvidenceForPair(provider, PAIR_B, '49', '49.5', CONVERSION_RATE, Date.now(), breakEvenA, '49');
     const openB = await runtime.executeOpen(await buildOpenParamsForPair(accountId, PAIR_B, {}, T0 + MINUTE));
     if (openB.outcome !== 'FILLED') throw new Error('second OPEN setup did not fill');
 
     // New mark generation deliberately carries only A. B's old mark cannot be
     // reused across generations, so the all-OPEN-position valuation must fail.
     const nowMs = Date.now();
-    const bookGeneration = provider.startOrderbookWebSocket();
-    expect(provider.ingestOrderbookWebSocket(bookPayload(nowMs, '99', '99.5'), bookGeneration, PAIR, PRODUCTION_ACQUISITION_CAPABILITY))
-      .toMatchObject({ accepted: true });
-    expect(provider.ingestConversionRest(conversionPayload(CONVERSION_RATE, nowMs), PRODUCTION_ACQUISITION_CAPABILITY))
-      .toMatchObject({ accepted: true });
-    const markGeneration = provider.startMarkWebSocket();
+    provider.startOrderbookWebSocket();
+    latestProductionSocket().trigger('depth-snapshot', bookPayload(nowMs, '99', '99.5'));
+    conversionResponse = conversionPayload(CONVERSION_RATE, nowMs);
+    expect(await provider.readConversion()).toMatchObject({ accepted: true });
+    provider.startMarkWebSocket();
     const onlyA = { data: JSON.stringify({ ts: String(nowMs), vs: '3', [PROVIDER_SYMBOL]: { mp: breakEvenA, bmST: String(nowMs) } }) };
-    expect(provider.ingestMarkWebSocket(onlyA, markGeneration, PRODUCTION_ACQUISITION_CAPABILITY)).toMatchObject({ accepted: true });
+    latestProductionSocket().trigger('currentPrices@futures#update', onlyA);
 
     const retryShape = await buildOpenParamsForPair(accountId, PAIR, {}, T0 + 2 * MINUTE, 'SHORT');
     const consistentA: ProductionOpenParams = {
@@ -1321,7 +1369,7 @@ describe('F14-01 live-DB — production MTM equity drives OPEN risk (§12.3/§12
     await provisionPairSlot(accountId, PAIR);
     await provisionPairSlot(accountId, PAIR_B);
     const provider = makeProvider();
-    feedFreshEvidence(provider);
+    await feedFreshEvidence(provider);
 
     let bumps = 0;
     const racing = racingPrisma(prisma, 2, async () => {
@@ -1334,7 +1382,7 @@ describe('F14-01 live-DB — production MTM equity drives OPEN risk (§12.3/§12
     await openSmallShort(runtime, accountId);
 
     const breakEvenA = await shortMarkForTargetEquity(accountId, '999999');
-    feedFreshEvidenceForPair(provider, PAIR_B, '99', '99.5', CONVERSION_RATE, Date.now(), breakEvenA, '99');
+    await feedFreshEvidenceForPair(provider, PAIR_B, '99', '99.5', CONVERSION_RATE, Date.now(), breakEvenA, '99');
     const valuationRead = vi.spyOn(CoinDcxPaperEvidence.prototype, 'readProductionAcquiredValuationEvidence');
     racing.arm();
     await expect(runtime.executeOpen(await buildOpenParamsForPair(accountId, PAIR_B, {}, T0 + MINUTE)))
@@ -1352,18 +1400,109 @@ describe('F14-01 live-DB — production MTM equity drives OPEN risk (§12.3/§12
 // [F14-02] Fabricated market evidence cannot reach production OPEN or CLOSE.
 // ---------------------------------------------------------------------------
 
-/** A provider a public caller can build: same fakes, but NO acquisition capability anywhere. */
+/**
+ * [F14-02] A provider a public caller can build, fed entirely through the
+ * PUBLIC ingestion surface. There is no capability to omit any more: the public
+ * constructor can never produce a production-trusted provider, and the public
+ * ingest methods can never produce production-trusted data.
+ */
 function callerFabricatedProvider(bid = '99', ask = '99.5', conversionRate = '80'): CoinDcxPaperEvidence {
   const provider = new CoinDcxPaperEvidence({
-    instruments: PROVIDER_INSTRUMENTS, clock: WALL_CLOCK, socketFactory: new FakeCoinDcxSocketFactory(),
+    instruments: PROVIDER_INSTRUMENTS, clock: WALL_CLOCK,
     policy: { orderbookFreshnessMs: 30_000, markFreshnessMs: 30_000, conversionLocalPollFreshnessMs: 60_000, allowedProviderFutureSkewMs: 5_000 },
   });
   const nowMs = Date.now();
   const generation = provider.startOrderbookWebSocket();
   if (!provider.ingestOrderbookWebSocket(bookPayload(nowMs, bid, ask), generation).accepted) throw new Error('setup: fabricated orderbook rejected');
   if (!provider.ingestConversionRest(conversionPayload(conversionRate, nowMs)).accepted) throw new Error('setup: fabricated conversion rejected');
+  const markGeneration = provider.startMarkWebSocket();
+  if (!provider.ingestMarkWebSocket(markPayload(nowMs, bid, bid), markGeneration).accepted) throw new Error('setup: fabricated mark rejected');
   // Every pre-F14-02 P14-B gate passes on this data — that is the whole point.
   if (provider.getLatestExecutionQuote(PAIR).state !== 'AVAILABLE') throw new Error('setup: expected a fresh fabricated quote');
+  if (provider.getLatestMark(PAIR).state !== 'AVAILABLE') throw new Error('setup: expected a fresh fabricated mark');
+  return provider;
+}
+
+/**
+ * [F14-02 4A.1 §19] The prototype-patch attacker: ordinary application code
+ * that deep-imports the exported transport and socket factory and replaces
+ * their writable prototype methods before asking for a production provider.
+ * Returns the provider plus the counters proving the privileged path never
+ * touched either replacement.
+ */
+function prototypePatchedProductionProvider(bid = '99', ask = '99.5', conversionRate = '80'): {
+  provider: CoinDcxPaperEvidence; transportCalls(): number; socketCalls(): number;
+} {
+  let transportCalls = 0;
+  let socketCalls = 0;
+  const nowMs = Date.now();
+  const executeRead = vi.spyOn(CoinDcxTransport.prototype, 'executeRead');
+  const previousExecuteRead = executeRead.getMockImplementation();
+  executeRead.mockImplementation(async (options) => {
+    if (options.endpoint === 'FUTURES_CONVERSIONS') {
+      transportCalls += 1;
+      return { status: 200, headers: {}, durationMs: 0, data: conversionPayload(conversionRate, nowMs) } as never;
+    }
+    // Leave Wave3-A instrument acquisition working so the OPEN reaches the
+    // market-evidence gate rather than failing earlier for an unrelated reason.
+    return previousExecuteRead?.(options) as never;
+  });
+  vi.spyOn(ProductionCoinDcxSocketFactory.prototype, 'createSocket').mockImplementation(() => {
+    socketCalls += 1;
+    return { connected: false, connect: () => undefined, disconnect: () => undefined, on: () => undefined, off: () => undefined, emit: () => undefined } as never;
+  });
+
+  const provider = createProductionPaperEvidenceProvider({
+    instruments: PROVIDER_INSTRUMENTS,
+    policy: { orderbookFreshnessMs: 30_000, markFreshnessMs: 30_000, conversionLocalPollFreshnessMs: 60_000, allowedProviderFutureSkewMs: 5_000 },
+  });
+  provider.startOrderbookWebSocket();
+  provider.startMarkWebSocket();
+  // Whatever the attacker can still reach is the public, caller-supplied surface.
+  const generation = provider.orderbookGenerationId;
+  provider.ingestOrderbookWebSocket(bookPayload(nowMs, bid, ask), generation, PAIR);
+  provider.ingestConversionRest(conversionPayload(conversionRate, nowMs));
+  provider.ingestMarkWebSocket(markPayload(nowMs, bid, bid), provider.markGenerationId);
+  return { provider, transportCalls: () => transportCalls, socketCalls: () => socketCalls };
+}
+
+/**
+ * [F14-02 §18.1] Astra ATTACK A, end to end: option getters that return
+ * undefined on the trust-decision read and attacker-controlled acquisition
+ * dependencies on the use read. Construction asserts each option was read
+ * exactly once, so this fixture fails loudly if the TOCTOU ever reopens.
+ */
+function getterToctouProvider(bid = '99', ask = '99.5', conversionRate = '80'): CoinDcxPaperEvidence {
+  const reads = new Map<string, number>();
+  const evil: Record<string, unknown> = {
+    socketFactory: new FakeCoinDcxSocketFactory(),
+    conversionTransport: { executeRead: async () => ({ status: 200, headers: {}, durationMs: 0, data: conversionPayload(conversionRate, Date.now()) }) },
+    clock: WALL_CLOCK,
+  };
+  const options: Record<string, unknown> = {
+    instruments: PROVIDER_INSTRUMENTS,
+    policy: { orderbookFreshnessMs: 30_000, markFreshnessMs: 30_000, conversionLocalPollFreshnessMs: 60_000, allowedProviderFutureSkewMs: 5_000 },
+  };
+  for (const [key, value] of Object.entries(evil)) {
+    Object.defineProperty(options, key, {
+      get(): unknown {
+        const seen = (reads.get(key) ?? 0) + 1;
+        reads.set(key, seen);
+        return seen === 1 ? undefined : value;
+      },
+      enumerable: true, configurable: true,
+    });
+  }
+  const provider = new CoinDcxPaperEvidence(options as never);
+  for (const key of Object.keys(evil)) {
+    if (reads.get(key) !== 1) throw new Error(`setup: ${key} was read ${String(reads.get(key))} times, expected exactly 1`);
+  }
+  const nowMs = Date.now();
+  const generation = provider.startOrderbookWebSocket();
+  provider.ingestOrderbookWebSocket(bookPayload(nowMs, bid, ask), generation);
+  provider.ingestConversionRest(conversionPayload(conversionRate, nowMs));
+  const markGeneration = provider.startMarkWebSocket();
+  provider.ingestMarkWebSocket(markPayload(nowMs, bid, bid), markGeneration);
   return provider;
 }
 
@@ -1390,7 +1529,7 @@ describe('F14-02 live-DB — production OPEN/CLOSE reject caller-fabricated mark
     await initAccount(accountId);
     await provisionPairSlot(accountId, PAIR);
     const genuineProvider = makeProvider();
-    feedFreshEvidence(genuineProvider, '99', '99.5');
+    await feedFreshEvidence(genuineProvider, '99', '99.5');
     const composer = new PaperAccountProductionComposer({ prisma });
     const runtime = await composer.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider: genuineProvider });
     const openParams = await buildOpenParams(accountId);
@@ -1406,6 +1545,149 @@ describe('F14-02 live-DB — production OPEN/CLOSE reject caller-fabricated mark
     expect(await prisma.paperFill.count({ where: { accountId } })).toBe(1); // still only the OPEN fill
     expect((await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } })).status).toBe('OPEN');
     expect(await prisma.paperPositionOwnershipHistory.count({ where: { accountId } })).toBe(0);
+  }, 30_000);
+
+  // [F14-02 §18.13 / §14] Astra ATTACK A driven all the way to a real OPEN.
+  it('OPEN: a getter-TOCTOU provider is rejected before any fill or economic mutation', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const composer = new PaperAccountProductionComposer({ prisma });
+    const runtime = await composer.start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider: getterToctouProvider() });
+
+    await expect(runtime.executeOpen(await buildOpenParams(accountId))).rejects.toMatchObject({ code: 'EVIDENCE_UNAVAILABLE' });
+    expect(await prisma.paperFill.count({ where: { accountId } })).toBe(0);
+    expect(await prisma.paperLedgerEntry.count({ where: { accountId } })).toBe(0);
+    expect(await prisma.paperOrder.count({ where: { accountId } })).toBe(0);
+  }, 30_000);
+
+  // [F14-02 §18.14] The same attack against CLOSE.
+  it('CLOSE: a getter-TOCTOU provider cannot close a genuinely OPEN position', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const genuineProvider = makeProvider();
+    await feedFreshEvidence(genuineProvider, '99', '99.5');
+    const runtime = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider: genuineProvider });
+    const openParams = await buildOpenParams(accountId);
+    const openResult = await runtime.executeOpen(openParams);
+    if (openResult.outcome !== 'FILLED') throw new Error('setup failed');
+
+    const runtime2 = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider: getterToctouProvider('110', '112') });
+    await expect(runtime2.executeClose(buildCloseParams(openParams.kernel, accountId, openResult.quantity)))
+      .rejects.toMatchObject({ code: 'EVIDENCE_UNAVAILABLE' });
+
+    expect(await prisma.paperFill.count({ where: { accountId } })).toBe(1);
+    expect((await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } })).status).toBe('OPEN');
+    expect(await prisma.paperPositionOwnershipHistory.count({ where: { accountId } })).toBe(0);
+  }, 30_000);
+
+  // [F14-02 4A.1 §19] The new bypass, driven to a real OPEN and CLOSE.
+  it('OPEN: a prototype-patched attacker cannot fill, and never reaches the privileged acquisition path', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const attacker = prototypePatchedProductionProvider();
+    const runtime = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider: attacker.provider });
+
+    await expect(runtime.executeOpen(await buildOpenParams(accountId))).rejects.toMatchObject({ code: 'EVIDENCE_UNAVAILABLE' });
+
+    expect(attacker.transportCalls(), 'fake transport privileged calls').toBe(0);
+    expect(attacker.socketCalls(), 'fake socket factory privileged calls').toBe(0);
+    expect(await prisma.paperFill.count({ where: { accountId } })).toBe(0);
+    expect(await prisma.paperLedgerEntry.count({ where: { accountId } })).toBe(0);
+    expect(await prisma.paperOrder.count({ where: { accountId } })).toBe(0);
+  }, 30_000);
+
+  it('CLOSE: a prototype-patched attacker cannot close a genuinely OPEN position, and the OPEN reservation stays recoverable', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const genuineProvider = makeProvider();
+    await feedFreshEvidence(genuineProvider, '99', '99.5');
+    const runtime = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider: genuineProvider });
+    const openParams = await buildOpenParams(accountId);
+    const openResult = await runtime.executeOpen(openParams);
+    if (openResult.outcome !== 'FILLED') throw new Error('setup failed');
+
+    const attacker = prototypePatchedProductionProvider('110', '112');
+    const runtime2 = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider: attacker.provider });
+    await expect(runtime2.executeClose(buildCloseParams(openParams.kernel, accountId, openResult.quantity)))
+      .rejects.toMatchObject({ code: 'EVIDENCE_UNAVAILABLE' });
+
+    expect(attacker.transportCalls()).toBe(0);
+    expect(attacker.socketCalls()).toBe(0);
+    expect(await prisma.paperFill.count({ where: { accountId } })).toBe(1);
+    expect((await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } })).status).toBe('OPEN');
+    expect(await prisma.paperPositionOwnershipHistory.count({ where: { accountId } })).toBe(0);
+
+    // [§19] The position is not wedged: a genuine provider still closes it.
+    vi.restoreAllMocks();
+    await installSuiteMocks();
+    const recoveryProvider = makeProvider();
+    await feedFreshEvidence(recoveryProvider, '110', '112');
+    const runtime3 = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider: recoveryProvider });
+    const closed = await runtime3.executeClose(buildCloseParams(openParams.kernel, accountId, openResult.quantity, {}, T0 + 2 * MINUTE));
+    expect(closed.outcome).toBe('CLOSED');
+    expect((await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } })).status).toBe('EMPTY');
+  }, 30_000);
+
+  /**
+   * [F14-02 §18.15 / §11 / §15] An account that genuinely holds an OPEN
+   * position, then valued by a forged provider. The mark-to-market valuation
+   * must fail closed BEFORE admission, so no fabricated currentEquityInr,
+   * drawdown, risk budget or available margin is ever produced, and no
+   * reservation/revision/economic mutation is attributable to the request.
+   */
+  it('MTM: forged valuation evidence cannot influence risk admission for an account with an OPEN position', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    await provisionPairSlot(accountId, PAIR_B);
+    const genuineProvider = makeProvider();
+    await feedFreshEvidence(genuineProvider, '99', '99.5');
+    const runtime = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider: genuineProvider });
+    const openResult = await runtime.executeOpen(await buildOpenParams(accountId));
+    if (openResult.outcome !== 'FILLED') throw new Error('setup failed');
+
+    // A forged provider carrying a fabricated, wildly profitable mark for both
+    // pairs — exactly the fabrication Astra used to inflate equity. The
+    // ownership takeover itself legitimately bumps the revision, so the
+    // baseline is captured AFTER it: what must not move is anything
+    // attributable to the forged REQUEST.
+    const forged = callerFabricatedProvider('999999', '1000000', '80');
+    const runtime2 = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider: forged });
+    const before = {
+      fills: await prisma.paperFill.count({ where: { accountId } }),
+      ledger: await prisma.paperLedgerEntry.count({ where: { accountId } }),
+      reservations: await prisma.paperReservation.count({ where: { accountId } }),
+      revision: (await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).revision,
+    };
+
+    // [§11/§15] The mark-to-market valuation fails closed BEFORE admission, so
+    // no fabricated currentEquityInr, drawdown, risk budget or available margin
+    // is ever produced and no durable reservation is even attempted.
+    await expect(runtime2.executeOpen(await buildOpenParamsForPair(accountId, PAIR_B, {}, T0 + MINUTE)))
+      .rejects.toMatchObject({ code: 'EVIDENCE_UNAVAILABLE' });
+
+    expect(await prisma.paperFill.count({ where: { accountId } })).toBe(before.fills);
+    expect(await prisma.paperLedgerEntry.count({ where: { accountId } })).toBe(before.ledger);
+    expect(await prisma.paperReservation.count({ where: { accountId } })).toBe(before.reservations);
+    expect((await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).revision).toBe(before.revision);
+    expect((await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR_B } } })).status).toBe('EMPTY');
   }, 30_000);
 });
 

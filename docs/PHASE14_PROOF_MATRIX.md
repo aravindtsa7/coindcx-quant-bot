@@ -399,6 +399,230 @@ PAPER.
 
 ---
 
+## 13D. Final-Gate Correction Wave 4A — F14-02 public market-evidence trust bypass
+
+The Wave 2 F14-02 correction was **insufficient**. A later Astra pass
+reproduced two production-reachable trust bypasses against it, and this wave
+closes both. Scope is F14-02 only.
+
+### Reproduced before the correction
+
+| # | Attack | Pre-fix result |
+|---|---|---|
+| A | Constructor option **getter TOCTOU**. The Wave 2 constructor read `socketFactory`/`orderbookRestTransport`/`markRestTransport`/`conversionTransport`/`clock` once to decide trust ("every seam is the genuine default") and again to build the provider. Caller getters returned `undefined` on the first read and a fake socket factory / fake REST transport on the second. Fabricated frames then entered through the provider's OWN internal acquisition callbacks, which supplied the capability themselves. | Execution evidence **AVAILABLE**; valuation evidence **AVAILABLE**; fabricated trusted mark **999999**; **0** network requests; attacker supplied **no** capability |
+| B | **Deep-imported acquisition token.** `PRODUCTION_ACQUISITION_CAPABILITY` was `export const` in `acquisition-capability.ts` (barrel-absent, but deep-importable) and was accepted both as a public constructor option and as a public `ingest*` argument. | Manually fabricated mark/conversion accepted as `PRODUCTION_ACQUISITION`; valuation **AVAILABLE** at 999999 |
+
+### Correction
+
+Trust no longer derives from a token, nor from any inference about option
+values. It derives from **which construction path built the provider**.
+
+- **The capability is no longer a value.** `PRODUCTION_ACQUISITION_CAPABILITY`
+  is deleted. `acquisition-capability.ts` retains only the
+  `PaperEvidenceAcquisition` label type and exports **no runtime value at
+  all**. Production acquisition provenance is object identity in the
+  module-private `PRODUCTION_PROVIDERS` `WeakSet` inside `paper-evidence.ts`,
+  written only by that module's own factory — the same construction Wave3-A
+  uses for `INSTRUMENT_BINDING_ISSUER`. There is nothing to import, name,
+  copy, serialize, or structurally reproduce, and it is not a string/boolean
+  brand.
+- **No capability parameter survives anywhere.** `acquisitionCapability` is
+  removed from `CoinDcxPaperEvidenceOptions` and from every public `ingest*`
+  signature. Public ingestion is permanently `CALLER_SUPPLIED`; no argument
+  can upgrade it.
+- **Options are captured exactly once.** `captureOptions` materializes every
+  caller property into a frozen record at the boundary; the constructor never
+  touches the caller's object again, so no getter or Proxy can present a second
+  value. `instruments` is copied, so a live array cannot mutate after
+  validation.
+- **A production provider has no injectable acquisition dependency.**
+  `createProductionPaperEvidenceProvider({ instruments, policy? })` is the sole
+  production mint; it selects the real `ProductionCoinDcxSocketFactory`, the
+  real `CoinDcxTransport`s and the real `SystemClock` itself. The public
+  `CoinDcxPaperEvidence` constructor keeps its injectable seams for tests and
+  can **never** be production-trusted under any option combination.
+- **Three independent proofs at the issuer** (§6): genuine registered instance
+  (`new.target`), `PRODUCTION_PROVIDERS` membership, and per-datum
+  `PRODUCTION_ACQUISITION` provenance. `instanceof` alone is explicitly not
+  acquisition provenance; a Proxy over a genuine provider is rejected.
+- **Zero-network testing of the genuine path exposes no trust authority.**
+  Tests intercept `CoinDcxTransport.prototype.executeRead` and
+  `ProductionCoinDcxSocketFactory.prototype.createSocket` with the test
+  runner's own mocking — the seam Wave3-A's accepted instrument-authority tests
+  already use. A `vi.spyOn` is not an export.
+
+Every frozen P14-B rule is preserved and still evaluated first: REST never
+blesses a WS generation, wrong generation / stale quote / stale mark / stale
+conversion / clock regression are rejected, and there is no candle, LTP, or
+private-position fallback. Wave3-A instrument authority is untouched and stays
+disjoint: market-evidence trust cannot mint an instrument binding, and instrument
+authority cannot mint a production provider.
+
+### Post-correction result (same attacks, same entry points)
+
+| Probe | Result |
+|---|---|
+| Option reads per property during construction | `{clock: 1, socketFactory: 1, conversionTransport: 1}` |
+| Attacker fake socket factory sockets created | **0** (never installed) |
+| Attacker fake REST transport calls | **0** (never installed) |
+| Execution evidence from the TOCTOU provider | `UNAVAILABLE / PROVIDER_NOT_PRODUCTION_ACQUIRED` |
+| Valuation evidence from the TOCTOU provider | `UNAVAILABLE / PROVIDER_NOT_PRODUCTION_ACQUIRED` |
+| Deep import of `acquisition-capability` | runtime exports `[]`; token `undefined` |
+| Capability/registry leaks from `paper-evidence` | `[]` |
+| Forged OPEN / CLOSE / MTM end-to-end (live DB) | rejected `EVIDENCE_UNAVAILABLE` with no fill, ledger, reservation or revision movement attributable to the request |
+
+### Evidence
+
+`tests/unit/execution/trusted-evidence.test.ts` (27 tests) covers §18.1–§18.12
+and §18.16: both getter-TOCTOU variants (asserting each option is read exactly
+once and the attacker's dependency is never installed), no option combination
+producing trust, the token being unimportable, manual orderbook/mark/conversion
+each unable to upgrade, injected socket factory and REST transport untrusted,
+Proxy/subclass/structural/own-property-shadow rejection, the genuine production
+path still succeeding, generation/staleness/clock gates unchanged, and
+capability/instrument-authority separation.
+`tests/integration/execution/paper-production-runtime.test.ts` (42 tests) covers
+§18.13–§18.15 end-to-end on a live database: forged and getter-TOCTOU providers
+cannot OPEN or CLOSE, and forged valuation evidence cannot influence risk
+admission for an account holding a genuine OPEN position.
+`tests/architecture/phase14-import-graph.test.ts` (25 tests) adds four
+mechanical guards — no `src` module exports any acquisition capability value
+under any name, the constructor never reads a caller option twice, the
+production factory accepts no injectable acquisition dependency, and no public
+`ingest` entry point accepts a capability argument. No allowlist is used.
+
+**`F14_02_CORRECTED`** — and separately, still open:
+
+Astra's same pass found that CLOSE does not maintain `consecutiveLossCount`,
+`cooldownActiveUntilMs`, or `peakEquityInr`. That defect is **deliberately not
+touched in this wave** and remains **OPEN**.
+
+Status: **AWAITING_F14_01_CORRECTION**, then **AWAITING_FINAL_ASTRA_REGATE**.
+Phase 14 is **not** PASS.
+
+### 13D.1 Correction 4A.1 — prototype-patch production trust bypass
+
+Wave 4A was **still insufficient**. An independent verifier found a third,
+equivalent production-reachable bypass and F14-02 stayed OPEN.
+
+**The exploit.** Ordinary application code — no Vitest, no test helper, no
+acquisition token — deep-imports `CoinDcxTransport` and
+`ProductionCoinDcxSocketFactory`, whose `executeRead` and `createSocket`
+prototype properties are both `writable: true, configurable: true`, replaces
+them, and then calls `createProductionPaperEvidenceProvider`. The production
+factory reached the network *through those exported prototypes*, so the
+attacker's implementations became the privileged acquisition path.
+
+Reproduced before the fix, verbatim:
+
+| Probe | Pre-fix |
+|---|---|
+| `executeRead` / `createSocket` descriptors | `writable=true configurable=true` |
+| fake transport privileged calls | **1** |
+| fake socket privileged calls | **2** |
+| trusted execution evidence | **AVAILABLE (forged)** |
+| trusted valuation evidence | **AVAILABLE (forged)** |
+
+**Why the earlier fix missed it.** Wave 4A made trust depend on *which
+construction path built the provider* (object identity in the module-private
+`PRODUCTION_PROVIDERS`). That is necessary but not sufficient: provider
+identity says nothing about whether the acquisition *implementation* is still
+the real one. The trust boundary must include acquisition **implementation
+integrity**.
+
+**The correction.** The privileged acquisition implementation is now
+module-local to `paper-evidence.ts` — the same module that owns the registry,
+the provider class and the factory:
+
+- `privilegedGetJson` performs the production REST reads directly over Node's
+  `https`, preserving the transport's semantics for these endpoints exactly
+  (all three P14-B production endpoints are unauthenticated public GETs): same
+  paths — pinned to `transport.ts`'s frozen map and held there by an
+  architecture test — same 10 s timeout, same 5 MB response cap, same lossless
+  numeric parsing, same typed CoinDCX errors.
+- `PrivilegedProductionSocket` constructs the socket with byte-identical
+  socket.io configuration to `ProductionCoinDcxSocket` (websocket-only
+  transport, no library reconnection, no autoConnect, exact-numeric parser,
+  `forceNew`). Generation IDs, reconnect handling, causality and staleness are
+  untouched.
+- Neither is exported from its own file, from any barrel, or under any other
+  name, and neither is a property of any exported object — so in CommonJS there
+  is no namespace entry to assign to either. The factory closes over them
+  directly and never calls back out through an exported class prototype.
+- `#startSocket` and the provider's `read*` methods select the privileged
+  implementation on `PRODUCTION_PROVIDERS.has(this)`, and the
+  exported-transport / exported-socket-factory branches now pass
+  `internal = false`. A patched exported prototype is therefore not merely
+  bypassed — anything it produces is permanently caller-supplied.
+
+The public `CoinDcxTransport` and `ProductionCoinDcxSocketFactory` remain fully
+usable for everything else, including Wave3-A instrument acquisition; they are
+simply no longer on the privileged path.
+
+**Post-correction, same attacks:**
+
+| Probe | Pre-import patch (§12) | Post-import patch (§13) |
+|---|---|---|
+| fake transport privileged calls | **0** | **0** |
+| fake socket privileged calls | **0** | **0** |
+| attacker ever asked to supply a socket | **no** | **no** |
+| trusted execution evidence | **UNAVAILABLE** | **UNAVAILABLE** |
+| trusted valuation evidence | **UNAVAILABLE** | **UNAVAILABLE** |
+
+`PROTOTYPE_PATCH_TRUST_BYPASS = SAFE`.
+
+**The test seam was the exploit, and is gone.**
+`tests/helpers/production-acquisition-harness.ts` used to patch exactly those
+two prototypes. It no longer can prove anything, so it now intercepts strictly
+*below* the production authority, at the external I/O boundary: `https.request`
+for REST and the `socket.io-client` package for WS. Neither is a
+repository-exported production API, so the test mechanism no longer
+demonstrates that a repo module surface is replaceable.
+
+**Boundary stated, not overclaimed.** The privileged primitives still stand on
+a Node builtin and one third-party package. Replacing those is a strictly
+broader capability that defeats every module in the process equally and lies
+outside this repository's module convention; it is not a repo-exported
+production API. `§8` is covered concretely: replacing `Date.now` alone cannot
+fabricate provenance — a test drives a fully attacker-controlled clock, passes
+every freshness gate, and still gets `PROVIDER_NOT_PRODUCTION_ACQUIRED`,
+because the clock influences freshness of already-acquired data and never
+acquisition provenance.
+
+**Evidence.** `tests/unit/execution/prototype-trust-bypass.test.ts` (6 tests):
+post-import patch, pre-import patch (with `vi.resetModules`, so a fix that
+merely captured prototypes at module init would fail), no trusted
+quote/depth/mark/conversion for a patched attacker, no reachable or mutable
+privileged dependency (no own data properties; every readable accessor returns
+a primitive), the `Date.now` distinction, and a positive control proving the
+genuine privileged path still mints both bundles.
+`tests/integration/execution/paper-production-runtime.test.ts` (44 tests) adds
+live-DB §19 coverage: a prototype-patched attacker cannot OPEN and cannot
+CLOSE, with zero privileged calls to either replacement, and the genuinely OPEN
+position is **not** wedged — a genuine provider still closes it afterwards.
+`tests/architecture/phase14-import-graph.test.ts` (28 tests) adds three
+structural guards: the privileged primitives exist and are exported from
+nowhere, the production path routes through them on the registry check with the
+exported-transport branch left untrusted, and the pinned endpoint paths stay in
+sync with `transport.ts`.
+
+**One architectural invariant was narrowed, deliberately.** Phase 3 invariant
+44 forbids importing socket.io outside the websocket layer. Constructing the
+privileged socket from a module-local binding requires that import inside
+`paper-evidence.ts`, because any cross-module reference is a writable property
+on the CommonJS exports object and is therefore patchable — the very thing
+being fixed. The invariant now carries exactly one pinned exception
+(`src/integration/coindcx/paper-evidence.ts`) and additionally asserts the
+exception set equals that single entry, so it polices its own size instead of
+hiding future drift. Its original purpose — no proliferation of WebSocket
+implementations outside the websocket layer — is unchanged.
+
+Status unchanged by this correction: **F14-02 correction awaiting targeted
+verify**, F14-01 durable loss/cooldown/peak-equity defect still **OPEN**,
+Phase 14 final **NOT PASS**.
+
+---
+
 ## 14. Final Phase14 Status
 
 | Question | Answer |
@@ -407,16 +631,17 @@ PAPER.
 | Production PAPER mechanical path (dispatch → risk → durable admission → evidence → execution) | **PROVEN** |
 | Restart / fencing / reconciliation | **PROVEN, Wave1-corrected** (§13: F14-04/05/06/07) |
 | Production risk-input authority | **PROVEN, Wave2-corrected** (§13B: F14-01 — derived from durable state under the admitted revision) |
-| Production market-evidence provenance | **PROVEN, Wave2-corrected** (§13B: F14-02 — approved CoinDCX acquisition required) |
+| Production market-evidence provenance | **Wave4A + 4A.1-corrected** (§13D/§13D.1: F14-02 — trust originates from the production construction path AND the privileged acquisition implementation is module-local, so no exported prototype can be patched onto it) |
 | Funding economic parity | **INTENTIONALLY UNSUPPORTED / PROVIDER-BLOCKED** (§11) |
 | Maximum lifecycle | **PAPER** |
 | Transitive paper/live import isolation | **PROVEN — strict zero, no exceptions** (§10) |
 | Live execution adapter | **NOT_IMPLEMENTED / NOT_ACTIVE** (§10) |
 | Drawdown gate sensitivity to unrealized PnL | **FULL MTM FOR OPEN ADMISSION** — every durable OPEN position valued from production-acquired fresh mark/conversion evidence (§13B.1) |
-| F14-01 / F14-02 | **CORRECTED** (§13B) |
+| F14-02 public market-evidence trust bypass | **CORRECTION IMPLEMENTED, awaiting targeted verify** (§13D/§13D.1 — getter TOCTOU, deep-imported token, and prototype-patch bypass all closed and re-probed) |
+| F14-01 durable loss/drawdown maintenance on CLOSE | **OPEN** — CLOSE does not maintain `consecutiveLossCount`, `cooldownActiveUntilMs`, `peakEquityInr`; deliberately out of scope for Wave4A |
 | F14-03 instrument acquisition authority prerequisite | **IMPLEMENTED in Wave3-A** — genuine pair-only CoinDCX acquisition produces an opaque binding; no caller metadata can mint it |
 | F14-03 durable economics/policy correction | **IMPLEMENTED in Wave3-B** — immutable pair-bound economics, canonical policy validation, OPEN→MTM→CLOSE lifecycle authority, restart, and legacy fail-closed reconciliation |
-| Final Astra milestone gate | **NOT YET PASS** — `AWAITING_FINAL_ASTRA_REGATE` |
+| Final Astra milestone gate | **NOT PASS** — `AWAITING_F14_01_CORRECTION`, then `AWAITING_FINAL_ASTRA_REGATE` |
 | Ready for Phase 15 ranking? | Only if Phase 15 explicitly consumes funding-excluded diagnostics as diagnostics, and does **not** treat funding-excluded PnL as production-approval economics. If Phase 15's dependency on funding-excluded profitability is ever ambiguous, that ambiguity should be documented as a Phase 15 limitation — P14-J does not invent or authorize Phase 15 policy here. |
 
 **Correct one-line summary:** Phase 14 is a mechanically production-ready
@@ -425,9 +650,15 @@ gated execution, and account-scoped reconciliation health-gating — **not** a
 full CoinDCX economic-parity paper simulation, and **not** promotion-eligible.
 Wave 1 (F14-04/05/06/07) and Wave 2 (F14-01/F14-02) of the final-gate
 correction are complete; Wave3-A establishes the production instrument
-authority prerequisite and Wave3-B implements the durable F14-03 correction.
-All Astra F14-01 through F14-07 corrections are implemented; final acceptance
-remains **AWAITING_FINAL_ASTRA_REGATE**.
+authority prerequisite and Wave3-B implements the durable F14-03 correction;
+Wave4A closes the two F14-02 market-evidence trust bypasses a later Astra pass
+reproduced against Wave 2 (§13D), and Wave4A.1 closes the prototype-patch
+bypass an independent verifier then found against Wave4A (§13D.1). One defect
+from that pass remains **OPEN**:
+CLOSE does not maintain `consecutiveLossCount`, `cooldownActiveUntilMs`, or
+`peakEquityInr`. Final acceptance is therefore
+**AWAITING_F14_01_CORRECTION**, then **AWAITING_FINAL_ASTRA_REGATE**. Phase 14
+is not PASS.
 
 ---
 

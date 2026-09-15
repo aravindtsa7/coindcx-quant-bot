@@ -278,12 +278,14 @@ describe('P14-J capability export safety (§18/§19/§52)', () => {
     PRODUCTION_ISSUER: 'src/integration/coindcx/paper-production-runtime.ts',
     SESSION_PROOF: 'src/execution/persistence/admission-bridge.ts',
     ACCOUNT_FAULT_RECOVERY_CAPABILITY: 'src/dispatch/admission.ts',
-    // [F14-02] The production market-evidence acquisition capability. Like
-    // SESSION_PROOF/ACCOUNT_FAULT_RECOVERY_CAPABILITY it IS exported from its
-    // own concrete module (so the P14-B provider, the trusted adapter, and
-    // zero-network test harnesses can import it directly) but must never be
-    // reachable through the public CoinDCX barrel.
-    PRODUCTION_ACQUISITION_CAPABILITY: 'src/integration/coindcx/acquisition-capability.ts',
+    // [F14-02] The production market-evidence acquisition capability. It is no
+    // longer a token at all: it is object identity in the module-private
+    // PRODUCTION_PROVIDERS WeakSet inside paper-evidence.ts, written only by
+    // that module's own approved production factory. Like
+    // INSTRUMENT_BINDING_ISSUER it must be exported from NOWHERE — not from its
+    // defining file, and therefore not from any barrel or deep import.
+    PRODUCTION_PROVIDERS: 'src/integration/coindcx/paper-evidence.ts',
+    PRODUCTION_ACQUISITION_CAPABILITY: 'src/integration/coindcx/paper-evidence.ts',
     INSTRUMENT_BINDING_ISSUER: 'src/integration/coindcx/instrument-authority.ts',
   };
 
@@ -323,11 +325,159 @@ describe('P14-J capability export safety (§18/§19/§52)', () => {
     for (const [name, definingFile] of Object.entries(DEFINING_FILES)) {
       const absDefiningFile = path.join(REPO_ROOT, definingFile);
       const ownExports = collectPublicExportNames(absDefiningFile, readFile, () => null);
-      if (name === 'SESSION_PROOF' || name === 'ACCOUNT_FAULT_RECOVERY_CAPABILITY' || name === 'PRODUCTION_ACQUISITION_CAPABILITY') {
+      if (name === 'SESSION_PROOF' || name === 'ACCOUNT_FAULT_RECOVERY_CAPABILITY') {
         expect(ownExports.has(name), `${definingFile} was expected to export ${name} at its own module level`).toBe(true);
       } else {
         expect(ownExports.has(name), `${definingFile} must keep ${name} module-private (not exported even from its own file)`).toBe(false);
       }
+    }
+  });
+
+  /**
+   * [F14-02 §3/§9/§17] No file anywhere in src/ may export a market-evidence
+   * acquisition capability value, under any name. This is a structural scan of
+   * every export statement in the tree, not an allowlist: if someone
+   * reintroduces a token — as a const, a helper that returns it, or a
+   * re-export — this fails.
+   */
+  it('no src module exports any production market-evidence acquisition capability value', () => {
+    const offenders: string[] = [];
+    const forbiddenNamePattern = /ACQUISITION_CAPABILITY|PRODUCTION_PROVIDERS|GENUINE_PROVIDERS|acquisitionFor/;
+    for (const absFile of listSourceFiles(SRC_ROOT)) {
+      const relative = path.relative(REPO_ROOT, absFile).split(path.sep).join('/');
+      const source = readFileSync(absFile, 'utf8');
+      // Strip block and line comments so prose about the capability is allowed.
+      const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+      for (const line of code.split(/\r?\n/)) {
+        if (!line.includes('export')) continue;
+        if (forbiddenNamePattern.test(line)) offenders.push(`${relative}: ${line.trim()}`);
+      }
+    }
+    expect(offenders, 'a market acquisition capability value must never be exported from src/').toEqual([]);
+  });
+
+  /**
+   * [F14-02 §4] The provider constructor must capture each caller-controlled
+   * option exactly once. A second read of the same caller property is what
+   * Astra's getter TOCTOU exploited, so the shape is asserted structurally.
+   */
+  it('the P14-B provider constructor never reads a caller option property twice', () => {
+    const source = readFileSync(path.join(REPO_ROOT, 'src/integration/coindcx/paper-evidence.ts'), 'utf8');
+    const constructorStart = source.indexOf('public constructor(options: CoinDcxPaperEvidenceOptions)');
+    expect(constructorStart, 'provider constructor not found').toBeGreaterThan(-1);
+    const constructorBody = source.slice(constructorStart, source.indexOf('#acquisition(internal: boolean)', constructorStart));
+    // Exactly one read of the caller object, into the single-read capture.
+    const optionReads = constructorBody.match(/\boptions\.[A-Za-z]+/g) ?? [];
+    expect(optionReads, 'the constructor must touch the caller options object only through captureOptions').toEqual([]);
+    expect(constructorBody).toContain('captureOptions(options)');
+    // And captureOptions itself reads each property exactly once.
+    const captureStart = source.indexOf('function captureOptions(');
+    const captureBody = source.slice(captureStart, source.indexOf('\n}', captureStart));
+    const capturedReads = (captureBody.match(/options\.([A-Za-z]+)/g) ?? []).map((m) => m.split('.')[1]);
+    expect(new Set(capturedReads).size, 'captureOptions must read each caller option exactly once').toBe(capturedReads.length);
+  });
+
+  /**
+   * [F14-02 §5/§8] The approved production construction path must expose no
+   * injectable acquisition dependency.
+   */
+  it('the production evidence provider factory accepts no injectable acquisition dependency', () => {
+    const source = readFileSync(path.join(REPO_ROOT, 'src/integration/coindcx/paper-evidence.ts'), 'utf8');
+    const start = source.indexOf('export interface ProductionPaperEvidenceOptions {');
+    expect(start, 'ProductionPaperEvidenceOptions not found').toBeGreaterThan(-1);
+    const body = source.slice(start, source.indexOf('}', start));
+    for (const seam of ['clock', 'socketFactory', 'orderbookRestTransport', 'markRestTransport', 'conversionTransport', 'transport', 'httpClient', 'reader']) {
+      expect(body.includes(seam), `the production factory must not accept an injectable ${seam}`).toBe(false);
+    }
+  });
+
+  /**
+   * [F14-02 §7] No public ingestion entry point may take a capability-shaped
+   * argument that could upgrade caller-supplied data.
+   */
+  it('no public ingest entry point accepts a capability argument', () => {
+    const source = readFileSync(path.join(REPO_ROOT, 'src/integration/coindcx/paper-evidence.ts'), 'utf8');
+    const publicIngestSignatures = source.match(/public ingest[A-Za-z]+\([^)]*\)/g) ?? [];
+    expect(publicIngestSignatures.length).toBeGreaterThan(0);
+    for (const signature of publicIngestSignatures) {
+      expect(signature.includes('acquisitionCapability'), `${signature} must not accept a capability`).toBe(false);
+      expect(signature.includes('capability'), `${signature} must not accept a capability`).toBe(false);
+      expect(signature.includes('internal'), `${signature} must not let the caller choose the internal path`).toBe(false);
+    }
+  });
+
+  /**
+   * [F14-02 4A.1 §21] The privileged production acquisition implementation is
+   * module-private. The behavioural proof lives in
+   * `tests/unit/execution/prototype-trust-bypass.test.ts`, which actually
+   * patches the exported prototypes and shows the privileged path never calls
+   * them; this is the structural companion that fails fast if the privileged
+   * primitives are ever exported or moved back onto an exported prototype.
+   */
+  it('the privileged production acquisition primitives exist and are exported from nowhere', () => {
+    const evidenceFile = 'src/integration/coindcx/paper-evidence.ts';
+    const source = readFileSync(path.join(REPO_ROOT, evidenceFile), 'utf8');
+    for (const primitive of ['privilegedGetJson', 'PrivilegedProductionSocket']) {
+      expect(source.includes(primitive), `${evidenceFile} must define ${primitive}`).toBe(true);
+    }
+    // Defined, never exported — from this file or any other.
+    const readFile = (f: string): string => readFileSync(f, 'utf8');
+    const ownExports = collectPublicExportNames(path.join(REPO_ROOT, evidenceFile), readFile, () => null);
+    for (const primitive of ['privilegedGetJson', 'PrivilegedProductionSocket']) {
+      expect(ownExports.has(primitive), `${primitive} must stay module-private`).toBe(false);
+    }
+    const offenders: string[] = [];
+    for (const absFile of listSourceFiles(SRC_ROOT)) {
+      const code = readFileSync(absFile, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+      for (const line of code.split(/\r?\n/)) {
+        if (!line.includes('export')) continue;
+        if (/privilegedGetJson|PrivilegedProductionSocket/.test(line)) {
+          offenders.push(`${path.relative(REPO_ROOT, absFile).split(path.sep).join('/')}: ${line.trim()}`);
+        }
+      }
+    }
+    expect(offenders, 'the privileged acquisition primitives must never be exported').toEqual([]);
+  });
+
+  /**
+   * [F14-02 4A.1 §6/§7] The privileged path must select the module-private
+   * primitives, and must do so on the production-registry check — not on a
+   * caller-influenced value.
+   */
+  it('the production acquisition path routes through the private primitives, not an exported prototype', () => {
+    const source = readFileSync(path.join(REPO_ROOT, 'src/integration/coindcx/paper-evidence.ts'), 'utf8');
+
+    const startSocketIndex = source.indexOf('#startSocket(state: SocketState');
+    const startSocket = source.slice(startSocketIndex, source.indexOf('#makeBookEvidence(instrument:', startSocketIndex));
+    expect(startSocket).toContain('const privileged = PRODUCTION_PROVIDERS.has(this)');
+    expect(startSocket).toContain('new PrivilegedProductionSocket(');
+    // The exported factory may still serve the untrusted branch, but the
+    // privileged branch must not reach it.
+    const privilegedSocketBranch = startSocket.slice(startSocket.indexOf('const socket = privileged'), startSocket.indexOf('state.socket = socket'));
+    expect(privilegedSocketBranch.indexOf('new PrivilegedProductionSocket('))
+      .toBeLessThan(privilegedSocketBranch.indexOf('this.#socketFactory.createSocket('));
+
+    for (const method of ['readConversion', 'readOrderbookBootstrap']) {
+      const start = source.indexOf(`public async ${method}(`);
+      expect(start, `${method} not found`).toBeGreaterThan(-1);
+      const body = source.slice(start, source.indexOf('\n  }', start));
+      expect(body, `${method} must gate on the production registry`).toContain('PRODUCTION_PROVIDERS.has(this)');
+      expect(body, `${method} must use the privileged GET`).toContain('privilegedGetJson(');
+      // The exported-transport branch must be explicitly caller-supplied.
+      expect(body, `${method}'s exported-transport branch must stay untrusted`).toMatch(/executeRead[\s\S]*false\)/);
+    }
+  });
+
+  /**
+   * [F14-02 4A.1 §6] The privileged GET reimplements no endpoint semantics: its
+   * paths must stay byte-identical to transport.ts's frozen definitions.
+   */
+  it('privileged production endpoint paths stay in sync with the transport endpoint map', () => {
+    const evidence = readFileSync(path.join(REPO_ROOT, 'src/integration/coindcx/paper-evidence.ts'), 'utf8');
+    const transport = readFileSync(path.join(REPO_ROOT, 'src/integration/coindcx/transport.ts'), 'utf8');
+    for (const literal of ['/market_data/v3/orderbook/{pair}-futures/{depth}', '/api/v1/derivatives/futures/data/conversions']) {
+      expect(evidence.includes(literal), `paper-evidence must pin ${literal}`).toBe(true);
+      expect(transport.includes(literal), `transport must still define ${literal}`).toBe(true);
     }
   });
 
@@ -337,6 +487,16 @@ describe('P14-J capability export safety (§18/§19/§52)', () => {
       'TrustedProductionInstrumentBinding',
       'INSTRUMENT_BINDING_ISSUER',
       'issueBinding',
+      // [F14-02] Market-evidence acquisition internals and fake-provider helpers.
+      'PRODUCTION_ACQUISITION_CAPABILITY',
+      'PRODUCTION_PROVIDERS',
+      'GENUINE_PROVIDERS',
+      'acquisitionFor',
+      'FakeCoinDcxSocket',
+      'FakeCoinDcxSocketFactory',
+      // [F14-02 4A.1] The privileged acquisition implementation.
+      'privilegedGetJson',
+      'PrivilegedProductionSocket',
     ];
     const readFile = (f: string): string => readFileSync(f, 'utf8');
     const allFiles = new Set(listSourceFiles(SRC_ROOT));

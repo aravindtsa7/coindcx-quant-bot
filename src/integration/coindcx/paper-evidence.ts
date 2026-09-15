@@ -1,14 +1,18 @@
+import https from 'node:https';
+import ioClient from 'socket.io-client';
 import { isLosslessNumber, parse as parseLosslessJson } from 'lossless-json';
+import { CoinDcxProviderError, CoinDcxResponseValidationError, CoinDcxTimeoutError } from '../../core/errors/app-error';
 import { sha256CanonicalJson } from '../../backtest/canonical-json';
 import { InstrumentMetadata } from '../../coin-runtime/types';
 import { PaperExecutionQuoteSnapshot } from '../../execution/evidence';
 import { PaperMarkSnapshot } from '../../execution/mark';
 import { canonicalPaperDecimalString, PaperCalcDecimal } from '../../execution/decimal';
-import { acquisitionFor, PRODUCTION_ACQUISITION_CAPABILITY, type PaperEvidenceAcquisition } from './acquisition-capability';
+import { type PaperEvidenceAcquisition } from './acquisition-capability';
 import { Clock, SystemClock } from './clock';
 import { CoinDcxTransport } from './transport';
 import { COINDCX_DEFAULT_SOCKET_ENDPOINT, ProductionCoinDcxSocketFactory } from './websocket/socket-adapter';
-import { CoinDcxSocket, CoinDcxSocketFactory } from './websocket/types';
+import { EXACT_CANDLE_SOCKET_PARSER } from './websocket/candle-json';
+import { CoinDcxSocket, CoinDcxSocketFactory, CoinDcxSocketOptions, SocketEventListener } from './websocket/types';
 
 /** Frozen source and policy identifiers. They intentionally form part of all identities. */
 export const P14_B_ORDERBOOK_SOURCE_ID = 'COINDCX_FUTURES_ORDERBOOK_WS_V1' as const;
@@ -125,6 +129,153 @@ export interface ProductionAcquiredExecutionEvidence {
  * bypass). Module-private: unreachable and unwritable from outside this file.
  */
 const GENUINE_PROVIDERS = new WeakSet<object>();
+
+/**
+ * [F14-02] THE acquisition capability, expressed as object identity rather
+ * than as a token.
+ *
+ * A provider is in this set iff it was built by
+ * `createProductionPaperEvidenceProvider` — the single approved production
+ * construction path, which accepts NO injectable acquisition dependency and
+ * selects the real socket factory, the real REST transports, and the real
+ * system clock itself. Membership is the only thing that lets this module's
+ * own internal acquisition callbacks label a datum
+ * `PRODUCTION_ACQUISITION`.
+ *
+ * Deliberately NOT a symbol, string, boolean, or option: there is nothing to
+ * export, deep-import, name, copy, serialize, or structurally reproduce. A
+ * caller cannot add an entry (the set is module-private and never handed out),
+ * and cannot make a provider it constructed itself become a member. This is
+ * the same construction Wave3-A uses for `INSTRUMENT_BINDING_ISSUER`, and it
+ * is what closes Astra's F14-02 deep-import exploit.
+ */
+const PRODUCTION_PROVIDERS = new WeakSet<object>();
+
+/* -------------------------------------------------------------------------
+ * [F14-02 4A.1] PRIVILEGED PRODUCTION ACQUISITION PRIMITIVES.
+ *
+ * An independent verifier showed that provider identity alone was not enough.
+ * The previous production factory reached the network through
+ * `CoinDcxTransport.prototype.executeRead` and
+ * `ProductionCoinDcxSocketFactory.prototype.createSocket` — both exported,
+ * both writable/configurable. Ordinary application code could deep-import those
+ * classes, patch the prototypes, then call the production factory and receive
+ * fully trusted execution AND valuation evidence with zero genuine CoinDCX
+ * acquisition and no capability of any kind.
+ *
+ * The production trust boundary therefore now includes acquisition
+ * IMPLEMENTATION integrity, not just provenance bookkeeping. Everything below
+ * is a module-local binding in THIS file: not exported, not on any barrel, not
+ * a property of any exported object, and not reachable through a namespace
+ * object under CommonJS interop. A caller cannot replace it, before or after
+ * importing this module, because there is no name anywhere to assign to. The
+ * production factory closes over these directly and never calls back out
+ * through an exported class prototype.
+ *
+ * Remaining boundary, stated precisely rather than overclaimed: these
+ * primitives still stand on Node's own `https` and on the `socket.io-client`
+ * package. Replacing a Node builtin or a third-party package export is a
+ * strictly broader capability that defeats every module in the process
+ * equally, and is outside this repository's module convention — it is not a
+ * repo-exported production API. That is exactly the layer the tests intercept
+ * (§9), which is why the test seam can no longer double as this exploit.
+ * ---------------------------------------------------------------------- */
+
+/** Mirrors transport.ts's frozen READ_ENDPOINT_DEFINITIONS; kept in sync by an architecture test. */
+const PRODUCTION_PUBLIC_BASE_URL = 'https://public.coindcx.com';
+const PRODUCTION_API_BASE_URL = 'https://api.coindcx.com';
+const PRODUCTION_ORDERBOOK_PATH = '/market_data/v3/orderbook/{pair}-futures/{depth}';
+const PRODUCTION_CONVERSIONS_PATH = '/api/v1/derivatives/futures/data/conversions';
+const PRODUCTION_REQUEST_TIMEOUT_MS = 10_000;
+const PRODUCTION_MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
+
+/**
+ * The privileged read. Every P14-B production endpoint is an unauthenticated
+ * public GET, so this preserves the transport's semantics for them exactly —
+ * same paths, same timeout, same response-size cap, same lossless numeric
+ * parsing, same typed CoinDCX errors — without routing through a replaceable
+ * exported method.
+ */
+async function privilegedGetJson(url: string): Promise<unknown> {
+  return new Promise<unknown>((resolve, reject) => {
+    let settled = false;
+    let receivedBytes = 0;
+    const chunks: Buffer[] = [];
+    const settle = (action: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      action();
+    };
+    const request = https.request(url, { method: 'GET', headers: { Accept: 'application/json' } }, (response) => {
+      response.on('data', (chunk: Buffer) => {
+        if (settled) return;
+        receivedBytes += chunk.length;
+        if (receivedBytes > PRODUCTION_MAX_RESPONSE_BYTES) {
+          settle(() => reject(new CoinDcxProviderError(`CoinDCX response exceeded maximum size limit of ${PRODUCTION_MAX_RESPONSE_BYTES} bytes`, 502, { url })));
+          response.destroy();
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.on('error', (error: Error) => settle(() => reject(error)));
+      response.on('end', () => settle(() => {
+        const status = response.statusCode ?? 500;
+        if (status < 200 || status >= 300) {
+          reject(new CoinDcxProviderError(`CoinDCX production acquisition failed with status ${status}`, status, { url }));
+          return;
+        }
+        const rawBody = Buffer.concat(chunks).toString('utf8');
+        if (rawBody.trim().length === 0) { resolve(null); return; }
+        try {
+          resolve(parseLosslessJson(rawBody, undefined, (token: string) => token));
+        } catch {
+          reject(new CoinDcxResponseValidationError('CoinDCX production acquisition returned unparseable JSON', { url }));
+        }
+      }));
+    });
+    const deadline = setTimeout(() => settle(() => {
+      reject(new CoinDcxTimeoutError(`CoinDCX request timed out after ${PRODUCTION_REQUEST_TIMEOUT_MS}ms`, { url }));
+      request.destroy();
+    }), PRODUCTION_REQUEST_TIMEOUT_MS);
+    request.on('error', (error: Error) => settle(() => reject(error)));
+    request.end();
+  });
+}
+
+interface RawProductionSocket {
+  connect(): void;
+  disconnect(): void;
+  on(event: string, fn: (...args: unknown[]) => void): void;
+  off(event: string, fn: (...args: unknown[]) => void): void;
+  emit(event: string, ...args: unknown[]): void;
+  connected?: boolean;
+}
+
+/**
+ * The privileged socket. Byte-for-byte the same socket.io-client configuration
+ * `ProductionCoinDcxSocket` uses (websocket transport only, no library
+ * reconnection, no autoConnect, exact-numeric parser, forceNew), constructed
+ * here so no exported factory prototype sits on the privileged path.
+ */
+class PrivilegedProductionSocket implements CoinDcxSocket {
+  readonly #raw: RawProductionSocket;
+
+  public constructor(endpoint: string, options: CoinDcxSocketOptions) {
+    const connect = ioClient as unknown as (url: string, opts: unknown) => RawProductionSocket;
+    this.#raw = connect(endpoint, {
+      transports: ['websocket'], reconnection: false, autoConnect: false,
+      ...options, parser: EXACT_CANDLE_SOCKET_PARSER, forceNew: true,
+    });
+  }
+
+  public connect(): void { this.#raw.connect(); }
+  public disconnect(): void { this.#raw.disconnect(); }
+  public on(event: string, listener: SocketEventListener): void { this.#raw.on(event, listener); }
+  public off(event: string, listener: SocketEventListener): void { this.#raw.off(event, listener); }
+  public emit(event: string, ...args: unknown[]): void { this.#raw.emit(event, ...args); }
+  public get connected(): boolean { return Boolean(this.#raw.connected); }
+}
 
 interface SocketState {
   generationId: number;
@@ -272,6 +423,16 @@ function orderbookFromPayload(payload: JsonRecord, expectedProviderSymbol: strin
   return freeze({ providerSymbol: symbol, ts, vs, bid: bestBid, ask: bestAsk, semanticLevels: freeze({ bids, asks }) });
 }
 
+/**
+ * [F14-02] Options for the PUBLIC, deliberately UNTRUSTED provider.
+ *
+ * Every acquisition seam here is freely injectable — and that is now safe,
+ * because a provider built through this constructor is NEVER a member of
+ * `PRODUCTION_PROVIDERS`. No option, argument, flag, or capability can make
+ * it one, so nothing it ever holds can be minted into production-usable
+ * trusted evidence. There is intentionally no `acquisitionCapability` option:
+ * the concept has been removed from the public surface, not merely hidden.
+ */
 export interface CoinDcxPaperEvidenceOptions {
   readonly instruments: readonly PaperEvidenceInstrument[];
   readonly policy?: PaperEvidencePolicy;
@@ -280,17 +441,41 @@ export interface CoinDcxPaperEvidenceOptions {
   readonly orderbookRestTransport?: CoinDcxTransport;
   readonly markRestTransport?: CoinDcxTransport;
   readonly conversionTransport?: CoinDcxTransport;
-  /**
-   * [F14-02] Internal-only, non-barrel acquisition capability
-   * (`./acquisition-capability`). Declaring it here is safe precisely because
-   * it cannot be forged: the value is a module-private `Symbol` absent from
-   * every public barrel, so a barrel consumer can name the option but never
-   * supply a matching value. Supplying the genuine capability re-enables
-   * production acquisition provenance on a provider that injects its own
-   * clock/socket/transport seams — the sanctioned zero-network test harness
-   * route, and the ONLY way a non-default-composed provider can ever acquire it.
-   */
-  readonly acquisitionCapability?: unknown;
+}
+
+/**
+ * [F14-02 §4] Every caller-controlled option, read EXACTLY ONCE at the
+ * boundary and materialized into a frozen module-local record.
+ *
+ * Astra's TOCTOU exploit supplied getters that returned `undefined` on the
+ * read that made the trust decision and an attacker-controlled socket factory
+ * / REST transport on the later read that actually built the provider. No
+ * property of the caller's object is ever read twice now, so no getter, Proxy
+ * trap, or accessor can present two different values; `instruments` is
+ * copied, so a live array cannot mutate after validation either.
+ */
+interface CapturedEvidenceOptions {
+  readonly instruments: readonly PaperEvidenceInstrument[];
+  readonly policy: PaperEvidencePolicy | undefined;
+  readonly clock: Clock | undefined;
+  readonly socketFactory: CoinDcxSocketFactory | undefined;
+  readonly orderbookRestTransport: CoinDcxTransport | undefined;
+  readonly markRestTransport: CoinDcxTransport | undefined;
+  readonly conversionTransport: CoinDcxTransport | undefined;
+}
+
+function captureOptions(options: CoinDcxPaperEvidenceOptions): CapturedEvidenceOptions {
+  const instruments = options.instruments;
+  if (!Array.isArray(instruments)) throw new Error('P14-B evidence requires an instruments array');
+  return freeze({
+    instruments: Object.freeze(Array.from(instruments as readonly PaperEvidenceInstrument[], (instrument) => freeze({ ...instrument }))),
+    policy: options.policy,
+    clock: options.clock,
+    socketFactory: options.socketFactory,
+    orderbookRestTransport: options.orderbookRestTransport,
+    markRestTransport: options.markRestTransport,
+    conversionTransport: options.conversionTransport,
+  });
 }
 
 /**
@@ -311,47 +496,55 @@ export class CoinDcxPaperEvidence {
   readonly #books = new Map<string, BookState>();
   readonly #marks = new Map<string, MarkState>();
   #conversion: ConversionState | null = null;
-  /**
-   * [F14-02] Whether this provider's OWN internal acquisition path (the
-   * socket callbacks it wires in `#startSocket`, and the REST reads it issues
-   * through its own transports) counts as approved CoinDCX acquisition.
-   *
-   * True only when every acquisition seam is the genuine default — no injected
-   * socket factory (a fake socket would otherwise let fabricated frames enter
-   * through the "internal" callback), no injected REST transport (a transport
-   * may be pointed at an arbitrary base URL), and no injected clock (an
-   * attacker clock defeats the P14-B freshness/skew gates) — or when the
-   * caller genuinely holds the non-forgeable acquisition capability.
-   */
-  readonly #productionAcquisition: boolean;
-
   public constructor(options: CoinDcxPaperEvidenceOptions) {
-    this.#productionAcquisition = options.acquisitionCapability === PRODUCTION_ACQUISITION_CAPABILITY
-      || (options.socketFactory === undefined && options.orderbookRestTransport === undefined
-        && options.markRestTransport === undefined && options.conversionTransport === undefined && options.clock === undefined);
-    this.#policy = validPolicy(options.policy ?? DEFAULT_PAPER_EVIDENCE_POLICY);
-    this.#clock = options.clock ?? new SystemClock();
-    this.#socketFactory = options.socketFactory ?? new ProductionCoinDcxSocketFactory();
-    this.#orderbookRestTransport = options.orderbookRestTransport ?? new CoinDcxTransport({ baseUrl: 'https://public.coindcx.com' });
-    this.#markRestTransport = options.markRestTransport ?? new CoinDcxTransport({ baseUrl: 'https://public.coindcx.com' });
-    this.#conversionTransport = options.conversionTransport ?? new CoinDcxTransport();
-    for (const instrument of options.instruments) {
+    // [F14-02 §4] Single-read capture. Everything below consumes ONLY these
+    // captured values; the caller's object is never touched again, so the
+    // "undefined during the security decision, fake socket during use" getter
+    // TOCTOU has no second read to exploit.
+    const captured = captureOptions(options);
+    this.#policy = validPolicy(captured.policy ?? DEFAULT_PAPER_EVIDENCE_POLICY);
+    this.#clock = captured.clock ?? new SystemClock();
+    this.#socketFactory = captured.socketFactory ?? new ProductionCoinDcxSocketFactory();
+    this.#orderbookRestTransport = captured.orderbookRestTransport ?? new CoinDcxTransport({ baseUrl: 'https://public.coindcx.com' });
+    this.#markRestTransport = captured.markRestTransport ?? new CoinDcxTransport({ baseUrl: 'https://public.coindcx.com' });
+    this.#conversionTransport = captured.conversionTransport ?? new CoinDcxTransport();
+    for (const instrument of captured.instruments) {
       if (!/^B-[A-Z0-9]+_[A-Z0-9]+$/.test(instrument.pair) || instrument.instrumentSpecSnapshotId.trim() === '') throw new Error('Invalid P14-B evidence instrument');
       const symbol = providerSymbol(instrument);
       if (this.#symbolToInstrument.has(symbol) || this.#pairToInstrument.has(instrument.pair)) throw new Error('Ambiguous P14-B provider symbol or canonical pair mapping');
-      this.#symbolToInstrument.set(symbol, freeze({ ...instrument }));
-      this.#pairToInstrument.set(instrument.pair, freeze({ ...instrument }));
+      this.#symbolToInstrument.set(symbol, instrument);
+      this.#pairToInstrument.set(instrument.pair, instrument);
     }
     if (this.#symbolToInstrument.size === 0) throw new Error('P14-B evidence requires at least one active instrument');
     // [F14-02] Only a DIRECT construction of this exact class is registered —
     // `class Evil extends CoinDcxPaperEvidence` runs this constructor too, but
     // its `new.target` differs, so it is never a genuine provider.
+    //
+    // Note what this constructor deliberately does NOT do: it never adds the
+    // instance to `PRODUCTION_PROVIDERS`. Public construction cannot produce a
+    // production-trusted provider under ANY option combination.
     if (new.target === CoinDcxPaperEvidence) GENUINE_PROVIDERS.add(this);
   }
 
-  /** [F14-02] `PRODUCTION_ACQUISITION` only for a caller holding the real capability on a provider whose own acquisition seams are approved. */
-  #acquisition(capability: unknown): PaperEvidenceAcquisition {
-    return this.#productionAcquisition ? acquisitionFor(capability) : 'CALLER_SUPPLIED';
+  /**
+   * [F14-02] The single provenance decision, with exactly two inputs, neither
+   * of them caller-controlled:
+   *
+   *  - `internal` is set only where the PRIVILEGED, module-private acquisition
+   *    implementation actually ran — the privileged socket in `#startSocket`
+   *    and `privilegedGetJson` in the provider's own `read*` methods. Public
+   *    `ingest*` entry points hard-code `false` and take no parameter that
+   *    could change it, and the exported-transport/socket-factory branches
+   *    pass `false` too, so a patched exported prototype yields caller-supplied
+   *    data even on a production-registered provider.
+   *  - `PRODUCTION_PROVIDERS.has(this)` is object identity in a module-private
+   *    `WeakSet` that only `createProductionPaperEvidenceProvider` writes.
+   *
+   * There is no third input, and in particular no capability argument: the
+   * former `acquisitionCapability` parameter is gone from every signature.
+   */
+  #acquisition(internal: boolean): PaperEvidenceAcquisition {
+    return internal && PRODUCTION_PROVIDERS.has(this) ? 'PRODUCTION_ACQUISITION' : 'CALLER_SUPPLIED';
   }
 
   public get orderbookGenerationId(): number { return this.#orderbookSocket.generationId; }
@@ -362,13 +555,15 @@ export class CoinDcxPaperEvidence {
   public get markSourceSessionId(): string { return this.#sessionId(P14_B_MARK_SOURCE_ID, this.#markSocket.generationId); }
 
   public startOrderbookWebSocket(): number {
-    // [F14-02] The approved CoinDCX Futures WS acquisition path — and the only
-    // orderbook caller that ever supplies the acquisition capability.
-    return this.#startSocket(this.#orderbookSocket, 'depth-snapshot', (generation, raw) => this.ingestOrderbookWebSocket(raw, generation, undefined, PRODUCTION_ACQUISITION_CAPABILITY));
+    // [F14-02] The approved CoinDCX Futures WS acquisition path. It dispatches
+    // to the PRIVATE `#ingestOrderbookWebSocket` with `internal = true`: a
+    // public `ingest*` call can never reach this branch, and an own-property
+    // shadow installed on the instance cannot intercept a `#` method either.
+    return this.#startSocket(this.#orderbookSocket, 'depth-snapshot', (generation, raw, privileged) => this.#ingestOrderbookWebSocket(raw, generation, undefined, privileged));
   }
 
   public startMarkWebSocket(): number {
-    return this.#startSocket(this.#markSocket, 'currentPrices@futures#update', (generation, raw) => this.ingestMarkWebSocket(raw, generation, PRODUCTION_ACQUISITION_CAPABILITY));
+    return this.#startSocket(this.#markSocket, 'currentPrices@futures#update', (generation, raw, privileged) => this.#ingestMarkWebSocket(raw, generation, privileged));
   }
 
   /** Explicit reconnect operation; no autonomous hidden source switching occurs. */
@@ -383,12 +578,19 @@ export class CoinDcxPaperEvidence {
   }
 
   /**
-   * [F14-02] Remains publicly callable — but a public caller holds no
-   * acquisition capability, so anything it feeds is stored as
-   * `CALLER_SUPPLIED` and can never reach the production trusted-evidence
-   * issuer. Parsing/generation/ordering/freshness semantics are unchanged.
+   * [F14-02] Remains publicly callable for parsing/validation and for tests —
+   * but it now takes NO capability argument and hard-codes `internal = false`,
+   * so whatever it accepts is stored as `CALLER_SUPPLIED` unconditionally, on
+   * every provider, forever. There is no argument, option, or second call that
+   * can upgrade it. Parsing/generation/ordering/freshness semantics are
+   * unchanged. The same is true of `ingestOrderbookRest`,
+   * `ingestMarkWebSocket`, `ingestMarkRest` and `ingestConversionRest`.
    */
-  public ingestOrderbookWebSocket(raw: unknown, generationId = this.#orderbookSocket.generationId, expectedPair?: string, acquisitionCapability?: unknown): EvidenceIngestResult {
+  public ingestOrderbookWebSocket(raw: unknown, generationId = this.#orderbookSocket.generationId, expectedPair?: string): EvidenceIngestResult {
+    return this.#ingestOrderbookWebSocket(raw, generationId, expectedPair, false);
+  }
+
+  #ingestOrderbookWebSocket(raw: unknown, generationId: number, expectedPair: string | undefined, internal: boolean): EvidenceIngestResult {
     if (generationId !== this.#orderbookSocket.generationId || generationId === 0) return freeze({ accepted: false, reason: 'OLD_GENERATION' });
     const payload = decodePayload(raw);
     if (payload !== null && payload.event !== undefined && payload.event !== 'depth-snapshot') return freeze({ accepted: false, reason: 'INVALID_ORDERBOOK_EVENT_TYPE' });
@@ -404,11 +606,15 @@ export class CoinDcxPaperEvidence {
     const now = this.#clock.nowMs();
     if (!this.#validEventTime(parsed.ts, now)) return freeze({ accepted: false, reason: 'INVALID_EVENT_TIME' });
     const evidence = this.#makeBookEvidence(instrument, parsed, now, 'WEBSOCKET_ACTIONABLE', generationId);
-    return this.#storeBook(evidence, instrument.instrumentSpecSnapshotId, this.#acquisition(acquisitionCapability));
+    return this.#storeBook(evidence, instrument.instrumentSpecSnapshotId, this.#acquisition(internal));
   }
 
   /** REST evidence is retained only as non-actionable bootstrap/recovery evidence. */
-  public ingestOrderbookRest(pair: string, raw: unknown, acquisitionCapability?: unknown): EvidenceIngestResult {
+  public ingestOrderbookRest(pair: string, raw: unknown): EvidenceIngestResult {
+    return this.#ingestOrderbookRest(pair, raw, false);
+  }
+
+  #ingestOrderbookRest(pair: string, raw: unknown, internal: boolean): EvidenceIngestResult {
     const instrument = this.#pairToInstrument.get(pair);
     if (instrument === undefined) return freeze({ accepted: false, reason: 'UNKNOWN_CANONICAL_PAIR' });
     const payload = decodePayload(raw);
@@ -420,11 +626,15 @@ export class CoinDcxPaperEvidence {
     // A REST response cannot overwrite valid WS execution evidence in the same generation.
     const existing = this.#books.get(pair);
     if (existing?.evidence.sourceClassification === 'WEBSOCKET_ACTIONABLE' && existing.evidence.generationId === this.#orderbookSocket.generationId) return freeze({ accepted: true, idempotent: true });
-    this.#books.set(pair, freeze({ evidence, instrumentSpecSnapshotId: instrument.instrumentSpecSnapshotId, acquisition: this.#acquisition(acquisitionCapability) }));
+    this.#books.set(pair, freeze({ evidence, instrumentSpecSnapshotId: instrument.instrumentSpecSnapshotId, acquisition: this.#acquisition(internal) }));
     return freeze({ accepted: true, idempotent: false });
   }
 
-  public ingestMarkWebSocket(raw: unknown, generationId = this.#markSocket.generationId, acquisitionCapability?: unknown): EvidenceIngestResult {
+  public ingestMarkWebSocket(raw: unknown, generationId = this.#markSocket.generationId): EvidenceIngestResult {
+    return this.#ingestMarkWebSocket(raw, generationId, false);
+  }
+
+  #ingestMarkWebSocket(raw: unknown, generationId: number, internal: boolean): EvidenceIngestResult {
     if (generationId !== this.#markSocket.generationId || generationId === 0) return freeze({ accepted: false, reason: 'OLD_GENERATION' });
     const payload = decodePayload(raw);
     if (payload === null) return freeze({ accepted: false, reason: 'INVALID_MARK_PAYLOAD' });
@@ -451,7 +661,7 @@ export class CoinDcxPaperEvidence {
       } else if (old && old.generationId === generationId && providerTime < old.providerEventTimeMs) {
         return freeze({ accepted: false, reason: 'OUT_OF_ORDER_MARK_EVENT' });
       } else {
-        this.#marks.set(instrument.pair, freeze({ snapshot, acquisition: this.#acquisition(acquisitionCapability) }));
+        this.#marks.set(instrument.pair, freeze({ snapshot, acquisition: this.#acquisition(internal) }));
         idempotent = false;
       }
       accepted = true;
@@ -471,7 +681,11 @@ export class CoinDcxPaperEvidence {
     return valid ? freeze({ accepted: true, idempotent: true }) : freeze({ accepted: false, reason: 'NO_VALID_REST_MARK' });
   }
 
-  public ingestConversionRest(raw: unknown, acquisitionCapability?: unknown): EvidenceIngestResult {
+  public ingestConversionRest(raw: unknown): EvidenceIngestResult {
+    return this.#ingestConversionRest(raw, false);
+  }
+
+  #ingestConversionRest(raw: unknown, internal: boolean): EvidenceIngestResult {
     const body = typeof raw === 'string' ? decodeJson(raw) : raw;
     if (!Array.isArray(body)) return freeze({ accepted: false, reason: 'INVALID_CONVERSION_RESPONSE' });
     const matches = body.filter((entry): entry is JsonRecord => isRecord(entry) && entry.symbol === 'USDTINR' && entry.margin_currency_short_name === 'INR' && entry.target_currency_short_name === 'USDT');
@@ -488,7 +702,7 @@ export class CoinDcxPaperEvidence {
     if (existing && providerTime === existing.providerEventTimeMs && existing.contentSha256 !== contentSha256) { this.#conversion = null; return freeze({ accepted: false, reason: 'CONFLICTING_CONVERSION_EVENT' }); }
     this.#conversion = freeze({
       evidence: freeze({ conversionPriceInrPerUsdt: rate, providerEventTimeMs: providerTime, observedAtMs: now, sourceId: P14_B_CONVERSION_SOURCE_ID, contentSha256 }),
-      acquisition: this.#acquisition(acquisitionCapability),
+      acquisition: this.#acquisition(internal),
     });
     return freeze({ accepted: true, idempotent: existing?.contentSha256 === contentSha256 });
   }
@@ -536,8 +750,12 @@ export class CoinDcxPaperEvidence {
   }
 
   public async readOrderbookBootstrap(pair: string): Promise<EvidenceIngestResult> {
+    if (PRODUCTION_PROVIDERS.has(this)) {
+      const path = PRODUCTION_ORDERBOOK_PATH.replace('{pair}', encodeURIComponent(pair)).replace('{depth}', String(P14_B_ORDERBOOK_DEPTH));
+      return this.#ingestOrderbookRest(pair, await privilegedGetJson(`${PRODUCTION_PUBLIC_BASE_URL}${path}`), true);
+    }
     const response = await this.#orderbookRestTransport.executeRead<unknown>({ endpoint: 'FUTURES_ORDERBOOK', pathParams: { pair, depth: P14_B_ORDERBOOK_DEPTH } });
-    return this.ingestOrderbookRest(pair, response.data, PRODUCTION_ACQUISITION_CAPABILITY);
+    return this.#ingestOrderbookRest(pair, response.data, false);
   }
 
   public async readMarkBootstrap(): Promise<EvidenceIngestResult> {
@@ -547,8 +765,16 @@ export class CoinDcxPaperEvidence {
 
   /** [F14-02] The approved CoinDCX conversion acquisition path — the only conversion caller that supplies the acquisition capability. */
   public async readConversion(): Promise<EvidenceIngestResult> {
+    // [F14-02 4A.1] Privileged providers read through the module-private GET;
+    // patching `CoinDcxTransport.prototype.executeRead` cannot reach this path.
+    // Every other provider keeps the exported transport AND is marked
+    // caller-supplied, so a patched transport is not merely ineffective — its
+    // output can never be production provenance in the first place.
+    if (PRODUCTION_PROVIDERS.has(this)) {
+      return this.#ingestConversionRest(await privilegedGetJson(`${PRODUCTION_API_BASE_URL}${PRODUCTION_CONVERSIONS_PATH}`), true);
+    }
     const response = await this.#conversionTransport.executeRead<unknown>({ endpoint: 'FUTURES_CONVERSIONS' });
-    return this.ingestConversionRest(response.data, PRODUCTION_ACQUISITION_CAPABILITY);
+    return this.#ingestConversionRest(response.data, false);
   }
 
   /**
@@ -606,18 +832,28 @@ export class CoinDcxPaperEvidence {
     }));
   }
 
-  #startSocket(state: SocketState, event: string, handle: (generation: number, raw: unknown) => EvidenceIngestResult): number {
+  #startSocket(state: SocketState, event: string, handle: (generation: number, raw: unknown, privileged: boolean) => EvidenceIngestResult): number {
     state.generationId++;
     const generation = state.generationId;
     state.socket?.disconnect();
-    const socket = this.#socketFactory.createSocket(COINDCX_DEFAULT_SOCKET_ENDPOINT, { transports: ['websocket'], reconnection: false, autoConnect: false });
+    // [F14-02 4A.1] A production-registered provider NEVER touches the exported
+    // socket factory. It constructs the module-private privileged socket
+    // directly, so patching `ProductionCoinDcxSocketFactory.prototype` cannot
+    // put fabricated frames on the privileged path. `privileged` records which
+    // implementation actually ran and is the only thing that can later mark a
+    // datum PRODUCTION_ACQUISITION.
+    const privileged = PRODUCTION_PROVIDERS.has(this);
+    const socketOptions: CoinDcxSocketOptions = { transports: ['websocket'], reconnection: false, autoConnect: false };
+    const socket = privileged
+      ? new PrivilegedProductionSocket(COINDCX_DEFAULT_SOCKET_ENDPOINT, socketOptions)
+      : this.#socketFactory.createSocket(COINDCX_DEFAULT_SOCKET_ENDPOINT, socketOptions);
     state.socket = socket;
     socket.on('connect', () => {
       if (state.socket !== socket || state.generationId !== generation) return;
       if (event === 'depth-snapshot') for (const instrument of this.#symbolToInstrument.values()) socket.emit('join', { channelName: `${instrument.pair}@orderbook@${P14_B_ORDERBOOK_DEPTH}-futures` });
       else socket.emit('join', { channelName: 'currentPrices@futures@rt' });
     });
-    socket.on(event, (raw: unknown) => { if (state.socket === socket && state.generationId === generation) handle(generation, raw); });
+    socket.on(event, (raw: unknown) => { if (state.socket === socket && state.generationId === generation) handle(generation, raw, privileged); });
     socket.connect();
     return generation;
   }
@@ -662,22 +898,81 @@ function decodeJson(text: string): unknown {
 }
 
 /**
+ * [F14-02 §5] Options for the approved PRODUCTION acquisition path.
+ *
+ * Deliberately a different, much smaller type than
+ * `CoinDcxPaperEvidenceOptions`: there is no `clock`, no `socketFactory`, no
+ * `orderbookRestTransport`, no `markRestTransport` and no `conversionTransport`
+ * member, so a production caller has no injectable acquisition dependency to
+ * supply — not a socket, transport, HTTP client, callback, reader, provider, or
+ * Proxy wrapper. `instruments` and `policy` are the only caller inputs, both
+ * already validated by the existing construction-time checks, and neither is an
+ * acquisition seam.
+ */
+export interface ProductionPaperEvidenceOptions {
+  readonly instruments: readonly PaperEvidenceInstrument[];
+  readonly policy?: PaperEvidencePolicy;
+}
+
+/**
+ * [F14-02 §5] The SOLE production mint for market-evidence acquisition
+ * authority — the P14-B counterpart of Wave3-A's
+ * `acquireProductionInstrumentBinding`.
+ *
+ * It selects the real `ProductionCoinDcxSocketFactory`, the real
+ * `CoinDcxTransport`s and the real `SystemClock` itself, then registers the
+ * resulting instance in the module-private `PRODUCTION_PROVIDERS` set. Trust
+ * therefore originates from THIS construction path, never from "some option
+ * happened to be `undefined`" — the inference Astra's getter TOCTOU abused.
+ *
+ * Zero-network testing of this genuine path does not go through any production
+ * API: tests intercept `CoinDcxTransport.prototype.executeRead` and
+ * `ProductionCoinDcxSocketFactory.prototype.createSocket` with the test
+ * runner's own mocking, exactly as Wave3-A's accepted instrument-authority
+ * tests already do. That seam is a property of the test runner, not an export,
+ * so it hands normal callers no trust-minting authority.
+ *
+ * [F14-02 §16] This mints market-evidence acquisition trust ONLY. It cannot
+ * produce a `TrustedProductionInstrumentBinding`, and instrument authority
+ * cannot produce a production provider; the two capabilities stay disjoint.
+ */
+export function createProductionPaperEvidenceProvider(options: ProductionPaperEvidenceOptions): CoinDcxPaperEvidence {
+  // Single-read capture of the caller's two non-acquisition inputs, then
+  // construction from values this function controls. The inner options object
+  // is built here, so no getter/Proxy of the caller's can be re-consulted.
+  const instruments = Object.freeze(Array.from(options.instruments, (instrument) => freeze({ ...instrument })));
+  const policy = options.policy;
+  const provider = new CoinDcxPaperEvidence(policy === undefined ? { instruments } : { instruments, policy: freeze({ ...policy }) });
+  PRODUCTION_PROVIDERS.add(provider);
+  return provider;
+}
+
+/**
  * [F14-02] The single provenance-checked entry point the trusted P14-E adapter
  * uses. Three independent, non-caller-controllable proofs must hold:
  *
- *  1. `provider` is an instance of the real class AND was registered by the
- *     real constructor's own `new.target` identity check — a structural
- *     look-alike object, a `Object.create(CoinDcxPaperEvidence.prototype)`
- *     forgery, and a `class X extends CoinDcxPaperEvidence` instance all fail.
- *  2. The reader is invoked as the PROTOTYPE method, never as `provider.read…`
- *     — so an own-property shadow installed on a provider instance cannot
- *     substitute its own result.
- *  3. Inside that reader, every constituent datum must carry
- *     `PRODUCTION_ACQUISITION` provenance, obtainable only through the
- *     approved CoinDCX acquisition path (module-private capability).
+ *  1. GENUINE PROVIDER IDENTITY — `provider` is an instance of the real class
+ *     AND was registered by the real constructor's own `new.target` identity
+ *     check: a structural look-alike, an
+ *     `Object.create(CoinDcxPaperEvidence.prototype)` forgery, a Proxy, and a
+ *     `class X extends CoinDcxPaperEvidence` instance all fail.
+ *  2. GENUINE PRODUCTION ACQUISITION PROVENANCE — `provider` is a member of
+ *     the module-private `PRODUCTION_PROVIDERS` set, i.e. it was built by
+ *     `createProductionPaperEvidenceProvider`, which exposes no injectable
+ *     socket factory, REST transport, HTTP client, reader, callback or clock.
+ *     [F14-02 §6] `instanceof`/`new.target` alone is explicitly NOT treated as
+ *     acquisition provenance; this is the separate, independent proof.
+ *  3. PER-DATUM PRODUCTION PROVENANCE — inside the reader, every constituent
+ *     datum must itself carry `PRODUCTION_ACQUISITION`, which only this
+ *     module's own internal acquisition callbacks assign.
+ *
+ * The reader is additionally invoked as the PROTOTYPE method, never as
+ * `provider.read…`, so an own-property shadow installed on a provider instance
+ * cannot substitute its own result.
  */
 export function readProductionAcquiredPaperExecutionEvidence(provider: unknown, pair: string): EvidenceReadResult<ProductionAcquiredExecutionEvidence> {
   if (!(provider instanceof CoinDcxPaperEvidence) || !GENUINE_PROVIDERS.has(provider)) return unavailable('UNTRUSTED_EVIDENCE_PROVIDER');
+  if (!PRODUCTION_PROVIDERS.has(provider)) return unavailable('PROVIDER_NOT_PRODUCTION_ACQUIRED');
   return CoinDcxPaperEvidence.prototype.readProductionAcquiredExecutionEvidence.call(provider, pair);
 }
 
@@ -689,5 +984,6 @@ export function readProductionAcquiredPaperExecutionEvidence(provider: unknown, 
  */
 export function readProductionAcquiredPaperValuationEvidence(provider: unknown, pairs: readonly string[]): EvidenceReadResult<ProductionAcquiredValuationEvidence> {
   if (!(provider instanceof CoinDcxPaperEvidence) || !GENUINE_PROVIDERS.has(provider)) return unavailable('UNTRUSTED_EVIDENCE_PROVIDER');
+  if (!PRODUCTION_PROVIDERS.has(provider)) return unavailable('PROVIDER_NOT_PRODUCTION_ACQUIRED');
   return CoinDcxPaperEvidence.prototype.readProductionAcquiredValuationEvidence.call(provider, pairs);
 }

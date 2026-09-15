@@ -53,6 +53,25 @@ describe('Phase 3 Architectural Scope & Non-Mutation Invariants', () => {
     }
   });
 
+  /**
+   * [F14-02 4A.1] The one deliberate exception, and why it stays narrow.
+   *
+   * The Phase 3 rule — WebSocket implementations must not proliferate outside
+   * the websocket layer — still holds. But the P14-B production market-evidence
+   * trust boundary requires the privileged socket to be constructed from a
+   * MODULE-LOCAL binding in the same module that owns the production registry
+   * and factory. An independent verifier showed that any cross-module reference
+   * is just a writable property on the CommonJS exports object
+   * (`socket_adapter_1.ProductionCoinDcxSocketFactory = evil`), which is exactly
+   * the patch that forged fully trusted execution and valuation evidence with
+   * zero network.
+   *
+   * So `paper-evidence.ts` constructs its privileged socket directly. The
+   * exception is pinned to that single file, and the test asserts the exception
+   * set is exactly that — an allowlist that polices its own size rather than one
+   * that hides a problem.
+   */
+  const PRIVILEGED_SOCKET_EXCEPTIONS = ['src/integration/coindcx/paper-evidence.ts'];
   it('44. proves coin-runtime and non-websocket layers contain zero WebSocket or Socket.IO implementations', () => {
     const srcDir = join(process.cwd(), 'src');
     const files = getAllTypeScriptFiles(srcDir).filter(
@@ -60,18 +79,29 @@ describe('Phase 3 Architectural Scope & Non-Mutation Invariants', () => {
     );
 
     const forbiddenLibraries = ['socket.io', 'socket.io-client', 'ws'];
+    const actualExceptions: string[] = [];
 
     for (const filePath of files) {
+      const normalized = filePath.split(/[\\/]/).join('/');
+      const relative = normalized.slice(normalized.lastIndexOf('src/'));
       const content = readFileSync(filePath, 'utf8');
       for (const lib of forbiddenLibraries) {
         // Ensure no import statement references these libraries
         const importRegex = new RegExp(`from\\s+['"]${lib}['"]|require\\(['"]${lib}['"]\\)`);
+        if (!importRegex.test(content)) continue;
+        if (PRIVILEGED_SOCKET_EXCEPTIONS.includes(relative)) {
+          actualExceptions.push(relative);
+          continue;
+        }
         expect(
-          importRegex.test(content),
+          true,
           `Prohibited network library '${lib}' imported in production file '${filePath}'`
         ).toBe(false);
       }
     }
+
+    // The exception set must be exactly the one documented privileged site.
+    expect([...new Set(actualExceptions)].sort()).toEqual([...PRIVILEGED_SOCKET_EXCEPTIONS].sort());
   });
 
   it('45. proves core runtime implementation contains zero hardcoded pair symbols or coin switches', () => {
