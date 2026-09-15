@@ -623,6 +623,108 @@ Phase 14 final **NOT PASS**.
 
 ---
 
+## 13E. Final Correction — F14-01 durable loss / cooldown / peak-equity state
+
+The last open Astra blocker. `docs/RISK_LEVERAGE_ENGINE.md` §12.4/§12.5 assign
+`consecutiveLossCount`, `cooldownActiveUntilMs` and `peakEquityInr` to the
+`AccountRiskStateProvider` adapter — "Phase 13 only compares the supplied
+values against configured thresholds; it never recomputes them from raw trades
+itself". Phase14's durable paper account IS that adapter, and it was
+maintaining none of the three: they were written once at account creation and
+never again.
+
+### Reproduced
+
+| Astra observation | Cause |
+|---|---|
+| 3 realized losing CLOSEs (−₹1,100, −₹1,087.68, −₹1,075.36) against a configured limit of 3 left `consecutiveLossCount = 0`, `cooldownActiveUntilMs = NULL`, and a 4th OPEN FILLED | the CLOSE economic transaction booked realized PnL and fees but never touched either field |
+| cash reached ₹100,879.10 and MTM equity ₹100,990 while stored `peakEquityInr` stayed ₹100,000 | nothing ever advanced the high-water mark, so §12.4's drawdown measured decline from the inception value |
+| stale risk state still reconciled HEALTHY | P14-H had no risk-state check at all |
+
+### Frozen semantics recovered (not invented)
+
+| Rule | Source | Implementation |
+|---|---|---|
+| LOSS = a closed trade's realized PnL `< 0` → +1 | §12.5 | the exact gross realized PnL P14-E already booked to the fill, the `REALIZED_PNL` ledger entry and the lifecycle row — never recomputed |
+| PROFIT or BREAKEVEN (`≥ 0`) → reset to 0 | §12.5 | breakeven clears the streak, it does not preserve it |
+| Cooldown start = the close that FIRST reaches the limit sets `closeTimeMs + cooldownMs` | §12.5 | "first reach" is literal, so a later loss never re-arms or extends the boundary |
+| Cooldown boundary: blocked strictly while `evaluationTimeMs < cooldownActiveUntilMs` | §12.5 | unchanged gate, now fed genuine state |
+| `peakEquityInr` = running high-water mark of `currentEquityInr`, never auto-resets | §12.4 | exact Decimal `max`; no path lowers it |
+| `currentEquityInr` INCLUDES unrealized PnL | §12.3 | so MTM observations are observations of the high-watered quantity |
+
+Fee treatment is deliberate: §12.1 keeps `realizedTradingPnlInr` and `feesInr`
+as separate daily-PnL components and `accounting.ts` documents the account's
+`R` column as "cumulative booked gross realized trading PnL", so the streak is
+classified on gross realized trading PnL. Funding is excluded and contributes
+nothing (§31).
+
+### Correction
+
+- **CLOSE (atomic).** `src/execution/persistence/durable-risk-state.ts` holds the
+  frozen rules as pure functions. The CLOSE economic transaction now folds the
+  loss streak and cooldown into the SAME `paperAccount.update` that books
+  realized PnL and fees, under the SAME account-row lock, with the SAME single
+  `revision` increment. There is no follow-up write, so a rolled-back CLOSE
+  advances no risk state, and F14-06's exactly-once revision semantics are
+  unchanged.
+- **Peak on CLOSE, only when exact.** Equity is `cash + Σ unrealized`, so
+  post-close cash equals equity only when the account holds no OPEN position.
+  A CLOSE that leaves the account flat advances the mark to that exact cash; a
+  CLOSE with positions still open makes no peak claim and leaves it to the next
+  MTM observation. No guess, one formula.
+- **Peak on OPEN/MTM.** `advanceDurablePeakEquity` writes the observed
+  authoritative equity BEFORE §12.4's drawdown gate measures against it. The
+  network read is already finished, so no I/O happens under the lock; the write
+  is conditional on the derivation's own revision, so a concurrent mutation
+  fails closed as `STALE_ACCOUNT_REVISION` rather than overwriting a newer peak
+  from a stale basis. [§26] An observation at or below the stored mark writes
+  nothing and leaves the revision untouched, so no admission race is
+  manufactured. [§27] Admission now binds to the post-advancement revision;
+  when no advancement was needed the two values are identical.
+- **Reconciliation (§22).** A new `RISK_STATE_MISMATCH` fault, flagging only
+  what committed facts mathematically prove, never repairing.
+
+### What reconciliation can and cannot prove
+
+| Field | Provable? | Check |
+|---|---|---|
+| `consecutiveLossCount` | **Fully** — a pure fold over every closed lifecycle's own realized PnL and close time; policy-independent | `DURABLE_CONSECUTIVE_LOSS_COUNT_MISMATCH` |
+| `cooldownActiveUntilMs` | **Only against the configured limit/duration**, which are policy, not durable facts | `DURABLE_COOLDOWN_BOUNDARY_MISMATCH`, checked when a policy is supplied and deliberately left unverified otherwise — never guessed |
+| `peakEquityInr` | **Lower bound only.** Historical marks are NOT durably stored, so the true high-water of an account that held open positions is genuinely unrecoverable and is not reconstructed | `PEAK_EQUITY_BELOW_PROVABLE_MINIMUM`, from starting capital and cash at each moment the account demonstrably held no open position (where equity equals cash exactly) |
+
+Fault identity stays deterministic — the semantic hash carries immutable facts
+only, never a detection timestamp — so the same defect yields the same
+`faultId` on every run. Funding is excluded from the peak bound: it is always
+0 in valid Phase14 state and a nonzero value is already owned by
+`FUNDING_INVARIANT_VIOLATION`, so folding it in would report one corruption
+twice.
+
+### Evidence
+
+`tests/unit/execution/persistence/durable-risk-state.test.ts` (11 tests) pins
+the frozen rules themselves: increment, profit reset, breakeven reset, first-reach
+cooldown arming, no re-arm or extension on a later loss, no-limit configuration,
+deterministic replay, exact Decimal sign, strict-advance-only peak, and the mark
+never lowering.
+
+`tests/integration/execution/paper-production-runtime.test.ts` (61 tests) adds
+the live-DB proofs: Astra's exact three-loss reproducer with the fourth OPEN now
+refused and no economics; the inclusive-end cooldown boundary; profitable reset;
+restart restoring streak, cooldown and peak from durable state across fresh
+compositions; account isolation; a duplicate terminal CLOSE retry advancing the
+streak exactly once; a profitable flat CLOSE advancing the peak to exact
+post-close equity; an unrealized MTM gain advancing the peak with a later
+decline never lowering it and drawdown measured from the historical mark; the
+no-churn and stale-revision behaviours of the peak write; a losing CLOSE never
+lowering the mark; and the four reconciliation faults plus the two cases
+reconciliation deliberately refuses to guess.
+
+Status: **F14-01 corrected, awaiting targeted verify.** Funding remains
+unsupported/excluded and the maximum lifecycle remains PAPER — no part of this
+wave changes that.
+
+---
+
 ## 14. Final Phase14 Status
 
 | Question | Answer |
@@ -638,10 +740,10 @@ Phase 14 final **NOT PASS**.
 | Live execution adapter | **NOT_IMPLEMENTED / NOT_ACTIVE** (§10) |
 | Drawdown gate sensitivity to unrealized PnL | **FULL MTM FOR OPEN ADMISSION** — every durable OPEN position valued from production-acquired fresh mark/conversion evidence (§13B.1) |
 | F14-02 public market-evidence trust bypass | **CORRECTION IMPLEMENTED, awaiting targeted verify** (§13D/§13D.1 — getter TOCTOU, deep-imported token, and prototype-patch bypass all closed and re-probed) |
-| F14-01 durable loss/drawdown maintenance on CLOSE | **OPEN** — CLOSE does not maintain `consecutiveLossCount`, `cooldownActiveUntilMs`, `peakEquityInr`; deliberately out of scope for Wave4A |
+| F14-01 durable loss/cooldown/peak-equity state | **CORRECTION IMPLEMENTED, awaiting targeted verify** (§13E — maintained atomically on CLOSE, advanced from authoritative MTM on OPEN, and reconciled against committed history) |
 | F14-03 instrument acquisition authority prerequisite | **IMPLEMENTED in Wave3-A** — genuine pair-only CoinDCX acquisition produces an opaque binding; no caller metadata can mint it |
 | F14-03 durable economics/policy correction | **IMPLEMENTED in Wave3-B** — immutable pair-bound economics, canonical policy validation, OPEN→MTM→CLOSE lifecycle authority, restart, and legacy fail-closed reconciliation |
-| Final Astra milestone gate | **NOT PASS** — `AWAITING_F14_01_CORRECTION`, then `AWAITING_FINAL_ASTRA_REGATE` |
+| Final Astra milestone gate | **NOT PASS** — `ALL_KNOWN_F14_01_TO_F14_07_CORRECTIONS_IMPLEMENTED`, `AWAITING_FINAL_ASTRA_REGATE` |
 | Ready for Phase 15 ranking? | Only if Phase 15 explicitly consumes funding-excluded diagnostics as diagnostics, and does **not** treat funding-excluded PnL as production-approval economics. If Phase 15's dependency on funding-excluded profitability is ever ambiguous, that ambiguity should be documented as a Phase 15 limitation — P14-J does not invent or authorize Phase 15 policy here. |
 
 **Correct one-line summary:** Phase 14 is a mechanically production-ready
@@ -652,13 +754,13 @@ Wave 1 (F14-04/05/06/07) and Wave 2 (F14-01/F14-02) of the final-gate
 correction are complete; Wave3-A establishes the production instrument
 authority prerequisite and Wave3-B implements the durable F14-03 correction;
 Wave4A closes the two F14-02 market-evidence trust bypasses a later Astra pass
-reproduced against Wave 2 (§13D), and Wave4A.1 closes the prototype-patch
-bypass an independent verifier then found against Wave4A (§13D.1). One defect
-from that pass remains **OPEN**:
-CLOSE does not maintain `consecutiveLossCount`, `cooldownActiveUntilMs`, or
-`peakEquityInr`. Final acceptance is therefore
-**AWAITING_F14_01_CORRECTION**, then **AWAITING_FINAL_ASTRA_REGATE**. Phase 14
-is not PASS.
+reproduced against Wave 2 (§13D), Wave4A.1 closes the prototype-patch bypass an
+independent verifier then found against Wave4A (§13D.1), and §13E closes the
+last blocker — durable `consecutiveLossCount`, `cooldownActiveUntilMs` and
+`peakEquityInr` maintenance. **ALL_KNOWN_F14_01_TO_F14_07_CORRECTIONS_IMPLEMENTED**;
+final acceptance remains **AWAITING_FINAL_ASTRA_REGATE**, and Phase 14 is not
+PASS. Funding remains unsupported/excluded and the maximum lifecycle remains
+PAPER.
 
 ---
 

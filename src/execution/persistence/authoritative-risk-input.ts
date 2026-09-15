@@ -9,6 +9,7 @@ import { computeAvailableMargin, computeCashBalance, computeEquity, computeUnrea
 import { paperDecimal, type PaperCalc } from '../decimal';
 import { PaperAccountOwnership } from './account-ownership';
 import { buildBaseExposureSnapshot } from './account-repository';
+import { advancesPeak, nextPeakEquityInr } from './durable-risk-state';
 import { PaperPersistenceError } from './errors';
 import { executionPolicySnapshotFromRow, instrumentEconomicsSnapshotFromRow } from './immutable-snapshots';
 
@@ -441,6 +442,87 @@ export function deriveMarkToMarketRiskInput(params: DeriveAuthoritativePaperRisk
  */
 export function deriveCloseRiskInput(params: Omit<DeriveAuthoritativePaperRiskInputParams, 'valuation'>): AuthoritativePaperRiskInput {
   return buildRiskInput(params.base, params.policy, params.accountMaxLeverage ?? null, paperDecimal('0'));
+}
+
+/**
+ * [F14-01 §12.4] Durably advance the running high-water mark from an
+ * authoritative mark-to-market observation.
+ *
+ * `peakEquityInr` is the high-water mark of `currentEquityInr`, and §12.3 is
+ * explicit that `currentEquityInr` INCLUDES unrealized PnL. So the production
+ * OPEN path's own authoritative equity observation is exactly an observation of
+ * the quantity being high-watered, and it must advance the durable mark before
+ * §12.4's drawdown gate measures decline against it. Astra's report is the
+ * failure mode: equity reached ₹100,990 while the stored peak stayed at the
+ * ₹100,000 inception value.
+ *
+ * Ordering and safety:
+ *
+ *  - No network I/O happens here or under the lock. The caller has already
+ *    finished acquiring MTM evidence and computed `observedEquityInr`; this
+ *    only writes.
+ *  - The write is conditional on `expectedRevision` inside the account-row
+ *    lock, so a concurrent mutation that advanced the account after the caller
+ *    read its base fails closed with `STALE_ACCOUNT_REVISION` instead of
+ *    overwriting a newer peak with a stale-basis value.
+ *  - [§26] When the observation does NOT exceed the stored mark, nothing is
+ *    written and the revision is returned unchanged. A re-observation of an
+ *    identical or lower equity never churns the revision, so it never creates
+ *    an admission race out of nothing.
+ *  - [§6] The stored mark can only ever move up: the caller's value is used
+ *    only on the strictly-greater branch, and the comparison is exact Decimal.
+ */
+export interface AdvancePeakEquityParams {
+  readonly prisma: PrismaClient;
+  readonly accountId: string;
+  readonly expectedRevision: bigint;
+  readonly observedEquityInr: string;
+}
+
+export interface AdvancePeakEquityResult {
+  readonly peakEquityInr: string;
+  /** The account revision in force after this step — unchanged when no write was needed. */
+  readonly revision: bigint;
+  readonly advanced: boolean;
+}
+
+export async function advanceDurablePeakEquity(params: AdvancePeakEquityParams): Promise<AdvancePeakEquityResult> {
+  const observed = paperDecimal(params.observedEquityInr);
+  return params.prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT account_id FROM paper_account WHERE account_id = ${params.accountId} FOR UPDATE`;
+    const account = await tx.paperAccount.findUnique({ where: { accountId: params.accountId } });
+    if (account === null) throw new PaperPersistenceError('ACCOUNT_NOT_FOUND', `No paper_account row for ${params.accountId}`);
+    if (account.revision !== params.expectedRevision) {
+      throw new PaperPersistenceError(
+        'STALE_ACCOUNT_REVISION',
+        `Expected account revision ${params.expectedRevision} for ${params.accountId} but current revision is ${account.revision}`,
+      );
+    }
+    const storedPeak = paperDecimal(account.peakEquityInr.toFixed());
+    if (!advancesPeak(storedPeak, observed)) {
+      return Object.freeze({ peakEquityInr: canonical(storedPeak), revision: account.revision, advanced: false });
+    }
+    const nextPeak = nextPeakEquityInr(storedPeak, observed);
+    const updated = await tx.paperAccount.update({
+      where: { accountId: params.accountId },
+      data: { peakEquityInr: new Prisma.Decimal(canonical(nextPeak)), revision: { increment: 1n } },
+      select: { revision: true },
+    });
+    return Object.freeze({ peakEquityInr: canonical(nextPeak), revision: updated.revision, advanced: true });
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted });
+}
+
+/**
+ * [F14-01] Rebase an already-loaded durable base onto the peak/revision that
+ * {@link advanceDurablePeakEquity} just established, so the risk snapshot the
+ * engine evaluates and the revision admission binds to are the same coherent
+ * state. Pure — no I/O, and it only ever carries a peak forward.
+ */
+export function rebaseOnAdvancedPeak(
+  base: AuthoritativePaperRiskBase, advanced: AdvancePeakEquityResult,
+): AuthoritativePaperRiskBase {
+  if (!advanced.advanced) return base;
+  return Object.freeze({ ...base, peakEquityInr: advanced.peakEquityInr, revision: advanced.revision });
 }
 
 /**

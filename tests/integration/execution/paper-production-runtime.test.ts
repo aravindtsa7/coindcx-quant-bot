@@ -12,7 +12,7 @@ import { buildExecutionPolicySnapshot, EXECUTION_POLICY_VERSION, paperDecimal, t
 import { PaperAccountReconciler } from '../../../src/execution/persistence/paper-account-reconciler';
 import { PaperAccountRepository } from '../../../src/execution/persistence/account-repository';
 import {
-  deriveMarkToMarketRiskInput, loadAuthoritativePaperRiskBase,
+  advanceDurablePeakEquity, deriveMarkToMarketRiskInput, loadAuthoritativePaperRiskBase,
   type AuthoritativePaperRiskBase, type AuthoritativePaperRiskInput,
 } from '../../../src/execution/persistence/authoritative-risk-input';
 import {
@@ -23,6 +23,7 @@ import { createdFakeSockets, type FakeIoSocket } from '../../helpers/fake-socket
 import {
   PaperAccountProductionComposer, PaperProductionRuntimeError, type ProductionCloseParams, type ProductionOpenParams,
 } from '../../../src/integration/coindcx/paper-production-runtime';
+import { lossDrawdownReasons } from '../../../src/risk/loss-drawdown';
 import { assertProductionLifecycleTransitionAuthorized } from '../../../src/coin-runtime/lifecycle';
 import { CoinLifecycleError } from '../../../src/core/errors/app-error';
 import { evaluateDecision, genuineResearchApproval, makeKernel, PAIR, policyFor, productionRiskRequest } from '../../unit/dispatch/helpers';
@@ -1689,6 +1690,548 @@ describe('F14-02 live-DB — production OPEN/CLOSE reject caller-fabricated mark
     expect((await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).revision).toBe(before.revision);
     expect((await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR_B } } })).status).toBe('EMPTY');
   }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// [F14-01] Durable risk state: consecutive losses, cooldown, and the running
+// equity high-water mark. Astra reproduced all three as unmaintained.
+// ---------------------------------------------------------------------------
+
+/** One complete losing OPEN->CLOSE lifecycle. OPEN fills at the ask, CLOSE at the (lower) bid. */
+async function losingLifecycle(
+  runtime: PaperAccountRuntimeUnderTest, provider: CoinDcxPaperEvidence, accountId: string, cycle: number,
+): Promise<{ readonly realizedPnlInr: string; readonly closedAtMs: number }> {
+  const openAt = T0 + cycle * 10 * MINUTE;
+  await feedFreshEvidence(provider, '99', '99.5');
+  const openParams = await buildOpenParams(accountId, {}, openAt);
+  const opened = await runtime.executeOpen(openParams);
+  if (opened.outcome !== 'FILLED') throw new Error(`cycle ${cycle}: OPEN did not fill (${opened.outcome})`);
+
+  await feedFreshEvidence(provider, '90', '90.5');
+  const closed = await runtime.executeClose(buildCloseParams(openParams.kernel, accountId, opened.quantity, {}, openAt + MINUTE));
+  if (closed.outcome !== 'CLOSED') throw new Error(`cycle ${cycle}: CLOSE did not close (${closed.outcome})`);
+  if (!paperDecimal(closed.realizedPnlInr).isNegative()) throw new Error(`cycle ${cycle}: expected a realized LOSS, got ${closed.realizedPnlInr}`);
+
+  const fill = await prisma.paperFill.findFirstOrThrow({
+    where: { accountId, action: 'CLOSE' }, orderBy: { eventTimeMs: 'desc' },
+  });
+  return { realizedPnlInr: closed.realizedPnlInr, closedAtMs: Number(fill.eventTimeMs) };
+}
+
+type PaperAccountRuntimeUnderTest = Awaited<ReturnType<PaperAccountProductionComposer['start']>>;
+
+describe('F14-01 live-DB — durable consecutive-loss and cooldown state (§12.5)', () => {
+  it('Astra reproducer: three realized losses set the streak to 3, arm the cooldown, and block the fourth OPEN', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const provider = makeProvider();
+    const runtime = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+
+    // Configured limit 3, cooldown 60_000 ms — exactly Astra's configuration.
+    expect(policyFor(PAIR).modeConfig.consecutiveLossLimit).toBe(3);
+    expect(policyFor(PAIR).modeConfig.cooldownMs).toBe(60_000);
+
+    const first = await losingLifecycle(runtime, provider, accountId, 0);
+    expect((await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).consecutiveLossCount).toBe(1);
+    expect((await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).cooldownActiveUntilMs).toBeNull();
+
+    await losingLifecycle(runtime, provider, accountId, 1);
+    expect((await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).consecutiveLossCount).toBe(2);
+    expect((await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).cooldownActiveUntilMs).toBeNull();
+
+    const third = await losingLifecycle(runtime, provider, accountId, 2);
+    const afterThird = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    expect(afterThird.consecutiveLossCount).toBe(3);
+    expect(afterThird.cooldownActiveUntilMs).not.toBeNull();
+    // §12.5: cooldownActiveUntilMs = thatTradeCloseTimeMs + cooldownMs, exactly.
+    expect(Number(afterThird.cooldownActiveUntilMs)).toBe(third.closedAtMs + 60_000);
+    expect(Number(afterThird.cooldownActiveUntilMs)).toBeGreaterThan(third.closedAtMs);
+    expect(paperDecimal(first.realizedPnlInr).isNegative()).toBe(true);
+
+    // §33.4 — the fourth OPEN Astra saw FILL is now refused, with no economics.
+    const fillsBefore = await prisma.paperFill.count({ where: { accountId } });
+    await feedFreshEvidence(provider, '99', '99.5');
+    await expect(runtime.executeOpen(await buildOpenParams(accountId, {}, T0 + 40 * MINUTE)))
+      .rejects.toMatchObject({ code: 'AUTHORITY_REJECTED' });
+    expect(await prisma.paperFill.count({ where: { accountId } })).toBe(fillsBefore);
+    expect((await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } })).status).toBe('EMPTY');
+
+    // The durable snapshot the engine reads now genuinely reports the cooldown.
+    // (`deriveBase` takes a fresh ownership fence, so it runs only once the
+    // runtime above is finished with the account.)
+    const base = await deriveBase(accountId, T0 + 40 * MINUTE);
+    expect(base.consecutiveLossCount).toBe(3);
+    expect(base.cooldownActiveUntilMs).toBe(third.closedAtMs + 60_000);
+    const input = deriveWithMarks(base);
+    expect(lossDrawdownReasons(input.accountSnapshot, policyFor(PAIR), T0 + 40 * MINUTE))
+      .toContain('CONSECUTIVE_LOSS_COOLDOWN_ACTIVE');
+  }, 60_000);
+
+  it('§33.5 at the inclusive-end cooldown boundary the stale cooldown alone no longer blocks', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const provider = makeProvider();
+    const runtime = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+    for (let cycle = 0; cycle < 3; cycle += 1) await losingLifecycle(runtime, provider, accountId, cycle);
+
+    const account = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    const cooldownUntil = Number(account.cooldownActiveUntilMs);
+    const base = await deriveBase(accountId, cooldownUntil);
+    const input = deriveWithMarks(base);
+
+    // §12.5: blocked strictly while evaluationTimeMs < cooldownActiveUntilMs;
+    // at equality the cooldown has elapsed (inclusive-end).
+    expect(lossDrawdownReasons(input.accountSnapshot, policyFor(PAIR), cooldownUntil - 1))
+      .toContain('CONSECUTIVE_LOSS_COOLDOWN_ACTIVE');
+    expect(lossDrawdownReasons(input.accountSnapshot, policyFor(PAIR), cooldownUntil))
+      .not.toContain('CONSECUTIVE_LOSS_COOLDOWN_ACTIVE');
+  }, 60_000);
+
+  it('§33.6 a profitable CLOSE resets the durable streak to zero', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const provider = makeProvider();
+    const runtime = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+
+    await losingLifecycle(runtime, provider, accountId, 0);
+    await losingLifecycle(runtime, provider, accountId, 1);
+    expect((await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).consecutiveLossCount).toBe(2);
+
+    // A genuinely profitable lifecycle: OPEN at 99.5, CLOSE at 150.
+    const openAt = T0 + 30 * MINUTE;
+    await feedFreshEvidence(provider, '99', '99.5');
+    const openParams = await buildOpenParams(accountId, {}, openAt);
+    const opened = await runtime.executeOpen(openParams);
+    expect(opened.outcome).toBe('FILLED');
+    if (opened.outcome !== 'FILLED') return;
+    await feedFreshEvidence(provider, '150', '151');
+    const closed = await runtime.executeClose(buildCloseParams(openParams.kernel, accountId, opened.quantity, {}, openAt + MINUTE));
+    expect(closed.outcome).toBe('CLOSED');
+    if (closed.outcome !== 'CLOSED') return;
+    expect(paperDecimal(closed.realizedPnlInr).isPositive()).toBe(true);
+
+    expect((await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).consecutiveLossCount).toBe(0);
+  }, 60_000);
+
+  it('§33.8/§33.9/§33.21 restart restores streak, cooldown and peak from durable state alone', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+
+    // Each lifecycle runs through a FRESH composition, so no process-local
+    // streak could possibly survive between them.
+    for (let cycle = 0; cycle < 3; cycle += 1) {
+      const provider = makeProvider();
+      const runtime = await new PaperAccountProductionComposer({ prisma })
+        .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+      await losingLifecycle(runtime, provider, accountId, cycle);
+      const account = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+      expect(account.consecutiveLossCount).toBe(cycle + 1);
+    }
+
+    const restored = await deriveBase(accountId, T0 + 40 * MINUTE);
+    expect(restored.consecutiveLossCount).toBe(3);
+    expect(restored.cooldownActiveUntilMs).not.toBeNull();
+
+    // A brand-new runtime immediately respects the restored cooldown.
+    const provider = makeProvider();
+    const runtime = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+    await feedFreshEvidence(provider, '99', '99.5');
+    await expect(runtime.executeOpen(await buildOpenParams(accountId, {}, T0 + 40 * MINUTE)))
+      .rejects.toMatchObject({ code: 'AUTHORITY_REJECTED' });
+  }, 60_000);
+
+  it('§33.15 a loss streak on one account never touches another account', async () => {
+    if (skip()) return;
+    const accountA = freshAccountId();
+    const accountB = freshAccountId();
+    await initAccount(accountA);
+    await initAccount(accountB);
+    await provisionPairSlot(accountA, PAIR);
+    await provisionPairSlot(accountB, PAIR);
+
+    const providerA = makeProvider();
+    const runtimeA = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId: accountA, coordinator: new RiskAdmissionCoordinator(), provider: providerA });
+    const beforeB = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId: accountB } });
+    for (let cycle = 0; cycle < 3; cycle += 1) await losingLifecycle(runtimeA, providerA, accountA, cycle);
+
+    const afterA = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId: accountA } });
+    const afterB = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId: accountB } });
+    expect(afterA.consecutiveLossCount).toBe(3);
+    expect(afterB.consecutiveLossCount).toBe(beforeB.consecutiveLossCount);
+    expect(afterB.cooldownActiveUntilMs).toBe(beforeB.cooldownActiveUntilMs);
+    expect(afterB.peakEquityInr.toFixed()).toBe(beforeB.peakEquityInr.toFixed());
+
+    // B is unaffected and still trades.
+    const providerB = makeProvider();
+    const runtimeB = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId: accountB, coordinator: new RiskAdmissionCoordinator(), provider: providerB });
+    await feedFreshEvidence(providerB, '99', '99.5');
+    expect((await runtimeB.executeOpen(await buildOpenParams(accountB, {}, T0))).outcome).toBe('FILLED');
+  }, 60_000);
+
+  it('§33.18 a duplicate terminal CLOSE retry advances the streak exactly once', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const provider = makeProvider();
+    const runtime = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+
+    await feedFreshEvidence(provider, '99', '99.5');
+    const openParams = await buildOpenParams(accountId, {}, T0);
+    const opened = await runtime.executeOpen(openParams);
+    if (opened.outcome !== 'FILLED') throw new Error('setup failed');
+    await feedFreshEvidence(provider, '90', '90.5');
+    const closeParams = buildCloseParams(openParams.kernel, accountId, opened.quantity, {}, T0 + MINUTE);
+    expect((await runtime.executeClose(closeParams)).outcome).toBe('CLOSED');
+
+    const afterFirst = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    expect(afterFirst.consecutiveLossCount).toBe(1);
+
+    // The very same source decision, replayed. The completed close left the
+    // slot EMPTY, so the replay is refused by the position gate (§54) before
+    // any economic transaction is entered.
+    await feedFreshEvidence(provider, '90', '90.5');
+    await expect(runtime.executeClose(closeParams)).rejects.toBeDefined();
+
+    const afterRetry = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    expect(afterRetry.consecutiveLossCount, 'a terminal retry must not double-increment').toBe(1);
+    expect(afterRetry.cooldownActiveUntilMs).toBe(afterFirst.cooldownActiveUntilMs);
+    expect(afterRetry.cumulativeRealizedPnlInr.toFixed()).toBe(afterFirst.cumulativeRealizedPnlInr.toFixed());
+    expect(afterRetry.revision).toBe(afterFirst.revision);
+  }, 60_000);
+});
+
+describe('F14-01 live-DB — durable peak equity high-water mark (§12.4)', () => {
+  it('§33.10/§33.14 a profitable CLOSE that leaves the account flat advances the peak to exact post-close equity', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId, '100000');
+    await provisionPairSlot(accountId, PAIR);
+    const provider = makeProvider();
+    const runtime = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+
+    const opening = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    expect(opening.peakEquityInr.toFixed()).toBe('100000');
+
+    await feedFreshEvidence(provider, '99', '99.5');
+    const openParams = await buildOpenParams(accountId, {}, T0);
+    const opened = await runtime.executeOpen(openParams);
+    if (opened.outcome !== 'FILLED') throw new Error('setup failed');
+    await feedFreshEvidence(provider, '150', '151');
+    const closed = await runtime.executeClose(buildCloseParams(openParams.kernel, accountId, opened.quantity, {}, T0 + MINUTE));
+    if (closed.outcome !== 'CLOSED') throw new Error('setup failed');
+
+    // The account is flat, so equity == cash exactly and the peak is provable.
+    const account = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    const cash = paperDecimal(account.startingCapitalInr.toFixed())
+      .plus(account.cumulativeRealizedPnlInr.toFixed()).minus(account.cumulativeFeesInr.toFixed()).plus(account.cumulativeFundingInr.toFixed());
+    expect(cash.greaterThan('100000')).toBe(true);
+    expect(account.peakEquityInr.toFixed()).toBe(cash.toFixed());
+  }, 60_000);
+
+  /** The proven small-SHORT fixture: a durable SHORT whose entry exposure cannot mask an MTM assertion. */
+  async function openSmallShortFixture(
+    runtime: PaperAccountRuntimeUnderTest, accountId: string,
+  ): Promise<{ readonly params: ProductionOpenParams; readonly quantity: string }> {
+    const baseParams = await buildOpenParamsForPair(accountId, PAIR, {}, T0, 'SHORT');
+    const params: ProductionOpenParams = {
+      ...baseParams,
+      riskRequest: {
+        ...baseParams.riskRequest,
+        entryStopProposal: baseParams.riskRequest.entryStopProposal === null
+          ? null
+          : seal({ ...baseParams.riskRequest.entryStopProposal, stopPriceUsdt: '110' }),
+        override: { overrideId: 'peak-fixture-open', overrideRiskPerTradePercent: null, overrideMaxLeverage: null, overrideMaxNotionalInr: '80' },
+      },
+    };
+    const result = await runtime.executeOpen(params);
+    if (result.outcome !== 'FILLED') throw new Error('small SHORT setup did not fill');
+    return { params, quantity: result.quantity };
+  }
+
+  /** Solves exactly for the provider USDT mark that makes authoritative equity equal `targetEquityInr`. */
+  async function shortMarkForEquity(accountId: string, targetEquityInr: string): Promise<string> {
+    const account = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    const slot = await prisma.paperPosition.findUniqueOrThrow({ where: { accountId_pair: { accountId, pair: PAIR } } });
+    if (slot.side !== 'SHORT' || slot.quantity === null || slot.averageEntryPriceInr === null) throw new Error('expected durable SHORT setup');
+    const cash = paperDecimal(account.startingCapitalInr.toFixed())
+      .plus(account.cumulativeRealizedPnlInr.toFixed())
+      .minus(account.cumulativeFeesInr.toFixed())
+      .plus(account.cumulativeFundingInr.toFixed());
+    const targetUnrealized = paperDecimal(targetEquityInr).minus(cash);
+    return paperDecimal(slot.averageEntryPriceInr.toFixed())
+      .minus(targetUnrealized.div(paperDecimal(slot.quantity.toFixed()).times('0.001')))
+      .div(CONVERSION_RATE)
+      .toFixed();
+  }
+
+  it('§33.11/§33.13/§33.16 an unrealized MTM gain advances the peak, and a later decline never lowers it', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    await provisionPairSlot(accountId, PAIR_B);
+    const provider = makeProvider();
+    await feedFreshEvidence(provider);
+    const runtime = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+    await openSmallShortFixture(runtime, accountId);
+
+    const startingPeak = paperDecimal((await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).peakEquityInr.toFixed());
+    expect(startingPeak.toFixed()).toBe('1000000');
+
+    // An unrealized gain that takes authoritative equity strictly above the
+    // inception high-water mark — Astra's ₹100,990-vs-₹100,000 case, scaled to
+    // this fixture's capital.
+    const targetEquity = '1000050';
+    const gainMark = await shortMarkForEquity(accountId, targetEquity);
+    await feedFreshEvidenceForPair(provider, PAIR_B, '99', '99.5', CONVERSION_RATE, Date.now(), gainMark, '99');
+    let secondOpen: Awaited<ReturnType<typeof runtime.executeOpen>>;
+    try {
+      secondOpen = await runtime.executeOpen(await buildOpenParamsForPair(accountId, PAIR_B, {}, T0 + MINUTE));
+    } catch (error) {
+      const cause = error instanceof PaperProductionRuntimeError ? error.cause : error;
+      throw new Error(`second OPEN rejected: ${JSON.stringify(cause)}`, { cause: error });
+    }
+    if (secondOpen.outcome !== 'FILLED') throw new Error(`expected second OPEN fill, got ${secondOpen.outcome}`);
+
+    // §33.11: the durable high-water mark advanced to the observed equity.
+    const afterGain = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    const peakAfterGain = paperDecimal(afterGain.peakEquityInr.toFixed());
+    expect(peakAfterGain.equals(targetEquity), `expected peak ${targetEquity}, got ${peakAfterGain.toFixed()}`).toBe(true);
+
+    // §33.12/§33.13: the mark then collapses. The mark must not follow equity
+    // down, and §12.4's drawdown must be measured from the historical peak.
+    const base = await deriveBase(accountId, T0 + 2 * MINUTE);
+    expect(paperDecimal(base.peakEquityInr).equals(targetEquity), 'the peak must never be lowered').toBe(true);
+    const collapsedMark = await shortMarkForEquity(accountId, '600000');
+    const collapsed = deriveWithMarks(base, { [PAIR]: collapsedMark, [PAIR_B]: '99' });
+    const currentEquity = paperDecimal(collapsed.accountSnapshot.currentEquityInr);
+    expect(currentEquity.lessThan(peakAfterGain)).toBe(true);
+    expect(paperDecimal(collapsed.accountSnapshot.peakEquityInr).equals(targetEquity)).toBe(true);
+    // decline = 1,200,000 - equity; the 40% mode cap is measured against the
+    // historical peak, never against the depressed current equity.
+    const decline = peakAfterGain.minus(currentEquity);
+    expect(decline.times('100').greaterThanOrEqualTo(peakAfterGain.times('40'))).toBe(true);
+    expect(lossDrawdownReasons(collapsed.accountSnapshot, policyFor(PAIR), T0 + 2 * MINUTE)).toContain('DRAWDOWN_LIMIT');
+
+    const afterCollapse = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    expect(afterCollapse.peakEquityInr.toFixed()).toBe(targetEquity);
+  }, 60_000);
+
+  it('§26 an observation at or below the stored peak writes nothing and does not churn the revision', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId, '100000');
+    await provisionPairSlot(accountId, PAIR);
+
+    const before = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    const unchanged = await advanceDurablePeakEquity({
+      prisma, accountId, expectedRevision: before.revision, observedEquityInr: '100000',
+    });
+    expect(unchanged.advanced).toBe(false);
+    expect(unchanged.revision).toBe(before.revision);
+    expect(unchanged.peakEquityInr).toBe('100000');
+    expect((await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).revision).toBe(before.revision);
+
+    const advanced = await advanceDurablePeakEquity({
+      prisma, accountId, expectedRevision: before.revision, observedEquityInr: '100990',
+    });
+    expect(advanced.advanced).toBe(true);
+    expect(advanced.revision).toBe(before.revision + 1n);
+    expect(advanced.peakEquityInr).toBe('100990');
+    expect((await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).peakEquityInr.toFixed()).toBe('100990');
+  }, 30_000);
+
+  it('§33.16 a stale-revision peak advancement fails closed and never overwrites a newer peak', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId, '100000');
+    await provisionPairSlot(accountId, PAIR);
+    const before = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+
+    // A legitimate concurrent advancement lands first.
+    const winner = await advanceDurablePeakEquity({ prisma, accountId, expectedRevision: before.revision, observedEquityInr: '100990' });
+    expect(winner.advanced).toBe(true);
+
+    // The stale-basis writer must not win, and must not lower the peak.
+    await expect(advanceDurablePeakEquity({ prisma, accountId, expectedRevision: before.revision, observedEquityInr: '100500' }))
+      .rejects.toMatchObject({ code: 'STALE_ACCOUNT_REVISION' });
+    const after = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    expect(after.peakEquityInr.toFixed()).toBe('100990');
+    expect(after.revision).toBe(winner.revision);
+  }, 30_000);
+
+  it('§33.12 a losing CLOSE never reduces the stored peak', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId, '100000');
+    await provisionPairSlot(accountId, PAIR);
+    const provider = makeProvider();
+    const runtime = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+
+    const seeded = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    await advanceDurablePeakEquity({ prisma, accountId, expectedRevision: seeded.revision, observedEquityInr: '100990' });
+
+    await losingLifecycle(runtime, provider, accountId, 0);
+
+    const after = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    expect(after.peakEquityInr.toFixed(), 'a realized loss must never lower the high-water mark').toBe('100990');
+    expect(after.consecutiveLossCount).toBe(1);
+  }, 60_000);
+});
+
+describe('F14-01 live-DB — reconciliation of durable risk state (§22)', () => {
+  /** Drives three genuine losing lifecycles, then hands back the account for tampering. */
+  async function accountWithThreeLosses(): Promise<string> {
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const provider = makeProvider();
+    const runtime = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+    for (let cycle = 0; cycle < 3; cycle += 1) await losingLifecycle(runtime, provider, accountId, cycle);
+    return accountId;
+  }
+
+  const LOSS_POLICY = { consecutiveLossLimit: 3, cooldownMs: 60_000 };
+
+  it('§33.19 flags a stale consecutive-loss count that the account\'s own close history contradicts', async () => {
+    if (skip()) return;
+    const accountId = await accountWithThreeLosses();
+    // Exactly Astra's observation: three qualifying losses, stored count 0.
+    await prisma.paperAccount.update({ where: { accountId }, data: { consecutiveLossCount: 0 } });
+
+    const result = await new PaperAccountReconciler(prisma).reconcile(accountId, { lossStatePolicy: LOSS_POLICY });
+    expect(result.status).toBe('UNHEALTHY');
+    expect(result.issues).toContainEqual(expect.objectContaining({
+      faultType: 'RISK_STATE_MISMATCH',
+      message: 'DURABLE_CONSECUTIVE_LOSS_COUNT_MISMATCH',
+      evidence: expect.objectContaining({ storedConsecutiveLossCount: 0, derivedConsecutiveLossCount: 3 }),
+    }));
+    // No repair.
+    expect((await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).consecutiveLossCount).toBe(0);
+  }, 60_000);
+
+  it('§33.20 flags a missing cooldown once the loss threshold is provably reached', async () => {
+    if (skip()) return;
+    const accountId = await accountWithThreeLosses();
+    await prisma.paperAccount.update({ where: { accountId }, data: { cooldownActiveUntilMs: null } });
+
+    const result = await new PaperAccountReconciler(prisma).reconcile(accountId, { lossStatePolicy: LOSS_POLICY });
+    expect(result.status).toBe('UNHEALTHY');
+    expect(result.issues).toContainEqual(expect.objectContaining({
+      faultType: 'RISK_STATE_MISMATCH',
+      message: 'DURABLE_COOLDOWN_BOUNDARY_MISMATCH',
+      evidence: expect.objectContaining({ storedCooldownActiveUntilMs: null, consecutiveLossLimit: 3, cooldownMs: 60_000 }),
+    }));
+  }, 60_000);
+
+  it('§22 leaves the cooldown unverified — never guessed — when no policy is supplied', async () => {
+    if (skip()) return;
+    const accountId = await accountWithThreeLosses();
+    await prisma.paperAccount.update({ where: { accountId }, data: { cooldownActiveUntilMs: null } });
+
+    // The count is still fully derivable and still correct here, so without the
+    // configured limit/duration there is nothing this pass can prove.
+    const result = await new PaperAccountReconciler(prisma).reconcile(accountId);
+    expect(result.issues.filter((issue) => issue.message === 'DURABLE_COOLDOWN_BOUNDARY_MISMATCH')).toEqual([]);
+  }, 60_000);
+
+  it('§33.21 flags a peak the account\'s own realized, flat-account cash proves is too low', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId, '100000');
+    await provisionPairSlot(accountId, PAIR);
+    const provider = makeProvider();
+    const runtime = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+
+    await feedFreshEvidence(provider, '99', '99.5');
+    const openParams = await buildOpenParams(accountId, {}, T0);
+    const opened = await runtime.executeOpen(openParams);
+    if (opened.outcome !== 'FILLED') throw new Error('setup failed');
+    await feedFreshEvidence(provider, '150', '151');
+    if ((await runtime.executeClose(buildCloseParams(openParams.kernel, accountId, opened.quantity, {}, T0 + MINUTE))).outcome !== 'CLOSED') {
+      throw new Error('setup failed');
+    }
+
+    const advanced = await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } });
+    expect(paperDecimal(advanced.peakEquityInr.toFixed()).greaterThan('100000')).toBe(true);
+
+    // Astra's observation: a profitable, now-flat account whose stored peak was
+    // never advanced past inception.
+    await prisma.paperAccount.update({ where: { accountId }, data: { peakEquityInr: '100000' } });
+    const result = await new PaperAccountReconciler(prisma).reconcile(accountId);
+    expect(result.status).toBe('UNHEALTHY');
+    expect(result.issues).toContainEqual(expect.objectContaining({
+      faultType: 'RISK_STATE_MISMATCH',
+      message: 'PEAK_EQUITY_BELOW_PROVABLE_MINIMUM',
+      evidence: expect.objectContaining({
+        storedPeakEquityInr: '100000',
+        provableMinimumPeakEquityInr: advanced.peakEquityInr.toFixed(),
+        derivation: 'REALIZED_FLAT_ACCOUNT_CASH_LOWER_BOUND_V1',
+      }),
+    }));
+    expect((await prisma.paperAccount.findUniqueOrThrow({ where: { accountId } })).peakEquityInr.toFixed()).toBe('100000');
+  }, 60_000);
+
+  it('§22 does not invent an unrecoverable historical MTM peak for an account that still holds a position', async () => {
+    if (skip()) return;
+    const accountId = freshAccountId();
+    await initAccount(accountId);
+    await provisionPairSlot(accountId, PAIR);
+    const provider = makeProvider();
+    const runtime = await new PaperAccountProductionComposer({ prisma })
+      .start({ accountId, coordinator: new RiskAdmissionCoordinator(), provider });
+    await feedFreshEvidence(provider, '99', '99.5');
+    if ((await runtime.executeOpen(await buildOpenParams(accountId, {}, T0))).outcome !== 'FILLED') throw new Error('setup failed');
+
+    // The position is still OPEN, so no flat-account observation exists beyond
+    // inception and there is nothing to prove. A genuinely higher historical
+    // MTM peak is NOT durably recoverable and must not be fabricated.
+    const result = await new PaperAccountReconciler(prisma).reconcile(accountId);
+    expect(result.issues.filter((issue) => issue.message === 'PEAK_EQUITY_BELOW_PROVABLE_MINIMUM')).toEqual([]);
+  }, 60_000);
+
+  it('§33.22 the same defect always produces the same faultId, and a healthy account produces none', async () => {
+    if (skip()) return;
+    const accountId = await accountWithThreeLosses();
+    await prisma.paperAccount.update({ where: { accountId }, data: { consecutiveLossCount: 1 } });
+
+    const reconciler = new PaperAccountReconciler(prisma);
+    const first = await reconciler.reconcile(accountId, { lossStatePolicy: LOSS_POLICY });
+    const second = await reconciler.reconcile(accountId, { lossStatePolicy: LOSS_POLICY });
+    const riskFault = (result: typeof first): string | undefined =>
+      result.issues.find((issue) => issue.message === 'DURABLE_CONSECUTIVE_LOSS_COUNT_MISMATCH')?.faultId;
+    expect(riskFault(first)).toBeDefined();
+    // Deterministic identity: no detection timestamp in the semantic hash.
+    expect(riskFault(second)).toBe(riskFault(first));
+    expect(await prisma.paperReconciliationFault.count({ where: { accountId, faultType: 'RISK_STATE_MISMATCH' } })).toBe(1);
+
+    // Restored to the value its own history derives, the account is clean again.
+    await prisma.paperAccount.update({ where: { accountId }, data: { consecutiveLossCount: 3 } });
+    const restored = await reconciler.reconcile(accountId, { lossStatePolicy: LOSS_POLICY });
+    expect(restored.issues.filter((issue) => issue.faultType === 'RISK_STATE_MISMATCH')).toEqual([]);
+    expect(restored.status).toBe('HEALTHY');
+  }, 60_000);
 });
 
 describe('P14-I sanity â€” PaperProductionRuntimeError shape', () => {

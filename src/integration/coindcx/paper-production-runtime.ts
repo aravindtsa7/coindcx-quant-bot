@@ -5,7 +5,8 @@ import { SerialQueue } from '../../dispatch/serial-queue';
 import type { AdmissionRequest } from '../../dispatch';
 import {
   PaperAccountKernel, PaperAccountReconciler, PaperPersistenceError, SystemClock,
-  deriveCloseRiskInput, deriveMarkToMarketRiskInput, loadAuthoritativePaperRiskBase, pairSnapshotDurableMismatch,
+  advanceDurablePeakEquity, deriveCloseRiskInput, deriveMarkToMarketRiskInput, loadAuthoritativePaperRiskBase,
+  pairSnapshotDurableMismatch, rebaseOnAdvancedPeak,
   type AuthoritativePaperRiskBase, type AuthoritativePaperRiskInput, type AuthoritativeValuationEvidence,
   type Clock, type PaperAccountReconciliationResult, type PaperAccountRuntime,
   type PaperCloseExecutionResult, type PaperOpenExecutionResult,
@@ -341,7 +342,34 @@ export class PaperAccountProductionRuntime {
       };
     }
 
-    const derived = deriveMarkToMarketRiskInput({ base, policy: params.policy, valuation, accountMaxLeverage: params.accountMaxLeverage ?? null });
+    const probe = deriveMarkToMarketRiskInput({ base, policy: params.policy, valuation, accountMaxLeverage: params.accountMaxLeverage ?? null });
+    if (probe.status !== 'DERIVED') {
+      throw new PaperProductionRuntimeError(
+        'EVIDENCE_UNAVAILABLE',
+        `Mark-to-market equity for ${this.accountId} could not be derived: ${probe.reason}`,
+      );
+    }
+
+    // [F14-01 §12.4] The authoritative equity just observed IS an observation
+    // of the very quantity peakEquityInr high-waters (§12.3: currentEquityInr
+    // INCLUDES unrealized PnL), so it advances the durable mark BEFORE §12.4's
+    // drawdown gate measures decline against it. The network read above has
+    // already finished — no I/O happens under the account lock — and the write
+    // is conditional on THIS derivation's revision, so a concurrent mutation
+    // fails closed instead of overwriting a newer peak from a stale basis.
+    // When equity does not exceed the stored mark nothing is written and the
+    // revision is untouched (§26), so admission sees no manufactured race.
+    const advanced = await advanceDurablePeakEquity({
+      prisma: this.#prisma, accountId: this.accountId,
+      expectedRevision: base.revision, observedEquityInr: probe.input.accountSnapshot.currentEquityInr,
+    });
+
+    // Re-derive against the coherent post-advancement state so the snapshot the
+    // engine evaluates, the peak drawdown is measured from, and the revision
+    // admission binds to all describe the same account state.
+    const derived = advanced.advanced
+      ? deriveMarkToMarketRiskInput({ base: rebaseOnAdvancedPeak(base, advanced), policy: params.policy, valuation, accountMaxLeverage: params.accountMaxLeverage ?? null })
+      : probe;
     if (derived.status !== 'DERIVED') {
       throw new PaperProductionRuntimeError('EVIDENCE_UNAVAILABLE', `Mark-to-market equity could not be derived for ${this.accountId}: ${derived.reason}`);
     }
@@ -424,10 +452,19 @@ export class PaperAccountProductionRuntime {
 
     const admissionContext = PaperAccountProductionRuntime.#riskContext(riskRequest, authoritative, authorized.strategyOrigin, authorized.candidate);
     const admissionRequest: AdmissionRequest = { accountId: this.accountId, policy: params.policy, context: admissionContext };
-    // [F14-06] Bind admission to the exact revision this call's own fresh
-    // health observation just saw, atomically re-verified under the account
-    // lock inside admitAndPersist itself — never a separate preflight check.
-    const admitted = await this.#kernelRuntime.session.admitAndPersist(params.kernel.pair, admissionRequest, this.#coordinator, health.revision);
+    // [F14-06] Bind admission to the exact revision this call's own derivation
+    // is bound to, atomically re-verified under the account lock inside
+    // admitAndPersist itself — never a separate preflight check.
+    //
+    // [F14-01 §27] That is `authoritative.revision`, not `health.revision`:
+    // when the MTM observation advanced the durable high-water mark, the peak
+    // write already moved the account to the next revision, and the snapshot
+    // the engine just evaluated describes THAT state. Binding to the stale
+    // pre-advancement value would reject every OPEN that set a new peak. When
+    // no peak advancement was needed the two values are identical, so the
+    // F14-06 guarantee is unchanged: exactly one admission, atomically
+    // re-verified against the exact state its evidence came from.
+    const admitted = await this.#kernelRuntime.session.admitAndPersist(params.kernel.pair, admissionRequest, this.#coordinator, authoritative.revision);
     if (admitted.outcome === 'SOURCE_DECISION_ALREADY_EXECUTED') {
       // §22 terminal retry idempotency — nothing left to admit/mint/execute; the durable terminal fact already exists.
       return disclosePaperFundingExcluded({ outcome: 'SOURCE_DECISION_ALREADY_EXECUTED' as const });
@@ -524,6 +561,10 @@ export class PaperAccountProductionRuntime {
     // account lock inside executeClose itself.
     return this.#kernelRuntime.session.executeClose(authority, {
       evidence: evidenceRead.evidence, executionPolicy, nowMs: this.#clock.nowMs(),
+      // [F14-01 §12.5] The frozen consecutive-loss/cooldown configuration, so
+      // the CLOSE economic transaction maintains the durable streak and arms
+      // the cooldown atomically with the economics it books.
+      lossStatePolicy: { consecutiveLossLimit: params.policy.modeConfig.consecutiveLossLimit, cooldownMs: params.policy.modeConfig.cooldownMs },
     }, health.revision);
   }
 }

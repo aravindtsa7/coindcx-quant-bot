@@ -2,7 +2,8 @@ import { Prisma, PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../persistence/prisma';
 import { RiskAdmissionCoordinator } from '../../dispatch/admission';
 import { assertQuantityAligned, ceilToTick, floorToTick, paperDecimal, PaperCalcDecimal, PAPER_ONE, type PaperCalc } from '../decimal';
-import { computeFeeInr, computeRealizedPnlInr, quantizePaperPosting } from '../accounting';
+import { computeCashBalance, computeFeeInr, computeRealizedPnlInr, quantizePaperPosting } from '../accounting';
+import { advancesPeak, nextLossState, nextPeakEquityInr, type PaperLossStatePolicy } from './durable-risk-state';
 import { computeOpenExecutionIntentId, computeCloseExecutionIntentId, computePositionInstanceId, computeSourceExecutionKey } from '../identity';
 import { validateExecutionPolicySnapshot, type ExecutionPolicySnapshot } from '../policy';
 import { validateInstrumentEconomicsSnapshot, type InstrumentEconomicsSnapshot } from '../instrument-economics';
@@ -213,6 +214,14 @@ export interface PaperCloseExecutionInputs {
   readonly evidence: TrustedPaperExecutionEvidence;
   readonly executionPolicy: ExecutionPolicySnapshot;
   readonly nowMs: number;
+  /**
+   * [F14-01] The frozen `RiskModeConfig` loss/cooldown knobs
+   * (`consecutiveLossLimit`/`cooldownMs`), carried in as a plain value so the
+   * persistence layer maintains §12.5's durable state without taking a
+   * dependency on the whole `RiskPolicy`. Omitted ⇒ no configured limit, which
+   * still tracks the streak count but arms no cooldown.
+   */
+  readonly lossStatePolicy?: PaperLossStatePolicy;
 }
 
 export type PaperCloseExecutionOutcome =
@@ -647,9 +656,51 @@ export class PaperExecutionEngine {
         },
       });
 
+      // [F14-01] §12.5 durable loss streak / cooldown, and §12.4's high-water
+      // mark, advanced in THIS transaction, under THIS account-row lock, in the
+      // SAME update that books the economics. There is no follow-up write: if
+      // the close rolls back, none of the risk state advances either, and the
+      // single `revision` increment covers economics and risk state together
+      // (F14-06 stays exactly-once).
+      const lossState = nextLossState({
+        current: { consecutiveLossCount: account.consecutiveLossCount, cooldownActiveUntilMs: account.cooldownActiveUntilMs === null ? null : Number(account.cooldownActiveUntilMs) },
+        // The canonical realized result for THIS close — the very value booked
+        // to the fill, the REALIZED_PNL ledger entry and the lifecycle row.
+        realizedPnlInr,
+        closeTimeMs: quote.providerEventTimeMs,
+        policy: inputs.lossStatePolicy ?? { consecutiveLossLimit: null, cooldownMs: null },
+      });
+
+      // [F14-01 §12.3/§12.4] A high-water observation is only made here when it
+      // is EXACT. `currentEquityInr` is `cash + Σ unrealized` over every open
+      // position, so post-close cash equals equity only once the account holds
+      // no OPEN position at all. With positions still open, this close makes no
+      // peak claim — the next OPEN's authoritative MTM derivation observes the
+      // real equity and advances the mark there, using the same single formula.
+      const remainingOpen = await tx.paperPosition.count({ where: { accountId: held.accountId, status: 'OPEN' } });
+      const storedPeak = paperDecimal(account.peakEquityInr.toFixed());
+      let peakUpdate: { peakEquityInr: Prisma.Decimal } | Record<string, never> = {};
+      if (remainingOpen === 0) {
+        const postCloseCash = computeCashBalance({
+          startingCapitalInr: paperDecimal(account.startingCapitalInr.toFixed()),
+          cumulativeRealizedPnlInr: paperDecimal(account.cumulativeRealizedPnlInr.toFixed()).plus(realizedPnlInr),
+          cumulativeFeesInr: paperDecimal(account.cumulativeFeesInr.toFixed()).plus(feeInr),
+          cumulativeFundingInr: paperDecimal(account.cumulativeFundingInr.toFixed()),
+        });
+        if (advancesPeak(storedPeak, postCloseCash)) {
+          peakUpdate = { peakEquityInr: post(nextPeakEquityInr(storedPeak, postCloseCash)) };
+        }
+      }
+
       await tx.paperAccount.update({
         where: { accountId: held.accountId },
-        data: { cumulativeRealizedPnlInr: { increment: post(realizedPnlInr) }, cumulativeFeesInr: { increment: post(feeInr) }, revision: { increment: 1n } },
+        data: {
+          cumulativeRealizedPnlInr: { increment: post(realizedPnlInr) }, cumulativeFeesInr: { increment: post(feeInr) },
+          consecutiveLossCount: lossState.consecutiveLossCount,
+          cooldownActiveUntilMs: lossState.cooldownActiveUntilMs === null ? null : BigInt(lossState.cooldownActiveUntilMs),
+          ...peakUpdate,
+          revision: { increment: 1n },
+        },
       });
 
       return {

@@ -6,6 +6,7 @@ import { paperDecimal } from '../decimal';
 import { computePositionInstanceId } from '../identity';
 import { PAPER_FUNDING_CAPABILITY, type PaperFundingDisclosure } from '../funding-capability';
 import { SystemClock, type Clock } from './account-repository';
+import { replayLossState, type PaperLossStatePolicy } from './durable-risk-state';
 import { PaperPersistenceError } from './errors';
 import { executionPolicySnapshotFromRow, instrumentEconomicsSnapshotFromRow } from './immutable-snapshots';
 
@@ -43,7 +44,9 @@ export type PaperReconciliationFaultType =
   | 'POSITION_STATE_MISMATCH'
   | 'RESERVATION_STATE_MISMATCH'
   | 'ORDER_FILL_MISMATCH'
-  | 'OWNERSHIP_HISTORY_MISMATCH';
+  | 'OWNERSHIP_HISTORY_MISMATCH'
+  /** [F14-01] Durable §12.4/§12.5 risk state contradicted by the account's own committed economic history. */
+  | 'RISK_STATE_MISMATCH';
 
 export interface PaperAccountReconciliationIssue {
   readonly faultId: string;
@@ -67,6 +70,21 @@ export interface PaperAccountReconciliationResult {
   readonly issues: readonly PaperAccountReconciliationIssue[];
   /** Reconciliation health never implies funding/economic completeness (§30). */
   readonly fundingDisclosure: PaperFundingDisclosure;
+}
+
+/**
+ * [F14-01 §22] Optional inputs for the checks that cannot be derived from
+ * durable state alone.
+ *
+ * `consecutiveLossCount` and the peak lower bound are both fully derivable from
+ * committed economic history, so they are always checked. The cooldown BOUNDARY
+ * is not: it is a function of the configured `consecutiveLossLimit`/`cooldownMs`,
+ * which are policy, not durable account facts. Supply them and the cooldown is
+ * checked too; omit them and it is deliberately left unverified rather than
+ * guessed.
+ */
+export interface PaperReconcileOptions {
+  readonly lossStatePolicy?: PaperLossStatePolicy;
 }
 
 const FAULT_IDENTITY_POLICY_ID = 'P14_H_RECONCILIATION_FAULT_IDENTITY_V1';
@@ -137,7 +155,7 @@ export class PaperAccountReconciler {
    * unlike `acquireOwnership`, never writes `ownerFence`, so a live session
    * elsewhere is never invalidated by running this (§34).
    */
-  public async reconcile(accountId: string): Promise<PaperAccountReconciliationResult> {
+  public async reconcile(accountId: string, options: PaperReconcileOptions = {}): Promise<PaperAccountReconciliationResult> {
     const observedAtMs = this.#clock.nowMs();
 
     return this.#prisma.$transaction(async (tx) => {
@@ -191,6 +209,7 @@ export class PaperAccountReconciler {
       this.#reconcileOrders(builder, orders, fillByOrderId);
       this.#reconcileTerminalDedup(builder, fills);
       for (const row of history) this.#reconcileHistory(builder, row, fillByOrderId, ledgerEntries, positions);
+      this.#reconcileDurableRiskState(builder, account, history, fills, positions, options.lossStatePolicy);
       this.#reconcileReservationsReverse(builder, reservations, positionByPair, intentByAdmissionId, history);
       this.#reconcileCompletedClosesReverse(builder, intents, orderByIntentId, fillByOrderId, history);
 
@@ -538,6 +557,102 @@ export class PaperAccountReconciler {
   // is already caught by the forward check (`PENDING_SLOT_RESERVATION_NOT_ADMITTED`)
   // and is not duplicated here.
   // -------------------------------------------------------------------------
+  /**
+   * [F14-01 §22] Durable §12.4/§12.5 risk state versus the account's own
+   * committed economic history.
+   *
+   * Astra's report included stale risk state reconciling HEALTHY. These checks
+   * close that, and are careful to flag ONLY what committed facts mathematically
+   * prove — never to fabricate a historical market observation.
+   *
+   *  - CONSECUTIVE LOSS COUNT is fully derivable: every closed lifecycle carries
+   *    its own canonical realized PnL and close time, and §12.5's rules are a
+   *    pure fold over them. Replayed exactly, no policy required.
+   *  - COOLDOWN is derivable only against the configured limit/duration, which
+   *    are policy rather than durable facts — checked when supplied, otherwise
+   *    deliberately left unverified.
+   *  - PEAK EQUITY is only bounded below. Historical marks are NOT durably
+   *    stored, so the true high-water of an account that held open positions is
+   *    genuinely unrecoverable after the fact and is NOT reconstructed here.
+   *    What IS provable: the peak can never be below the starting capital, and
+   *    can never be below the account's cash at any moment it demonstrably held
+   *    no open position — because equity equals cash exactly at those moments.
+   *    A stored peak below that bound is a contradiction, and only that is
+   *    flagged.
+   */
+  #reconcileDurableRiskState(
+    builder: Builder,
+    account: { readonly startingCapitalInr: Prisma.Decimal; readonly peakEquityInr: Prisma.Decimal; readonly consecutiveLossCount: number; readonly cooldownActiveUntilMs: bigint | null },
+    history: readonly { readonly realizedPnlInr: Prisma.Decimal; readonly closedAtMs: bigint; readonly openedAtMs: bigint; readonly closingExecutionIntentId: string; readonly positionInstanceId: string }[],
+    fills: readonly { readonly action: string; readonly realizedPnlInr: Prisma.Decimal | null; readonly feeInr: Prisma.Decimal; readonly eventTimeMs: bigint }[],
+    positions: readonly { readonly status: string }[],
+    lossStatePolicy: PaperLossStatePolicy | undefined,
+  ): void {
+    const closes = [...history]
+      .sort((left, right) => {
+        const byTime = Number(left.closedAtMs - right.closedAtMs);
+        return byTime !== 0 ? byTime : left.closingExecutionIntentId.localeCompare(right.closingExecutionIntentId);
+      })
+      .map((row) => ({ realizedPnlInr: row.realizedPnlInr.toFixed(), closeTimeMs: Number(row.closedAtMs) }));
+
+    // --- §12.5 consecutive loss count (always derivable) --------------------
+    const derivedCount = replayLossState(closes, { consecutiveLossLimit: null, cooldownMs: null }).consecutiveLossCount;
+    if (derivedCount !== account.consecutiveLossCount) {
+      addIssue(builder, 'RISK_STATE_MISMATCH', {}, 'DURABLE_CONSECUTIVE_LOSS_COUNT_MISMATCH', {
+        storedConsecutiveLossCount: account.consecutiveLossCount, derivedConsecutiveLossCount: derivedCount, closedLifecycles: closes.length,
+      });
+    }
+
+    // --- §12.5 cooldown (derivable only against configured policy) ----------
+    if (lossStatePolicy !== undefined && lossStatePolicy.consecutiveLossLimit !== null) {
+      const derived = replayLossState(closes, lossStatePolicy);
+      const stored = account.cooldownActiveUntilMs === null ? null : Number(account.cooldownActiveUntilMs);
+      if (derived.cooldownActiveUntilMs !== stored) {
+        addIssue(builder, 'RISK_STATE_MISMATCH', {}, 'DURABLE_COOLDOWN_BOUNDARY_MISMATCH', {
+          storedCooldownActiveUntilMs: stored, derivedCooldownActiveUntilMs: derived.cooldownActiveUntilMs,
+          consecutiveLossLimit: lossStatePolicy.consecutiveLossLimit, cooldownMs: lossStatePolicy.cooldownMs,
+        });
+      }
+    }
+
+    // --- §12.4 peak equity, lower bound only --------------------------------
+    // Cash replayed over committed fills, sampled at each moment the account
+    // demonstrably held no open position (so equity === cash exactly there).
+    // Funding is deliberately excluded from this bound. It is unsupported in
+    // Phase14 and is always exactly 0 in valid state; a nonzero value is
+    // already owned by FUNDING_INVARIANT_VIOLATION, and folding it in here
+    // would report the same corruption twice under a second fault type.
+    const startingCapital = paperDecimal(account.startingCapitalInr.toFixed());
+    const openIntervals = history.map((row) => ({ from: Number(row.openedAtMs), to: Number(row.closedAtMs) }));
+    const orderedFills = [...fills].sort((left, right) => Number(left.eventTimeMs - right.eventTimeMs));
+
+    let provableMinimum = startingCapital;
+    let cash = startingCapital;
+    for (const fill of orderedFills) {
+      cash = cash.plus(fill.realizedPnlInr === null ? '0' : fill.realizedPnlInr.toFixed()).minus(fill.feeInr.toFixed());
+      if (fill.action !== 'CLOSE') continue;
+      const at = Number(fill.eventTimeMs);
+      // Flat iff no OTHER lifecycle was open strictly across this instant.
+      const stillOpen = openIntervals.some((interval) => interval.from < at && interval.to > at);
+      if (stillOpen) continue;
+      if (cash.greaterThan(provableMinimum)) provableMinimum = cash;
+    }
+    // The account's CURRENT state is the same kind of proof when it is flat.
+    if (!positions.some((slot) => slot.status === 'OPEN') && cash.greaterThan(provableMinimum)) provableMinimum = cash;
+
+    const storedPeak = paperDecimal(account.peakEquityInr.toFixed());
+    if (storedPeak.lessThan(provableMinimum)) {
+      addIssue(builder, 'RISK_STATE_MISMATCH', {}, 'PEAK_EQUITY_BELOW_PROVABLE_MINIMUM', {
+        storedPeakEquityInr: storedPeak.toFixed(), provableMinimumPeakEquityInr: provableMinimum.toFixed(),
+        // Stated explicitly: this is a lower bound from realized, flat-account
+        // observations only. An account that held open positions may have had a
+        // genuinely higher historical MTM peak that is not durably recoverable,
+        // and its absence is NOT treated as a fault.
+        derivation: 'REALIZED_FLAT_ACCOUNT_CASH_LOWER_BOUND_V1',
+      });
+    }
+  }
+
   #reconcileReservationsReverse(
     builder: Builder,
     reservations: readonly { readonly admissionId: string; readonly pair: string; readonly status: string }[],

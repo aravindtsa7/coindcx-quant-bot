@@ -9,11 +9,19 @@ export {
 // durable-state derivation plus a strict (never silently rewriting)
 // pair-snapshot binding check; it mints no capability and mutates nothing.
 export {
-  DAILY_WINDOW_MS, deriveCloseRiskInput, deriveMarkToMarketRiskInput, loadAuthoritativePaperRiskBase, pairSnapshotDurableMismatch,
+  DAILY_WINDOW_MS, advanceDurablePeakEquity, deriveCloseRiskInput, deriveMarkToMarketRiskInput,
+  loadAuthoritativePaperRiskBase, pairSnapshotDurableMismatch, rebaseOnAdvancedPeak,
+  type AdvancePeakEquityParams, type AdvancePeakEquityResult,
   type AuthoritativeOpenPositionValuation, type AuthoritativePairSlotFacts, type AuthoritativePaperRiskBase,
   type AuthoritativePaperRiskInput, type AuthoritativeRiskInputResult, type AuthoritativeValuationEvidence,
   type DeriveAuthoritativePaperRiskInputParams, type LoadAuthoritativePaperRiskBaseParams,
 } from './authoritative-risk-input';
+// [F14-01] The frozen §12.4/§12.5 durable risk-state rules. Pure functions over
+// durable facts — they mint nothing and hold no state of their own.
+export {
+  advancesPeak, nextLossState, nextPeakEquityInr, replayLossState,
+  type PaperLossState, type PaperLossStatePolicy,
+} from './durable-risk-state';
 // [P14-D MAJ-01] `PaperAdmissionBridge` itself and its `SESSION_PROOF` token
 // are deliberately NOT exported here — the only public route to durable
 // admission/release is a READY `PaperAccountSession` (below). The bridge
