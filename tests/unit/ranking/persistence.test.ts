@@ -1,12 +1,13 @@
-import { describe, expect, it } from 'vitest';
-import { composeRankingRunSet } from '../../../src/ranking/core';
+import { beforeAll, describe, expect, it } from 'vitest';
+import { rankStrategyCandidates } from '../../../src/ranking/engine';
 import { RankingError } from '../../../src/ranking/errors';
 import {
+  RankingEvidenceUniqueViolationError,
   StrategyRankingRepository, toRankingResultRow,
   type RankingEvidenceStore, type RankingResultRow, type RankingRunRow, type StoredRankingRunSummary,
 } from '../../../src/ranking/persistence/ranking-repository';
 import type { StrategyRankingRun } from '../../../src/ranking/types';
-import { buildEvidence, runForPair } from './helpers';
+import { getGenuineRankingFixture, getGenuineRankingRunSet, runForPair, testAuthority } from './helpers';
 
 // P15 §11 — append-only, idempotent, restart-reproducible ranking evidence.
 // Static store double: the repository's immutability/idempotence rules are
@@ -25,32 +26,30 @@ class InMemoryRankingStore implements RankingEvidenceStore {
 
   public insertRun(run: RankingRunRow, results: readonly RankingResultRow[]): Promise<void> {
     this.insertCalls += 1;
-    if (this.runs.has(run.rankingRunId)) throw new Error('primary key violation');
+    if (this.runs.has(run.rankingRunId)) {
+      throw new RankingEvidenceUniqueViolationError(`Unique constraint failed on rankingRunId: ${run.rankingRunId}`);
+    }
     this.runs.set(run.rankingRunId, run);
     for (const result of results) {
-      if (this.results.has(result.rankingResultSha256)) throw new Error('primary key violation');
+      if (this.results.has(result.rankingResultSha256)) {
+        throw new RankingEvidenceUniqueViolationError(`Unique constraint failed on rankingResultSha256: ${result.rankingResultSha256}`);
+      }
       this.results.set(result.rankingResultSha256, result);
     }
     return Promise.resolve();
   }
 }
 
-const EVIDENCES = [
-  buildEvidence({ pair: 'BTC-INR', strategyId: 'EMA_TREND', metrics: { SHARPE: '3', MAX_DRAWDOWN: '5' } }),
-  buildEvidence({ pair: 'BTC-INR', strategyId: 'ATR_BREAKOUT', metrics: { SHARPE: '1', MAX_DRAWDOWN: '20' } }),
-  buildEvidence({ pair: 'BTC-INR', strategyId: 'GAPPY', metrics: { PARAMETER_ROBUSTNESS: null } }),
-  buildEvidence({ pair: 'ETH-INR', strategyId: 'EMA_TREND', metrics: { SHARPE: '2' } }),
-] as const;
-
-function freshRunSet() {
-  return composeRankingRunSet([...EVIDENCES], []);
-}
-
 describe('P15 ranking persistence', () => {
+  beforeAll(async () => {
+    await getGenuineRankingFixture();
+  }, 60_000);
+
   it('inserts a completed pair-local run and all of its result rows', async () => {
     const store = new InMemoryRankingStore();
-    const repository = new StrategyRankingRepository(store);
-    const run = runForPair(freshRunSet(), 'BTC-INR');
+    const repository = new StrategyRankingRepository(store, testAuthority());
+    const runSet = await getGenuineRankingRunSet();
+    const run = runForPair(runSet, 'BTC-INR');
     expect(await repository.persistRun(run)).toEqual({ rankingRunId: run.rankingRunId, outcome: 'INSERTED' });
     expect(store.runs.size).toBe(1);
     expect(store.results.size).toBe(run.results.length);
@@ -58,8 +57,9 @@ describe('P15 ranking persistence', () => {
 
   it('is idempotent: re-persisting the identical run writes nothing', async () => {
     const store = new InMemoryRankingStore();
-    const repository = new StrategyRankingRepository(store);
-    const run = runForPair(freshRunSet(), 'BTC-INR');
+    const repository = new StrategyRankingRepository(store, testAuthority());
+    const runSet = await getGenuineRankingRunSet();
+    const run = runForPair(runSet, 'BTC-INR');
     await repository.persistRun(run);
     expect(await repository.persistRun(run)).toEqual({ rankingRunId: run.rankingRunId, outcome: 'ALREADY_IDENTICAL' });
     expect(store.insertCalls).toBe(1);
@@ -67,50 +67,66 @@ describe('P15 ranking persistence', () => {
 
   it('is restart-reproducible: a recomputed run collides on the same deterministic id', async () => {
     const store = new InMemoryRankingStore();
-    const repository = new StrategyRankingRepository(store);
-    await repository.persistRun(runForPair(freshRunSet(), 'BTC-INR'));
-    // Simulated process restart: nothing is replayed, the ranking is simply
-    // recomputed from the same Phase12 evidence in a different input order.
-    const recomputed = runForPair(composeRankingRunSet([...EVIDENCES].reverse(), []), 'BTC-INR');
+    const repository = new StrategyRankingRepository(store, testAuthority());
+    const { planResult, candidates } = await getGenuineRankingFixture();
+    const initialRunSet = rankStrategyCandidates({ planResult, candidates });
+    await repository.persistRun(runForPair(initialRunSet, 'BTC-INR'));
+
+    // Simulated process restart: recomputed from same Phase12 evidence with reversed candidate order
+    const recomputedRunSet = rankStrategyCandidates({ planResult, candidates: [...candidates].reverse() });
+    const recomputed = runForPair(recomputedRunSet, 'BTC-INR');
     expect(await repository.persistRun(recomputed)).toEqual({ rankingRunId: recomputed.rankingRunId, outcome: 'ALREADY_IDENTICAL' });
     expect(store.insertCalls).toBe(1);
   });
 
   it('fails closed on a same-id / different-content write instead of overwriting', async () => {
     const store = new InMemoryRankingStore();
-    const repository = new StrategyRankingRepository(store);
-    const run = runForPair(freshRunSet(), 'BTC-INR');
+    const repository = new StrategyRankingRepository(store, testAuthority());
+    const runSet = await getGenuineRankingRunSet();
+    const run = runForPair(runSet, 'BTC-INR');
     await repository.persistRun(run);
     const tampered = { ...run, rankingRunSha256: 'e'.repeat(64) } as StrategyRankingRun;
     await expect(repository.persistRun(tampered)).rejects.toThrow(RankingError);
-    await expect(repository.persistRun(tampered)).rejects.toThrow(/RANKING_EVIDENCE_CONFLICT/);
+    try {
+      await repository.persistRun(tampered);
+      expect.unreachable('expected persistRun to throw');
+    } catch (error) {
+      expect((error as RankingError).code).toBe('RANKING_EVIDENCE_NOT_AUTHORITATIVE');
+    }
     expect(store.insertCalls).toBe(1);
   });
 
   it('refuses to persist a run that weakens the frozen economic limitation', async () => {
-    const repository = new StrategyRankingRepository(new InMemoryRankingStore());
-    const run = runForPair(freshRunSet(), 'BTC-INR');
+    const repository = new StrategyRankingRepository(new InMemoryRankingStore(), testAuthority());
+    const runSet = await getGenuineRankingRunSet();
+    const run = runForPair(runSet, 'BTC-INR');
     for (const weakened of [
       { ...run, promotionEligible: true },
       { ...run, economicStatus: 'FUNDING_INCLUDED' },
       { ...run, maxLifecycle: 'SHADOW' },
     ] as unknown as StrategyRankingRun[]) {
-      await expect(repository.persistRun(weakened)).rejects.toThrow(/RANKING_ECONOMIC_LIMIT_VIOLATION/);
+      try {
+        await repository.persistRun(weakened);
+        expect.unreachable('expected persistRun to throw');
+      } catch (error) {
+        expect((error as RankingError).code).toBe('RANKING_EVIDENCE_NOT_AUTHORITATIVE');
+      }
     }
   });
 
   it('persists every pair-local run of a set in deterministic pair order', async () => {
     const store = new InMemoryRankingStore();
-    const repository = new StrategyRankingRepository(store);
-    const set = freshRunSet();
+    const repository = new StrategyRankingRepository(store, testAuthority());
+    const set = await getGenuineRankingRunSet();
     const outcomes = await repository.persistRunSet(set);
     expect(outcomes.map((entry) => entry.outcome)).toEqual(['INSERTED', 'INSERTED']);
     expect([...store.runs.values()].map((row) => row.pair)).toEqual(['BTC-INR', 'ETH-INR']);
     expect(await repository.persistRunSet(set)).toEqual(outcomes.map((entry) => ({ ...entry, outcome: 'ALREADY_IDENTICAL' })));
   });
 
-  it('stores decimals as canonical strings and never fabricates a score for an unrankable row', () => {
-    const run = runForPair(freshRunSet(), 'BTC-INR');
+  it('stores decimals as canonical strings and never fabricates a score for an unrankable row', async () => {
+    const runSet = await getGenuineRankingRunSet();
+    const run = runForPair(runSet, 'BTC-INR');
     const rows = run.results.map(toRankingResultRow);
     const ranked = rows.find((row) => row.status === 'RANKED');
     const gap = rows.find((row) => row.status === 'INSUFFICIENT_RANKING_EVIDENCE');
@@ -128,10 +144,29 @@ describe('P15 ranking persistence', () => {
     }
   });
 
+  it('store throwing RankingEvidenceUniqueViolationError resolves to ALREADY_IDENTICAL on post-collision match', async () => {
+    let insertAttempted = false;
+    const runSet = await getGenuineRankingRunSet();
+    const run = runForPair(runSet, 'BTC-INR');
+    const store: RankingEvidenceStore = {
+      findRun: async (id: string) => {
+        if (!insertAttempted) return null;
+        return { rankingRunId: id, rankingRunSha256: run.rankingRunSha256 };
+      },
+      insertRun: async () => {
+        insertAttempted = true;
+        throw new RankingEvidenceUniqueViolationError('Simulated race condition collision');
+      },
+    };
+    const repository = new StrategyRankingRepository(store, testAuthority());
+    const outcome = await repository.persistRun(run);
+    expect(outcome).toEqual({ rankingRunId: run.rankingRunId, outcome: 'ALREADY_IDENTICAL' });
+  });
+
   it('exposes no update or delete method on the repository surface', () => {
     const names = new Set([
       ...Object.getOwnPropertyNames(StrategyRankingRepository.prototype),
-      ...Object.getOwnPropertyNames(new StrategyRankingRepository(new InMemoryRankingStore())),
+      ...Object.getOwnPropertyNames(new StrategyRankingRepository(new InMemoryRankingStore(), testAuthority())),
     ]);
     expect([...names].sort()).toEqual(['constructor', 'persistRun', 'persistRunSet']);
   });

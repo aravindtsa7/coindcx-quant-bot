@@ -56,8 +56,9 @@ export type PaperObservationStatus = 'OBSERVED' | 'NOT_OBSERVED' | 'LINEAGE_UNPR
 export type PaperReconciliationStatus = 'HEALTHY' | 'UNHEALTHY' | 'UNKNOWN';
 
 /**
- * Durable Phase14 identifiers that tie an observation to one candidate. Every
- * field is a durable fact, never a wall-clock read or a derived economic value.
+ * Declared candidate lineage metadata. In Phase 15 V1, this is caller-declared /
+ * non-authoritative metadata, not proven durable facts, as Phase 15 intentionally
+ * has no Phase 14 durable reader.
  */
 export interface PaperObservationLineage {
   readonly accountId: string;
@@ -71,7 +72,7 @@ export interface PaperObservationLineage {
   readonly parameterHash: string;
 }
 
-/** Mechanical, non-economic durable facts. Nothing here is a performance metric. */
+/** Declared mechanical, non-economic observation metrics (non-authoritative observational metadata). Nothing here is a performance metric. */
 export interface PaperMechanicalHealth {
   readonly reconciliationStatus: PaperReconciliationStatus;
   readonly observationDurationMs: number;

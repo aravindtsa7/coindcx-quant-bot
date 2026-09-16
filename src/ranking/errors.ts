@@ -10,7 +10,15 @@ export type RankingErrorCode =
   /** A Phase15 result was asked to declare an economic status the frozen Phase14 limitation forbids. */
   | 'RANKING_ECONOMIC_LIMIT_VIOLATION'
   /** Persisted ranking evidence disagreed with recomputed ranking evidence under the same identity. */
-  | 'RANKING_EVIDENCE_CONFLICT';
+  | 'RANKING_EVIDENCE_CONFLICT'
+  /** Caller attempted to persist ranking evidence without genuine Phase15 engine authority. */
+  | 'RANKING_EVIDENCE_NOT_AUTHORITATIVE'
+  /** Attempted to persist a forged or structurally fabricated ranking run. */
+  | 'RANKING_EVIDENCE_FORGERY'
+  /** Ranking evidence internal fields or hashes failed cryptographic recomputation or consistency checks. */
+  | 'RANKING_EVIDENCE_CORRUPTED'
+  /** Ranking engine persistence authority registration was invalid or already bound. */
+  | 'RANKING_AUTHORITY_INVALID';
 
 export class RankingError extends Error {
   public readonly code: RankingErrorCode;

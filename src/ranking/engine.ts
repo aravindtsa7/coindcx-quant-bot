@@ -1,4 +1,5 @@
 import type { ResearchValidationPlanResult } from '../research/research-validation/types';
+import { createRankingAuthorityChannel } from './authority';
 import { composeRankingRunSet, deepFreezeRanking, rankingAscii, rankingEconomicFields } from './core';
 import { RankingError } from './errors';
 import { deriveAuthoritativeRankingEvidence } from './evidence';
@@ -9,6 +10,25 @@ import {
   type RankingCandidateEvidence,
   type StrategyRankingRunSet,
 } from './types';
+
+/**
+ * This ranking engine's ONE authority channel. Created exactly once, at
+ * module load, from the leaf `authority.ts` factory. `attestRankingRunSet` is
+ * kept in this module-private `const` forever - it is never exported, never
+ * assigned to `module.exports`, never returned from any public function, and
+ * therefore not reachable via `Reflect.ownKeys`, `Object.getOwnPropertyNames`,
+ * or a fresh `import` of this module. The two verifiers below are the only
+ * part of this channel this module ever hands out.
+ */
+const rankingAuthority = createRankingAuthorityChannel();
+
+export function isAuthoritativeRankingRun(run: unknown): boolean {
+  return rankingAuthority.isAuthoritativeRankingRun(run);
+}
+
+export function isAuthoritativeRankingRunSet(runSet: unknown): boolean {
+  return rankingAuthority.isAuthoritativeRankingRunSet(runSet);
+}
 
 /**
  * Phase15 ranking engine - the single authoritative public entry point.
@@ -106,5 +126,22 @@ export function rankStrategyCandidates(params: RankStrategyCandidatesParams): St
     declaredKey({ pair: right.declaredPair, strategyId: right.declaredStrategyId, strategyVersion: right.declaredStrategyVersion, parameterHash: right.declaredParameterHash }),
   ));
 
-  return composeRankingRunSet(authoritative, Object.freeze(nonAuthoritative));
+  const runSet = composeRankingRunSet(authoritative, Object.freeze(nonAuthoritative));
+  rankingAuthority.attestRankingRunSet(runSet);
+  return runSet;
+}
+
+// Pin CommonJS authority entry points to lexical implementations. This also
+// prevents pre-import replacement through an already-loaded repo namespace.
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  if (Object.getOwnPropertyDescriptor(module.exports, 'rankStrategyCandidates')?.configurable !== false) {
+    Object.defineProperty(module.exports, 'rankStrategyCandidates', { get: () => rankStrategyCandidates, configurable: false });
+  }
+  if (Object.getOwnPropertyDescriptor(module.exports, 'isAuthoritativeRankingRun')?.configurable !== false) {
+    Object.defineProperty(module.exports, 'isAuthoritativeRankingRun', { get: () => isAuthoritativeRankingRun, configurable: false });
+  }
+  if (Object.getOwnPropertyDescriptor(module.exports, 'isAuthoritativeRankingRunSet')?.configurable !== false) {
+    Object.defineProperty(module.exports, 'isAuthoritativeRankingRunSet', { get: () => isAuthoritativeRankingRunSet, configurable: false });
+  }
+  Object.freeze(module.exports);
 }

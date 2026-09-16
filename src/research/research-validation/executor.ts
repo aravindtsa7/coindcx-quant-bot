@@ -1,6 +1,15 @@
 import { canonicalJson, sha256CanonicalJson } from '../../backtest/canonical-json';
-import { registerGenuineResearchValidationResult } from './approval-authority';
 import { StrategyCoinMatrixError } from '../strategy-coin-matrix/errors';
+
+const GENUINE_RESULTS = new WeakSet<ResearchValidationPlanResult>();
+
+/**
+ * Read-only verifier for genuine executor-constructed research validation results.
+ * Genuine results are added exclusively within the executor result construction path.
+ */
+export function isGenuineResearchValidationResult(result: unknown): boolean {
+  return typeof result === 'object' && result !== null && GENUINE_RESULTS.has(result as ResearchValidationPlanResult);
+}
 import { ProductionGitSourceVerifier, type GitSourceVerifier } from '../strategy-coin-matrix/git-source';
 import { executeWithGitSourceVerifier } from '../strategy-coin-matrix/executor';
 import { assertPairResourceIdentity, planWithGitSourceVerifier } from '../strategy-coin-matrix/planner';
@@ -98,7 +107,7 @@ function failedResult(finalized: FinalizedResearchValidationPlan, abortedCode: s
     passedSubjects: payload.passedSubjects, failedSubjects: payload.failedSubjects, insufficientEvidenceSubjects: payload.insufficientEvidenceSubjects,
     totalFolds: payload.totalFolds, unusedTailMs: payload.unusedTailMs, freshnessBasis: payload.freshnessBasis, subjectDigests: Object.freeze([]), abortedSubjects: payload.abortedSubjects };
   const result = freezeValidationRuntime({ ...payload, validationResultSha256: sha256CanonicalJson(hashPayload) });
-  registerGenuineResearchValidationResult(result);
+  GENUINE_RESULTS.add(result);
   return result;
 }
 
@@ -192,10 +201,19 @@ export async function executeResearchValidationWithGitSourceVerifier(finalizedIn
     totalFolds: payload.totalFolds, unusedTailMs: payload.unusedTailMs, freshnessBasis: payload.freshnessBasis,
     subjectDigests: subjectResults.map((item) => ({ validationSubjectId: item.validationSubjectId, verdict: item.verdict, validationSubjectResultSha256: item.validationSubjectResultSha256 })), abortedSubjects: payload.abortedSubjects };
   const result = freezeValidationRuntime({ ...payload, validationResultSha256: sha256CanonicalJson(hashPayload) });
-  registerGenuineResearchValidationResult(result);
+  GENUINE_RESULTS.add(result);
   return result;
 }
 
 export async function executeResearchValidation(finalized: FinalizedResearchValidationPlan, dependencies: ValidationExecutionDependencies, options: ValidationExecutionOptions = {}): Promise<ResearchValidationPlanResult> { return executeResearchValidationWithGitSourceVerifier(finalized, dependencies, options, new ProductionGitSourceVerifier(process.cwd())); }
 export async function runResearchValidation(input: ResearchValidationPlanInput, dependencies: ValidationExecutionDependencies, options: ValidationExecutionOptions = {}): Promise<ResearchValidationPlanResult> { const finalized = await planResearchValidation(input, dependencies); return executeResearchValidation(finalized, dependencies, options); }
 export async function runResearchValidationWithGitSourceVerifier(input: ResearchValidationPlanInput, dependencies: ValidationExecutionDependencies, options: ValidationExecutionOptions, verifier: GitSourceVerifier): Promise<ResearchValidationPlanResult> { const finalized = await planResearchValidationWithGitSourceVerifier(input, dependencies, verifier); return executeResearchValidationWithGitSourceVerifier(finalized, dependencies, options, verifier); }
+
+// Pin CommonJS authority entry points to lexical implementations. This also
+// prevents pre-import replacement through an already-loaded repo namespace.
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  if (Object.getOwnPropertyDescriptor(module.exports, 'isGenuineResearchValidationResult')?.configurable !== false) {
+    Object.defineProperty(module.exports, 'isGenuineResearchValidationResult', { get: () => isGenuineResearchValidationResult, configurable: false });
+  }
+  Object.freeze(module.exports);
+}

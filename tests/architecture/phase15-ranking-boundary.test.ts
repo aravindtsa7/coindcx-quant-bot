@@ -117,7 +117,7 @@ describe('Phase15 analytical boundary', () => {
     // -> `market-data/historical/index` -> `persistence/prisma`). That edge is
     // Phase12's, not Phase15's; refactoring it is out of Phase15 scope, and it
     // is asserted here so a future change to it is visible rather than silent.
-    for (const file of ['src/ranking/persistence/ranking-repository.ts', 'src/ranking/persistence/prisma-ranking-store.ts', 'src/ranking/core.ts', 'src/ranking/normalize.ts', 'src/ranking/score.ts', 'src/ranking/tie-break.ts', 'src/ranking/identity.ts', 'src/ranking/policy.ts', 'src/ranking/numeric.ts']) {
+    for (const file of ['src/ranking/authority.ts', 'src/ranking/persistence/ranking-repository.ts', 'src/ranking/core.ts', 'src/ranking/normalize.ts', 'src/ranking/score.ts', 'src/ranking/tie-break.ts', 'src/ranking/identity.ts', 'src/ranking/policy.ts', 'src/ranking/numeric.ts']) {
       expect(reachableFrom(file).has('src/persistence/prisma.ts'), `${file} reaches the Prisma singleton`).toBe(false);
     }
     for (const file of rankingFiles) {
@@ -130,6 +130,26 @@ describe('Phase15 analytical boundary', () => {
       'src/market-data/historical/index.ts',
       'src/persistence/prisma.ts',
     ]);
+  });
+
+  it('authority.ts is a genuine leaf: it reaches nothing but its own type declarations, never engine.ts, evidence.ts, or the Phase12 evaluation graph', () => {
+    expect(graph.get('src/ranking/authority.ts')).toEqual(['src/ranking/types.ts']);
+    const reachable = reachableFrom('src/ranking/authority.ts');
+    for (const forbidden of [
+      'src/ranking/engine.ts',
+      'src/ranking/evidence.ts',
+      'src/research/research-validation/approval-authority.ts',
+      'src/research/research-validation/executor.ts',
+      'src/persistence/prisma.ts',
+    ]) {
+      expect(reachable.has(forbidden), `authority.ts must not reach ${forbidden}`).toBe(false);
+    }
+  });
+
+  it('ranking-repository.ts has no static dependency on authority.ts or engine.ts at all (authority is received by constructor injection)', () => {
+    const reachable = reachableFrom('src/ranking/persistence/ranking-repository.ts');
+    expect(reachable.has('src/ranking/authority.ts')).toBe(false);
+    expect(reachable.has('src/ranking/engine.ts')).toBe(false);
   });
 });
 
@@ -189,6 +209,56 @@ describe('Phase15 public export surface', () => {
   it('does NOT expose a caller-constructible authoritative evidence type producer', () => {
     expect(publicNames.has('RankingCandidateEvidence')).toBe(false);
     expect(publicNames.has('RankingComponentMetric')).toBe(false);
+  });
+
+  it('does NOT expose raw persistence store or persistence row DTOs on the barrel', () => {
+    for (const raw of [
+      'PrismaRankingEvidenceStore', 'PrismaEvidenceStore', 'toRankingRunRow', 'toRankingResultRow',
+      'RankingRunRow', 'RankingResultRow', 'RankingEvidenceStore', 'RankingRunAuthority',
+    ]) {
+      expect(publicNames.has(raw), `${raw} must not be on the Phase15 barrel`).toBe(false);
+    }
+  });
+
+  it('no ranking file other than the barrel itself declares a Prisma-backed RankingEvidenceStore implementation (Finding 1 final closure)', () => {
+    // The vulnerable pattern was: a separately importable module exporting a
+    // factory that combines a real Prisma-backed store with a caller-supplied
+    // authority. Closing it means the store implementation itself must live
+    // ONLY inside the barrel, never in any other file under src/ranking/**.
+    for (const file of rankingFiles) {
+      if (path.join(REPO_ROOT, file) === RANKING_BARREL) continue;
+      const source = readFileSync(path.join(REPO_ROOT, file), 'utf8');
+      expect(source, `${file} must not implement RankingEvidenceStore`).not.toMatch(/implements\s+RankingEvidenceStore/);
+      expect(source, `${file} must not reference PrismaClient`).not.toMatch(/PrismaClient/);
+    }
+  });
+
+  it('no exported function or class anywhere in the Phase15 source tree accepts both a Prisma-shaped parameter and an authority-shaped parameter', () => {
+    const offenders: string[] = [];
+    for (const file of rankingFiles) {
+      const source = readFileSync(path.join(REPO_ROOT, file), 'utf8');
+      const signatures = [
+        ...[...source.matchAll(/export\s+function\s+\w+\s*\(([^)]*)\)/g)].map((m) => m[1] ?? ''),
+        ...[...source.matchAll(/export\s+class\s+\w+[^{]*\{[^}]*?constructor\s*\(([^)]*)\)/gs)].map((m) => m[1] ?? ''),
+      ];
+      for (const params of signatures) {
+        if (/PrismaClient/i.test(params) && /authority/i.test(params)) offenders.push(`${file}: (${params.trim()})`);
+      }
+    }
+    expect(offenders, `found exported Prisma+authority combiner(s): ${offenders.join(' | ')}`).toEqual([]);
+  });
+
+  it('exposes only the authority-bound repository and safe summary types', () => {
+    expect(publicNames.has('StrategyRankingRepository')).toBe(true);
+    expect(publicNames.has('PersistRankingRunOutcome')).toBe(true);
+    expect(publicNames.has('PersistRankingRunResult')).toBe(true);
+    expect(publicNames.has('StoredRankingRunSummary')).toBe(true);
+  });
+
+  it('exposes createStrategyRankingRepository as a single-argument factory (no substitutable authority parameter)', () => {
+    expect(publicNames.has('createStrategyRankingRepository')).toBe(true);
+    const source = readFileSync(RANKING_BARREL, 'utf8');
+    expect(source).toMatch(/export function createStrategyRankingRepository\(prisma: PrismaClient\): StrategyRankingRepository/);
   });
 
   it('exposes no symbol whose name implies mutation or promotion', () => {

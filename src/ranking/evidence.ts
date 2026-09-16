@@ -153,3 +153,12 @@ export function deriveAuthoritativeRankingEvidence(
     metrics: Object.freeze(metrics) as RankingComponentMetrics,
   });
 }
+
+// Pin CommonJS authority entry points to lexical implementations. This also
+// prevents pre-import replacement through an already-loaded repo namespace.
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  if (Object.getOwnPropertyDescriptor(module.exports, 'deriveAuthoritativeRankingEvidence')?.configurable !== false) {
+    Object.defineProperty(module.exports, 'deriveAuthoritativeRankingEvidence', { get: () => deriveAuthoritativeRankingEvidence, configurable: false });
+  }
+  Object.freeze(module.exports);
+}
