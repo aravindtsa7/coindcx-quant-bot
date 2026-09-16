@@ -60,7 +60,15 @@ describe('P14-C plus Wave3-B — final Phase14 model set', () => {
   it('preserves all pre-Phase14 (Phase0-13) models unchanged in presence', () => {
     const names = dm.models.map((m) => m.name);
     for (const expected of PHASE0_13_MODELS) expect(names).toContain(expected);
-    expect(names).toHaveLength(PHASE0_13_MODELS.length + PHASE14_MODELS.length);
+    // Scoped to what Phase14 owns. A later phase may add its OWN additive
+    // models (Phase15 adds `RankingRun`/`RankingResult`, guarded by
+    // `phase15-schema.test.ts`); what must never change is that Phase14
+    // neither removed a pre-Phase14 model nor gained an unclaimed Paper* one.
+    const paperModels = names.filter((n) => n.startsWith('Paper'));
+    expect(paperModels.slice().sort()).toEqual([...PHASE14_MODELS].sort());
+    for (const name of [...PHASE0_13_MODELS, ...PHASE14_MODELS]) {
+      expect(names.filter((n) => n === name)).toHaveLength(1);
+    }
   });
 });
 

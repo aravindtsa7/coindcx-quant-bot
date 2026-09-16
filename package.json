@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit --project tsconfig.test.json",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
+    "test:integration:ranking": "tsx scripts/run-ranking-db-integration.ts",
     "lint": "eslint \"src/**/*.ts\" \"tests/**/*.ts\"",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",

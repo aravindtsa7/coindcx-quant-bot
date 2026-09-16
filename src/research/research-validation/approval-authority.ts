@@ -1,21 +1,9 @@
 import { sha256CanonicalJson } from '../../backtest/canonical-json';
+import { isGenuineResearchValidationResult } from './executor';
 import type { ResearchValidationPlanResult } from './types';
 
-// [C-F06] Genuine origin, not a self-consistent caller hash. Only a
-// `ResearchValidationPlanResult` object that this module itself observed being
-// constructed by the real executor (tracked by reference in this WeakSet) can ever
-// back an issued `ResearchApprovalOrigin`. A caller-fabricated object with a
-// byte-for-byte identical, internally self-consistent PASSED verdict and a
-// correctly-recomputed `validationSubjectResultSha256` is *not* sufficient — it is
-// simply not present in this WeakSet, so `issueResearchApprovalOrigin` returns null.
-const GENUINE_RESULTS = new WeakSet<ResearchValidationPlanResult>();
-
-/** Called only by the research-validation executor at its actual result construction sites. */
-export function registerGenuineResearchValidationResult(result: ResearchValidationPlanResult): void {
-  GENUINE_RESULTS.add(result);
-}
-
 const ORIGIN_ISSUER = Symbol('P12 research approval origin');
+const trustedIsGenuineResearchValidationResult = isGenuineResearchValidationResult;
 
 export interface ResearchApprovalOriginRecord {
   readonly pair: string;
@@ -58,7 +46,7 @@ Object.freeze(ResearchApprovalOrigin);
  * (`FAILED`, `INSUFFICIENT_EVIDENCE`, or simply absent because the plan aborted it).
  */
 export function issueResearchApprovalOrigin(planResult: ResearchValidationPlanResult, subject: ResearchApprovalSubject): ResearchApprovalOrigin | null {
-  if (planResult === null || typeof planResult !== 'object' || !GENUINE_RESULTS.has(planResult)) return null;
+  if (planResult === null || typeof planResult !== 'object' || !trustedIsGenuineResearchValidationResult(planResult)) return null;
   const validationSubjectId = sha256CanonicalJson({ pair: subject.pair, strategyId: subject.strategyId, strategyVersion: subject.strategyVersion, parameterHash: subject.parameterHash });
   const record = planResult.subjectResults.find((entry) => entry.validationSubjectId === validationSubjectId);
   if (record === undefined || record.verdict !== 'PASSED') return null;
@@ -66,4 +54,16 @@ export function issueResearchApprovalOrigin(planResult: ResearchValidationPlanRe
     pair: subject.pair, strategyId: subject.strategyId, strategyVersion: subject.strategyVersion, parameterHash: subject.parameterHash,
     validationSubjectId, validationPlanId: planResult.validationPlanId, validationSubjectResultSha256: record.validationSubjectResultSha256,
   });
+}
+
+// Pin CommonJS authority entry points to lexical implementations. This also
+// prevents pre-import replacement through an already-loaded repo namespace.
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  if (Object.getOwnPropertyDescriptor(module.exports, 'issueResearchApprovalOrigin')?.configurable !== false) {
+    Object.defineProperty(module.exports, 'issueResearchApprovalOrigin', { get: () => issueResearchApprovalOrigin, configurable: false });
+  }
+  if (Object.getOwnPropertyDescriptor(module.exports, 'ResearchApprovalOrigin')?.configurable !== false) {
+    Object.defineProperty(module.exports, 'ResearchApprovalOrigin', { get: () => ResearchApprovalOrigin, configurable: false });
+  }
+  Object.freeze(module.exports);
 }

@@ -1,4 +1,12 @@
-import type { InstrumentMetadata } from '../coin-runtime/types';
+export interface BacktestInstrumentMetadataInput {
+  readonly pair: string;
+  readonly priceIncrement: { toFixed(): string };
+  readonly quantityIncrement: { toFixed(): string };
+  readonly minQuantity: { toFixed(): string };
+  readonly minTradeSize: { toFixed(): string };
+  readonly minNotional: { toFixed(): string };
+  readonly unitContractValue: { toFixed(): string };
+}
 import { BacktestDecimal, toBacktestCalcDecimal, type BacktestCalc } from './decimal';
 import { sha256CanonicalJson } from './canonical-json';
 import { BacktestError, type BacktestErrorCode } from './errors';
@@ -19,7 +27,7 @@ export function computeBacktestInstrumentSpecSnapshotId(
   });
 }
 
-export function createBacktestInstrumentSpec(metadata: InstrumentMetadata): BacktestInstrumentSpec {
+export function createBacktestInstrumentSpec(metadata: BacktestInstrumentMetadataInput): BacktestInstrumentSpec {
   const identity = {
     pair: metadata.pair,
     priceIncrement: metadata.priceIncrement.toFixed(),

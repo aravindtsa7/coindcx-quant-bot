@@ -529,3 +529,81 @@ model PaperReconciliationFault {
   @@index([accountId, faultType], map: "paper_reconciliation_fault_account_type_idx")
   @@map("paper_reconciliation_fault")
 }
+
+// ---------------------------------------------------------------------------
+// Phase 15 — Strategy Ranking (additive, immutable, read-only analytical
+// evidence). Nothing here participates in admission, execution, or promotion:
+// every persisted row is permanently funding-excluded, promotion-ineligible,
+// and capped at the PAPER lifecycle.
+// ---------------------------------------------------------------------------
+
+/// Immutable completed pair-local ranking run (`P15_RANKING_V1`). The primary
+/// key IS the deterministic `rankingRunId`, so re-running the same semantic
+/// ranking is idempotent rather than duplicative, and `ranking_run_sha256`
+/// makes a same-id/different-content write detectable instead of silent.
+model RankingRun {
+  rankingRunId         String   @id @map("ranking_run_id") @db.VarChar(64)
+  schemaVersion        Int      @map("schema_version")
+  rankingPolicyId      String   @map("ranking_policy_id") @db.VarChar(64)
+  rankingPolicyVersion String   @map("ranking_policy_version") @db.VarChar(32)
+  pair                 String   @db.VarChar(64)
+  /// Phase12 plan identity; transitively binds the verified-clean source Git commit.
+  validationPlanId     String   @map("validation_plan_id") @db.VarChar(64)
+  candidateCount       Int      @map("candidate_count")
+  rankedCount          Int      @map("ranked_count")
+  /// Frozen Phase14 limitation, persisted explicitly so stored evidence can never be re-read as economically complete.
+  economicStatus       String   @map("economic_status") @db.VarChar(32)
+  promotionEligible    Boolean  @map("promotion_eligible")
+  maxLifecycle         String   @map("max_lifecycle") @db.VarChar(32)
+  rankingRunSha256     String   @map("ranking_run_sha256") @db.VarChar(64)
+  createdAt            DateTime @default(now()) @map("created_at")
+
+  results RankingResult[]
+
+  @@index([pair, rankingPolicyId], map: "ranking_run_pair_policy_idx")
+  @@index([validationPlanId], map: "ranking_run_validation_plan_idx")
+  @@map("ranking_run")
+}
+
+/// Immutable ranking result row. The primary key IS the deterministic result
+/// content hash (which itself binds `rankingRunId`), so identical semantic
+/// evidence collides on re-persist instead of being duplicated. Ranked-only
+/// columns are NULL for an `INSUFFICIENT_RANKING_EVIDENCE` row — never a
+/// fabricated zero score or rank.
+model RankingResult {
+  rankingResultSha256 String @id @map("ranking_result_sha256") @db.VarChar(64)
+  rankingRunId        String @map("ranking_run_id") @db.VarChar(64)
+  schemaVersion       Int    @map("schema_version")
+  status              String @db.VarChar(40)
+
+  pair                          String @db.VarChar(64)
+  strategyId                    String @map("strategy_id") @db.VarChar(128)
+  strategyVersion               String @map("strategy_version") @db.VarChar(32)
+  parameterHash                 String @map("parameter_hash") @db.VarChar(64)
+  validationSubjectId           String @map("validation_subject_id") @db.VarChar(64)
+  validationPlanId              String @map("validation_plan_id") @db.VarChar(64)
+  validationSubjectResultSha256 String @map("validation_subject_result_sha256") @db.VarChar(64)
+
+  compositeScore        Decimal? @map("composite_score") @db.Decimal(36, 18)
+  rank                  Int?
+  candidateCount        Int?     @map("candidate_count")
+  compositeTieGroupSize Int?     @map("composite_tie_group_size")
+  tieBreakLevelApplied  String?  @map("tie_break_level_applied") @db.VarChar(48)
+
+  /// Canonical JSON of the published component score rows (Decimal-safe strings).
+  componentScoresJson       String? @map("component_scores_json") @db.Text
+  reasonCodesJson           String  @map("reason_codes_json") @db.Text
+  unavailableComponentsJson String? @map("unavailable_components_json") @db.Text
+
+  economicStatus    String   @map("economic_status") @db.VarChar(32)
+  promotionEligible Boolean  @map("promotion_eligible")
+  maxLifecycle      String   @map("max_lifecycle") @db.VarChar(32)
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  run RankingRun @relation(fields: [rankingRunId], references: [rankingRunId], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([rankingRunId, validationSubjectId], map: "ranking_result_run_subject_unique")
+  @@index([rankingRunId, rank], map: "ranking_result_run_rank_idx")
+  @@index([validationSubjectId], map: "ranking_result_validation_subject_idx")
+  @@map("ranking_result")
+}
