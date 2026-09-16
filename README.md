@@ -21,13 +21,17 @@ The **CoinDCX Quant Futures Bot** is built from first principles to operate reli
 ## 2. Current Implementation Status
 
 > [!IMPORTANT]
-> **Implemented Phases:**
-> - **Phase 0:** Frozen Documentation (`docs/PRODUCT_SCOPE.md`, `docs/ARCHITECTURE.md`, `docs/INVARIANTS.md`, `docs/ROADMAP.md`, `docs/COIN_ONBOARDING.md`, `docs/STRATEGY_LIFECYCLE.md`).
-> - **Phase 1:** Foundation Architecture (TypeScript strict mode, Express, MySQL 8 + Prisma, Zod config validation, decimal safety, structured logging with secret redaction, health check API, graceful lifecycle manager, Vitest test suite, Dockerfile, docker-compose, and GitHub Actions CI).
+> **Implemented Phases: 0-15** (see `docs/ROADMAP.md` for the authoritative per-phase status).
+> - **Phase 0-1:** Frozen documentation and foundation architecture (TypeScript strict mode, Express, MySQL 8 + Prisma, Zod config validation, decimal safety, structured logging with secret redaction, health check API, graceful lifecycle manager, Vitest test suite, Dockerfile, docker-compose, and GitHub Actions CI).
+> - **Phase 2-8:** CoinDCX read layer, coin runtime layer, public/private WebSockets, canonical 1m market data, higher-timeframe engine, historical dataset engine, and indicator engine.
+> - **Phase 9-12:** Backtest engine, strategy framework and first four strategies, Strategy x Coin matrix and parameter research, and the Research Validation Lab.
+> - **Phase 13-14:** Risk / leverage engine and paper trading.
+> - **Phase 15 (current):** Deterministic Strategy x Coin ranking (`docs/STRATEGY_RANKING.md`).
 >
 > **Explicit Notice:**
-> - **Live trading is NOT implemented or enabled.**
-> - **Order placement, WebSockets, market-data ingestion, and Phase 2 (CoinDCX Read Layer) are NOT yet implemented.**
+> - **Live trading is NOT implemented or enabled.** Live order placement is Phase 17; shadow mode is Phase 19.
+> - **Paper trading is NOT economically complete.** CoinDCX provider evidence is insufficient to reproduce perpetual-funding economics, so paper funding is `FUNDING_UNSUPPORTED` and all paper PnL is labelled `FUNDING_EXCLUDED` (Invariant 28). Funding-excluded evidence can never authorize `PAPER_APPROVED`, `SHADOW`, `LIVE_CANDIDATE` or `LIVE`.
+> - **A Phase 15 ranking is research evidence, not a promotion.** Every ranking result is permanently `promotionEligible=false` with `maxLifecycle=PAPER`.
 
 ---
 
@@ -64,7 +68,7 @@ DATABASE_URL="mysql://quant_user:quant_password@localhost:3306/coindcx_quant"
 COINDCX_API_KEY=
 COINDCX_API_SECRET=
 ```
-*(Note: CoinDCX credentials are not required for Phase 1).*
+*(Note: CoinDCX credentials are required only for the live read/WebSocket smoke scripts. The deterministic research, validation and ranking suites run entirely offline.)*
 
 ### 4.3 Database Initialization
 ```bash
