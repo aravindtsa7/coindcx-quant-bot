@@ -170,3 +170,40 @@ All coin behavior is governed solely by verified instrument metadata and externa
 
 ### 4.4 Independent Paper Portfolios
 - During paper testing, each coin-strategy combination trades in an isolated virtual portfolio to guarantee that performance metrics remain uncorrupted by other concurrent assets.
+
+---
+
+## 5. Phase 16 — New-Coin Architecture Proof (SOL Verification)
+
+Phase 16 verifies SOL compatibility through application configuration, dynamic instrument discovery, deterministic fixture tests, generic production components, and an AST boundary scanner. It does not enable SOL paper, shadow, or live execution and does not modify the protected production core.
+
+### 5.1 Configuration and discovery
+
+`src/app/config/coins.ts` adds the actual SOL `CoinProfile` as an `Object.freeze({ ... })` entry with `underlying: 'SOL'`, the standard timeframes, the `DEFAULT_SAFE` risk profile, leverage values represented by `Decimal`, and all execution flags disabled. `CoinRuntimeBootstrapService` discovers the active pair dynamically from the underlying.
+
+### 5.2 Scanner proof
+
+The TypeScript compiler API scanner checks 209 files across the 12 protected directories. It performs case-insensitive, boundary-aware detection in string literals, all template token kinds, regular-expression literals, constant string concatenations, method arguments, comparisons, and object/array/property values. Identifier detection tokenizes camelCase, PascalCase, and separator-delimited names; it does not maintain an English-word allowlist. Synthetic tests cover the acceptance-review bypasses and ordinary-word negatives.
+
+### 5.3 Integration proof level
+
+The 28 Phase 16 integration tests establish these boundaries:
+
+- CoinDCX fixture schema parsing, decimal normalization, `CoinMetadata` mapping, runtime eligibility, registry, and bootstrap.
+- Generic public WebSocket channel construction.
+- `createCanonicalCandle1m` validation from supplied OHLCV fields, historical chunk planning, exact 5-minute aggregation, and EMA/RSI/ATR calculations. The proof does not exercise `CanonicalMarketDataEngine` trade-tick ingestion.
+- A minimal `BacktestEngine` run and SOL-compatible backtest instrument specification.
+- Construction of four production strategy kernels and a `StrategyRegistry` kernel. No candles are executed through those kernels and no signal is asserted. Exposure terminology is `LONG` / `SHORT` / `FLAT`.
+- Strategy × coin planning through the real `planWithGitSourceVerifier` function.
+- Phase 13 `verifyCurrentValuation` compatibility for unit valuation and aggregate current notional. Maintenance margin and liquidation price remain deferred.
+- Construction and validation of a `PaperInstrumentEconomicsSnapshot` only. `PaperAccountKernel`, paper sessions, ledger postings, and the paper fill path are not exercised.
+- Genuine Phase 12 `PASSED` output entering `rankStrategyCandidates` and producing an authoritative in-memory ranking run set. No ranking persistence is claimed.
+- BTC/ETH configuration and pair-generic strategy regression checks.
+
+### 5.4 Optional live gate
+
+`npm run test:integration:sol-live` performs read-only discovery, checks the underlying, INR margin currency, perpetual kind, active status, and positive multiplier/tick/lot values, then reports current metadata. It does not assert an exact multiplier, tick, lot, or tier count.
+
+For the exact fixture, scanner token set, limitations, and reproduction commands, see [PHASE16_NEW_COIN_PROOF.md](./PHASE16_NEW_COIN_PROOF.md).
+
+The Phase 16 final acceptance run passed exactly 182 test files and 2,362 tests.
