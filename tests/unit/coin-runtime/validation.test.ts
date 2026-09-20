@@ -203,10 +203,11 @@ describe('Coin Profile Validation & Canonicalization', () => {
   it('loads and validates DEFAULT_COIN_PROFILES via loadCoinProfiles()', async () => {
     const { loadCoinProfiles, DEFAULT_COIN_PROFILES } = await import('../../../src/app/config/coins');
     const profiles = loadCoinProfiles();
-    expect(profiles.length).toBe(2);
+    expect(profiles.length).toBe(3);
     expect(profiles[0]!.underlying).toBe('BTC');
     expect(profiles[1]!.underlying).toBe('ETH');
-    expect(DEFAULT_COIN_PROFILES.length).toBe(2);
+    expect(profiles[2]!.underlying).toBe('SOL');
+    expect(DEFAULT_COIN_PROFILES.length).toBe(3);
   });
 });
 

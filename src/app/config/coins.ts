@@ -49,6 +49,20 @@ export const DEFAULT_COIN_PROFILES: readonly CoinProfile[] = Object.freeze([
     defaultLeverage: new Decimal(1),
     configuredAbsoluteMaxLeverage: new Decimal(20),
   }),
+  Object.freeze({
+    underlying: 'SOL',
+    enabled: true,
+    dataEnabled: true,
+    researchEnabled: true,
+    paperEnabled: false,
+    shadowEnabled: false,
+    liveEnabled: false,
+    timeframes: STANDARD_TIMEFRAMES,
+    strategyAssignments: Object.freeze([]),
+    riskProfileId: 'DEFAULT_SAFE',
+    defaultLeverage: new Decimal(1),
+    configuredAbsoluteMaxLeverage: new Decimal(20),
+  }),
 ]);
 
 
