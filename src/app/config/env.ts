@@ -74,6 +74,26 @@ export const EnvSchema = z.object({
   // Reserved for future phases - not required or validated in Phase 1
   COINDCX_API_KEY: z.string().optional().default(''),
   COINDCX_API_SECRET: z.string().optional().default(''),
+  // CoinDCX does not expose a safely documented pre-mutation credential-owner
+  // proof in Phase 17, so deployment must bind credentials to this trusted
+  // configured account identity.
+  COINDCX_LIVE_ACCOUNT_ID: z.string().optional().default(''),
+
+  // -------------------------------------------------------------------------
+  // Phase 17 — live order mutation. DISABLED BY DEFAULT (P17-I04).
+  //
+  // Every default below is the closed one: the flag defaults to the exact
+  // string 'false', and both allowlists plus the notional ceiling default to
+  // empty. The authoritative decision is made by `resolveLiveExecutionGate`
+  // (`src/execution/live/gate.ts`), which additionally requires
+  // NODE_ENV=production and non-empty CoinDCX credentials. Nothing here can
+  // enable live trading on its own, and an absent or malformed value can never
+  // flip it on.
+  // -------------------------------------------------------------------------
+  LIVE_EXECUTION_ENABLED: z.string().optional().default('false'),
+  LIVE_EXECUTION_ACCOUNT_ALLOWLIST: z.string().optional().default(''),
+  LIVE_EXECUTION_PAIR_ALLOWLIST: z.string().optional().default(''),
+  LIVE_EXECUTION_MAX_ORDER_NOTIONAL_INR: z.string().optional().default(''),
 });
 
 export type AppConfig = z.infer<typeof EnvSchema>;

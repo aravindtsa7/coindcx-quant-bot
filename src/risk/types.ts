@@ -153,6 +153,8 @@ export type PendingExposureState =
   | { readonly status: 'UNKNOWN' };
 
 export interface PortfolioExposureSnapshot {
+  /** Account whose authoritative exposure projection this snapshot describes. */
+  readonly accountId: string;
   readonly globalOpenNotionalInr: string;
   readonly perPairOpenNotionalInr: Readonly<Record<string, string>>;
   readonly perStrategyOpenNotionalInr: Readonly<Record<string, string>>;

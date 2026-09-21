@@ -202,15 +202,15 @@ model PaperExecutionPolicySnapshot {
 /// existing paper lifecycle.
 model PaperInstrumentEconomicsSnapshot {
   instrumentEconomicsSnapshotId  String   @id @map("instrument_economics_snapshot_id") @db.VarChar(64)
-  identityPolicyId                String   @map("identity_policy_id") @db.VarChar(64)
-  sourceId                        String   @map("source_id") @db.VarChar(64)
-  instrumentSpecIdentityPolicyId  String   @map("instrument_spec_identity_policy_id") @db.VarChar(64)
-  instrumentSpecSnapshotId        String   @map("instrument_spec_snapshot_id") @db.VarChar(64)
-  pair                            String   @map("pair") @db.VarChar(64)
-  contractMultiplier              Decimal  @map("contract_multiplier") @db.Decimal(36, 18)
-  priceIncrement                  Decimal  @map("price_increment") @db.Decimal(36, 18)
-  quantityIncrement               Decimal  @map("quantity_increment") @db.Decimal(36, 18)
-  createdAt                       DateTime @default(now()) @map("created_at")
+  identityPolicyId               String   @map("identity_policy_id") @db.VarChar(64)
+  sourceId                       String   @map("source_id") @db.VarChar(64)
+  instrumentSpecIdentityPolicyId String   @map("instrument_spec_identity_policy_id") @db.VarChar(64)
+  instrumentSpecSnapshotId       String   @map("instrument_spec_snapshot_id") @db.VarChar(64)
+  pair                           String   @map("pair") @db.VarChar(64)
+  contractMultiplier             Decimal  @map("contract_multiplier") @db.Decimal(36, 18)
+  priceIncrement                 Decimal  @map("price_increment") @db.Decimal(36, 18)
+  quantityIncrement              Decimal  @map("quantity_increment") @db.Decimal(36, 18)
+  createdAt                      DateTime @default(now()) @map("created_at")
 
   executionIntents PaperExecutionIntent[]
 
@@ -272,21 +272,21 @@ model PaperReservation {
 /// immutable, write-once audit facts (V2.2 §2) — excluded from both the OPEN
 /// and CLOSE identity hashes, never overwritten on a later equivalent reissue.
 model PaperExecutionIntent {
-  executionIntentId         String               @id @map("execution_intent_id") @db.VarChar(64)
-  action                    PaperExecutionAction @map("action")
-  accountId                 String               @map("account_id") @db.VarChar(128)
-  pair                      String               @map("pair") @db.VarChar(64)
-  strategyInstanceId        String               @map("strategy_instance_id") @db.VarChar(64)
-  strategyId                String               @map("strategy_id") @db.VarChar(128)
-  strategyVersion           String               @map("strategy_version") @db.VarChar(32)
-  parameterHash             String               @map("parameter_hash") @db.VarChar(64)
-  riskDecisionId            String               @map("risk_decision_id") @db.VarChar(64)
-  evaluationTimeMs          BigInt               @map("evaluation_time_ms")
-  executionPolicySnapshotId String               @map("execution_policy_snapshot_id") @db.VarChar(64)
+  executionIntentId             String               @id @map("execution_intent_id") @db.VarChar(64)
+  action                        PaperExecutionAction @map("action")
+  accountId                     String               @map("account_id") @db.VarChar(128)
+  pair                            String   @map("pair") @db.VarChar(64)
+  strategyInstanceId            String               @map("strategy_instance_id") @db.VarChar(64)
+  strategyId                    String               @map("strategy_id") @db.VarChar(128)
+  strategyVersion               String               @map("strategy_version") @db.VarChar(32)
+  parameterHash                 String               @map("parameter_hash") @db.VarChar(64)
+  riskDecisionId                String               @map("risk_decision_id") @db.VarChar(64)
+  evaluationTimeMs              BigInt               @map("evaluation_time_ms")
+  executionPolicySnapshotId     String               @map("execution_policy_snapshot_id") @db.VarChar(64)
   /// Nullable only for migration compatibility. Every newly-created economic
   /// intent must bind authoritative lifecycle economics; NULL is legacy and
   /// unverifiable, never a default or backfill candidate.
-  instrumentEconomicsSnapshotId String?          @map("instrument_economics_snapshot_id") @db.VarChar(64)
+  instrumentEconomicsSnapshotId String?              @map("instrument_economics_snapshot_id") @db.VarChar(64)
 
   /// OPEN-only (NULL for CLOSE — CLOSE is never capacity-tracked).
   admissionId         String?  @map("admission_id") @db.VarChar(64)
@@ -309,11 +309,11 @@ model PaperExecutionIntent {
 
   createdAt DateTime @default(now()) @map("created_at")
 
-  account         PaperAccount                 @relation(fields: [accountId], references: [accountId], onDelete: Restrict, onUpdate: Restrict)
-  executionPolicy PaperExecutionPolicySnapshot @relation(fields: [executionPolicySnapshotId], references: [executionPolicySnapshotId], onDelete: Restrict, onUpdate: Restrict)
+  account             PaperAccount                      @relation(fields: [accountId], references: [accountId], onDelete: Restrict, onUpdate: Restrict)
+  executionPolicy     PaperExecutionPolicySnapshot      @relation(fields: [executionPolicySnapshotId], references: [executionPolicySnapshotId], onDelete: Restrict, onUpdate: Restrict)
   instrumentEconomics PaperInstrumentEconomicsSnapshot? @relation(fields: [instrumentEconomicsSnapshotId, pair], references: [instrumentEconomicsSnapshotId, pair], onDelete: Restrict, onUpdate: Restrict)
-  reservation     PaperReservation?            @relation(fields: [admissionId], references: [admissionId], onDelete: Restrict, onUpdate: Restrict)
-  order           PaperOrder?
+  reservation         PaperReservation?                 @relation(fields: [admissionId], references: [admissionId], onDelete: Restrict, onUpdate: Restrict)
+  order               PaperOrder?
 
   /// One reservation may back at most one execution intent (V2 §11).
   @@unique([admissionId], map: "paper_execution_intent_admission_unique")
@@ -606,4 +606,261 @@ model RankingResult {
   @@index([rankingRunId, rank], map: "ranking_result_run_rank_idx")
   @@index([validationSubjectId], map: "ranking_result_validation_subject_idx")
   @@map("ranking_result")
+}
+
+// =============================================================================
+// PHASE 17 — LIVE EXECUTION (additive; nothing above this line is modified)
+//
+// Durable state for authenticated CoinDCX futures order operations. Five
+// tables, mirroring the Phase14 intent/order/fact split:
+//
+//   live_execution_intent  immutable economic identity, written once
+//   live_order             mutable state projection, guarded by `revision`
+//   live_order_event       append-only validated exchange observations
+//
+// Idempotence is enforced by database constraints, never by in-memory locks:
+// `PRIMARY KEY(intent_id)` plus `UNIQUE(client_order_id)` make a duplicate
+// intent collide; the conditional `UPDATE ... WHERE state='CREATED'` in
+// `PrismaLiveExecutionRepository.claimDispatch` makes exactly one concurrent
+// worker the dispatcher; `UNIQUE(intent_id, observation_sha256)` makes a
+// replayed provider event a no-op.
+//
+// Legacy rows do not exist: these tables are new, and nothing is backfilled or
+// guessed from exchange state (P17 §14).
+// =============================================================================
+
+/// Exchange-side order direction. Distinct from `PaperPositionSide`.
+enum LiveOrderSide {
+  BUY
+  SELL
+}
+
+/// Economic intent against the account's position.
+enum LiveExecutionActionKind {
+  OPEN
+  CLOSE
+}
+
+/// Economic order shape. The venue's own `order_type` lexeme is stored
+/// separately in `wire_order_type` — Phase17 never invents an exchange enum.
+enum LiveOrderTypeKind {
+  MARKET
+  LIMIT
+}
+
+/// Time-in-force semantics Phase17 is willing to claim. `UNSPECIFIED` is the
+/// only value the verified CoinDCX futures order contract supports today; the
+/// other two exist so an intent requiring them is rejected rather than
+/// silently degraded (P17-I12).
+enum LiveTimeInForceKind {
+  UNSPECIFIED
+  GOOD_TILL_CANCEL
+  FILL_OR_KILL
+  POST_ONLY
+  IMMEDIATE_OR_CANCEL
+}
+
+/// Durable Phase17 order states. Ambiguous create and provider-conflict states
+/// are terminal here; resolving them is Phase18 reconciliation (P17-I20).
+enum LiveOrderState {
+  CREATED
+  DISPATCH_RESERVED
+  SUBMISSION_AMBIGUOUS
+  ACKNOWLEDGED
+  PARTIALLY_FILLED
+  FILLED
+  CANCEL_REQUESTED
+  CANCELLED
+  REJECTED
+  RECONCILIATION_REQUIRED
+}
+
+/// Exclusive durable ownership and outcome of the cancellation mutation.
+enum LiveCancelState {
+  NONE
+  CANCEL_RESERVED
+  CANCEL_ACKNOWLEDGED
+  CANCEL_AMBIGUOUS
+  CANCEL_REJECTED
+}
+
+/// Kind of a validated exchange observation.
+enum LiveOrderEventKind {
+  ACKNOWLEDGED
+  PARTIAL_FILL
+  FILL
+  CANCELLED
+  REJECTED
+}
+
+/// Immutable live execution intent. The primary key IS the deterministic
+/// canonical identity hash (`computeLiveExecutionIntentId`), so replaying the
+/// same economic request collides instead of creating a second order, and
+/// `client_order_id` — derived from the same preimage in its own hash domain —
+/// is globally unique so a truncation collision fails closed as a conflict
+/// rather than reusing an existing exchange order.
+model LiveExecutionIntent {
+  intentId      String @id @map("intent_id") @db.VarChar(64)
+  clientOrderId String @unique(map: "live_execution_intent_client_order_id_unique") @map("client_order_id") @db.VarChar(64)
+  contentSha256 String @map("content_sha256") @db.VarChar(64)
+
+  accountId     String                  @map("account_id") @db.VarChar(128)
+  pair          String                  @db.VarChar(64)
+  side          LiveOrderSide
+  action        LiveExecutionActionKind
+  quantity      Decimal                 @db.Decimal(36, 18)
+  orderType     LiveOrderTypeKind       @map("order_type")
+  /// NULL for MARKET. Quote-currency limit price, exact to the instrument tick.
+  price         Decimal?                @db.Decimal(36, 18)
+  timeInForce   LiveTimeInForceKind     @map("time_in_force")
+  /// Authoritative execution leverage. NULL when the action binds none (CLOSE).
+  leverage      Decimal?                @db.Decimal(36, 18)
+  /// The venue's own declared order-type lexeme actually sent on the wire.
+  wireOrderType String                  @map("wire_order_type") @db.VarChar(64)
+
+  /// Phase13 risk lineage (P17-I02). admission_id is OPEN-only — a CLOSE is
+  /// never capacity-tracked, exactly as in Phase14.
+  riskDecisionId String  @map("risk_decision_id") @db.VarChar(64)
+  admissionId    String? @map("admission_id") @db.VarChar(64)
+
+  strategyInstanceId String @map("strategy_instance_id") @db.VarChar(64)
+  strategyId         String @map("strategy_id") @db.VarChar(128)
+  strategyVersion    String @map("strategy_version") @db.VarChar(32)
+  parameterHash      String @map("parameter_hash") @db.VarChar(64)
+
+  liveExecutionPolicyId     String   @map("live_execution_policy_id") @db.VarChar(64)
+  instrumentSpecSnapshotId  String   @map("instrument_spec_snapshot_id") @db.VarChar(64)
+  authorizedNotionalInr     Decimal  @map("authorized_notional_inr") @db.Decimal(36, 18)
+  settlementRateInrPerQuote Decimal? @map("settlement_rate_inr_per_quote") @db.Decimal(36, 18)
+  positionInstanceId        String?  @map("position_instance_id") @db.VarChar(64)
+  positionRevision          Int?     @map("position_revision")
+  reduceOnlyQuantity        Decimal? @map("reduce_only_quantity") @db.Decimal(36, 18)
+
+  /// Audit-only lineage, deliberately excluded from the identity hash so a
+  /// genuine research-approval reissue never forks an existing identity.
+  /// Research columns are OPEN-only (CLOSE is research-exempt).
+  sourceStrategyDecisionId      String  @map("source_strategy_decision_id") @db.VarChar(64)
+  validationSubjectId           String? @map("validation_subject_id") @db.VarChar(64)
+  validationPlanId              String? @map("validation_plan_id") @db.VarChar(64)
+  validationSubjectResultSha256 String? @map("validation_subject_result_sha256") @db.VarChar(64)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  order                LiveOrder?
+  admissionConsumption LiveAdmissionConsumption?
+
+  @@index([accountId, pair], map: "live_execution_intent_account_pair_idx")
+  @@index([riskDecisionId], map: "live_execution_intent_risk_decision_idx")
+  @@index([sourceStrategyDecisionId], map: "live_execution_intent_source_decision_idx")
+  @@map("live_execution_intent")
+}
+
+/// One durable winner for one Phase13 capacity grant. The admission id is the
+/// primary key, so distinct economic intents cannot consume the same capacity.
+model LiveAdmissionConsumption {
+  admissionId    String   @id @map("admission_id") @db.VarChar(64)
+  intentId       String   @unique(map: "live_admission_consumption_intent_unique") @map("intent_id") @db.VarChar(64)
+  accountId      String   @map("account_id") @db.VarChar(128)
+  pair           String   @db.VarChar(64)
+  riskDecisionId String   @map("risk_decision_id") @db.VarChar(64)
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  intent LiveExecutionIntent @relation(fields: [intentId], references: [intentId], onDelete: Restrict, onUpdate: Restrict, map: "live_admission_consumption_intent_fkey")
+
+  @@index([accountId, pair], map: "live_admission_consumption_account_pair_idx")
+  @@map("live_admission_consumption")
+}
+
+/// Reconciled durable live-position ownership. CLOSE dispatch compares every
+/// bound field under a row lock; stale revisions and over-reductions fail.
+model LivePosition {
+  accountId                String            @map("account_id") @db.VarChar(128)
+  pair                     String            @db.VarChar(64)
+  positionInstanceId       String            @unique(map: "live_position_instance_unique") @map("position_instance_id") @db.VarChar(64)
+  revision                 Int               @default(0)
+  side                     PaperPositionSide
+  quantity                 Decimal           @db.Decimal(36, 18)
+  instrumentSpecSnapshotId String            @map("instrument_spec_snapshot_id") @db.VarChar(64)
+  ownerStrategyInstanceId  String            @map("owner_strategy_instance_id") @db.VarChar(64)
+  ownerStrategyId          String            @map("owner_strategy_id") @db.VarChar(128)
+  ownerStrategyVersion     String            @map("owner_strategy_version") @db.VarChar(32)
+  ownerParameterHash       String            @map("owner_parameter_hash") @db.VarChar(64)
+  updatedAt                DateTime          @updatedAt @map("updated_at")
+
+  @@id([accountId, pair])
+  @@map("live_position")
+}
+
+/// Mutable state projection for exactly one intent. intent_id is the primary
+/// key, so the one-intent-one-order cardinality is structural rather than
+/// merely constrained. revision is the optimistic-concurrency token: every
+/// durable transition is a conditional update on the exact expected value.
+model LiveOrder {
+  intentId      String @id @map("intent_id") @db.VarChar(64)
+  clientOrderId String @unique(map: "live_order_client_order_id_unique") @map("client_order_id") @db.VarChar(64)
+
+  accountId String         @map("account_id") @db.VarChar(128)
+  pair      String         @db.VarChar(64)
+  state     LiveOrderState
+
+  /// Present only once CoinDCX genuinely supplied one — never fabricated.
+  exchangeOrderId String? @map("exchange_order_id") @db.VarChar(64)
+
+  orderedQuantity          Decimal  @map("ordered_quantity") @db.Decimal(36, 18)
+  cumulativeFilledQuantity Decimal  @default(0) @map("cumulative_filled_quantity") @db.Decimal(36, 18)
+  /// Always exactly ordered_quantity - cumulative_filled_quantity; stored so
+  /// the column is queryable, never as an independent source of truth.
+  remainingQuantity        Decimal  @map("remaining_quantity") @db.Decimal(36, 18)
+  averageFillPrice         Decimal? @map("average_fill_price") @db.Decimal(36, 18)
+
+  /// Raw validated venue status lexeme, kept verbatim for audit.
+  lastExchangeStatus      String? @map("last_exchange_status") @db.VarChar(32)
+  /// Provider-supplied event time of the newest applied observation. Labelled
+  /// as exchange time; created_at/updated_at remain local operational time.
+  lastProviderEventTimeMs BigInt? @map("last_provider_event_time_ms")
+  /// Phase17 taxonomy code recorded when this order reached a fail-closed state.
+  faultCode               String? @map("fault_code") @db.VarChar(64)
+
+  cancelState           LiveCancelState @default(NONE) @map("cancel_state")
+  cancelGeneration      Int             @default(0) @map("cancel_generation")
+  cancelExchangeOrderId String?         @map("cancel_exchange_order_id") @db.VarChar(64)
+  cancelFaultCode       String?         @map("cancel_fault_code") @db.VarChar(64)
+  cancelClaimedAt       DateTime?       @map("cancel_claimed_at")
+
+  revision  Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  intent LiveExecutionIntent @relation(fields: [intentId], references: [intentId], onDelete: Restrict, onUpdate: Restrict, map: "live_order_intent_fkey")
+  events LiveOrderEvent[]
+
+  @@index([accountId, state], map: "live_order_account_state_idx")
+  @@index([exchangeOrderId], map: "live_order_exchange_order_idx")
+  @@map("live_order")
+}
+
+/// Append-only log of validated exchange observations. The
+/// (intent_id, observation_sha256) uniqueness is what makes a repeated
+/// provider event idempotent: the second insert collides and the state machine
+/// is never re-applied.
+model LiveOrderEvent {
+  eventId String @id @default(uuid()) @map("event_id")
+
+  intentId          String             @map("intent_id") @db.VarChar(64)
+  observationSha256 String             @map("observation_sha256") @db.VarChar(64)
+  kind              LiveOrderEventKind
+
+  exchangeOrderId          String   @map("exchange_order_id") @db.VarChar(64)
+  exchangeStatus           String   @map("exchange_status") @db.VarChar(32)
+  cumulativeFilledQuantity Decimal  @map("cumulative_filled_quantity") @db.Decimal(36, 18)
+  averageFillPrice         Decimal? @map("average_fill_price") @db.Decimal(36, 18)
+  providerEventTimeMs      BigInt   @map("provider_event_time_ms")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  order LiveOrder @relation(fields: [intentId], references: [intentId], onDelete: Restrict, onUpdate: Restrict, map: "live_order_event_order_fkey")
+
+  @@unique([intentId, observationSha256], map: "live_order_event_intent_observation_unique")
+  @@index([intentId, providerEventTimeMs], map: "live_order_event_intent_provider_time_idx")
+  @@map("live_order_event")
 }

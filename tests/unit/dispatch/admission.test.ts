@@ -218,6 +218,7 @@ describe('C-F07 account-wide atomicity and multi-coin capacity', () => {
     // A global cap that comfortably fits one grant but not two.
     const tightCap = singleNotional.mul('1.5').toFixed();
     const exposureSnapshot: PortfolioExposureSnapshot = seal({
+      accountId: ACCOUNT,
       globalOpenNotionalInr: '0', perPairOpenNotionalInr: {}, perStrategyOpenNotionalInr: {}, concurrentOpenPositions: 0,
       pending: { status: 'KNOWN', globalPendingNotionalInr: '0', pairPendingNotionalInr: {}, strategyPendingNotionalInr: {}, instancePendingReservations: [], pendingReservationCount: 0, pendingDirectionalNotionalInr: { longInr: '0', shortInr: '0' } },
       provenance: { sourceId: 'exposure-source', sourceTimeMs: T0, observedAtMs: T0, contentSha256: 'a'.repeat(64) },

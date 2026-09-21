@@ -140,6 +140,7 @@ export function makePair(): PairRiskSnapshot {
 
 export function makeExposure(): PortfolioExposureSnapshot {
   return seal({
+    accountId: 'account-1',
     globalOpenNotionalInr: '0', perPairOpenNotionalInr: {}, perStrategyOpenNotionalInr: {}, concurrentOpenPositions: 0,
     pending: { status: 'KNOWN', globalPendingNotionalInr: '0', pairPendingNotionalInr: {}, strategyPendingNotionalInr: {},
       instancePendingReservations: [], pendingReservationCount: 0, pendingDirectionalNotionalInr: { longInr: '0', shortInr: '0' } },

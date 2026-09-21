@@ -189,9 +189,10 @@ function pending(value: unknown): PendingExposureState {
     pendingReservationCount: record.pendingReservationCount, pendingDirectionalNotionalInr: { longInr: decimal(record.pendingDirectionalNotionalInr.longInr, 'longInr'), shortInr: decimal(record.pendingDirectionalNotionalInr.shortInr, 'shortInr') } };
 }
 function exposureSnapshot(value: unknown): PortfolioExposureSnapshot {
-  assertExactKeys(value, ['globalOpenNotionalInr', 'perPairOpenNotionalInr', 'perStrategyOpenNotionalInr', 'concurrentOpenPositions', 'pending', 'provenance'], 'PortfolioExposureSnapshot');
+  assertExactKeys(value, ['accountId', 'globalOpenNotionalInr', 'perPairOpenNotionalInr', 'perStrategyOpenNotionalInr', 'concurrentOpenPositions', 'pending', 'provenance'], 'PortfolioExposureSnapshot');
+  assertString(value.accountId, 'PortfolioExposureSnapshot.accountId');
   assertSafeInteger(value.concurrentOpenPositions, 'concurrentOpenPositions');
-  return { globalOpenNotionalInr: decimal(value.globalOpenNotionalInr, 'globalOpenNotionalInr'), perPairOpenNotionalInr: decimalRecord(value.perPairOpenNotionalInr, 'perPairOpenNotionalInr'),
+  return { accountId: value.accountId, globalOpenNotionalInr: decimal(value.globalOpenNotionalInr, 'globalOpenNotionalInr'), perPairOpenNotionalInr: decimalRecord(value.perPairOpenNotionalInr, 'perPairOpenNotionalInr'),
     perStrategyOpenNotionalInr: decimalRecord(value.perStrategyOpenNotionalInr, 'perStrategyOpenNotionalInr'), concurrentOpenPositions: value.concurrentOpenPositions,
     pending: pending(value.pending), provenance: provenance(value.provenance, 'PortfolioExposureSnapshot.provenance') };
 }
