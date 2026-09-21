@@ -51,26 +51,174 @@ export function listSourceFiles(dir: string): string[] {
  * (no leading `.`) are not local edges and are filtered by the caller via
  * `resolveLocalSpecifier` returning `null` for them.
  */
-export function extractImportSpecifiers(sourceText: string, fileName: string): string[] {
+export type ModuleLoadKind = 'dynamic-import' | 'require' | 'aliased-require' | 'module-require' | 'create-require' | 'indirect-loader';
+
+export interface UnresolvedDynamicModuleLoad {
+  readonly file: string;
+  readonly kind: ModuleLoadKind;
+  readonly line: number;
+  readonly expression: string;
+}
+
+export interface ModuleReferenceAnalysis {
+  readonly specifiers: readonly string[];
+  readonly unresolvedDynamicLoads: readonly Omit<UnresolvedDynamicModuleLoad, 'file'>[];
+}
+
+function literalModuleSpecifier(node: ts.Expression | undefined): string | null {
+  if (node !== undefined && (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node))) return node.text;
+  return null;
+}
+
+/**
+ * AST-based module-load analysis. In addition to normal imports/re-exports it
+ * follows statically resolvable aliases of CommonJS `require`, `module.require`,
+ * and loaders produced by `createRequire`. A computed loader target is evidence
+ * of an unresolved architecture edge, not an edge that may be silently ignored.
+ */
+export function analyzeModuleReferences(sourceText: string, fileName: string): ModuleReferenceAnalysis {
   const sourceFile = ts.createSourceFile(fileName, sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const specifiers: string[] = [];
+  const unresolvedDynamicLoads: Omit<UnresolvedDynamicModuleLoad, 'file'>[] = [];
+  const requireAliases = new Set(['require']);
+  const createRequireNames = new Set<string>();
+  const moduleNamespaceNames = new Set<string>();
+  const moduleAliases = new Set(['module']);
+
+  for (const statement of sourceFile.statements) {
+    if (!ts.isImportDeclaration(statement) || statement.importClause === undefined) continue;
+    const moduleName = literalModuleSpecifier(statement.moduleSpecifier);
+    if (moduleName !== 'node:module' && moduleName !== 'module') continue;
+    const bindings = statement.importClause.namedBindings;
+    if (bindings !== undefined && ts.isNamespaceImport(bindings)) moduleNamespaceNames.add(bindings.name.text);
+    if (bindings !== undefined && ts.isNamedImports(bindings)) {
+      for (const element of bindings.elements) {
+        if ((element.propertyName?.text ?? element.name.text) === 'createRequire') createRequireNames.add(element.name.text);
+      }
+    }
+  }
+
+  const declarations: Array<{ readonly name: string; readonly initializer: ts.Expression }> = [];
+  const destructuredModuleRequireAliases: string[] = [];
+  const assignments: Array<{ readonly name: string; readonly initializer: ts.Expression }> = [];
+  const collectAliases = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) && node.initializer !== undefined) {
+      if (ts.isIdentifier(node.name)) declarations.push({ name: node.name.text, initializer: node.initializer });
+      else if (ts.isObjectBindingPattern(node.name) && ts.isIdentifier(node.initializer) && moduleAliases.has(node.initializer.text)) {
+        for (const element of node.name.elements) {
+          if ((element.propertyName?.getText(sourceFile) ?? element.name.getText(sourceFile)) === 'require' && ts.isIdentifier(element.name)) {
+            destructuredModuleRequireAliases.push(element.name.text);
+          }
+        }
+      }
+    } else if (
+      ts.isBinaryExpression(node)
+      && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && ts.isIdentifier(node.left)
+    ) {
+      assignments.push({ name: node.left.text, initializer: node.right });
+    }
+    ts.forEachChild(node, collectAliases);
+  };
+  collectAliases(sourceFile);
+
+  for (const alias of destructuredModuleRequireAliases) requireAliases.add(alias);
+
+  const isModuleRequire = (expression: ts.Expression): boolean => {
+    if (ts.isPropertyAccessExpression(expression)) {
+      return ts.isIdentifier(expression.expression) && moduleAliases.has(expression.expression.text) && expression.name.text === 'require';
+    }
+    return ts.isElementAccessExpression(expression)
+      && ts.isIdentifier(expression.expression)
+      && moduleAliases.has(expression.expression.text)
+      && literalModuleSpecifier(expression.argumentExpression) === 'require';
+  };
+  const isCreateRequireCall = (expression: ts.Expression): boolean =>
+    ts.isCallExpression(expression)
+    && (
+      (ts.isIdentifier(expression.expression) && createRequireNames.has(expression.expression.text))
+      || (ts.isPropertyAccessExpression(expression.expression)
+        && ts.isIdentifier(expression.expression.expression)
+        && moduleNamespaceNames.has(expression.expression.expression.text)
+        && expression.expression.name.text === 'createRequire')
+    );
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const { name, initializer } of [...declarations, ...assignments]) {
+      if (requireAliases.has(name)) continue;
+      if (ts.isIdentifier(initializer) && moduleAliases.has(initializer.text)) {
+        moduleAliases.add(name);
+        changed = true;
+        continue;
+      }
+      if (
+        (ts.isIdentifier(initializer) && requireAliases.has(initializer.text))
+        || isModuleRequire(initializer)
+        || isCreateRequireCall(initializer)
+        || (ts.isCallExpression(initializer)
+          && ts.isPropertyAccessExpression(initializer.expression)
+          && initializer.expression.name.text === 'bind'
+          && (ts.isIdentifier(initializer.expression.expression)
+            ? requireAliases.has(initializer.expression.expression.text)
+            : isModuleRequire(initializer.expression.expression)))
+      ) {
+        requireAliases.add(name);
+        changed = true;
+      }
+    }
+  }
+
+  const recordCall = (node: ts.CallExpression, kind: ModuleLoadKind): void => {
+    const firstArg = node.arguments[0];
+    const specifier = literalModuleSpecifier(firstArg);
+    if (specifier !== null) {
+      specifiers.push(specifier);
+      return;
+    }
+    const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
+    unresolvedDynamicLoads.push({
+      kind,
+      line: line + 1,
+      expression: node.getText(sourceFile),
+    });
+  };
+  const recordUnresolvedNode = (node: ts.Node, kind: ModuleLoadKind): void => {
+    const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
+    unresolvedDynamicLoads.push({ kind, line: line + 1, expression: node.getText(sourceFile) });
+  };
 
   function visit(node: ts.Node): void {
     if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
       const moduleSpecifier = node.moduleSpecifier;
-      if (moduleSpecifier !== undefined && ts.isStringLiteral(moduleSpecifier)) specifiers.push(moduleSpecifier.text);
+      const specifier = literalModuleSpecifier(moduleSpecifier);
+      if (specifier !== null) specifiers.push(specifier);
     } else if (ts.isCallExpression(node)) {
       const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword;
-      const isRequire = ts.isIdentifier(node.expression) && node.expression.text === 'require';
-      if (isDynamicImport || isRequire) {
-        const firstArg = node.arguments[0];
-        if (firstArg !== undefined && ts.isStringLiteral(firstArg)) specifiers.push(firstArg.text);
-      }
+      if (isDynamicImport) recordCall(node, 'dynamic-import');
+      else if (ts.isIdentifier(node.expression) && requireAliases.has(node.expression.text)) {
+        recordCall(node, node.expression.text === 'require' ? 'require' : 'aliased-require');
+      } else if (isModuleRequire(node.expression)) recordCall(node, 'module-require');
+      else if (ts.isCallExpression(node.expression) && isCreateRequireCall(node.expression)) recordCall(node, 'create-require');
+      else if (
+        (ts.isIdentifier(node.expression) && (node.expression.text === 'eval' || node.expression.text === 'Function'))
+        || (ts.isPropertyAccessExpression(node.expression)
+          && ts.isIdentifier(node.expression.expression)
+          && node.expression.expression.text === 'process'
+          && node.expression.name.text === 'getBuiltinModule')
+      ) recordUnresolvedNode(node, 'indirect-loader');
+    } else if (ts.isNewExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'Function') {
+      recordUnresolvedNode(node, 'indirect-loader');
     }
     ts.forEachChild(node, visit);
   }
   visit(sourceFile);
-  return specifiers;
+  return { specifiers, unresolvedDynamicLoads };
+}
+
+export function extractImportSpecifiers(sourceText: string, fileName: string): string[] {
+  return [...analyzeModuleReferences(sourceText, fileName).specifiers];
 }
 
 /**
@@ -100,6 +248,8 @@ export interface BuildImportGraphResult {
   readonly graph: ImportGraph;
   /** Every relative import specifier this build could not resolve to a file in `files` — should always be empty for a real project tree (§8/§31). */
   readonly unresolved: readonly { readonly file: string; readonly specifier: string }[];
+  /** Computed/otherwise non-literal module loads. Protected production code must reject these unless explicitly reviewed. */
+  readonly unresolvedDynamicLoads: readonly UnresolvedDynamicModuleLoad[];
 }
 
 /**
@@ -114,10 +264,16 @@ export function buildImportGraph(absoluteRootDir: string, repoRoot: string): Bui
 
   const graph = new Map<string, string[]>();
   const unresolved: { readonly file: string; readonly specifier: string }[] = [];
+  const unresolvedDynamicLoads: UnresolvedDynamicModuleLoad[] = [];
 
   for (const absoluteFile of absoluteFiles) {
     const sourceText = readFileSync(absoluteFile, 'utf8');
-    const specifiers = extractImportSpecifiers(sourceText, absoluteFile);
+    const analysis = analyzeModuleReferences(sourceText, absoluteFile);
+    const specifiers = analysis.specifiers;
+    unresolvedDynamicLoads.push(...analysis.unresolvedDynamicLoads.map((load) => ({
+      file: toRepoRelative(absoluteFile),
+      ...load,
+    })));
     const edges = new Set<string>();
     for (const specifier of specifiers) {
       if (!specifier.startsWith('.')) continue; // external package — not a local architecture edge
@@ -135,6 +291,8 @@ export function buildImportGraph(absoluteRootDir: string, repoRoot: string): Bui
     files: absoluteFiles.map(toRepoRelative).sort(),
     graph,
     unresolved: unresolved.slice().sort((a, b) => (a.file === b.file ? (a.specifier < b.specifier ? -1 : 1) : a.file < b.file ? -1 : 1)),
+    unresolvedDynamicLoads: unresolvedDynamicLoads.slice().sort((a, b) =>
+      a.file === b.file ? a.line - b.line : a.file < b.file ? -1 : 1),
   };
 }
 

@@ -312,8 +312,7 @@ export async function loadAuthoritativePaperRiskBase(
     // `PortfolioExposureSnapshot` key set, so it is dropped here and the
     // content hash resealed with `evidenceContentSha256` — the exact hash
     // RiskEngine independently recomputes over the whole snapshot.
-    const { accountId: _projectionAccountId, ...exposureFields } = projection as PortfolioExposureSnapshot & { readonly accountId?: string };
-    const exposureSnapshot = seal(exposureFields as PortfolioExposureSnapshot);
+    const exposureSnapshot = seal(projection);
 
     return Object.freeze({
       accountId: record.accountId, fence: account.ownerFence, revision: account.revision, evaluationTimeMs,

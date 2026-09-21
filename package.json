@@ -12,6 +12,8 @@
     "test:coverage": "vitest run --coverage",
     "test:integration:ranking": "tsx scripts/run-ranking-db-integration.ts",
     "test:integration:sol-live": "tsx scripts/run-sol-live-integration.ts",
+    "test:integration:live-execution": "tsx scripts/run-live-execution-db-integration.ts",
+    "verify:migration:phase17": "tsx scripts/verify-phase17-migration-parity.ts",
     "lint": "eslint \"src/**/*.ts\" \"tests/**/*.ts\"",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",

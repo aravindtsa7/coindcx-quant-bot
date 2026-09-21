@@ -3,13 +3,52 @@ import type { RiskCalc } from '../risk/decimal';
 import { KeyedSerialQueue } from './serial-queue';
 import type { AdmissionOutcome, AdmissionRecord, AdmissionRequest, PortfolioExposureSnapshot, ReleaseOutcome } from './types';
 
+type LiveAdmissionConsumptionOutcome =
+  | { readonly status: 'CONSUMED' | 'ALREADY_CONSUMED_SAME_INTENT' }
+  | { readonly status: 'UNAVAILABLE' };
+
+interface LiveCoordinatorChannel {
+  readonly admit: (request: AdmissionRequest) => Promise<AdmissionOutcome>;
+  readonly consume: (accountId: string, admissionId: string, intentId: string) => Promise<LiveAdmissionConsumptionOutcome>;
+  /** [F17-R04] Read-only cardinality of live consumption markers; see `liveAdmissionConsumptionCardinality`. */
+  readonly consumptionCardinality: () => number;
+}
+
+/**
+ * Module-private channels are installed only by the genuine class constructor.
+ * Live execution never invokes a caller-overridable public method: a plain
+ * object, subclass override, proxy, or structurally compatible test double has
+ * no channel and therefore cannot manufacture trusted admission facts.
+ */
+const LIVE_COORDINATOR_CHANNELS = new WeakMap<object, LiveCoordinatorChannel>();
+
 type KnownPending = Extract<PendingExposureState, { readonly status: 'KNOWN' }>;
 /**
  * `decision` is `null` only for an entry populated by `restore()` (P14-D) that
  * this process has not yet itself re-evaluated — every entry produced by a
  * genuine `#admitLocked` evaluation always carries a real decision.
  */
-interface Entry { readonly record: AdmissionRecord; readonly decision: Extract<AdmissionOutcome, { readonly status: 'ADMITTED' }>['decision'] | null; }
+interface Entry {
+  readonly record: AdmissionRecord;
+  readonly decision: Extract<AdmissionOutcome, { readonly status: 'ADMITTED' }>['decision'] | null;
+  /**
+   * [F17-R04] The Phase17 intent that has consumed this admission's capacity in
+   * THIS process, or `null`. Deliberately a field of the admission entry rather
+   * than a separate map keyed by `admissionId`: an independent map would be a
+   * second, unpruned lifetime that grows once per consumed admission forever,
+   * whereas this state is created, replaced and discarded with the entry that
+   * owns it and can never outlive or outnumber it. Consumption markers are
+   * therefore strictly bounded by the admission population itself, and
+   * `restoreAuthoritative` — which is the only path that evicts admission
+   * entries — evicts them together with the entry in a single step.
+   *
+   * Restart does not repopulate this: the durable authority is Phase17's
+   * `live_admission_consumption` table (`PRIMARY KEY(admission_id)` plus
+   * `UNIQUE(intent_id)`), which refuses a second consumer regardless of what
+   * this process remembers. Nothing is fabricated here to fill that gap.
+   */
+  readonly consumedByIntentId: string | null;
+}
 
 /** A durably-restored admission attempt lacks the full original `RiskDecision`
  * (P14-C's `PaperReservation` persists only its identity-relevant subset,
@@ -85,6 +124,18 @@ export class RiskAdmissionCoordinator {
    * (see `AdmissionGenerationWatermark`). */
   readonly #latestGeneration = new Map<string, Map<string, number>>();
   readonly #faultedAccounts = new Set<string>();
+
+  public constructor() {
+    LIVE_COORDINATOR_CHANNELS.set(this, Object.freeze({
+      admit: (request: AdmissionRequest) => this.#queues.enqueue(request.accountId, () => this.#admitLocked(request)),
+      consume: (accountId: string, admissionId: string, intentId: string) => this.#queues.enqueue(accountId, () => this.#consumeForLiveLocked(accountId, admissionId, intentId)),
+      consumptionCardinality: () => {
+        let total = 0;
+        for (const entry of this.#byAdmissionId.values()) if (entry.consumedByIntentId !== null) total += 1;
+        return total;
+      },
+    }));
+  }
 
   public admit(request: AdmissionRequest): Promise<AdmissionOutcome> {
     return this.#queues.enqueue(request.accountId, () => this.#admitLocked(request));
@@ -225,7 +276,10 @@ export class RiskAdmissionCoordinator {
       if (byDecision.has(record.sourceStrategyDecisionId)) {
         throw new Error(`RiskAdmissionCoordinator.restore: duplicate sourceStrategyDecisionId ${record.sourceStrategyDecisionId} in restore batch`);
       }
-      const entry: Entry = { record, decision: null };
+      // [F17-R04] A restored admission carries no process-local consumption
+      // marker: the durable `live_admission_consumption` row is the authority
+      // after a restart, and inventing a marker here would fabricate state.
+      const entry: Entry = { record, decision: null, consumedByIntentId: null };
       byDecision.set(record.sourceStrategyDecisionId, entry);
       byAdmissionIdEntries.push([record.admissionId, entry]);
       byGeneration.set(record.sourceStrategyDecisionId, record.generation);
@@ -278,7 +332,7 @@ export class RiskAdmissionCoordinator {
       if (reconfirmed.status !== 'ACCEPTED' || reconfirmed.action !== 'OPEN' || reconfirmed.riskDecisionId !== existing.record.riskDecisionId) {
         throw new Error('RiskAdmissionCoordinator: restored admission disagrees with fresh re-evaluation — refusing to silently fork a generation while the prior admission remains ADMITTED');
       }
-      const healedEntry: Entry = { record: existing.record, decision: reconfirmed };
+      const healedEntry: Entry = { record: existing.record, decision: reconfirmed, consumedByIntentId: existing.consumedByIntentId };
       this.#byAccountAndDecision.get(accountId)?.set(decision.decisionId, healedEntry);
       this.#byAdmissionId.set(existing.record.admissionId, healedEntry);
       return { status: 'ADMITTED', decision: reconfirmed, admission: existing.record };
@@ -328,7 +382,7 @@ export class RiskAdmissionCoordinator {
       pair: decision.pair, decisionSequence: decision.decisionSequence, direction,
       approvedNotionalInr: riskDecision.approved.approvedNotionalInr, approvedMarginInr: riskDecision.approved.estimatedInitialMarginInr, status: 'ADMITTED',
     });
-    const entry: Entry = { record, decision: riskDecision };
+    const entry: Entry = { record, decision: riskDecision, consumedByIntentId: null };
 
     let byDecision = this.#byAccountAndDecision.get(accountId);
     if (byDecision === undefined) { byDecision = new Map(); this.#byAccountAndDecision.set(accountId, byDecision); }
@@ -351,10 +405,32 @@ export class RiskAdmissionCoordinator {
     const entry = this.#byAdmissionId.get(admissionId);
     if (entry?.record.accountId !== accountId) return { status: 'UNKNOWN_ADMISSION' };
     if (entry.record.status === 'RELEASED') return { status: 'ALREADY_RELEASED', admission: entry.record };
-    const releasedEntry: Entry = { decision: entry.decision, record: Object.freeze({ ...entry.record, status: 'RELEASED' as const }) };
+    // [F17-R04] Release replaces the entry, so the consumption marker is
+    // carried forward rather than silently dropped: releasing capacity must
+    // never make an already-consumed admission look freshly consumable.
+    const releasedEntry: Entry = { decision: entry.decision, consumedByIntentId: entry.consumedByIntentId, record: Object.freeze({ ...entry.record, status: 'RELEASED' as const }) };
     this.#byAdmissionId.set(admissionId, releasedEntry);
     this.#byAccountAndDecision.get(accountId)?.set(entry.record.sourceStrategyDecisionId, releasedEntry);
     return { status: 'RELEASED', admission: releasedEntry.record };
+  }
+
+  /**
+   * [F17-R04] Records the process-local half of live allocation consumption ON
+   * the admission entry, so it adds no independently-growing structure. The
+   * replacement entry is written to both maps that hold entries, exactly as
+   * `#releaseLocked` does, because the two maps share entry objects by
+   * reference and must never disagree about consumption.
+   */
+  #consumeForLiveLocked(accountId: string, admissionId: string, intentId: string): LiveAdmissionConsumptionOutcome {
+    if (this.#faultedAccounts.has(accountId)) return { status: 'UNAVAILABLE' };
+    const entry = this.#byAdmissionId.get(admissionId);
+    if (entry?.record.accountId !== accountId || entry.record.status !== 'ADMITTED') return { status: 'UNAVAILABLE' };
+    if (entry.consumedByIntentId === intentId) return { status: 'ALREADY_CONSUMED_SAME_INTENT' };
+    if (entry.consumedByIntentId !== null) return { status: 'UNAVAILABLE' };
+    const consumedEntry: Entry = { record: entry.record, decision: entry.decision, consumedByIntentId: intentId };
+    this.#byAdmissionId.set(admissionId, consumedEntry);
+    this.#byAccountAndDecision.get(accountId)?.set(entry.record.sourceStrategyDecisionId, consumedEntry);
+    return { status: 'CONSUMED' };
   }
 
   /**
@@ -382,6 +458,77 @@ export class RiskAdmissionCoordinator {
     const resealed = { ...withPending, provenance: { ...withPending.provenance, contentSha256: evidenceContentSha256(withPending) } };
     return { ...context, exposureSnapshot: resealed };
   }
+}
+
+/**
+ * Authenticated Phase13 admission entry point reserved for live execution.
+ * Besides proving the coordinator instance, it binds every account-bearing
+ * input and the instrument identity before returning the genuine outcome.
+ */
+export async function admitForLiveExecution(coordinator: unknown, request: AdmissionRequest): Promise<AdmissionOutcome> {
+  const channel = coordinator !== null && typeof coordinator === 'object' ? LIVE_COORDINATOR_CHANNELS.get(coordinator) : undefined;
+  if (channel === undefined) throw new Error('RiskAdmissionCoordinator: live admission requires a genuine coordinator instance');
+  const { accountId, context } = request;
+  if (context.accountSnapshot?.accountId !== accountId) throw new Error('RiskAdmissionCoordinator: live risk account does not match execution account');
+  if (context.exposureSnapshot?.accountId !== accountId) throw new Error('RiskAdmissionCoordinator: live exposure account does not match execution account');
+  if (context.pairSnapshot.ownership.status !== 'RECONCILED' || context.pairSnapshot.ownership.accountId !== accountId) {
+    throw new Error('RiskAdmissionCoordinator: live instrument ownership does not match execution account');
+  }
+  if (context.candidate.pair !== context.pairSnapshot.pair
+      || context.candidate.instrumentSpecSnapshotId !== context.pairSnapshot.instrumentSpecSnapshotId) {
+    throw new Error('RiskAdmissionCoordinator: live risk instrument identity mismatch');
+  }
+  const outcome = await channel.admit(request);
+  if (outcome.status === 'ADMITTED' && (outcome.admission.accountId !== accountId
+      || outcome.admission.pair !== context.pairSnapshot.pair
+      || outcome.admission.riskDecisionId !== outcome.decision.riskDecisionId)) {
+    throw new Error('RiskAdmissionCoordinator: authenticated live admission lineage mismatch');
+  }
+  return outcome;
+}
+
+/** Atomic process-local half of durable live allocation consumption. */
+export async function consumeLiveAdmissionForIntent(
+  coordinator: unknown, accountId: string, admissionId: string, intentId: string,
+): Promise<LiveAdmissionConsumptionOutcome> {
+  const channel = coordinator !== null && typeof coordinator === 'object' ? LIVE_COORDINATOR_CHANNELS.get(coordinator) : undefined;
+  if (channel === undefined) return { status: 'UNAVAILABLE' };
+  return channel.consume(accountId, admissionId, intentId);
+}
+
+/**
+ * [F17-R04] How many admission entries currently carry a live consumption
+ * marker. Read-only and channel-gated: it mutates nothing, grants nothing, and
+ * cannot be used to clear, forge or transfer a consumption. It exists so the
+ * boundedness claim in `Entry.consumedByIntentId` is a measurable property
+ * rather than an assertion — the returned count can never exceed the number of
+ * admission entries this coordinator holds, and falls to zero for an account
+ * whose entries `restoreAuthoritative` replaces.
+ *
+ * Deliberately NOT re-exported from `src/dispatch/index.ts`, for the same
+ * reason as `ACCOUNT_FAULT_RECOVERY_CAPABILITY`: it is an internal diagnostic,
+ * not part of the barrel's supported surface.
+ */
+export function liveAdmissionConsumptionCardinality(coordinator: unknown): number {
+  const channel = coordinator !== null && typeof coordinator === 'object' ? LIVE_COORDINATOR_CHANNELS.get(coordinator) : undefined;
+  if (channel === undefined) throw new Error('RiskAdmissionCoordinator: consumption cardinality requires a genuine coordinator instance');
+  return channel.consumptionCardinality();
+}
+
+Object.freeze(RiskAdmissionCoordinator.prototype);
+Object.freeze(RiskAdmissionCoordinator);
+
+// Pin the CommonJS authority entry points to their lexical implementations.
+// This is stronger than freezing a mutable value export: the properties are
+// non-configurable accessors and live consumers do not trust a replaceable DTO
+// reader from the module namespace.
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const [name, value] of Object.entries({ RiskAdmissionCoordinator, admitForLiveExecution, consumeLiveAdmissionForIntent, liveAdmissionConsumptionCardinality })) {
+    if (Object.getOwnPropertyDescriptor(module.exports, name)?.configurable !== false) {
+      Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+    }
+  }
+  Object.freeze(module.exports);
 }
 
 function buildPending(base: PendingExposureState, admitted: readonly AdmissionRecord[]): KnownPending {

@@ -3,7 +3,6 @@
  */
 
 export * from './clock';
-export * from './signer';
 export type {
   CoinDcxReadEndpoint,
   ExecuteReadOptions,

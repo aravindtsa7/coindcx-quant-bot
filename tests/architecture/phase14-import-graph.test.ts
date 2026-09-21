@@ -17,6 +17,9 @@ const SRC_ROOT = path.join(REPO_ROOT, 'src');
 const PAPER_PRODUCTION_ROOT = 'src/integration/coindcx/paper-production-runtime.ts';
 const PRIVATE_ECONOMIC_SOURCE_FILE = 'src/integration/coindcx/client.ts';
 const PRODUCTION_INSTRUMENT_AUTHORITY_FILE = 'src/integration/coindcx/instrument-authority.ts';
+const LIVE_MUTATION_TRANSPORT = 'src/integration/coindcx/live/mutation-transport.ts';
+const LIVE_MUTATION_GATEWAY = 'src/integration/coindcx/live/order-gateway.ts';
+const LIVE_PRODUCTION_ROOT = 'src/integration/coindcx/live/production-runtime.ts';
 
 /**
  * [P14-J-MAJ-01/MAJ-02 correction] There is no allowlist here. The two
@@ -227,21 +230,34 @@ describe('P14-J paper root — live-mutation sink absence (§12/§13/§33)', () 
     const hits = findMutatingOrderSymbols(files, (f) => readFileSync(f, 'utf8'));
     // Evidence, not assumption: `src/integration/coindcx/client.ts` and
     // `src/integration/coindcx/transport.ts` were manually inspected and
-    // expose only read (`executeRead`, `listXxx`/`getXxx`) methods — no
-    // create/place/cancel/modify/submit/amend/delete/new *Order* symbol
-    // exists anywhere else in this repository today. LIVE_EXECUTION = NOT_IMPLEMENTED.
-    expect(hits).toEqual([]);
+    // expose only read (`executeRead`, `listXxx`/`getXxx`) methods.
+    //
+    // [P17 amendment] Phase17 introduced live execution, so the sink set is no
+    // longer empty — it is EXACTLY the approved Phase17 boundary, enumerated
+    // below. This is a strengthening, not a relaxation: the very next test
+    // proves the Phase14 paper production root reaches none of these files,
+    // which is now a real non-reachability proof against a NON-EMPTY sink set
+    // rather than a vacuous one. Any new mutating-order symbol appearing
+    // anywhere else in `src/` still fails this assertion.
+    expect(hits.map((hit) => `${posix(path.relative(REPO_ROOT, hit.file))}#${hit.name}`)).toEqual([
+      // The execution-owned PORT: an interface declaration only, with no
+      // implementation, no HTTP, and no credentials.
+      'src/execution/live/gateway.ts#cancelOrder',
+      'src/execution/live/gateway.ts#placeOrder',
+      // The single CoinDCX adapter implementing that port.
+      'src/integration/coindcx/live/order-gateway.ts#cancelOrder',
+      'src/integration/coindcx/live/order-gateway.ts#placeOrder',
+      // The approved production root's private gateway factory.
+      'src/integration/coindcx/live/production-runtime.ts#createProductionOrderGateway',
+    ]);
   });
 
-  it('the P14-I paper production root does not transitively reach any live-mutation sink (the sink set is empty by repository-wide evidence, not a filename guess)', () => {
+  it('the P14-I paper production root cannot reach the explicit live network, gateway, or production-root capabilities', () => {
     const { graph, files } = buildImportGraph(SRC_ROOT, REPO_ROOT);
-    const scannedFiles = listSourceFiles(SRC_ROOT).filter((f) => !posix(path.relative(SRC_ROOT, f)).startsWith('backtest/'));
-    const sinkHits = findMutatingOrderSymbols(scannedFiles, (f) => readFileSync(f, 'utf8'));
-    const sinkFiles = new Set(sinkHits.map((h) => posix(path.relative(REPO_ROOT, h.file))));
     expect(files).toContain(PAPER_PRODUCTION_ROOT);
     const reachable = computeReachable(graph, PAPER_PRODUCTION_ROOT);
-    const reached = [...reachable].filter((n) => sinkFiles.has(n));
-    expect(reached).toEqual([]);
+    expect([LIVE_MUTATION_TRANSPORT, LIVE_MUTATION_GATEWAY, LIVE_PRODUCTION_ROOT]
+      .filter((target) => reachable.has(target))).toEqual([]);
   });
 });
 

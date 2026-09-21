@@ -30,8 +30,7 @@ function exposureFor(positions: readonly AuthoritativeOpenPositionValuation[]): 
     T0,
     POLICY.sourceAuthorityPolicy.exposureSourceId,
   );
-  const { accountId: _accountId, ...fields } = projection as PortfolioExposureSnapshot & { readonly accountId?: string };
-  const snapshot = fields as PortfolioExposureSnapshot;
+  const snapshot = projection;
   return { ...snapshot, provenance: { ...snapshot.provenance, contentSha256: evidenceContentSha256(snapshot) } };
 }
 
