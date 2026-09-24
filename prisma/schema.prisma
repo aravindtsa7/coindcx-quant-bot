@@ -827,6 +827,16 @@ model LiveOrder {
   cancelFaultCode       String?         @map("cancel_fault_code") @db.VarChar(64)
   cancelClaimedAt       DateTime?       @map("cancel_claimed_at")
 
+  /// [P18 Wave A2 / F18-14] Durable proof that the create-order wire request
+  /// may have left this process. `false` while the order holds only a LOCAL
+  /// dispatch reservation, which a crash-recovering reconciliation generation
+  /// may safely reclaim to CREATED with zero exchange mutation. Set true by
+  /// the SAME fenced transaction that is the last durable checkpoint before
+  /// the HTTP call, so a stale worker can never arm it after being superseded.
+  dispatchWireArmed Boolean @default(false) @map("dispatch_wire_armed")
+  /// [P18 Wave A2 / F18-14] The cancel-mutation equivalent of `dispatchWireArmed`.
+  cancelWireArmed   Boolean @default(false) @map("cancel_wire_armed")
+
   revision  Int      @default(0)
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
@@ -863,4 +873,325 @@ model LiveOrderEvent {
   @@unique([intentId, observationSha256], map: "live_order_event_intent_observation_unique")
   @@index([intentId, providerEventTimeMs], map: "live_order_event_intent_provider_time_idx")
   @@map("live_order_event")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 18 — Startup reconciliation and crash recovery (additive).
+//
+// Phase 17 established durable live execution but deliberately left restart
+// reconciliation unresolved. These five tables are the authoritative durable
+// answer to one question: may this account mutate exchange state right now?
+//
+// Nothing here rewrites Phase 17 data. `live_position` is never altered; when
+// reconciliation can prove exact strategy ownership it writes an explicit
+// ownership share row and, only in the exactly-one-owner case, materializes
+// the Phase 17 CLOSE ownership record through the repository.
+// ---------------------------------------------------------------------------
+
+/// Durable startup-barrier status for one account.
+enum LiveReconciliationStatus {
+  /// The default for any account that has never proven health in this runtime.
+  RECONCILIATION_REQUIRED
+  RUNNING
+  HEALTHY
+  UNHEALTHY
+  MANUAL_REVIEW_REQUIRED
+}
+
+enum LiveReconciliationRunStatus {
+  RUNNING
+  COMPLETED_HEALTHY
+  COMPLETED_UNHEALTHY
+  COMPLETED_MANUAL_REVIEW
+  /// A newer generation fenced this run out before it committed a result.
+  ABANDONED
+}
+
+/// The conservative classification taxonomy (Phase 18 section 12). Only the
+/// first three are ever compatible with a HEALTHY account.
+enum LiveReconciliationFindingCategory {
+  VERIFIED_MATCH
+  SAFE_AUTHORITATIVE_ADVANCE
+  LOCAL_INCOMPLETE_BUT_PROVABLY_RECONSTRUCTABLE
+  CONFLICT
+  ORPHAN
+  AMBIGUOUS
+  MANUAL_REVIEW_REQUIRED
+}
+
+/// Durable claim state of an orphan-order cancellation. The claim is always
+/// persisted BEFORE the wire mutation, so a crash can never present as
+/// "never attempted".
+enum LiveOrphanCancelState {
+  NONE
+  CANCEL_CLAIMED
+  CANCEL_ACKNOWLEDGED
+  CANCEL_AMBIGUOUS
+  CANCEL_REJECTED
+  /// [P18 Wave C1 / F18-06] A durable `CANCEL_AMBIGUOUS` cancellation an
+  /// operator has explicitly, auditably resolved (see `LiveOrphanCancelResolution`).
+  /// Deliberately NOT `NONE`: reusing `NONE` would make the orphan eligible for
+  /// `claimOrphanCancellation`'s `NONE -> CANCEL_CLAIMED` transition again,
+  /// silently re-arming automatic cancellation for a claim a human just took
+  /// off the automatic path. Deliberately NOT `CANCEL_ACKNOWLEDGED` or
+  /// `CANCEL_REJECTED` either: both of those mean this system itself proved a
+  /// specific venue outcome; this state means a human recorded a decision
+  /// while the true venue outcome may still be unproven by this system.
+  CANCEL_AMBIGUOUS_RESOLVED
+}
+
+/// [P18 Wave C1 / F18-06] What an operator resolving a durable
+/// `CANCEL_AMBIGUOUS` orphan cancellation is actually asserting. Deliberately
+/// not a boolean: the two outcomes carry different evidentiary weight and
+/// license different downstream behavior if the same exchange order id is
+/// ever seen active at the venue again (see `RECON_ORPHAN_REAPPEARED_AFTER_RESOLUTION`).
+enum LiveOrphanCancelResolutionOutcome {
+  /// The operator does not claim to know the true venue outcome of this
+  /// cancellation attempt. They assert only: stop blocking on it, and never
+  /// retry the cancel. The safe default when no independent venue-outcome
+  /// proof is available.
+  ACKNOWLEDGED_NO_RETRY
+  /// The operator asserts, based on evidence independently verified OUTSIDE
+  /// this system (CoinDCX support, the CoinDCX UI, or another authoritative
+  /// out-of-band channel), that this exact venue order was in fact
+  /// terminated. This system never verifies the claim itself — it only
+  /// durably records that an operator made it.
+  CONFIRMED_CANCELLED
+}
+
+/// One authoritative barrier row per account. `current_runtime_epoch` is what
+/// makes a stale HEALTHY row from a previous process incapable of authorizing a
+/// new one: the barrier requires the stored epoch to equal the running
+/// process's own epoch, so every restart begins RECONCILIATION_REQUIRED in
+/// effect without mutating history.
+model LiveReconciliationState {
+  accountId String @id @map("account_id") @db.VarChar(128)
+
+  status               LiveReconciliationStatus @default(RECONCILIATION_REQUIRED)
+  /// Monotonic fencing token. Every claim increments it; a stale owner refuses.
+  currentGeneration    Int                      @default(0) @map("current_generation")
+  currentRunId         String?                  @map("current_run_id") @db.VarChar(64)
+  /// Identity of the process/runtime that last proved this account healthy.
+  currentRuntimeEpoch  String?                  @map("current_runtime_epoch") @db.VarChar(64)
+  /// Generation whose completion produced the current status.
+  healthyGeneration    Int?                     @map("healthy_generation")
+  lastEvaluatedAtMs    BigInt?                  @map("last_evaluated_at_ms")
+  blockingFindingCount Int                      @default(0) @map("blocking_finding_count")
+
+  revision  Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  runs LiveReconciliationRun[]
+
+  @@index([status], map: "live_reconciliation_state_status_idx")
+  @@map("live_reconciliation_state")
+}
+
+/// One reconciliation attempt. `(account_id, generation)` is unique, so two
+/// racing workers can never own the same generation: the loser's insert
+/// collides in the database rather than in a process-local lock.
+model LiveReconciliationRun {
+  runId String @id @map("run_id") @db.VarChar(64)
+
+  accountId    String                      @map("account_id") @db.VarChar(128)
+  generation   Int
+  status       LiveReconciliationRunStatus @default(RUNNING)
+  /// The runtime epoch that owns this run. A different epoch cannot complete it.
+  runtimeEpoch String                      @map("runtime_epoch") @db.VarChar(64)
+
+  /// Content-addressed identity of the exchange evidence this run consumed.
+  /// NULL until the snapshot has actually been read and validated.
+  snapshotSha256      String? @map("snapshot_sha256") @db.VarChar(64)
+  snapshotValidated   Boolean @default(false) @map("snapshot_validated")
+  ordersComplete      Boolean @default(false) @map("orders_complete")
+  positionsComplete   Boolean @default(false) @map("positions_complete")
+  /// Local time the evidence set was observed, and the evaluation time. All
+  /// three are local operational time; provider time lives on the evidence.
+  snapshotStartedAtMs BigInt  @map("snapshot_started_at_ms")
+  snapshotEndedAtMs   BigInt? @map("snapshot_ended_at_ms")
+  evaluatedAtMs       BigInt? @map("evaluated_at_ms")
+
+  findingCount         Int @default(0) @map("finding_count")
+  blockingFindingCount Int @default(0) @map("blocking_finding_count")
+
+  createdAt   DateTime  @default(now()) @map("created_at")
+  completedAt DateTime? @map("completed_at")
+
+  state LiveReconciliationState @relation(fields: [accountId], references: [accountId], onDelete: Restrict, onUpdate: Restrict, map: "live_reconciliation_run_state_fkey")
+
+  findings LiveReconciliationFinding[]
+
+  @@unique([accountId, generation], map: "live_reconciliation_run_account_generation_unique")
+  @@index([accountId, status], map: "live_reconciliation_run_account_status_idx")
+  @@map("live_reconciliation_run")
+}
+
+/// One durable reconciliation fact. `finding_sha256` is deterministic over the
+/// immutable content of the finding, so rerunning reconciliation against
+/// unchanged evidence updates `last_seen_generation` instead of inserting a
+/// duplicate. Only findings whose `last_seen_generation` equals the account's
+/// current generation can block live mutation, so a fault that genuinely
+/// stopped applying does not block the account forever — without ever deleting
+/// the historical fact.
+model LiveReconciliationFinding {
+  findingId String @id @default(uuid()) @map("finding_id")
+
+  accountId     String                            @map("account_id") @db.VarChar(128)
+  findingSha256 String                            @map("finding_sha256") @db.VarChar(64)
+  category      LiveReconciliationFindingCategory
+  /// Stable Phase 18 taxonomy code naming the exact detection point.
+  code          String                            @db.VarChar(64)
+  /// Whether this finding forbids live mutation for the account.
+  blocking      Boolean                           @default(true)
+
+  pair               String? @db.VarChar(64)
+  intentId           String? @map("intent_id") @db.VarChar(64)
+  exchangeOrderId    String? @map("exchange_order_id") @db.VarChar(64)
+  venuePositionId    String? @map("venue_position_id") @db.VarChar(64)
+  strategyInstanceId String? @map("strategy_instance_id") @db.VarChar(64)
+
+  /// Sanitized structured evidence only. No credential material, no raw
+  /// provider payload, no authorization header — ever.
+  evidenceJson String @map("evidence_json") @db.Text
+
+  firstSeenRunId      String @map("first_seen_run_id") @db.VarChar(64)
+  firstSeenGeneration Int    @map("first_seen_generation")
+  lastSeenGeneration  Int    @map("last_seen_generation")
+  firstSeenAtMs       BigInt @map("first_seen_at_ms")
+  lastSeenAtMs        BigInt @map("last_seen_at_ms")
+
+  resolvedAtMs BigInt? @map("resolved_at_ms")
+  resolvedBy   String? @map("resolved_by") @db.VarChar(128)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  run LiveReconciliationRun @relation(fields: [firstSeenRunId], references: [runId], onDelete: Restrict, onUpdate: Restrict, map: "live_reconciliation_finding_run_fkey")
+
+  @@unique([accountId, findingSha256], map: "live_reconciliation_finding_account_content_unique")
+  @@index([accountId, lastSeenGeneration, blocking], map: "live_reconciliation_finding_account_generation_idx")
+  @@index([accountId, category], map: "live_reconciliation_finding_account_category_idx")
+  @@map("live_reconciliation_finding")
+}
+
+/// An active venue order for the managed account with no proven local lineage.
+/// It is NEVER adopted into a local intent. Cancellation, when policy enables
+/// it at all, claims this row before the wire call and binds the exact venue
+/// order identity.
+model LiveOrphanVenueOrder {
+  accountId       String @map("account_id") @db.VarChar(128)
+  exchangeOrderId String @map("exchange_order_id") @db.VarChar(64)
+
+  pair            String        @db.VarChar(64)
+  side            LiveOrderSide
+  venueStatus     String        @map("venue_status") @db.VarChar(32)
+  orderedQuantity Decimal       @map("ordered_quantity") @db.Decimal(36, 18)
+  filledQuantity  Decimal       @map("filled_quantity") @db.Decimal(36, 18)
+  price           Decimal?      @db.Decimal(36, 18)
+
+  firstSeenGeneration Int    @map("first_seen_generation")
+  lastSeenGeneration  Int    @map("last_seen_generation")
+  providerEventTimeMs BigInt @map("provider_event_time_ms")
+
+  cancelState      LiveOrphanCancelState @default(NONE) @map("cancel_state")
+  cancelGeneration Int                   @default(0) @map("cancel_generation")
+  cancelFaultCode  String?               @map("cancel_fault_code") @db.VarChar(64)
+  cancelClaimedAt  DateTime?             @map("cancel_claimed_at")
+  /// [P18 Wave A2 / F18-14] Durable proof the orphan-cancel wire request may
+  /// have left this process, exactly like `LiveOrder.cancelWireArmed`.
+  cancelWireArmed  Boolean               @default(false) @map("cancel_wire_armed")
+
+  revision  Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  resolutions LiveOrphanCancelResolution[]
+
+  @@id([accountId, exchangeOrderId])
+  @@index([accountId, cancelState], map: "live_orphan_venue_order_account_cancel_idx")
+  @@index([accountId, pair], map: "live_orphan_venue_order_account_pair_idx")
+  @@map("live_orphan_venue_order")
+}
+
+/// [P18 Wave C1 / F18-06] One durable, append-only, auditable operator
+/// decision that clears a `CANCEL_AMBIGUOUS` orphan cancellation. Never
+/// updated or deleted: the original ambiguity stays provable forever, and
+/// `(account_id, exchange_order_id, resolved_cancel_generation)` is unique so
+/// the exact cancellation attempt a resolution targets can be resolved
+/// exactly once. A resolution is a fact about what an OPERATOR asserted, at a
+/// specific durable orphan revision — never a fact this system independently
+/// verified against the venue.
+model LiveOrphanCancelResolution {
+  resolutionId String @id @default(uuid()) @map("resolution_id")
+
+  accountId       String @map("account_id") @db.VarChar(128)
+  exchangeOrderId String @map("exchange_order_id") @db.VarChar(64)
+
+  /// The exact `live_orphan_venue_order.revision` this resolution was proven
+  /// against. Audit-only here (the fencing check itself runs against the live
+  /// row at resolution time); kept so a historical row can be understood
+  /// without needing the live row to still be at that revision.
+  resolvedOrphanRevision Int @map("resolved_orphan_revision")
+  /// The orphan's `cancel_generation` at resolution time — which specific
+  /// cancellation ATTEMPT this resolution answers for.
+  resolvedCancelGeneration Int @map("resolved_cancel_generation")
+
+  outcome LiveOrphanCancelResolutionOutcome
+
+  /// Bounded operator/service identity string. Never a credential.
+  resolvedBy String  @map("resolved_by") @db.VarChar(128)
+  /// Bounded, optional free-text operator reference. Never treated as
+  /// provider evidence, never used to derive identity, never written into any
+  /// reconciliation finding's evidence.
+  note       String? @db.VarChar(512)
+
+  resolvedAtMs BigInt   @map("resolved_at_ms")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  orphan LiveOrphanVenueOrder @relation(fields: [accountId, exchangeOrderId], references: [accountId, exchangeOrderId], onDelete: Restrict, onUpdate: Restrict, map: "live_orphan_cancel_resolution_orphan_fkey")
+
+  @@unique([accountId, exchangeOrderId, resolvedCancelGeneration], map: "live_orphan_cancel_resolution_account_order_gen_key")
+  @@index([accountId, exchangeOrderId], map: "live_orphan_cancel_resolution_account_order_idx")
+  @@map("live_orphan_cancel_resolution")
+}
+
+/// Proven strategy-instance ownership of part or all of an authoritative venue
+/// position. An exchange aggregate alone never establishes ownership: a row
+/// here exists only where exact local accepted-fill lineage proves it, and the
+/// shares for one (account, pair) must sum exactly to the venue aggregate
+/// before any of them is considered attributable.
+model LivePositionOwnershipShare {
+  accountId               String @map("account_id") @db.VarChar(128)
+  pair                    String @db.VarChar(64)
+  ownerStrategyInstanceId String @map("owner_strategy_instance_id") @db.VarChar(64)
+
+  side     PaperPositionSide
+  quantity Decimal           @db.Decimal(36, 18)
+
+  ownerStrategyId      String @map("owner_strategy_id") @db.VarChar(128)
+  ownerStrategyVersion String @map("owner_strategy_version") @db.VarChar(32)
+  ownerParameterHash   String @map("owner_parameter_hash") @db.VarChar(64)
+
+  /// Authoritative venue position identity when the provider supplies one.
+  venuePositionId String? @map("venue_position_id") @db.VarChar(64)
+  /// Deterministic digest of the exact order/fill lineage that proves this
+  /// share. Recomputed on every run; an unchanged proof never churns revision.
+  lineageSha256   String  @map("lineage_sha256") @db.VarChar(64)
+  /// Intent ids of the accepted local orders whose fills compose this share.
+  lineageJson     String  @map("lineage_json") @db.Text
+
+  establishedGeneration Int     @map("established_generation")
+  lastProvenGeneration  Int     @map("last_proven_generation")
+  /// True once the Phase 17 single-owner `live_position` record was
+  /// materialized from this share. Shared ownership never sets it.
+  materialized          Boolean @default(false)
+
+  revision  Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@id([accountId, pair, ownerStrategyInstanceId])
+  @@index([accountId, pair], map: "live_position_ownership_share_account_pair_idx")
+  @@map("live_position_ownership_share")
 }

@@ -109,6 +109,8 @@ export function initialLiveOrderState(input: {
     cancelGeneration: 0,
     cancelExchangeOrderId: null,
     cancelFaultCode: null,
+    dispatchWireArmed: false,
+    cancelWireArmed: false,
     revision: 0,
   });
 }
@@ -116,7 +118,79 @@ export function initialLiveOrderState(input: {
 /** CREATED -> DISPATCH_RESERVED. The local claim taken before any wire call. */
 export function reserveDispatch(current: LiveOrderStateRecord): LiveOrderStateRecord {
   assertTransitionAllowed(current.state, 'DISPATCH_RESERVED', current.intentId);
-  return Object.freeze({ ...current, state: 'DISPATCH_RESERVED' as const, revision: current.revision + 1 });
+  // A fresh reservation always starts unarmed: arming is a separate, later,
+  // independently-fenced transition (`armDispatchWireAttempt`), never implied
+  // by taking the reservation itself (§F18-14).
+  return Object.freeze({ ...current, state: 'DISPATCH_RESERVED' as const, dispatchWireArmed: false, revision: current.revision + 1 });
+}
+
+/**
+ * [P18 Wave A2 / F18-14] DISPATCH_RESERVED -> DISPATCH_RESERVED (wire-armed).
+ *
+ * The durable checkpoint proving a create-order wire request MAY have left
+ * this process. Committed by the SAME fenced transaction pattern as every
+ * other HEALTHY-authorized mutation, immediately before the HTTP call — so a
+ * worker whose generation was superseded before this commits can never send
+ * the request (Case A), and a worker whose generation is superseded AFTER it
+ * commits leaves durable proof that recovery must treat as unresolved rather
+ * than safely reclaimable (Case B).
+ */
+export function armDispatchWireAttempt(current: LiveOrderStateRecord): LiveOrderStateRecord {
+  if (current.state !== 'DISPATCH_RESERVED' || current.dispatchWireArmed) {
+    stateConflict('Cannot arm a create-order wire attempt outside an unarmed DISPATCH_RESERVED claim', {
+      intentId: current.intentId, state: current.state, dispatchWireArmed: current.dispatchWireArmed,
+    });
+  }
+  return Object.freeze({ ...current, dispatchWireArmed: true, revision: current.revision + 1 });
+}
+
+/**
+ * [P18 Wave A2 / F18-14] CANCEL_RESERVED -> CANCEL_RESERVED (wire-armed). The
+ * cancel-mutation equivalent of `armDispatchWireAttempt`.
+ */
+export function armCancelWireAttempt(current: LiveOrderStateRecord): LiveOrderStateRecord {
+  if (current.cancelState !== 'CANCEL_RESERVED' || current.cancelWireArmed) {
+    stateConflict('Cannot arm a cancel wire attempt outside an unarmed CANCEL_RESERVED claim', {
+      intentId: current.intentId, cancelState: current.cancelState, cancelWireArmed: current.cancelWireArmed,
+    });
+  }
+  return Object.freeze({ ...current, cancelWireArmed: true, revision: current.revision + 1 });
+}
+
+/**
+ * [P18 Wave A2 / F18-14] DISPATCH_RESERVED -> CREATED, used ONLY by a
+ * crash-recovering reconciliation generation (RUNNING authority), never by
+ * the dispatching worker itself.
+ *
+ * Distinct from `releaseDispatchClaim`: that function trusts a POSITIVE
+ * gateway proof ("nothing left this process") and therefore permits release
+ * regardless of the arm flag. This function has no such proof — restart is
+ * the only signal available — so it requires `dispatchWireArmed` to already
+ * be false. An armed claim can NEVER be reclaimed this way; it must be
+ * resolved through evidence (`resolveAmbiguousCreate`) or left blocking.
+ */
+export function reclaimDispatchAfterCrash(current: LiveOrderStateRecord): LiveOrderStateRecord {
+  if (current.state !== 'DISPATCH_RESERVED' || current.dispatchWireArmed || current.exchangeOrderId !== null) {
+    stateConflict('Cannot reclaim a dispatch reservation that may have reached the wire', {
+      intentId: current.intentId, state: current.state, dispatchWireArmed: current.dispatchWireArmed,
+    });
+  }
+  return Object.freeze({ ...current, state: 'CREATED' as const, dispatchWireArmed: false, revision: current.revision + 1 });
+}
+
+/**
+ * [P18 Wave A2 / F18-14] CANCEL_RESERVED -> NONE (cancel claim only; order
+ * state is untouched), used ONLY by a crash-recovering reconciliation
+ * generation. Requires `cancelWireArmed` to already be false, for the same
+ * reason `reclaimDispatchAfterCrash` does.
+ */
+export function reclaimCancelAfterCrash(current: LiveOrderStateRecord): LiveOrderStateRecord {
+  if (current.cancelState !== 'CANCEL_RESERVED' || current.cancelWireArmed) {
+    stateConflict('Cannot reclaim a cancel reservation that may have reached the wire', {
+      intentId: current.intentId, cancelState: current.cancelState, cancelWireArmed: current.cancelWireArmed,
+    });
+  }
+  return Object.freeze({ ...current, cancelState: 'NONE' as const, cancelWireArmed: false, revision: current.revision + 1 });
 }
 
 /**
@@ -126,7 +200,11 @@ export function reserveDispatch(current: LiveOrderStateRecord): LiveOrderStateRe
  */
 export function markSubmissionAmbiguous(current: LiveOrderStateRecord, faultCode: string): LiveOrderStateRecord {
   assertTransitionAllowed(current.state, 'SUBMISSION_AMBIGUOUS', current.intentId);
-  return Object.freeze({ ...current, state: 'SUBMISSION_AMBIGUOUS' as const, faultCode, revision: current.revision + 1 });
+  // [F18-18] Leaving DISPATCH_RESERVED for good: `dispatchWireArmed` is only
+  // ever meaningful while parked there, and a stale `true` alongside a
+  // non-DISPATCH_RESERVED state is exactly the contradictory durable
+  // combination the integrity check refuses to read back.
+  return Object.freeze({ ...current, state: 'SUBMISSION_AMBIGUOUS' as const, faultCode, dispatchWireArmed: false, revision: current.revision + 1 });
 }
 
 /**
@@ -141,7 +219,7 @@ export function releaseDispatchClaim(current: LiveOrderStateRecord, faultCode: s
       intentId: current.intentId,
     });
   }
-  return Object.freeze({ ...current, state: 'CREATED' as const, faultCode, revision: current.revision + 1 });
+  return Object.freeze({ ...current, state: 'CREATED' as const, faultCode, dispatchWireArmed: false, revision: current.revision + 1 });
 }
 
 /** ACKNOWLEDGED|PARTIALLY_FILLED -> CANCEL_REQUESTED. */
@@ -160,7 +238,10 @@ export function markRejected(current: LiveOrderStateRecord, faultCode: string): 
   if (!liveDecimal(current.cumulativeFilledQuantity).isZero()) {
     stateConflict('A rejected order cannot carry executed quantity', { intentId: current.intentId });
   }
-  return Object.freeze({ ...current, state: 'REJECTED' as const, faultCode, revision: current.revision + 1 });
+  // [F18-18] Same reasoning as `markSubmissionAmbiguous`: REJECTED is terminal
+  // and never DISPATCH_RESERVED, so any wire-arm proof this order carried is
+  // no longer meaningful and must not linger as a contradictory `true`.
+  return Object.freeze({ ...current, state: 'REJECTED' as const, faultCode, dispatchWireArmed: false, revision: current.revision + 1 });
 }
 
 /** Records a cancel whose outcome could not be established. State is unchanged; the fault is durable. */
@@ -324,6 +405,11 @@ export function applyLiveOrderObservation(
         ? observation.providerEventTimeMs
         : Math.max(current.lastProviderEventTimeMs, observation.providerEventTimeMs),
       faultCode: nextState === 'RECONCILIATION_REQUIRED' ? 'LIVE_ORDER_STATE_CONFLICT' : current.faultCode,
+      // [F18-18] `nextState` is never `DISPATCH_RESERVED` — observation
+      // folding only ever advances FROM it, never back into it — so any
+      // wire-arm proof is no longer meaningful once folded and must not
+      // survive as a contradictory `true` against a non-reserved state.
+      dispatchWireArmed: false,
       revision: current.revision + 1,
     }),
   };

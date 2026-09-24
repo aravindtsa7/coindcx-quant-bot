@@ -75,6 +75,44 @@ export function isSuspiciousCoinIdentifier(name: string): boolean {
   return identifierWords(name).some((word) => COIN_SYMBOLS.has(word.toUpperCase()));
 }
 
+// [F18-30] The schema-level SOL guard (below) needs to reject both the
+// ticker ("SOL") and the full coin name ("Solana"), which COIN_SYMBOLS does
+// not cover -- COIN_SYMBOLS is scoped to ticker-style hardcoding in core
+// engine source and deliberately left unchanged here so that behavior isn't
+// disturbed. This reuses the SAME `identifierWords` tokenizer (camelCase /
+// PascalCase / ALL_CAPS / underscore / digit boundaries), so a name is only
+// rejected when one of its whole words is "SOL" or "SOLANA" -- never on a
+// bare substring match. That whole-word matching is what correctly passes
+// `LiveOrphanCancelResolution` and `Console` (neither tokenizes to a "sol"
+// or "solana" word) while correctly rejecting `SOLCandle`, `solPosition`,
+// `Solana`, and `SolanaCandle` regardless of casing -- cases the previous
+// ad hoc `/(^|[a-z0-9])Sol([A-Z]|$)/` boundary regex missed entirely because
+// it required an exact-case "Sol" substring immediately followed by another
+// capital letter or end of string.
+const SOL_SPECIFIC_TOKENS: ReadonlySet<string> = new Set(['SOL', 'SOLANA']);
+
+export function isSolSpecificIdentifier(name: string): boolean {
+  return identifierWords(name).some((word) => SOL_SPECIFIC_TOKENS.has(word.toUpperCase()));
+}
+
+// [F18-32] The schema guard's MODEL and ENUM checks were fixed to use
+// `isSolSpecificIdentifier` (above) in Wave C1.1, but its FIELD check was
+// left comparing a field's first token against exactly three literal strings
+// ('sol'/'solUsdt'/'solana'), so a field named e.g. `solPosition` or
+// `SolanaCandle` -- anything that isn't one of those three exact strings --
+// silently bypassed the guard. This applies the SAME tokenizer to fields
+// too, reusing the field-name-token extraction the real schema scan already
+// performs (trim, drop comments/`@@` block attributes/blank lines, take the
+// first whitespace-separated token) so this one function is exercised both
+// by the real-schema assertion below and by the adversarial test that proves
+// it against synthetic field lines the schema does not currently contain.
+export function isSolSpecificSchemaFieldLine(rawLine: string): boolean {
+  const trimmed = rawLine.trim();
+  if (trimmed.startsWith('//') || trimmed.startsWith('@@') || trimmed.length === 0) return false;
+  const firstToken = trimmed.split(/\s+/)[0] ?? '';
+  return isSolSpecificIdentifier(firstToken);
+}
+
 function toPosix(p: string): string {
   return p.split(path.sep).join('/');
 }
@@ -355,33 +393,129 @@ describe('Phase 16 — Protected Core Generic Architecture Proof', () => {
     expect(violatingEdges).toEqual([]);
   });
 
+  it('flags SOL/Solana-specific model or enum names regardless of casing', () => {
+    const rejected = [
+      'SolCandle', 'SOLCandle', 'solCandle',
+      'SolPosition', 'SOLPosition', 'solPosition',
+      'Solana', 'SolanaCandle', 'SOLANAPosition', 'solanaOrder',
+    ];
+    for (const name of rejected) {
+      expect(isSolSpecificIdentifier(name), name).toBe(true);
+    }
+  });
+
+  it('does not flag names where "sol" appears inside an unrelated word', () => {
+    const allowed = [
+      'Resolution', 'LiveOrphanCancelResolution', 'Console', 'PaperConsole', 'ConsolidatedResult',
+    ];
+    for (const name of allowed) {
+      expect(isSolSpecificIdentifier(name), name).toBe(false);
+    }
+  });
+
+  it('[F18-32] the field-name guard rejects synthetic SOL/Solana-named field declarations, including underscore- and digit-separated and prefixed forms', () => {
+    // Every case §6 of the F18-32 task brief requires, run against actual
+    // synthetic Prisma field-declaration lines (not the bare tokenizer) so
+    // the real trim/comment-skip/first-token extraction the schema scan
+    // performs is exercised too, not only isSolSpecificIdentifier in
+    // isolation.
+    const rejectedFieldLines = [
+      'sol                 String   @db.VarChar(64)',
+      'SOL                 String   @db.VarChar(64)',
+      'Sol                 String   @db.VarChar(64)',
+      'solPosition         Decimal  @db.Decimal(24, 8)',
+      'SOLPosition         Decimal  @db.Decimal(24, 8)',
+      'SolPosition         Decimal  @db.Decimal(24, 8)',
+      'solCandle           String?  @db.VarChar(64)',
+      'SOLCandle           String?  @db.VarChar(64)',
+      'SolCandle           String?  @db.VarChar(64)',
+      'solana              String   @db.VarChar(64)',
+      'SOLANA              String   @db.VarChar(64)',
+      'Solana              String   @db.VarChar(64)',
+      'solanaOrder         String?  @db.VarChar(191)',
+      'SOLANAOrder         String?  @db.VarChar(191)',
+      'SolanaOrder         String?  @db.VarChar(191)',
+      'SolanaCandle        String?  @db.VarChar(64)',
+      'SOLANAPosition      Decimal  @db.Decimal(24, 8)',
+      'SOL_Order           String?  @db.VarChar(191)',
+      'sol_position        Decimal  @db.Decimal(24, 8)',
+      'Solana_Order        String?  @db.VarChar(191)',
+      'SOLANA_POSITION     Decimal  @db.Decimal(24, 8)',
+      'MySolPosition       Decimal  @db.Decimal(24, 8)',
+      'MySOLPosition       Decimal  @db.Decimal(24, 8)',
+      'MySolanaPosition    Decimal  @db.Decimal(24, 8)',
+      'Sol2Position        Decimal  @db.Decimal(24, 8)',
+      'SOL2Position        Decimal  @db.Decimal(24, 8)',
+      'Solana2Order        String?  @db.VarChar(191)',
+    ];
+    for (const line of rejectedFieldLines) {
+      expect(isSolSpecificSchemaFieldLine(line), line).toBe(true);
+    }
+  });
+
+  it('[F18-32] the field-name guard allows synthetic Resolution/Console-style field declarations', () => {
+    const allowedFieldLines = [
+      'resolution                 String   @db.VarChar(64)',
+      'resolutionState             String   @db.VarChar(32)',
+      'resolvedPosition            Decimal  @db.Decimal(24, 8)',
+      'console                     String?  @db.VarChar(64)',
+      'consoleState                String?  @db.VarChar(32)',
+      'paperConsole                String?  @db.VarChar(64)',
+      'consolidatedResult          String?  @db.VarChar(64)',
+      'consolidatedOrder           String?  @db.VarChar(64)',
+      'liveOrphanCancelResolution  String?  @db.VarChar(64)',
+      '// sol comment lines are not field declarations and must be ignored',
+      '@@unique([solPosition])',
+    ];
+    for (const line of allowedFieldLines) {
+      expect(isSolSpecificSchemaFieldLine(line), line).toBe(false);
+    }
+  });
+
+  it('[F18-32 §8] BTC/ETH ticker detection is unchanged: representative cases still behave exactly as before', () => {
+    // Regression guard, not a new feature: isSuspiciousCoinIdentifier /
+    // COIN_SYMBOLS were not touched by the F18-32 fix (only the SEPARATE
+    // SOL_SPECIFIC_TOKENS-based field guard changed), so ticker-style BTC/ETH
+    // detection must behave identically to before this wave.
+    for (const identifier of ['BTCPosition', 'btcOrder', 'ETHSignal', 'ethCandle']) {
+      expect(isSuspiciousCoinIdentifier(identifier), identifier).toBe(true);
+    }
+    // Full coin NAMES (as opposed to the 3-letter ticker) are deliberately
+    // out of scope for isSuspiciousCoinIdentifier/COIN_SYMBOLS -- it has
+    // never covered "Ethereum"/"Bitcoin", only the tickers that actually
+    // appear in this codebase's hardcoded pair strings (e.g. "B-ETH_USDT").
+    // F18-32 must not broaden that scope, so this is pinned explicitly.
+    expect(isSuspiciousCoinIdentifier('EthereumPosition')).toBe(false);
+  });
+
   it('proves prisma/schema.prisma requires zero SOL-specific models, fields, or enums', () => {
     const schemaContent = readFileSync(SCHEMA_FILE, 'utf8');
 
-    // Reject models like model SolCandle, model SolPosition
+    // Reject models like model SolCandle, model SolPosition, model Solana* —
+    // matched via the same whole-word tokenizer as isSuspiciousCoinIdentifier
+    // (see isSolSpecificIdentifier above), not a bare substring: a bare
+    // substring test also flags legitimate, non-coin-specific names like
+    // "LiveOrphanCancelResolution" (contains "sol" inside "Resolution"),
+    // which is not what this check means to catch.
     const modelMatches = [...schemaContent.matchAll(/model\s+([A-Za-z0-9_]+)/g)];
     const coinSpecificModels = modelMatches
       .map((m) => m[1] ?? '')
-      .filter((name) => /sol/i.test(name));
+      .filter((name) => isSolSpecificIdentifier(name));
     expect(coinSpecificModels).toEqual([]);
 
-    // Reject enums like enum SolStatus
+    // Reject enums like enum SolStatus, enum SolanaStatus
     const enumMatches = [...schemaContent.matchAll(/enum\s+([A-Za-z0-9_]+)/g)];
     const coinSpecificEnums = enumMatches
       .map((m) => m[1] ?? '')
-      .filter((name) => /sol/i.test(name));
+      .filter((name) => isSolSpecificIdentifier(name));
     expect(coinSpecificEnums).toEqual([]);
 
-    // Reject fields named 'sol' or 'solUsdt'
-    const fieldLines = schemaContent
-      .split('\n')
-      .map((line) => line.trim())
-      .filter((line) => !line.startsWith('//') && !line.startsWith('@@') && line.length > 0);
-
-    const coinFields = fieldLines.filter((line) => {
-      const firstToken = line.split(/\s+/)[0] ?? '';
-      return /^(sol|solUsdt|solana)$/i.test(firstToken);
-    });
+    // Reject fields whose name tokenizes to a whole "sol"/"solana" word —
+    // not just the three exact literal names 'sol'/'solUsdt'/'solana' (F18-32:
+    // that exact-match check let solPosition/SOLPosition/SolanaCandle/etc.
+    // bypass the guard entirely, even though the model/enum checks above
+    // were already fixed to use the tokenizer).
+    const coinFields = schemaContent.split('\n').filter((line) => isSolSpecificSchemaFieldLine(line));
     expect(coinFields).toEqual([]);
 
     // Confirm all market-data and paper-execution tables store pair as generic VarChar(64)

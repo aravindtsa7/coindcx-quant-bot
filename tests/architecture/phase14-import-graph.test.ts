@@ -244,6 +244,15 @@ describe('P14-J paper root — live-mutation sink absence (§12/§13/§33)', () 
       // implementation, no HTTP, and no credentials.
       'src/execution/live/gateway.ts#cancelOrder',
       'src/execution/live/gateway.ts#placeOrder',
+      // [P18] Orphan-order cancellation. Both entries are execution-owned and
+      // credential-free, exactly like the two above: `ports.ts#cancelVenueOrder`
+      // is an interface declaration, and
+      // `gateway-orphan-cancellation.ts#cancelVenueOrder` is a thin translation
+      // that delegates to the Phase17 gateway PORT. Neither builds an HTTP
+      // request, names an endpoint, or holds a credential, so Phase18 adds no
+      // second mutation sink — it reuses the approved one.
+      'src/execution/live/reconciliation/gateway-orphan-cancellation.ts#cancelVenueOrder',
+      'src/execution/live/reconciliation/ports.ts#cancelVenueOrder',
       // The single CoinDCX adapter implementing that port.
       'src/integration/coindcx/live/order-gateway.ts#cancelOrder',
       'src/integration/coindcx/live/order-gateway.ts#placeOrder',

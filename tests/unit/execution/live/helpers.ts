@@ -27,6 +27,7 @@ import {
   type ClaimCancelOutcome,
   type ClaimDispatchOutcome,
   type CompleteCancelAttemptOutcome,
+  type LiveDurableOrderRow,
   type LiveExecutionRepository,
   type LivePositionOwnershipRecord,
 } from '../../../../src/execution/live/repository';
@@ -260,6 +261,7 @@ export class InMemoryLiveExecutionRepository implements LiveExecutionRepository 
   readonly #events = new Set<string>();
   readonly #admissionConsumers = new Map<string, string>();
   readonly #positions = new Map<string, LivePositionOwnershipRecord>();
+  readonly #orderTimestamps = new Map<string, { readonly createdAtMs: number; readonly updatedAtMs: number }>();
   public commitCount = 0;
 
   public seedPositionOwnership(position: LivePositionOwnershipRecord): void {
@@ -295,7 +297,15 @@ export class InMemoryLiveExecutionRepository implements LiveExecutionRepository 
     return initial;
   }
 
-  public async claimDispatch(intentId: string, consumeOpenAdmission?: () => Promise<boolean>): Promise<ClaimDispatchOutcome> {
+  public async claimDispatch(
+    intentId: string,
+    reconciliationAuthorizationOrConsume?: unknown,
+    authorizedConsume?: () => Promise<boolean>,
+  ): Promise<ClaimDispatchOutcome> {
+    const consumeOpenAdmission = authorizedConsume
+      ?? (typeof reconciliationAuthorizationOrConsume === 'function'
+        ? reconciliationAuthorizationOrConsume as () => Promise<boolean>
+        : undefined);
     const current = this.#orders.get(intentId);
     if (current === undefined) {
       throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Live order vanished during dispatch claim', { details: { intentId } });
@@ -303,7 +313,7 @@ export class InMemoryLiveExecutionRepository implements LiveExecutionRepository 
     if (current.state !== 'CREATED') return { kind: 'ALREADY_CLAIMED', order: current };
     // Emulate the database's conditional UPDATE before any awaited work so
     // concurrent callers cannot both pass the CREATED predicate.
-    const claimed = Object.freeze({ ...current, state: 'DISPATCH_RESERVED' as const, revision: current.revision + 1 });
+    const claimed = Object.freeze({ ...current, state: 'DISPATCH_RESERVED' as const, dispatchWireArmed: false, revision: current.revision + 1 });
     this.#orders.set(intentId, claimed);
     try {
       const intent = this.#intents.get(intentId);
@@ -361,9 +371,29 @@ export class InMemoryLiveExecutionRepository implements LiveExecutionRepository 
     if (current.exchangeOrderId === null) throw new LiveExecutionError('LIVE_ORDER_IDENTITY_MISMATCH', 'Missing exchange order id');
     const generation = current.cancelGeneration + 1;
     const claimed = Object.freeze({ ...current, state: 'CANCEL_REQUESTED' as const, cancelState: 'CANCEL_RESERVED' as const,
-      cancelGeneration: generation, cancelExchangeOrderId: current.exchangeOrderId, cancelFaultCode: null, revision: current.revision + 1 });
+      cancelGeneration: generation, cancelExchangeOrderId: current.exchangeOrderId, cancelFaultCode: null, cancelWireArmed: false, revision: current.revision + 1 });
     this.#orders.set(intentId, claimed);
     return { kind: 'CLAIMED', order: claimed, generation };
+  }
+
+  public async armDispatchWire(intentId: string, expectedRevision: number): Promise<LiveOrderStateRecord> {
+    const current = this.#orders.get(intentId);
+    if (current === undefined || current.state !== 'DISPATCH_RESERVED' || current.dispatchWireArmed || current.revision !== expectedRevision) {
+      throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Cannot arm a create-order wire attempt outside an unarmed DISPATCH_RESERVED claim at the expected revision', { details: { intentId, expectedRevision } });
+    }
+    const next = Object.freeze({ ...current, dispatchWireArmed: true, revision: current.revision + 1 });
+    this.#orders.set(intentId, next);
+    return next;
+  }
+
+  public async armCancelWire(intentId: string, expectedRevision: number): Promise<LiveOrderStateRecord> {
+    const current = this.#orders.get(intentId);
+    if (current === undefined || current.cancelState !== 'CANCEL_RESERVED' || current.cancelWireArmed || current.revision !== expectedRevision) {
+      throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Cannot arm a cancel wire attempt outside an unarmed CANCEL_RESERVED claim at the expected revision', { details: { intentId, expectedRevision } });
+    }
+    const next = Object.freeze({ ...current, cancelWireArmed: true, revision: current.revision + 1 });
+    this.#orders.set(intentId, next);
+    return next;
   }
 
   public async completeCancelAttempt(intentId: string, generation: number, outcome: CompleteCancelAttemptOutcome, faultCode: string | null): Promise<LiveOrderStateRecord> {
@@ -412,6 +442,91 @@ export class InMemoryLiveExecutionRepository implements LiveExecutionRepository 
 
   public async loadPositionOwnership(accountId: string, pair: string): Promise<LivePositionOwnershipRecord | null> {
     return this.#positions.get(`${accountId}:${pair}`) ?? null;
+  }
+
+  /**
+   * [Phase18] Emulates the production commit: revision guard first, then the
+   * append-only observation dedup, then the projection write — with the dedup
+   * short-circuiting BEFORE any state change, exactly as the Prisma adapter
+   * does, so a replayed reconciliation effect is a true no-op here too.
+   */
+  public async commitReconciledState(
+    next: LiveOrderStateRecord,
+    expectedRevision: number,
+    observation: LiveOrderObservation | null,
+  ): Promise<LiveOrderStateRecord> {
+    const current = this.#orders.get(next.intentId);
+    if (current === undefined || current.revision !== expectedRevision) {
+      throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Concurrent modification: durable live order revision moved', {
+        details: { intentId: next.intentId, expectedRevision },
+      });
+    }
+    if (observation !== null) {
+      const intent = this.#intents.get(next.intentId);
+      if (intent !== undefined && observation.side !== intent.content.side) {
+        throw new LiveExecutionError('LIVE_ORDER_IDENTITY_MISMATCH', 'Reconciliation observation side does not belong to this live order');
+      }
+      const key = `${next.intentId}:${observationSha256(observation)}`;
+      if (this.#events.has(key)) return current;
+      this.#events.add(key);
+    }
+    this.commitCount += 1;
+    this.#orders.set(next.intentId, next);
+    return next;
+  }
+
+  /** [Phase18] The verified durable order view, joined with its immutable intent. */
+  public async listAccountOrderViews(accountId: string): Promise<readonly LiveDurableOrderRow[]> {
+    const views: LiveDurableOrderRow[] = [];
+    for (const [intentId, order] of [...this.#orders.entries()].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))) {
+      if (order.accountId !== accountId) continue;
+      const intent = this.#intents.get(intentId);
+      if (intent === undefined) {
+        throw new LiveExecutionError('LIVE_DURABLE_INTEGRITY_VIOLATION', 'Durable live order exists without the immutable intent that authorizes it');
+      }
+      const timestamps = this.#orderTimestamps.get(intentId) ?? { createdAtMs: 0, updatedAtMs: 0 };
+      views.push(Object.freeze({
+        intentId,
+        clientOrderId: order.clientOrderId,
+        accountId: order.accountId,
+        pair: order.pair,
+        state: order.state,
+        exchangeOrderId: order.exchangeOrderId,
+        side: intent.content.side,
+        action: intent.content.action,
+        wireOrderType: intent.wireOrderType,
+        orderedQuantity: order.orderedQuantity,
+        cumulativeFilledQuantity: order.cumulativeFilledQuantity,
+        averageFillPrice: order.averageFillPrice,
+        price: intent.content.price,
+        leverage: intent.content.leverage,
+        timeInForce: intent.content.timeInForce,
+        cancelState: order.cancelState,
+        strategyInstanceId: intent.content.strategyInstanceId,
+        strategyId: intent.content.strategyId,
+        strategyVersion: intent.content.strategyVersion,
+        parameterHash: intent.content.parameterHash,
+        instrumentSpecSnapshotId: intent.content.instrumentSpecSnapshotId,
+        positionInstanceId: intent.content.positionInstanceId,
+        reduceOnlyQuantity: intent.content.reduceOnlyQuantity,
+        createdAtMs: timestamps.createdAtMs,
+        updatedAtMs: timestamps.updatedAtMs,
+        dispatchWireArmed: order.dispatchWireArmed,
+        cancelWireArmed: order.cancelWireArmed,
+        revision: order.revision,
+      }));
+    }
+    return Object.freeze(views);
+  }
+
+  /** Lets a Phase18 test pin the local submission window an order was recorded in. */
+  public setOrderTimestamps(intentId: string, createdAtMs: number, updatedAtMs: number): void {
+    this.#orderTimestamps.set(intentId, { createdAtMs, updatedAtMs });
+  }
+
+  /** Lets a Phase18 test place an order directly into a durable state under test. */
+  public setOrderState(order: LiveOrderStateRecord): void {
+    this.#orders.set(order.intentId, Object.freeze({ ...order }));
   }
 
   public get eventCount(): number {

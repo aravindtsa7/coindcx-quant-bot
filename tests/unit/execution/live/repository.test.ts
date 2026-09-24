@@ -2,7 +2,7 @@ import type { PrismaClient } from '@prisma/client';
 import { describe, expect, it } from 'vitest';
 import { LiveExecutionError } from '../../../../src/execution/live/errors';
 import type { LiveExecutionIntentRecord } from '../../../../src/execution/live/intent';
-import { observationSha256, PrismaLiveExecutionRepository } from '../../../../src/execution/live/repository';
+import { LIVE_EXECUTION_TEST_TRANSACTION, observationSha256, PrismaLiveExecutionRepository } from '../../../../src/execution/live/repository';
 import type { LiveOrderObservation, LiveOrderStateRecord } from '../../../../src/execution/live/types';
 
 /**
@@ -11,8 +11,14 @@ import type { LiveOrderObservation, LiveOrderStateRecord } from '../../../../src
  * collisions raise Prisma error code P2002, and `updateMany` reports how many
  * rows its WHERE clause matched. The repository's idempotence claims rest on
  * exactly those two behaviours, so this is what must be exercised.
+ *
+ * [F18-15] This suite predates Phase18 reconciliation and never supplies a
+ * `reconciliationAuthorization`, so it EXPLICITLY opts out of that fence via
+ * the same marker `durable-integrity.test.ts` uses — never by omitting a
+ * delegate, which is exactly the structural inference F18-15 closed off.
  */
 class FakePrisma {
+  public readonly [LIVE_EXECUTION_TEST_TRANSACTION] = true as const;
   public readonly intents = new Map<string, Record<string, unknown>>();
   public readonly orders = new Map<string, Record<string, unknown>>();
   public readonly events = new Set<string>();
@@ -48,7 +54,7 @@ class FakePrisma {
       run: () => {
         const intentId = data['intentId'] as string;
         if (this.orders.has(intentId)) throw this.#uniqueViolation();
-        this.orders.set(intentId, { ...data });
+        this.orders.set(intentId, { dispatchWireArmed: false, cancelWireArmed: false, ...data });
         return data;
       },
     }),
@@ -347,6 +353,8 @@ describe('P17 optimistic-concurrency state commits', () => {
       cancelGeneration: 0,
       cancelExchangeOrderId: null,
       cancelFaultCode: null,
+      dispatchWireArmed: false,
+      cancelWireArmed: false,
       revision: 1,
     }, 0)).rejects.toThrow(/LIVE_ORDER_STATE_CONFLICT/);
   });

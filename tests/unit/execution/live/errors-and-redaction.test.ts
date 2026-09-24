@@ -23,11 +23,23 @@ describe('P17 fault taxonomy', () => {
     expect(error).toBeInstanceOf(Error);
   });
 
-  it('marks exactly the two unestablished-outcome codes as ambiguous', () => {
-    expect(LIVE_AMBIGUOUS_CODES).toEqual(['LIVE_SUBMISSION_AMBIGUOUS', 'LIVE_CANCEL_AMBIGUOUS']);
+  it('marks exactly the unestablished-outcome codes as ambiguous', () => {
+    // [P18] The orphan-cancel code joins the two Phase17 codes because it means
+    // the same thing: a mutation reached the wire and its outcome could not be
+    // established, so the venue may hold state this process cannot account for.
+    expect(LIVE_AMBIGUOUS_CODES).toEqual([
+      'LIVE_SUBMISSION_AMBIGUOUS',
+      'LIVE_CANCEL_AMBIGUOUS',
+      'LIVE_ORPHAN_CANCEL_AMBIGUOUS',
+    ]);
     expect(new LiveExecutionError('LIVE_SUBMISSION_AMBIGUOUS', 'x').isAmbiguous).toBe(true);
     expect(new LiveExecutionError('LIVE_CANCEL_AMBIGUOUS', 'x').isAmbiguous).toBe(true);
+    expect(new LiveExecutionError('LIVE_ORPHAN_CANCEL_AMBIGUOUS', 'x').isAmbiguous).toBe(true);
     expect(new LiveExecutionError('LIVE_ORDER_REJECTED', 'x').isAmbiguous).toBe(false);
+    // A reconciliation refusal is NOT ambiguity: it means this process declines
+    // to act, not that the venue may hold an unaccounted mutation.
+    expect(new LiveExecutionError('LIVE_RECONCILIATION_REQUIRED', 'x').isAmbiguous).toBe(false);
+    expect(new LiveExecutionError('LIVE_RECONCILIATION_STALE_GENERATION', 'x').isAmbiguous).toBe(false);
   });
 
   it('freezes its details and serializes them for structured logging', () => {

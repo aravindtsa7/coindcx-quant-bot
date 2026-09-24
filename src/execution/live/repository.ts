@@ -23,6 +23,7 @@ import { sha256CanonicalJson } from '../../risk';
 import { canonicalLiveDecimalString, liveDecimal } from './decimal';
 import { LiveExecutionError } from './errors';
 import type { LiveExecutionIntentRecord } from './intent';
+import { LiveReconciliationAuthorization, type LiveReconciliationAuthorizationRecord } from './reconciliation/repository';
 import { applyLiveOrderObservation, initialLiveOrderState } from './state-machine';
 import type { LiveCancelAttemptState, LiveOrderObservation, LiveOrderStateName, LiveOrderStateRecord } from './types';
 
@@ -72,21 +73,95 @@ export interface LiveExecutionRepository {
    */
   ensureIntent(intent: LiveExecutionIntentRecord): Promise<LiveOrderStateRecord>;
   /** Atomic, database-enforced single dispatch claim. */
-  claimDispatch(intentId: string, consumeOpenAdmission?: () => Promise<boolean>): Promise<ClaimDispatchOutcome>;
+  claimDispatch(intentId: string, reconciliationAuthorization?: unknown, consumeOpenAdmission?: () => Promise<boolean>): Promise<ClaimDispatchOutcome>;
   /** Optimistic-concurrency state commit. */
-  commitState(next: LiveOrderStateRecord, expectedRevision: number): Promise<LiveOrderStateRecord>;
+  commitState(next: LiveOrderStateRecord, expectedRevision: number, reconciliationAuthorization?: unknown): Promise<LiveOrderStateRecord>;
   /** Validates, deduplicates, records, and projects one observation in one transaction. */
-  applyObservationAtomically(intentId: string, observation: LiveOrderObservation): Promise<LiveOrderStateRecord>;
+  applyObservationAtomically(intentId: string, observation: LiveOrderObservation, reconciliationAuthorization?: unknown): Promise<LiveOrderStateRecord>;
   /** Database-enforced exclusive cancellation mutation claim. */
-  claimCancel(intentId: string, trustedAccountId: string): Promise<ClaimCancelOutcome>;
-  completeCancelAttempt(intentId: string, generation: number, outcome: CompleteCancelAttemptOutcome, faultCode: string | null): Promise<LiveOrderStateRecord>;
+  claimCancel(intentId: string, trustedAccountId: string, reconciliationAuthorization?: unknown): Promise<ClaimCancelOutcome>;
+  completeCancelAttempt(intentId: string, generation: number, outcome: CompleteCancelAttemptOutcome, faultCode: string | null, reconciliationAuthorization?: unknown): Promise<LiveOrderStateRecord>;
+  /**
+   * [P18 Wave A2 / F18-14] Durably proves a create-order wire request MAY be
+   * about to leave this process. HEALTHY-fenced exactly like `commitState`,
+   * and must commit BEFORE the gateway is ever called. Refuses (fenced out)
+   * if this account's reconciliation generation was superseded since the
+   * dispatch reservation was taken, so a stale worker can never arm — and
+   * therefore never send — a wire request (Case A of F18-14).
+   */
+  armDispatchWire(intentId: string, expectedRevision: number, reconciliationAuthorization?: unknown): Promise<LiveOrderStateRecord>;
+  /** [P18 Wave A2 / F18-14] The cancel-mutation equivalent of `armDispatchWire`. */
+  armCancelWire(intentId: string, expectedRevision: number, reconciliationAuthorization?: unknown): Promise<LiveOrderStateRecord>;
   /** A timed-out create claim becomes explicitly ambiguous; timeout never releases or resends it. */
-  markExpiredDispatchUnresolved(intentId: string, trustedAccountId: string, cutoff: Date): Promise<LiveOrderStateRecord>;
+  markExpiredDispatchUnresolved(intentId: string, trustedAccountId: string, cutoff: Date, reconciliationAuthorization?: unknown): Promise<LiveOrderStateRecord>;
   load(intentId: string): Promise<LiveOrderStateRecord | null>;
   /** Immutable economics used to validate every provider observation. */
   loadObservationIdentity(intentId: string): Promise<LiveOrderObservationIdentity | null>;
   /** Authoritative durable ownership used to compose CLOSE; never caller DTO data. */
   loadPositionOwnership(accountId: string, pair: string): Promise<LivePositionOwnershipRecord | null>;
+  /**
+   * [Phase18] Commits a state Phase18 reconciliation computed from
+   * authoritative venue evidence, optionally recording the observation that
+   * proved it in the SAME transaction.
+   *
+   * This exists so reconciliation never writes `live_order` itself: it gets the
+   * identical verify-before-write discipline as every Phase17 path — sealed
+   * intent digest, immutable mirror re-proof, revision-guarded conditional
+   * update — plus the append-only event dedup. It is the only way an
+   * ambiguous create or a crash-interrupted dispatch claim can be resolved.
+   */
+  commitReconciledState(
+    next: LiveOrderStateRecord,
+    expectedRevision: number,
+    observation: LiveOrderObservation | null,
+    reconciliationAuthorization?: unknown,
+  ): Promise<LiveOrderStateRecord>;
+  /**
+   * [Phase18] Every durable order for one account, each verified exactly as
+   * `load` verifies a single one, joined with the immutable intent economics
+   * reconciliation must compare against.
+   */
+  listAccountOrderViews(accountId: string): Promise<readonly LiveDurableOrderRow[]>;
+}
+
+/**
+ * [Phase18] A verified durable order joined with its verified immutable intent.
+ *
+ * Both halves come from the same digest-checked read, so reconciliation can
+ * never compare a projection against a different snapshot of the intent that
+ * authorizes it.
+ */
+export interface LiveDurableOrderRow {
+  readonly intentId: string;
+  readonly clientOrderId: string;
+  readonly accountId: string;
+  readonly pair: string;
+  readonly state: LiveOrderStateName;
+  readonly exchangeOrderId: string | null;
+  readonly side: 'BUY' | 'SELL';
+  readonly action: 'OPEN' | 'CLOSE';
+  readonly wireOrderType: string;
+  readonly orderedQuantity: string;
+  readonly cumulativeFilledQuantity: string;
+  readonly averageFillPrice: string | null;
+  readonly price: string | null;
+  readonly leverage: string | null;
+  readonly timeInForce: string;
+  readonly cancelState: LiveCancelAttemptState;
+  readonly strategyInstanceId: string;
+  readonly strategyId: string;
+  readonly strategyVersion: string;
+  readonly parameterHash: string;
+  readonly instrumentSpecSnapshotId: string;
+  readonly positionInstanceId: string | null;
+  readonly reduceOnlyQuantity: string | null;
+  readonly createdAtMs: number;
+  readonly updatedAtMs: number;
+  readonly revision: number;
+  /** [P18 Wave A2 / F18-14] See `LiveOrderStateRecord.dispatchWireArmed`. */
+  readonly dispatchWireArmed: boolean;
+  /** [P18 Wave A2 / F18-14] See `LiveOrderStateRecord.cancelWireArmed`. */
+  readonly cancelWireArmed: boolean;
 }
 
 /** Stable dedup identity of one exchange observation (P17 §9 repeated event). */
@@ -170,11 +245,40 @@ interface LiveOrderRow {
   readonly cancelGeneration: number;
   readonly cancelExchangeOrderId: string | null;
   readonly cancelFaultCode: string | null;
+  readonly dispatchWireArmed: boolean;
+  readonly cancelWireArmed: boolean;
   readonly revision: number;
 }
 
+/**
+ * [F18-18] The valid-state matrix for the two wire-arm flags this file owns.
+ *
+ * `dispatchWireArmed` may be `true` ONLY while `state === 'DISPATCH_RESERVED'`;
+ * `cancelWireArmed` may be `true` ONLY while `cancelState === 'CANCEL_RESERVED'`.
+ * Every legitimate write path in this file clears the corresponding flag the
+ * instant its owning state is left — `applyLiveOrderObservation`,
+ * `markSubmissionAmbiguous`, `markRejected`, `releaseDispatchClaim`,
+ * `reclaimDispatchAfterCrash`/`reclaimCancelAfterCrash`, `completeCancelAttempt`,
+ * and `markExpiredDispatchUnresolved` — so a row that violates this matrix
+ * cannot be produced by any code path here. Reading one back is therefore
+ * corruption or tampering, exactly like a sealed-digest mismatch, and it
+ * fails closed rather than being silently ignored or coerced.
+ */
+function assertWireArmedConsistency(order: LiveOrderStateRecord): void {
+  if (order.dispatchWireArmed && order.state !== 'DISPATCH_RESERVED') {
+    throw new LiveExecutionError('LIVE_DURABLE_INTEGRITY_VIOLATION', 'Durable live order is wire-armed for dispatch outside an active DISPATCH_RESERVED claim', {
+      details: { intentId: order.intentId, state: order.state },
+    });
+  }
+  if (order.cancelWireArmed && order.cancelState !== 'CANCEL_RESERVED') {
+    throw new LiveExecutionError('LIVE_DURABLE_INTEGRITY_VIOLATION', 'Durable live order is wire-armed for cancel outside an active CANCEL_RESERVED claim', {
+      details: { intentId: order.intentId, cancelState: order.cancelState },
+    });
+  }
+}
+
 function toStateRecord(row: LiveOrderRow): LiveOrderStateRecord {
-  return Object.freeze({
+  const record = Object.freeze({
     intentId: row.intentId,
     clientOrderId: row.clientOrderId,
     accountId: row.accountId,
@@ -192,8 +296,12 @@ function toStateRecord(row: LiveOrderRow): LiveOrderStateRecord {
     cancelGeneration: row.cancelGeneration,
     cancelExchangeOrderId: row.cancelExchangeOrderId,
     cancelFaultCode: row.cancelFaultCode,
+    dispatchWireArmed: row.dispatchWireArmed === true,
+    cancelWireArmed: row.cancelWireArmed === true,
     revision: row.revision,
   });
+  assertWireArmedConsistency(record);
+  return record;
 }
 
 function isUniqueConstraintViolation(error: unknown): boolean {
@@ -347,6 +455,85 @@ interface IntentReadClient {
   readonly liveExecutionIntent: { findUnique(args: { where: { intentId: string } }): Promise<unknown> };
 }
 
+interface ReconciliationFenceClient {
+  $executeRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<number>;
+  $queryRaw<T>(query: TemplateStringsArray, ...values: unknown[]): Promise<T>;
+}
+
+/**
+ * [F18-15] Tags a deliberate Phase17 unit-test transaction double so it may
+ * skip the reconciliation fence — for tests that exist purely to exercise
+ * intent-integrity verification and never touch reconciliation at all.
+ *
+ * This is an EXPLICIT opt-in a real Prisma client or interactive transaction
+ * can never carry, unlike the structural "does this object happen to expose a
+ * `liveReconciliationState` delegate" check this replaces. That structural
+ * check silently fail-opened the fence whenever a Prisma client's generated
+ * delegate was absent or stale — a partially-deployed migration, a stale
+ * generated client, or any other accidental mismatch would have silently
+ * disabled Phase18 fencing in production instead of blocking live mutation.
+ * A production transaction never carries this symbol, so its absence is what
+ * makes the fence fail closed by default; only a fixture that explicitly sets
+ * `tx[LIVE_EXECUTION_TEST_TRANSACTION] = true` may bypass it.
+ */
+export const LIVE_EXECUTION_TEST_TRANSACTION: unique symbol = Symbol('live-execution-test-transaction');
+
+interface MaybeTestTransaction {
+  readonly [LIVE_EXECUTION_TEST_TRANSACTION]?: true;
+}
+
+/** Locks and validates the exact generation authority inside an economic write. */
+async function assertReconciliationFence(
+  tx: ReconciliationFenceClient,
+  authorization: unknown,
+  accountId: string | null,
+  requiredMode?: 'HEALTHY' | 'RUNNING',
+): Promise<LiveReconciliationAuthorizationRecord | null> {
+  // [F18-15] The ONLY bypass, and it requires an explicit, deliberate marker —
+  // never inferred from what the transaction object happens to be missing.
+  if ((tx as MaybeTestTransaction)[LIVE_EXECUTION_TEST_TRANSACTION] === true) return null;
+  const authority = LiveReconciliationAuthorization.read(authorization);
+  if (authority === null || (requiredMode !== undefined && authority.mode !== requiredMode)
+      || (accountId !== null && authority.accountId !== accountId)) {
+    throw new LiveExecutionError('LIVE_RECONCILIATION_REQUIRED', 'A genuine current reconciliation authorization is required');
+  }
+  // Use the locking read itself as the value read. A separate ordinary SELECT
+  // here would establish a REPEATABLE READ snapshot before a later live_order
+  // lock wait and could observe a pre-wait projection; the single locking read
+  // preserves both the account serialization order and Phase17's fresh-read
+  // integrity guarantees.
+  const rows = await tx.$queryRaw<Array<{
+    accountId: string;
+    status: string;
+    currentGeneration: number;
+    currentRunId: string | null;
+    currentRuntimeEpoch: string | null;
+    healthyGeneration: number | null;
+    blockingFindingCount: number;
+    revision: number;
+  }>>`SELECT account_id AS accountId, status, current_generation AS currentGeneration,
+      current_run_id AS currentRunId, current_runtime_epoch AS currentRuntimeEpoch,
+      healthy_generation AS healthyGeneration, blocking_finding_count AS blockingFindingCount,
+      revision
+    FROM live_reconciliation_state WHERE account_id = ${authority.accountId} FOR UPDATE`;
+  const state = rows[0] ?? null;
+  const healthy = authority.mode === 'HEALTHY'
+    && state?.status === 'HEALTHY'
+    && state.healthyGeneration === authority.generation
+    && state.blockingFindingCount === 0;
+  const running = authority.mode === 'RUNNING' && state?.status === 'RUNNING';
+  if (state === null || state.currentRunId !== authority.runId
+      || state.currentGeneration !== authority.generation
+      || state.currentRuntimeEpoch !== authority.runtimeEpoch
+      || state.revision !== authority.stateRevision
+      || (!healthy && !running)) {
+    throw new LiveExecutionError('LIVE_RECONCILIATION_STALE_GENERATION', 'Reconciliation authorization no longer owns the current durable generation', {
+      details: { accountId: authority.accountId, generation: authority.generation },
+    });
+  }
+  return authority;
+}
+
 /** A verified order projection together with the verified intent that authorizes it. */
 export interface VerifiedLiveOrder {
   readonly order: LiveOrderStateRecord;
@@ -457,10 +644,16 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
     }
   }
 
-  public async claimDispatch(intentId: string, consumeOpenAdmission?: () => Promise<boolean>): Promise<ClaimDispatchOutcome> {
+  public async claimDispatch(intentId: string, reconciliationAuthorization?: unknown, consumeOpenAdmission?: () => Promise<boolean>): Promise<ClaimDispatchOutcome> {
+    // Backward-compatible argument shape for pure Phase17 test doubles only.
+    if (typeof reconciliationAuthorization === 'function' && consumeOpenAdmission === undefined) {
+      consumeOpenAdmission = reconciliationAuthorization as () => Promise<boolean>;
+      reconciliationAuthorization = undefined;
+    }
     let claimed: { readonly count: number };
     try {
       claimed = await this.#prisma.$transaction(async (tx) => {
+      const fence = await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, null, 'HEALTHY');
       // Lock before reading either half of the sealed identity. Verification
       // and CREATED -> DISPATCH_RESERVED therefore share one transaction.
       await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;
@@ -470,6 +663,9 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
         throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Live order vanished during dispatch claim', { details: { intentId } });
       }
       const { order: current, verifiedIntent } = projection;
+      if (fence !== null && current.accountId !== fence.accountId) {
+        throw new LiveExecutionError('LIVE_RECONCILIATION_REQUIRED', 'Reconciliation authorization belongs to a different account');
+      }
       if (current.state !== 'CREATED') return { count: 0 };
       const intent = verifiedIntent.intent.content;
 
@@ -525,7 +721,7 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
           pair: current.pair,
           orderedQuantity: canonicalLiveDecimalString(current.orderedQuantity, 'orderedQuantity'),
         },
-        data: { state: 'DISPATCH_RESERVED', revision: { increment: 1 } },
+        data: { state: 'DISPATCH_RESERVED', dispatchWireArmed: false, revision: { increment: 1 } },
       });
       });
     } catch (error) {
@@ -557,12 +753,101 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
   }
 
   /**
+   * [P18 Wave A2 / F18-14] The durable pre-wire checkpoint (§5, §11). Locks and
+   * re-verifies the sealed intent and immutable mirrors exactly like every
+   * other HEALTHY-fenced write, then conditionally flips `dispatchWireArmed`
+   * from false to true on the exact expected revision. Refuses (fenced out) if
+   * the account's reconciliation generation was superseded since the caller's
+   * `HEALTHY` authorization was minted — so a stale worker's arm attempt fails
+   * BEFORE it can ever reach the gateway, and it sends zero wire requests.
+   */
+  public async armDispatchWire(intentId: string, expectedRevision: number, reconciliationAuthorization?: unknown): Promise<LiveOrderStateRecord> {
+    return this.#prisma.$transaction(async (tx) => {
+      const fence = await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, null, 'HEALTHY');
+      await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;
+      await tx.$executeRaw`SELECT intent_id FROM live_execution_intent WHERE intent_id = ${intentId} FOR UPDATE`;
+      const verified = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
+      if (verified === null) {
+        throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Live order vanished while arming the dispatch wire attempt', { details: { intentId } });
+      }
+      const current = verified.order;
+      if (fence !== null && current.accountId !== fence.accountId) {
+        throw new LiveExecutionError('LIVE_RECONCILIATION_REQUIRED', 'Reconciliation authorization belongs to a different account');
+      }
+      if (current.state !== 'DISPATCH_RESERVED' || current.dispatchWireArmed || current.revision !== expectedRevision) {
+        throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Cannot arm a create-order wire attempt outside an unarmed DISPATCH_RESERVED claim at the expected revision', {
+          details: { intentId, expectedRevision },
+        });
+      }
+      const updated = await tx.liveOrder.updateMany({
+        where: {
+          intentId, state: 'DISPATCH_RESERVED', dispatchWireArmed: false, revision: expectedRevision,
+          clientOrderId: current.clientOrderId, accountId: current.accountId, pair: current.pair,
+          orderedQuantity: canonicalLiveDecimalString(current.orderedQuantity, 'orderedQuantity'),
+        },
+        data: { dispatchWireArmed: true, revision: { increment: 1 } },
+      });
+      if (updated.count !== 1) {
+        throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Concurrent modification: dispatch wire arm claim moved before it could commit', {
+          details: { intentId, expectedRevision },
+        });
+      }
+      const committed = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
+      if (committed === null) {
+        throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Live order vanished after arming the dispatch wire attempt', { details: { intentId } });
+      }
+      return committed.order;
+    });
+  }
+
+  /** [P18 Wave A2 / F18-14] The cancel-mutation equivalent of `armDispatchWire`. */
+  public async armCancelWire(intentId: string, expectedRevision: number, reconciliationAuthorization?: unknown): Promise<LiveOrderStateRecord> {
+    return this.#prisma.$transaction(async (tx) => {
+      const fence = await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, null, 'HEALTHY');
+      await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;
+      await tx.$executeRaw`SELECT intent_id FROM live_execution_intent WHERE intent_id = ${intentId} FOR UPDATE`;
+      const verified = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
+      if (verified === null) {
+        throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Live order vanished while arming the cancel wire attempt', { details: { intentId } });
+      }
+      const current = verified.order;
+      if (fence !== null && current.accountId !== fence.accountId) {
+        throw new LiveExecutionError('LIVE_RECONCILIATION_REQUIRED', 'Reconciliation authorization belongs to a different account');
+      }
+      if (current.cancelState !== 'CANCEL_RESERVED' || current.cancelWireArmed || current.revision !== expectedRevision) {
+        throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Cannot arm a cancel wire attempt outside an unarmed CANCEL_RESERVED claim at the expected revision', {
+          details: { intentId, expectedRevision },
+        });
+      }
+      const updated = await tx.liveOrder.updateMany({
+        where: {
+          intentId, cancelState: 'CANCEL_RESERVED', cancelWireArmed: false, revision: expectedRevision,
+          clientOrderId: current.clientOrderId, accountId: current.accountId, pair: current.pair,
+          orderedQuantity: canonicalLiveDecimalString(current.orderedQuantity, 'orderedQuantity'),
+        },
+        data: { cancelWireArmed: true, revision: { increment: 1 } },
+      });
+      if (updated.count !== 1) {
+        throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Concurrent modification: cancel wire arm claim moved before it could commit', {
+          details: { intentId, expectedRevision },
+        });
+      }
+      const committed = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
+      if (committed === null) {
+        throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Live order vanished after arming the cancel wire attempt', { details: { intentId } });
+      }
+      return committed.order;
+    });
+  }
+
+  /**
    * Locks and re-verifies both the sealed intent and every immutable order
    * mirror immediately before the conditional state write. The predicate also
    * pins the verified state, revision, identity, and canonical quantity.
    */
-  public async commitState(next: LiveOrderStateRecord, expectedRevision: number): Promise<LiveOrderStateRecord> {
+  public async commitState(next: LiveOrderStateRecord, expectedRevision: number, reconciliationAuthorization?: unknown): Promise<LiveOrderStateRecord> {
     return this.#prisma.$transaction(async (tx) => {
+      await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, next.accountId, 'HEALTHY');
       await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${next.intentId} FOR UPDATE`;
       await tx.$executeRaw`SELECT intent_id FROM live_execution_intent WHERE intent_id = ${next.intentId} FOR UPDATE`;
       const verified = await readVerifiedOrder(tx as unknown as IntentReadClient, next.intentId);
@@ -601,6 +886,8 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
           cancelGeneration: next.cancelGeneration,
           cancelExchangeOrderId: next.cancelExchangeOrderId,
           cancelFaultCode: next.cancelFaultCode,
+          dispatchWireArmed: next.dispatchWireArmed,
+          cancelWireArmed: next.cancelWireArmed,
           revision: next.revision,
         },
       });
@@ -617,8 +904,9 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
     });
   }
 
-  public async applyObservationAtomically(intentId: string, observation: LiveOrderObservation): Promise<LiveOrderStateRecord> {
+  public async applyObservationAtomically(intentId: string, observation: LiveOrderObservation, reconciliationAuthorization?: unknown): Promise<LiveOrderStateRecord> {
     return this.#prisma.$transaction(async (tx) => {
+      const fence = await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, null);
       await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;
       // [F17-R03] Folding a provider observation writes money-bearing state, so
       // the local truth it is validated against must itself be proven first.
@@ -629,6 +917,9 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
         });
       }
       const { order: current, verifiedIntent } = verified;
+      if (fence !== null && current.accountId !== fence.accountId) {
+        throw new LiveExecutionError('LIVE_RECONCILIATION_REQUIRED', 'Reconciliation authorization belongs to a different account');
+      }
       if (observation.side !== verifiedIntent.intent.content.side) {
         throw new LiveExecutionError('LIVE_ORDER_IDENTITY_MISMATCH', 'Observation side does not belong to this live order', {
           details: { intentId },
@@ -668,6 +959,11 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
           lastExchangeStatus: next.lastExchangeStatus,
           lastProviderEventTimeMs: next.lastProviderEventTimeMs === null ? null : BigInt(next.lastProviderEventTimeMs),
           faultCode: next.faultCode,
+          // [F18-18] `applyLiveOrderObservation` already resets this to false
+          // whenever the fold leaves DISPATCH_RESERVED (always, here); persist
+          // it so the column agrees with what `toStateRecord`'s integrity
+          // check requires on every subsequent read.
+          dispatchWireArmed: next.dispatchWireArmed,
           revision: next.revision,
         },
       });
@@ -675,8 +971,9 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
     });
   }
 
-  public async claimCancel(intentId: string, trustedAccountId: string): Promise<ClaimCancelOutcome> {
+  public async claimCancel(intentId: string, trustedAccountId: string, reconciliationAuthorization?: unknown): Promise<ClaimCancelOutcome> {
     return this.#prisma.$transaction(async (tx) => {
+      await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, trustedAccountId, 'HEALTHY');
       await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;
       // [F17-R03] A cancellation claim is a wire mutation authorization whose
       // only ownership proof is `accountId`, an immutable mirror column — so it
@@ -708,6 +1005,7 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
         cancelExchangeOrderId: current.exchangeOrderId,
         cancelFaultCode: null,
         cancelClaimedAt: new Date(),
+        cancelWireArmed: false,
         revision: { increment: 1 },
       } });
       const claimedOrder = toStateRecord(updated as unknown as LiveOrderRow);
@@ -721,8 +1019,10 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
     generation: number,
     outcome: CompleteCancelAttemptOutcome,
     faultCode: string | null,
+    reconciliationAuthorization?: unknown,
   ): Promise<LiveOrderStateRecord> {
     return this.#prisma.$transaction(async (tx) => {
+      const fence = await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, null, 'HEALTHY');
       await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;
       await tx.$executeRaw`SELECT intent_id FROM live_execution_intent WHERE intent_id = ${intentId} FOR UPDATE`;
       const verified = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
@@ -730,6 +1030,7 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
         throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Live order vanished while completing cancellation', { details: { intentId } });
       }
       const current = verified.order;
+      if (fence !== null && current.accountId !== fence.accountId) throw new LiveExecutionError('LIVE_RECONCILIATION_REQUIRED', 'Reconciliation authorization belongs to a different account');
       const cancelState = outcome === 'ACKNOWLEDGED' ? 'CANCEL_ACKNOWLEDGED'
         : outcome === 'AMBIGUOUS' ? 'CANCEL_AMBIGUOUS' : 'CANCEL_REJECTED';
       if (current.cancelGeneration === generation && current.cancelState === cancelState) return current;
@@ -752,6 +1053,11 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
           cancelState,
           cancelFaultCode: faultCode,
           ...(outcome === 'AMBIGUOUS' ? { faultCode: 'LIVE_CANCEL_AMBIGUOUS' } : {}),
+          // [F18-18] This transition always leaves CANCEL_RESERVED (the
+          // precondition above requires it), so any wire-arm proof is no
+          // longer meaningful and must not survive as a contradictory `true`
+          // against a non-reserved cancel state.
+          cancelWireArmed: false,
           revision: { increment: 1 },
         },
       });
@@ -766,8 +1072,9 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
     });
   }
 
-  public async markExpiredDispatchUnresolved(intentId: string, trustedAccountId: string, cutoff: Date): Promise<LiveOrderStateRecord> {
+  public async markExpiredDispatchUnresolved(intentId: string, trustedAccountId: string, cutoff: Date, reconciliationAuthorization?: unknown): Promise<LiveOrderStateRecord> {
     return this.#prisma.$transaction(async (tx) => {
+      await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, trustedAccountId, 'HEALTHY');
       await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;
       // [F17-R03] Restart recovery is an authoritative durable read: it decides
       // whether an order becomes permanently unresolvable, so it is verified on
@@ -785,7 +1092,11 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
       }
       if (verified.order.state !== 'DISPATCH_RESERVED' || row.updatedAt > cutoff) return verified.order;
       const updated = await tx.liveOrder.update({ where: { intentId }, data: {
-        state: 'SUBMISSION_AMBIGUOUS', faultCode: 'LIVE_SUBMISSION_AMBIGUOUS', revision: { increment: 1 },
+        // [F18-18] Leaving DISPATCH_RESERVED for good, exactly like
+        // `markSubmissionAmbiguous`: whether this claim was armed or not, the
+        // flag is no longer meaningful once the order stops being reserved,
+        // and it must not persist as a contradictory `true`.
+        state: 'SUBMISSION_AMBIGUOUS', faultCode: 'LIVE_SUBMISSION_AMBIGUOUS', dispatchWireArmed: false, revision: { increment: 1 },
       } });
       const unresolved = toStateRecord(updated as unknown as LiveOrderRow);
       assertOrderProjectionMatchesIntent(unresolved, verified.verifiedIntent);
@@ -847,6 +1158,164 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
       ownerStrategyInstanceId: row.ownerStrategyInstanceId, ownerStrategyId: row.ownerStrategyId,
       ownerStrategyVersion: row.ownerStrategyVersion, ownerParameterHash: row.ownerParameterHash,
     });
+  }
+
+  /**
+   * [Phase18 §8] Commits a reconciliation-computed state.
+   *
+   * Deliberately built from `commitState`'s exact discipline rather than a
+   * looser path: lock both halves, re-verify the sealed intent digest,
+   * re-prove the immutable order mirrors against it, then conditionally update
+   * on the expected revision AND every immutable identity column. The optional
+   * observation is inserted into the append-only log inside the SAME
+   * transaction, so an event can never outrun the financial effect it proves,
+   * and `UNIQUE(intent_id, observation_sha256)` makes a replayed reconciliation
+   * a no-op instead of a second fill.
+   */
+  public async commitReconciledState(
+    next: LiveOrderStateRecord,
+    expectedRevision: number,
+    observation: LiveOrderObservation | null,
+    reconciliationAuthorization?: unknown,
+  ): Promise<LiveOrderStateRecord> {
+    return this.#prisma.$transaction(async (tx) => {
+      await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, next.accountId, 'RUNNING');
+      await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${next.intentId} FOR UPDATE`;
+      await tx.$executeRaw`SELECT intent_id FROM live_execution_intent WHERE intent_id = ${next.intentId} FOR UPDATE`;
+      const verified = await readVerifiedOrder(tx as unknown as IntentReadClient, next.intentId);
+      if (verified === null) {
+        throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Concurrent modification: durable live order vanished', {
+          details: { intentId: next.intentId, expectedRevision },
+        });
+      }
+      const current = verified.order;
+      assertOrderProjectionMatchesIntent(next, verified.verifiedIntent);
+      if (current.revision !== expectedRevision) {
+        throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Concurrent modification: durable live order revision moved', {
+          details: { intentId: next.intentId, expectedRevision },
+        });
+      }
+      if (observation !== null) {
+        if (observation.side !== verified.verifiedIntent.intent.content.side) {
+          throw new LiveExecutionError('LIVE_ORDER_IDENTITY_MISMATCH', 'Reconciliation observation side does not belong to this live order', {
+            details: { intentId: next.intentId },
+          });
+        }
+        const digest = observationSha256(observation);
+        const existing = await tx.liveOrderEvent.findUnique({
+          where: { intentId_observationSha256: { intentId: next.intentId, observationSha256: digest } },
+        });
+        // An already-recorded observation means this exact reconciliation
+        // effect was applied before. Return current state untouched: no
+        // duplicate event, no second projection write, no revision churn.
+        if (existing !== null) return current;
+        await tx.liveOrderEvent.create({ data: {
+          intentId: next.intentId,
+          observationSha256: digest,
+          kind: observation.kind,
+          exchangeOrderId: observation.exchangeOrderId,
+          exchangeStatus: observation.exchangeStatus,
+          cumulativeFilledQuantity: observation.cumulativeFilledQuantity,
+          averageFillPrice: observation.averageFillPrice,
+          providerEventTimeMs: BigInt(observation.providerEventTimeMs),
+        } });
+      }
+      const updated = await tx.liveOrder.updateMany({
+        where: {
+          intentId: current.intentId,
+          state: current.state,
+          revision: expectedRevision,
+          clientOrderId: current.clientOrderId,
+          accountId: current.accountId,
+          pair: current.pair,
+          orderedQuantity: canonicalLiveDecimalString(current.orderedQuantity, 'orderedQuantity'),
+        },
+        data: {
+          state: next.state,
+          exchangeOrderId: next.exchangeOrderId,
+          cumulativeFilledQuantity: next.cumulativeFilledQuantity,
+          remainingQuantity: next.remainingQuantity,
+          averageFillPrice: next.averageFillPrice,
+          lastExchangeStatus: next.lastExchangeStatus,
+          lastProviderEventTimeMs: next.lastProviderEventTimeMs === null ? null : BigInt(next.lastProviderEventTimeMs),
+          faultCode: next.faultCode,
+          cancelState: next.cancelState,
+          cancelGeneration: next.cancelGeneration,
+          cancelExchangeOrderId: next.cancelExchangeOrderId,
+          cancelFaultCode: next.cancelFaultCode,
+          dispatchWireArmed: next.dispatchWireArmed,
+          cancelWireArmed: next.cancelWireArmed,
+          revision: next.revision,
+        },
+      });
+      if (updated.count !== 1) {
+        throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Concurrent modification: durable live order identity or revision moved', {
+          details: { intentId: next.intentId, expectedRevision },
+        });
+      }
+      const committed = await readVerifiedOrder(tx as unknown as IntentReadClient, next.intentId);
+      if (committed === null) {
+        throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Live order vanished after reconciliation commit', { details: { intentId: next.intentId } });
+      }
+      return committed.order;
+    });
+  }
+
+  /**
+   * [Phase18 §8] Every durable order for one account, each proven against its
+   * own sealed intent digest before it is returned. Reconciliation therefore
+   * never sees a raw projection row, exactly like every Phase17 path.
+   */
+  public async listAccountOrderViews(accountId: string): Promise<readonly LiveDurableOrderRow[]> {
+    const rows = await this.#prisma.liveOrder.findMany({
+      where: { accountId },
+      include: { intent: true },
+      orderBy: { intentId: 'asc' },
+    }) as readonly (LiveOrderRow & { intent: unknown; createdAt: Date; updatedAt: Date })[];
+
+    const views: LiveDurableOrderRow[] = [];
+    for (const row of rows) {
+      if (row.intent === null || row.intent === undefined) {
+        throw new LiveExecutionError('LIVE_DURABLE_INTEGRITY_VIOLATION', 'Durable live order exists without the immutable intent that authorizes it', {
+          details: { intentId: row.intentId },
+        });
+      }
+      const verifiedIntent = verifyStoredIntentIntegrity(row.intent);
+      const order = toStateRecord(row);
+      assertOrderProjectionMatchesIntent(order, verifiedIntent);
+      const { content } = verifiedIntent.intent;
+      views.push(Object.freeze({
+        intentId: order.intentId,
+        clientOrderId: order.clientOrderId,
+        accountId: order.accountId,
+        pair: order.pair,
+        state: order.state,
+        exchangeOrderId: order.exchangeOrderId,
+        side: content.side,
+        action: content.action,
+        wireOrderType: verifiedIntent.intent.wireOrderType,
+        orderedQuantity: order.orderedQuantity,
+        cumulativeFilledQuantity: order.cumulativeFilledQuantity,
+        averageFillPrice: order.averageFillPrice,
+        price: content.price,
+        leverage: content.leverage,
+        timeInForce: content.timeInForce,
+        cancelState: order.cancelState,
+        strategyInstanceId: content.strategyInstanceId,
+        strategyId: content.strategyId,
+        strategyVersion: content.strategyVersion,
+        parameterHash: content.parameterHash,
+        instrumentSpecSnapshotId: content.instrumentSpecSnapshotId,
+        positionInstanceId: content.positionInstanceId,
+        reduceOnlyQuantity: content.reduceOnlyQuantity,
+        createdAtMs: row.createdAt.getTime(),
+        updatedAtMs: row.updatedAt.getTime(),
+        dispatchWireArmed: order.dispatchWireArmed,
+        cancelWireArmed: order.cancelWireArmed,
+        revision: order.revision,
+      }));
+    }
+    return Object.freeze(views);
   }
 
   #intentCreateData(intent: LiveExecutionIntentRecord) {

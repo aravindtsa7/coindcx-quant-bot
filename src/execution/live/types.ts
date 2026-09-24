@@ -151,6 +151,16 @@ export interface LiveOrderStateRecord {
   readonly cancelGeneration: number;
   readonly cancelExchangeOrderId: string | null;
   readonly cancelFaultCode: string | null;
+  /**
+   * [P18 Wave A2 / F18-14] `true` only once the SAME fenced transaction that is
+   * the last durable checkpoint before the create-order HTTP call has committed.
+   * `false` means this is a LOCAL-ONLY dispatch reservation: no wire request can
+   * possibly have been sent, so a crash-recovering reconciliation generation may
+   * safely reclaim it to `CREATED` with zero exchange mutation.
+   */
+  readonly dispatchWireArmed: boolean;
+  /** [P18 Wave A2 / F18-14] The cancel-mutation equivalent of `dispatchWireArmed`. */
+  readonly cancelWireArmed: boolean;
   /** Optimistic-concurrency token. Every durable state mutation bumps it. */
   readonly revision: number;
 }

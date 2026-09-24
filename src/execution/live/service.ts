@@ -72,7 +72,7 @@ export class LiveExecutionService {
    * without touching the gateway. An intent whose prior attempt is ambiguous
    * fails closed and is never resent (P17-I07/I14/I20).
    */
-  public async dispatch(authority: unknown, intent: unknown): Promise<LiveDispatchOutcome> {
+  public async dispatch(authority: unknown, intent: unknown, reconciliationAuthorization?: unknown): Promise<LiveDispatchOutcome> {
     const intentRecord = this.#requireIntent(intent);
     const authorityRecord = readLiveAuthorityForIntent(authority, intent);
     assertLiveExecutionIntentIdentity(intentRecord);
@@ -91,7 +91,7 @@ export class LiveExecutionService {
       return Object.freeze({ kind: 'ALREADY_DISPATCHED' as const, order: persisted, faultCode: persisted.faultCode });
     }
 
-    const claim = await this.#repository.claimDispatch(intentRecord.intentId, authorityRecord.admission === null ? undefined : async () => {
+    const claim = await this.#repository.claimDispatch(intentRecord.intentId, reconciliationAuthorization, authorityRecord.admission === null ? undefined : async () => {
       const consumed = await consumeLiveAdmissionForIntent(
         authorityRecord.coordinator, authorityRecord.accountId, authorityRecord.admission!.admissionId, intentRecord.intentId,
       );
@@ -102,7 +102,11 @@ export class LiveExecutionService {
       return Object.freeze({ kind: 'ALREADY_DISPATCHED' as const, order: claim.order, faultCode: claim.order.faultCode });
     }
 
-    const reserved = claim.order;
+    // [P18 Wave A2 / F18-14] The durable pre-wire checkpoint. Committing this
+    // BEFORE the HTTP call means a worker whose reconciliation generation was
+    // superseded since the claim above sends ZERO wire requests: the arm
+    // itself is refused, fenced out, before the gateway is ever reached.
+    const reserved = await this.#repository.armDispatchWire(claim.order.intentId, claim.order.revision, reconciliationAuthorization);
     const result = await this.#gateway.placeOrder({
       clientOrderId: intentRecord.clientOrderId,
       pair: intentRecord.content.pair,
@@ -118,13 +122,13 @@ export class LiveExecutionService {
 
     switch (result.kind) {
       case 'ACCEPTED': {
-        const order = await this.#ingest(reserved, result.observation);
+        const order = await this.#ingest(reserved, result.observation, reconciliationAuthorization);
         return Object.freeze({ kind: 'SUBMITTED' as const, order, faultCode: null });
       }
       case 'REJECTED': {
         const order = result.observation === null
-          ? await this.#commitRejection(reserved, result.reasonCode)
-          : await this.#ingest(reserved, result.observation);
+          ? await this.#commitRejection(reserved, result.reasonCode, reconciliationAuthorization)
+          : await this.#ingest(reserved, result.observation, reconciliationAuthorization);
         logger.warn({ intentId: reserved.intentId, reasonCode: result.reasonCode }, 'CoinDCX rejected the live order');
         return Object.freeze({ kind: 'REJECTED' as const, order, faultCode: result.reasonCode });
       }
@@ -132,7 +136,7 @@ export class LiveExecutionService {
         // Provably nothing left this process, so the claim is safe to release
         // and the intent may be attempted again later.
         const released = releaseDispatchClaim(reserved, result.reasonCode);
-        const order = await this.#repository.commitState(released, reserved.revision);
+        const order = await this.#repository.commitState(released, reserved.revision, reconciliationAuthorization);
         throw new LiveExecutionError('LIVE_PROVIDER_ERROR', 'Live order was refused before dispatch; nothing reached CoinDCX', {
           details: { intentId: order.intentId, reasonCode: result.reasonCode },
         });
@@ -140,7 +144,7 @@ export class LiveExecutionService {
       case 'AMBIGUOUS':
       default: {
         const ambiguous = markSubmissionAmbiguous(reserved, 'LIVE_SUBMISSION_AMBIGUOUS');
-        const order = await this.#repository.commitState(ambiguous, reserved.revision);
+        const order = await this.#repository.commitState(ambiguous, reserved.revision, reconciliationAuthorization);
         logger.error({ intentId: order.intentId, reasonCode: result.reasonCode }, 'Live order submission outcome is unknown; failing closed for Phase18 reconciliation');
         return Object.freeze({ kind: 'AMBIGUOUS' as const, order, faultCode: 'LIVE_SUBMISSION_AMBIGUOUS' });
       }
@@ -155,19 +159,19 @@ export class LiveExecutionService {
    * and when none can be obtained the order stays CANCEL_REQUESTED with a
    * durable ambiguity fault rather than a fabricated CANCELLED.
    */
-  public async cancel(authority: unknown, intent: unknown): Promise<LiveCancelOutcome> {
+  public async cancel(authority: unknown, intent: unknown, reconciliationAuthorization?: unknown): Promise<LiveCancelOutcome> {
     const intentRecord = this.#requireIntent(intent);
     const authorityRecord = readLiveAuthorityForIntent(authority, intent);
-    return this.cancelDurable(intentRecord.intentId, authorityRecord.accountId);
+    return this.cancelDurable(intentRecord.intentId, authorityRecord.accountId, reconciliationAuthorization);
   }
 
   /**
    * Cancels from durable order ownership plus the trusted configured account
    * boundary. No admission or process-local authority object is required.
    */
-  public async cancelDurable(intentId: string, trustedAccountId: string): Promise<LiveCancelOutcome> {
+  public async cancelDurable(intentId: string, trustedAccountId: string, reconciliationAuthorization?: unknown): Promise<LiveCancelOutcome> {
     const cutoff = new Date(Date.now() - this.#policy.content.dispatchClaimTimeoutMs);
-    const current = await this.#repository.markExpiredDispatchUnresolved(intentId, trustedAccountId, cutoff);
+    const current = await this.#repository.markExpiredDispatchUnresolved(intentId, trustedAccountId, cutoff, reconciliationAuthorization);
     if (current.state === 'SUBMISSION_AMBIGUOUS') {
       throw new LiveExecutionError('LIVE_CANCEL_AMBIGUOUS', 'Cannot cancel an order whose submission outcome is unresolved', {
         details: { intentId: current.intentId },
@@ -176,7 +180,7 @@ export class LiveExecutionService {
     if (isLiveTerminalState(current.state) || current.state === 'CREATED' || current.state === 'DISPATCH_RESERVED') {
       return Object.freeze({ kind: 'NOT_CANCELLABLE' as const, order: current, faultCode: current.faultCode });
     }
-    const claim = await this.#repository.claimCancel(intentId, trustedAccountId);
+    const claim = await this.#repository.claimCancel(intentId, trustedAccountId, reconciliationAuthorization);
     if (claim.kind === 'NOT_CANCELLABLE') {
       return Object.freeze({ kind: 'NOT_CANCELLABLE' as const, order: claim.order, faultCode: claim.order.faultCode });
     }
@@ -190,9 +194,13 @@ export class LiveExecutionService {
       return Object.freeze({ kind: 'CANCEL_REQUESTED' as const, order: claim.order, faultCode: claim.order.cancelFaultCode });
     }
 
-    const requested = claim.order;
-    const exchangeOrderId = requested.exchangeOrderId;
+    const exchangeOrderId = claim.order.exchangeOrderId;
     if (exchangeOrderId === null) throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Cancellation claim lost its exchange order identity', { details: { intentId } });
+
+    // [P18 Wave A2 / F18-14] The durable pre-wire checkpoint for cancel. A
+    // worker whose reconciliation generation was superseded since the claim
+    // above is fenced out here, before the gateway is ever reached.
+    const requested = await this.#repository.armCancelWire(intentId, claim.order.revision, reconciliationAuthorization);
 
     const result = await this.#gateway.cancelOrder({
       clientOrderId: requested.clientOrderId,
@@ -202,22 +210,22 @@ export class LiveExecutionService {
     });
 
     if (result.kind === 'AMBIGUOUS') {
-      const order = await this.#repository.completeCancelAttempt(intentId, claim.generation, 'AMBIGUOUS', 'LIVE_CANCEL_AMBIGUOUS');
+      const order = await this.#repository.completeCancelAttempt(intentId, claim.generation, 'AMBIGUOUS', 'LIVE_CANCEL_AMBIGUOUS', reconciliationAuthorization);
       return Object.freeze({ kind: 'AMBIGUOUS' as const, order, faultCode: 'LIVE_CANCEL_AMBIGUOUS' });
     }
     if (result.kind === 'PRE_DISPATCH_FAILURE' || result.kind === 'REJECTED') {
-      const order = await this.#repository.completeCancelAttempt(intentId, claim.generation, 'REJECTED', result.reasonCode);
+      const order = await this.#repository.completeCancelAttempt(intentId, claim.generation, 'REJECTED', result.reasonCode, reconciliationAuthorization);
       return Object.freeze({ kind: 'NOT_CANCELLABLE' as const, order, faultCode: result.reasonCode });
     }
 
     const observation = result.observation ?? await this.#fetchAuthoritativeObservation(requested, exchangeOrderId);
     if (observation === null) {
-      const order = await this.#repository.completeCancelAttempt(intentId, claim.generation, 'AMBIGUOUS', 'LIVE_CANCEL_AMBIGUOUS');
+      const order = await this.#repository.completeCancelAttempt(intentId, claim.generation, 'AMBIGUOUS', 'LIVE_CANCEL_AMBIGUOUS', reconciliationAuthorization);
       return Object.freeze({ kind: 'AMBIGUOUS' as const, order, faultCode: 'LIVE_CANCEL_AMBIGUOUS' });
     }
 
-    const acknowledged = await this.#repository.completeCancelAttempt(intentId, claim.generation, 'ACKNOWLEDGED', null);
-    const order = await this.#ingest(acknowledged, observation);
+    const acknowledged = await this.#repository.completeCancelAttempt(intentId, claim.generation, 'ACKNOWLEDGED', null, reconciliationAuthorization);
+    const order = await this.#ingest(acknowledged, observation, reconciliationAuthorization);
     if (order.state === 'FILLED') {
       return Object.freeze({ kind: 'FILLED_BEFORE_CANCEL' as const, order, faultCode: null });
     }
@@ -232,12 +240,12 @@ export class LiveExecutionService {
    * from `syncOrderState`). Idempotent: a replayed event and a late event both
    * resolve without regressing durable state.
    */
-  public async applyObservation(intentId: string, observation: LiveOrderObservation): Promise<LiveOrderStateRecord> {
+  public async applyObservation(intentId: string, observation: LiveOrderObservation, reconciliationAuthorization?: unknown): Promise<LiveOrderStateRecord> {
     const current = await this.#repository.load(intentId);
     if (current === null) {
       throw new LiveExecutionError('LIVE_INTENT_INVALID', 'No durable live order exists for this intent', { details: { intentId } });
     }
-    return this.#ingest(current, observation);
+    return this.#ingest(current, observation, reconciliationAuthorization);
   }
 
   /**
@@ -246,7 +254,7 @@ export class LiveExecutionService {
    * an acknowledgement into an eventual fill/cancel outcome without inventing
    * one locally.
    */
-  public async syncOrderState(intentId: string): Promise<LiveOrderStateRecord> {
+  public async syncOrderState(intentId: string, reconciliationAuthorization?: unknown): Promise<LiveOrderStateRecord> {
     const current = await this.#repository.load(intentId);
     if (current === null) {
       throw new LiveExecutionError('LIVE_INTENT_INVALID', 'No durable live order exists for this intent', { details: { intentId } });
@@ -265,7 +273,7 @@ export class LiveExecutionService {
       return current;
     }
     const observation = await this.#fetchAuthoritativeObservation(current, current.exchangeOrderId);
-    return observation === null ? current : this.#ingest(current, observation);
+    return observation === null ? current : this.#ingest(current, observation, reconciliationAuthorization);
   }
 
   async #fetchAuthoritativeObservation(order: LiveOrderStateRecord, exchangeOrderId: string | null): Promise<LiveOrderObservation | null> {
@@ -292,15 +300,15 @@ export class LiveExecutionService {
   }
 
   /** Records the observation for audit/dedup, then folds it into durable state. */
-  async #ingest(current: LiveOrderStateRecord, observation: LiveOrderObservation): Promise<LiveOrderStateRecord> {
+  async #ingest(current: LiveOrderStateRecord, observation: LiveOrderObservation, reconciliationAuthorization: unknown): Promise<LiveOrderStateRecord> {
     // Pure validation is deliberately first. A hostile observation must not
     // reach even the append-only event log before its identity and financial
     // conservation have been proven against durable local truth.
-    return this.#repository.applyObservationAtomically(current.intentId, observation);
+    return this.#repository.applyObservationAtomically(current.intentId, observation, reconciliationAuthorization);
   }
 
-  async #commitRejection(reserved: LiveOrderStateRecord, reasonCode: string): Promise<LiveOrderStateRecord> {
-    return this.#repository.commitState(markRejected(reserved, reasonCode), reserved.revision);
+  async #commitRejection(reserved: LiveOrderStateRecord, reasonCode: string, reconciliationAuthorization: unknown): Promise<LiveOrderStateRecord> {
+    return this.#repository.commitState(markRejected(reserved, reasonCode), reserved.revision, reconciliationAuthorization);
   }
 
   #requireIntent(intent: unknown): LiveExecutionIntentRecord {

@@ -29,6 +29,7 @@ import { describe, expect, it } from 'vitest';
 import { LiveExecutionError } from '../../../../src/execution/live/errors';
 import type { LiveExecutionIntentRecord } from '../../../../src/execution/live/intent';
 import {
+  LIVE_EXECUTION_TEST_TRANSACTION,
   PrismaLiveExecutionRepository,
   liveExecutionIntentContentSha256,
   verifyStoredIntentIntegrity,
@@ -50,6 +51,11 @@ type Row = Record<string, unknown>;
  * through the repository.
  */
 class TamperableDb {
+  // [F18-15] This suite exists to prove Phase17 durable-integrity verification,
+  // not Phase18 reconciliation fencing — so it deliberately, EXPLICITLY opts
+  // out of the fence via the marker the production repository requires, never
+  // by omitting a delegate the fence used to infer that from.
+  public readonly [LIVE_EXECUTION_TEST_TRANSACTION] = true as const;
   public readonly intents = new Map<string, Row>();
   public readonly orders = new Map<string, Row>();
   public readonly events = new Map<string, Row>();
@@ -88,7 +94,8 @@ class TamperableDb {
       run: () => {
         const intentId = data['intentId'] as string;
         if (this.orders.has(intentId)) throw this.#unique();
-        this.orders.set(intentId, { ...data, updatedAt: new Date(0) });
+        // Mirrors the real column defaults for columns `ensureIntent` omits.
+        this.orders.set(intentId, { dispatchWireArmed: false, cancelWireArmed: false, ...data, updatedAt: new Date(0) });
         return data;
       },
     }),
@@ -109,6 +116,15 @@ class TamperableDb {
       this.orders.set(where.intentId, next);
       return next;
     },
+    // [P18] Faithful to Prisma: filters by account and joins the related intent,
+    // which is what lets the Phase18 account-wide read be verified per row.
+    findMany: async ({ where, include }: { where: { accountId: string }; include?: { intent?: boolean } }) =>
+      [...this.orders.entries()]
+        .filter(([, row]) => row['accountId'] === where.accountId)
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .map(([intentId, row]) => (include?.intent === true
+          ? { ...row, createdAt: new Date(0), updatedAt: new Date(0), intent: this.intents.get(intentId) ?? null }
+          : { ...row, createdAt: new Date(0), updatedAt: new Date(0) })),
   };
 
   public readonly liveOrderEvent = {
@@ -613,6 +629,8 @@ describe('F17-R03 no authoritative path accepts durable state without verificati
   }[] = [
     { name: 'ensureIntent', kind: 'verified-read', call: (r) => r.ensureIntent(intentRecord()) },
     { name: 'claimDispatch', kind: 'verified-read', call: (r) => r.claimDispatch(INTENT_ID, async () => true) },
+    { name: 'armDispatchWire', kind: 'verified-read', call: (r) => r.armDispatchWire(INTENT_ID, 999) },
+    { name: 'armCancelWire', kind: 'verified-read', call: (r) => r.armCancelWire(INTENT_ID, 999) },
     { name: 'applyObservationAtomically', kind: 'verified-read', call: (r) => r.applyObservationAtomically(INTENT_ID, observation()) },
     { name: 'claimCancel', kind: 'verified-read', call: (r) => r.claimCancel(INTENT_ID, ACCOUNT) },
     { name: 'completeCancelAttempt', kind: 'verified-read', call: (r) => r.completeCancelAttempt(INTENT_ID, 1, 'ACKNOWLEDGED', null) },
@@ -623,8 +641,21 @@ describe('F17-R03 no authoritative path accepts durable state without verificati
       intentId: INTENT_ID, clientOrderId: CLIENT_ORDER_ID, accountId: ACCOUNT, pair: PAIR, state: 'ACKNOWLEDGED',
       exchangeOrderId: 'venue-1', orderedQuantity: '0.5', cumulativeFilledQuantity: '0', remainingQuantity: '0.5',
       averageFillPrice: null, lastExchangeStatus: 'open', lastProviderEventTimeMs: 1_000, faultCode: null,
-      cancelState: 'NONE', cancelGeneration: 0, cancelExchangeOrderId: null, cancelFaultCode: null, revision: 3,
+      cancelState: 'NONE', cancelGeneration: 0, cancelExchangeOrderId: null, cancelFaultCode: null,
+      dispatchWireArmed: false, cancelWireArmed: false, revision: 3,
     }, 2) },
+    // [P18] Reconciliation's two additive paths get the SAME treatment as every
+    // Phase17 path: both re-prove the sealed intent digest and the immutable
+    // order mirrors before they return or write anything, so a poisoned
+    // database fails them closed too.
+    { name: 'commitReconciledState', kind: 'guarded-write', call: (r) => r.commitReconciledState({
+      intentId: INTENT_ID, clientOrderId: CLIENT_ORDER_ID, accountId: ACCOUNT, pair: PAIR, state: 'ACKNOWLEDGED',
+      exchangeOrderId: 'venue-1', orderedQuantity: '0.5', cumulativeFilledQuantity: '0', remainingQuantity: '0.5',
+      averageFillPrice: null, lastExchangeStatus: 'open', lastProviderEventTimeMs: 1_000, faultCode: null,
+      cancelState: 'NONE', cancelGeneration: 0, cancelExchangeOrderId: null, cancelFaultCode: null,
+      dispatchWireArmed: false, cancelWireArmed: false, revision: 3,
+    }, 2, null) },
+    { name: 'listAccountOrderViews', kind: 'verified-read', call: (r) => r.listAccountOrderViews(ACCOUNT) },
     { name: 'loadPositionOwnership', kind: 'undigested-read', call: (r) => r.loadPositionOwnership(ACCOUNT, PAIR) },
   ];
 

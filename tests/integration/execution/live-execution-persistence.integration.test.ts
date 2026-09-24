@@ -6,9 +6,12 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { RiskAdmissionCoordinator } from '../../../src/dispatch/admission';
 import { LiveExecutionAuthority } from '../../../src/execution/live/authority';
 import { LiveExecutionIntent, type LiveExecutionIntentRecord } from '../../../src/execution/live/intent';
-import { PrismaLiveExecutionRepository } from '../../../src/execution/live/repository';
+import { PrismaLiveExecutionRepository as ProductionPrismaLiveExecutionRepository } from '../../../src/execution/live/repository';
+import type { CompleteCancelAttemptOutcome } from '../../../src/execution/live/repository';
 import { LiveExecutionService } from '../../../src/execution/live/service';
 import type { LiveOrderObservation, LiveOrderStateRecord } from '../../../src/execution/live/types';
+import { newLiveRuntimeIdentity, readLiveRuntimeEpoch, type LiveRuntimeIdentity } from '../../../src/execution/live/reconciliation/barrier';
+import { PrismaLiveReconciliationRepository } from '../../../src/execution/live/reconciliation/repository';
 import { FakeOrderGateway, livePolicy, mintGenuineLiveOpen } from '../../unit/execution/live/helpers';
 
 // [P17-DB] Real MySQL proof of the Phase17 idempotence guarantees, over two
@@ -52,6 +55,132 @@ function executeShadowSql(sql: string): void {
 let dbAvailable = false;
 let connectionA: PrismaClient;
 let connectionB: PrismaClient;
+
+const phase17RuntimeIdentities = new Map<string, LiveRuntimeIdentity>();
+const phase17Authorizations = new Map<string, Promise<unknown>>();
+
+async function phase17ReconciliationAuthorization(client: PrismaClient, accountId: string): Promise<unknown> {
+  const existingAuthorization = phase17Authorizations.get(accountId);
+  if (existingAuthorization !== undefined) return existingAuthorization;
+  const pending = establishPhase17ReconciliationAuthorization(client, accountId);
+  phase17Authorizations.set(accountId, pending);
+  try {
+    return await pending;
+  } catch (error) {
+    phase17Authorizations.delete(accountId);
+    throw error;
+  }
+}
+
+async function establishPhase17ReconciliationAuthorization(client: PrismaClient, accountId: string): Promise<unknown> {
+  let identity = phase17RuntimeIdentities.get(accountId);
+  if (identity === undefined) {
+    identity = newLiveRuntimeIdentity();
+    phase17RuntimeIdentities.set(accountId, identity);
+  }
+  const epoch = readLiveRuntimeEpoch(identity)!;
+  await client.liveReconciliationState.upsert({
+    where: { accountId },
+    create: {
+      accountId,
+      status: 'HEALTHY',
+      currentGeneration: 1,
+      currentRunId: `p17-test-${accountId}`.slice(0, 64),
+      currentRuntimeEpoch: epoch,
+      healthyGeneration: 1,
+      blockingFindingCount: 0,
+      revision: 1,
+    },
+    update: {
+      status: 'HEALTHY',
+      currentGeneration: 1,
+      currentRunId: `p17-test-${accountId}`.slice(0, 64),
+      currentRuntimeEpoch: epoch,
+      healthyGeneration: 1,
+      blockingFindingCount: 0,
+      revision: 1,
+    },
+  });
+  const outcome = await new PrismaLiveReconciliationRepository(client).authorizeCurrentHealthy(accountId, identity);
+  if (outcome.authorization === null) throw new Error('Phase17 test fixture failed to establish reconciliation authority');
+  return outcome.authorization;
+}
+
+/**
+ * Phase17's real-MySQL suite predates the startup barrier. This adapter keeps
+ * every old assertion on the production repository while establishing a real,
+ * opaque reconciliation authority for the account before each mutation.
+ */
+class PrismaLiveExecutionRepository extends ProductionPrismaLiveExecutionRepository {
+  readonly #client: PrismaClient;
+
+  public constructor(client: PrismaClient) {
+    super(client);
+    this.#client = client;
+  }
+
+  async #accountForIntent(intentId: string): Promise<string> {
+    const row = await this.#client.liveExecutionIntent.findUnique({ where: { intentId }, select: { accountId: true } });
+    if (row === null) throw new Error(`Missing test intent ${intentId}`);
+    return row.accountId;
+  }
+
+  public override async claimDispatch(intentId: string, authorizationOrConsume?: unknown, authorizedConsume?: () => Promise<boolean>) {
+    const consume = authorizedConsume ?? (typeof authorizationOrConsume === 'function' ? authorizationOrConsume as () => Promise<boolean> : undefined);
+    const authorization = await phase17ReconciliationAuthorization(this.#client, await this.#accountForIntent(intentId));
+    return super.claimDispatch(intentId, authorization, consume);
+  }
+
+  // [F18-17] `LiveExecutionService.dispatch`/`cancelDurable` call `armDispatchWire`/
+  // `armCancelWire` with whatever `reconciliationAuthorization` THEY themselves
+  // received — never with what an overridden `claimDispatch`/`claimCancel`
+  // injected internally, since that injection is opaque to the service layer.
+  // Every test in this file calls `dispatch`/`cancelDurable` with no explicit
+  // authorization (Phase17's real-MySQL suite predates the startup barrier), so
+  // without these overrides the arm calls reach the PRODUCTION fence with
+  // `undefined` and fail closed. This is a fixture gap, not a production one:
+  // the two new arm methods get the exact same treatment as every other
+  // overridden mutation method above and below.
+  public override async armDispatchWire(intentId: string, expectedRevision: number) {
+    const authorization = await phase17ReconciliationAuthorization(this.#client, await this.#accountForIntent(intentId));
+    return super.armDispatchWire(intentId, expectedRevision, authorization);
+  }
+
+  public override async armCancelWire(intentId: string, expectedRevision: number) {
+    const authorization = await phase17ReconciliationAuthorization(this.#client, await this.#accountForIntent(intentId));
+    return super.armCancelWire(intentId, expectedRevision, authorization);
+  }
+
+  public override async commitState(next: LiveOrderStateRecord, expectedRevision: number) {
+    return super.commitState(next, expectedRevision, await phase17ReconciliationAuthorization(this.#client, next.accountId));
+  }
+
+  public override async applyObservationAtomically(intentId: string, observation: LiveOrderObservation) {
+    const authorization = await phase17ReconciliationAuthorization(this.#client, await this.#accountForIntent(intentId));
+    return super.applyObservationAtomically(intentId, observation, authorization);
+  }
+
+  public override async claimCancel(intentId: string, trustedAccountId: string) {
+    return super.claimCancel(intentId, trustedAccountId, await phase17ReconciliationAuthorization(this.#client, trustedAccountId));
+  }
+
+  public override async completeCancelAttempt(
+    intentId: string,
+    generation: number,
+    outcome: CompleteCancelAttemptOutcome,
+    faultCode: string | null,
+  ) {
+    const authorization = await phase17ReconciliationAuthorization(this.#client, await this.#accountForIntent(intentId));
+    return super.completeCancelAttempt(intentId, generation, outcome, faultCode, authorization);
+  }
+
+  public override async markExpiredDispatchUnresolved(intentId: string, trustedAccountId: string, cutoff: Date) {
+    return super.markExpiredDispatchUnresolved(
+      intentId, trustedAccountId, cutoff,
+      await phase17ReconciliationAuthorization(this.#client, trustedAccountId),
+    );
+  }
+}
 
 beforeAll(async () => {
   if (!BASE_DATABASE_URL) {

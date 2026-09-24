@@ -33,6 +33,42 @@ export const LIVE_WIRE_ORDER_TYPES = [
   'take_profit_market',
 ] as const;
 
+/**
+ * [Wave B3 / F18-24] Deliberately carries NO `time_in_force` field.
+ *
+ * This is the RESPONSE-side economics shape (create-response and list-orders/
+ * observation), not the create-REQUEST shape below (`LiveCreateRequestSchema`,
+ * which DOES send `time_in_force` — a request and its response are different
+ * contracts). `docs/PHASE18_RECONCILIATION.md` §8 records this precisely:
+ * [Wave B4 / F18-24] no authoritative time-in-force field is documented in
+ * the verified CoinDCX futures List Orders response contract available to
+ * this project. That is an evidence-bounded claim about what this project has
+ * verified and documented, not an assertion about the provider's full,
+ * possibly-undocumented behavior under every circumstance — this project has
+ * no way to prove a universal negative about an external API it does not
+ * control. The distinction matters operationally: it is why `.passthrough()`
+ * below preserves unexpected fields instead of stripping them, and why F18-21
+ * blocks on the ABSENCE of verified evidence rather than on a claim that the
+ * field structurally cannot exist.
+ *
+ * `.passthrough()` means any UNEXPECTED field the real venue response
+ * happens to carry — including, hypothetically, a TIF-like one — is
+ * preserved in the parsed object rather than stripped, but nothing here maps
+ * it into `LiveVenueOrderEvidence`: no such field is added to this schema on
+ * spec, because doing so without a verified field name and verified
+ * semantics would be exactly the kind of fabricated provider behavior this
+ * repository's evidence model forbids (§14 "absence is never proof" cuts
+ * both ways — presence of an UNVERIFIED field is not proof either). If a
+ * maintainer ever independently verifies a real field name and its
+ * authoritative meaning against actual CoinDCX documentation or a captured
+ * response, the correct sequence is: (1) add it here as a typed, non-optional
+ * enum of only the documented values; (2) map it into
+ * `LiveVenueOrderEvidence` with unknown/malformed values normalized to
+ * "unproven", never guessed; (3) SEPARATELY and explicitly decide whether to
+ * narrow `ambiguousCreateIdentityUnobservableReason` (F18-21) — its presence
+ * in the wire shape must never, by itself, re-enable automatic ambiguous-
+ * create resolution.
+ */
 const LiveOrderEconomicsSchema = z
   .object({
     id: z.string().min(1),

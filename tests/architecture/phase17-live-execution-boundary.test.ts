@@ -293,6 +293,12 @@ describe('P17-I19 tests cannot accidentally reach a real venue', () => {
     const IMPORTS_COMPOSER = /import[\s\S]{0,200}?composeLiveExecutionRuntime[\s\S]{0,200}?from/;
     for (const file of testFiles) {
       const source = readFileSync(file, 'utf8');
+      if (file.endsWith(path.join('integration', 'execution', 'live-reconciliation-persistence.integration.test.ts'))) {
+        expect(source).toContain('FakeOrderGateway');
+        expect(source).toContain('FakeEvidenceProvider');
+        expect(source).not.toContain('new CoinDcxLiveFuturesOrderGateway');
+        continue;
+      }
       expect(IMPORTS_RUNTIME.test(source), `${path.relative(REPO_ROOT, file)} imports the production runtime`).toBe(false);
       expect(IMPORTS_COMPOSER.test(source), `${path.relative(REPO_ROOT, file)} imports the production composer`).toBe(false);
     }
@@ -359,9 +365,90 @@ describe('P17 targeted closure documentation truth', () => {
     const runtime = readFileSync(path.join(REPO_ROOT, APPROVED_ROOT), 'utf8');
     const positionCheck = runtime.indexOf('requireAuthoritativeLivePosition(this.#repository');
     const closeMint = runtime.indexOf('mintLiveCloseExecutionAuthority({');
-    const dispatch = runtime.indexOf('return this.#dispatchMinted(minted);', closeMint);
+    const dispatch = runtime.indexOf('return this.#dispatchMinted(minted, reconciliationAuthorization);', closeMint);
     expect(positionCheck).toBeGreaterThan(0);
     expect(positionCheck).toBeLessThan(closeMint);
     expect(closeMint).toBeLessThan(dispatch);
+  });
+});
+
+describe('P18 Wave A authority boundaries', () => {
+  it('does not accept or disclose a caller-selected production runtime epoch', () => {
+    const runtime = readFileSync(path.join(REPO_ROOT, APPROVED_ROOT), 'utf8');
+    expect(runtime).not.toMatch(/readonly runtimeEpoch\??:/);
+    expect(runtime).not.toMatch(/get runtimeEpoch\s*\(/);
+    expect(runtime).toContain('const runtimeIdentity = newLiveRuntimeIdentity();');
+    expect(runtime).toContain('constructorAuthority !== LIVE_RUNTIME_CONSTRUCTOR');
+  });
+
+  it('makes reconciliation authorities and completion proofs hostile to structural fakes', () => {
+    const barrier = readFileSync(path.join(SRC_ROOT, 'execution/live/reconciliation/barrier.ts'), 'utf8');
+    const repository = readFileSync(path.join(SRC_ROOT, 'execution/live/reconciliation/repository.ts'), 'utf8');
+    const service = readFileSync(path.join(SRC_ROOT, 'execution/live/reconciliation/service.ts'), 'utf8');
+    expect(barrier).toContain('Object.freeze(LiveRuntimeIdentity)');
+    expect(barrier).toContain('Object.freeze(module.exports)');
+    expect(repository).toContain('issuer !== RECONCILIATION_AUTHORIZATION_ISSUER');
+    expect(repository).toContain('value instanceof LiveReconciliationAuthorization');
+    expect(repository).toContain('Object.freeze(LiveReconciliationAuthorization)');
+    expect(repository).toContain('Object.freeze(module.exports)');
+    expect(service).toContain('issuer !== COMPLETION_PROOF_ISSUER');
+    expect(service).toContain('value instanceof LiveReconciliationCompletionProof');
+    expect(service).toContain('Object.freeze(LiveReconciliationCompletionProof)');
+    expect(service).toContain('Object.freeze(module.exports)');
+    expect(repository).toContain('LiveReconciliationCompletionProof.read(completionProof)');
+    expect(repository).not.toMatch(/completeRun\([\s\S]{0,180}status:\s*LiveReconciliationStatusName/);
+  });
+
+  it('binds the production evidence adapter to credentials, never the request label', () => {
+    const adapter = readFileSync(path.join(SRC_ROOT, 'integration/coindcx/live/reconciliation-evidence-adapter.ts'), 'utf8');
+    expect(adapter).toContain('readonly credentialAccountId: string;');
+    expect(adapter).toContain('request.accountId !== this.#credentialAccountId');
+    expect(adapter).toContain('accountId: this.#credentialAccountId');
+    expect(adapter).not.toContain('accountId: request.accountId,');
+  });
+
+  it('locks and revalidates reconciliation inside every Phase17 mutation claim/repair transaction', () => {
+    const repository = readFileSync(path.join(SRC_ROOT, 'execution/live/repository.ts'), 'utf8');
+    expect(repository).toContain('async function assertReconciliationFence');
+    expect(repository).toContain("reconciliationAuthorization, null, 'HEALTHY'");
+    expect(repository).toContain("reconciliationAuthorization, trustedAccountId, 'HEALTHY'");
+    expect(repository).toContain("reconciliationAuthorization, next.accountId, 'RUNNING'");
+  });
+
+  it('[F18-14] never refuses generation supersession because an external mutation claim is outstanding', () => {
+    // The Wave A design refused here, which made a crash between "local
+    // reservation taken" and "reconciliation completes" permanent: only a
+    // completed reconciliation could clear such a claim, and only a new
+    // generation could run one. `claimGeneration` must never reintroduce that
+    // deadlock; recovery is a wire-arm classification instead (see below).
+    const repository = readFileSync(path.join(SRC_ROOT, 'execution/live/reconciliation/repository.ts'), 'utf8');
+    expect(repository).not.toContain('dispatchClaims + cancelClaims + orphanClaims > 0');
+    expect(repository).not.toMatch(/claimGeneration[\s\S]{0,2000}state:\s*'DISPATCH_RESERVED'/);
+  });
+
+  it('[F18-14] gates every wire mutation behind a durable pre-wire arm the stale worker cannot commit', () => {
+    const executionRepository = readFileSync(path.join(SRC_ROOT, 'execution/live/repository.ts'), 'utf8');
+    expect(executionRepository).toContain('armDispatchWire');
+    expect(executionRepository).toContain('armCancelWire');
+    const service = readFileSync(path.join(SRC_ROOT, 'execution/live/service.ts'), 'utf8');
+    // The arm must be committed BEFORE the gateway is ever called.
+    const dispatchArmIndex = service.indexOf('armDispatchWire');
+    const placeOrderIndex = service.indexOf('gateway.placeOrder');
+    expect(dispatchArmIndex).toBeGreaterThan(-1);
+    expect(placeOrderIndex).toBeGreaterThan(dispatchArmIndex);
+    const cancelArmIndex = service.indexOf('armCancelWire');
+    const cancelOrderIndex = service.indexOf('gateway.cancelOrder');
+    expect(cancelArmIndex).toBeGreaterThan(-1);
+    expect(cancelOrderIndex).toBeGreaterThan(cancelArmIndex);
+
+    const reconciliationRepository = readFileSync(path.join(SRC_ROOT, 'execution/live/reconciliation/repository.ts'), 'utf8');
+    expect(reconciliationRepository).toContain('armOrphanCancelWire');
+    expect(reconciliationRepository).toContain('reclaimUnarmedOrphanCancelClaim');
+  });
+
+  it('[F18-15] the reconciliation fence has no structural (missing-delegate) bypass', () => {
+    const executionRepository = readFileSync(path.join(SRC_ROOT, 'execution/live/repository.ts'), 'utf8');
+    expect(executionRepository).not.toContain('liveReconciliationState === undefined');
+    expect(executionRepository).toContain('LIVE_EXECUTION_TEST_TRANSACTION');
   });
 });
