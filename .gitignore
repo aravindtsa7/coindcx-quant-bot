@@ -33,3 +33,6 @@ Thumbs.db
 *.sln
 *.sw?
 
+
+# Local, never-committed artifacts (e.g. the read-only provider probe output)
+.local/
