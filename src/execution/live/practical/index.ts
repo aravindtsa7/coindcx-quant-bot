@@ -87,6 +87,7 @@ export {
   beginPracticalMutationLease,
   finishPracticalCertification,
   initialPracticalFence,
+  readPracticalAccountFence,
   releasePracticalMutationLease,
   type PracticalAccountFence,
   type PracticalFenceExpectation,

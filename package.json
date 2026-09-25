@@ -14,6 +14,7 @@
     "test:integration:sol-live": "tsx scripts/run-sol-live-integration.ts",
     "test:integration:live-execution": "tsx scripts/run-live-execution-db-integration.ts",
     "test:integration:live-reconciliation": "tsx scripts/run-live-reconciliation-db-integration.ts",
+    "test:integration:live-practical": "tsx scripts/run-live-practical-db-integration.ts",
     "verify:migration:phase17": "tsx scripts/verify-phase17-migration-parity.ts",
     "verify:migration:phase18": "tsx scripts/verify-phase18-migration-parity.ts",
     "lint": "eslint \"src/**/*.ts\" \"tests/**/*.ts\" \"scripts/provider-probe/**/*.ts\" scripts/coindcx-readonly-provider-probe.ts",

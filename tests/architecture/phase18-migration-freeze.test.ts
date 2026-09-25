@@ -35,9 +35,12 @@ const FROZEN_MIGRATIONS: Readonly<Record<string, string>> = Object.freeze({
   '20260921000000_phase18_reconciliation': '159d60b2314532a285e942b260300468285be19083166e2a123b6cf73761c0ab',
   '20260921010000_phase18_wave_a2_crash_recovery': '8387511487309150f7df64ee7bc822677c2774c695cb3d35d03dee2209a0c50a',
   '20260922000000_phase18_wave_c1_orphan_resolution': '14272259dc91d1a1c63325f47bf073b75e6a85583f3907de3c11b935e86cebf7',
+  // Phase 18B Stage 1B1 (practical live-safety persistence), frozen after final source + SQL review (P18B-1B1-01..05 closed).
+  '20260925000000_phase18b_practical_persistence': '734e3d01758667cf652c1a57745fc3c2bca9476599459b820f752a20eb054f99',
 });
 
 const PHASE18_MIGRATIONS = Object.keys(FROZEN_MIGRATIONS).filter((name) => name.includes('_phase18_'));
+const PHASE18B_STAGE_1B1_MIGRATION = '20260925000000_phase18b_practical_persistence';
 const MIGRATION_DIRECTORY = /^\d{14}_[a-z0-9_]+$/;
 
 function migrationDirectories(): string[] {
@@ -58,6 +61,21 @@ describe('[F18-19] accepted migrations are frozen', () => {
       '20260921010000_phase18_wave_a2_crash_recovery',
       '20260922000000_phase18_wave_c1_orphan_resolution',
     ]);
+  });
+
+  it('pins the accepted Phase18B Stage 1B1 migration under its exact name, and no other Phase18B migration', () => {
+    expect(Object.keys(FROZEN_MIGRATIONS).filter((name) => name.includes('phase18b'))).toEqual([PHASE18B_STAGE_1B1_MIGRATION]);
+    expect(FROZEN_MIGRATIONS[PHASE18B_STAGE_1B1_MIGRATION]).toBe('734e3d01758667cf652c1a57745fc3c2bca9476599459b820f752a20eb054f99');
+    expect(migrationDirectories()).toContain(PHASE18B_STAGE_1B1_MIGRATION);
+  });
+
+  it('a second Phase18B migration is never covered by the accepted one\'s pin: it is unfrozen and must be a later forward migration', () => {
+    // The pin is an exact directory-name lookup (no prefix or pattern match), so another
+    // phase18b directory is a separate, not-yet-accepted migration and must sort after it.
+    for (const directory of migrationDirectories().filter((name) => name.includes('phase18b') && name !== PHASE18B_STAGE_1B1_MIGRATION)) {
+      expect(Object.prototype.hasOwnProperty.call(FROZEN_MIGRATIONS, directory), directory).toBe(false);
+      expect(directory > PHASE18B_STAGE_1B1_MIGRATION, `${directory} must sort after ${PHASE18B_STAGE_1B1_MIGRATION}`).toBe(true);
+    }
   });
 
   it.each(Object.entries(FROZEN_MIGRATIONS))('%s is byte-identical to its accepted content', (directory, sha256) => {

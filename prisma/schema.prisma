@@ -1195,3 +1195,303 @@ model LivePositionOwnershipShare {
   @@index([accountId, pair], map: "live_position_ownership_share_account_pair_idx")
   @@map("live_position_ownership_share")
 }
+
+// ---------------------------------------------------------------------------
+// Phase 18B Stage 1B1: practical live-safety durable persistence.
+//
+// Durable storage ONLY. Nothing here authorizes, arms, or dispatches a
+// mutation, and nothing here is, or converts to, Phase 18 account continuity.
+// The Stage 1A pure-domain modules (src/execution/live/practical) remain the
+// authority model; these tables are their durable, fenced representation.
+//
+// Invariants the Prisma schema cannot express (the discriminated fence mode,
+// status/terminal-field coupling, state/current-pointer coupling, and
+// "no lease is armed in Stage 1B1") are enforced by CHECK constraints in the
+// migration AND re-validated by the repository on every read.
+// ---------------------------------------------------------------------------
+
+enum LivePracticalAccountStateName {
+  QUARANTINED
+  CERTIFYING
+  PROVIDER_UNAVAILABLE
+  CERTIFIED_IDLE
+  MUTATING
+  MANUAL_REVIEW_REQUIRED
+}
+
+enum LivePracticalFenceMode {
+  IDLE
+  CERTIFYING
+  MUTATION_LEASED
+}
+
+enum LivePracticalMutationAction {
+  OPEN
+  CANCEL
+  CLOSE
+}
+
+enum LivePracticalCertificateStatus {
+  ISSUED
+  CONSUMED
+  EXPIRED
+  REVOKED
+}
+
+enum LivePracticalLeaseStatus {
+  LEASED
+  COMPLETED
+}
+
+enum LivePracticalMutationOutcome {
+  ACCEPTED
+  REJECTED
+  AMBIGUOUS
+  DUPLICATE_CLIENT_ORDER_ID
+  PRE_DISPATCH_FAILURE
+}
+
+enum LivePracticalRecoveryEpisodeStatus {
+  OPEN
+  CERTIFIED
+  ESCALATED_TO_MANUAL_REVIEW
+}
+
+enum LivePracticalReviewEpisodeStatus {
+  OPEN
+  RESOLVED
+}
+
+enum LivePracticalReviewEpisodeKind {
+  /// Entered through a Stage 1A MANUAL_REVIEW invalidation of a valid account.
+  INVALIDATION
+  /// Entered because the account's durable practical rows failed strict validation.
+  MALFORMED_STATE
+}
+
+/// The CURRENT practical safety state of one account (Stage 1A state
+/// machine). Exactly one row per account. Absent row = genuinely no prior
+/// practical state; a present-but-malformed row is never read as absent.
+model LivePracticalAccountState {
+  accountId String @id @map("account_id") @db.VarChar(128)
+
+  state LivePracticalAccountStateName
+
+  /// Open recovery episode. Non-null exactly while QUARANTINED, CERTIFYING, or PROVIDER_UNAVAILABLE.
+  currentRecoveryEpisodeId String? @unique(map: "live_practical_account_state_recovery_episode_key") @map("current_recovery_episode_id") @db.VarChar(64)
+  /// Current manual-review episode. Non-null exactly while MANUAL_REVIEW_REQUIRED.
+  currentReviewEpisodeId   String? @unique(map: "live_practical_account_state_review_episode_key") @map("current_review_episode_id") @db.VarChar(64)
+  /// The ISSUED certificate. Non-null exactly while CERTIFIED_IDLE.
+  currentCertificateId     String? @unique(map: "live_practical_account_state_certificate_key") @map("current_certificate_id") @db.Char(64)
+
+  revision  BigInt   @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  currentRecoveryEpisode LivePracticalRecoveryEpisode? @relation("LivePracticalCurrentRecoveryEpisode", fields: [currentRecoveryEpisodeId], references: [episodeId], onDelete: Restrict, onUpdate: Restrict, map: "live_practical_account_state_recovery_episode_fkey")
+  currentReviewEpisode   LivePracticalReviewEpisode?   @relation("LivePracticalCurrentReviewEpisode", fields: [currentReviewEpisodeId], references: [reviewEpisodeId], onDelete: Restrict, onUpdate: Restrict, map: "live_practical_account_state_review_episode_fkey")
+  currentCertificate     LivePracticalCertificate?     @relation("LivePracticalCurrentCertificate", fields: [currentCertificateId], references: [certificateId], onDelete: Restrict, onUpdate: Restrict, map: "live_practical_account_state_certificate_fkey")
+
+  fence        LivePracticalAccountFence?
+  certificates LivePracticalCertificate[]    @relation("LivePracticalCertificateAccount")
+  leases       LivePracticalMutationLease[]
+
+  @@map("live_practical_account_state")
+}
+
+/// The per-account practical fence (Stage 1A `PracticalAccountFence`). One
+/// row per account; every transition is a compare-and-set on `revision`
+/// under `SELECT ... FOR UPDATE`.
+model LivePracticalAccountFence {
+  accountId String @id @map("account_id") @db.VarChar(128)
+
+  runtimeEpoch             String                 @map("runtime_epoch") @db.VarChar(64)
+  reconciliationGeneration Int                    @map("reconciliation_generation")
+  /// Compare-and-set token. BIGINT so the Stage 1A MAX_SAFE_INTEGER guard is reachable and provable.
+  revision                 BigInt                 @default(0)
+  mode                     LivePracticalFenceMode @default(IDLE)
+  /// CERTIFYING only.
+  runId                    String?                @map("run_id") @db.VarChar(64)
+  /// MUTATION_LEASED only.
+  leaseId                  String?                @map("lease_id") @db.VarChar(64)
+  /// MUTATION_LEASED only.
+  certificateId            String?                @map("certificate_id") @db.Char(64)
+  /// MUTATION_LEASED only.
+  leaseAction              LivePracticalMutationAction? @map("lease_action")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  account LivePracticalAccountState   @relation(fields: [accountId], references: [accountId], onDelete: Restrict, onUpdate: Restrict, map: "live_practical_account_fence_account_fkey")
+  /// A MUTATION_LEASED fence names a real lease with the SAME lease id, certificate, account, action, runtime epoch, and
+  /// generation (composite FK). The lease's LEASED status, and exact-case equality, are re-validated by the repository.
+  lease   LivePracticalMutationLease? @relation("LivePracticalFenceLease", fields: [leaseId, certificateId, accountId, leaseAction, runtimeEpoch, reconciliationGeneration], references: [leaseId, certificateId, accountId, action, runtimeEpoch, reconciliationGeneration], onDelete: Restrict, onUpdate: Restrict, map: "live_practical_account_fence_lease_fkey")
+
+  @@unique([leaseId, certificateId], map: "live_practical_account_fence_lease_key")
+  @@unique([leaseId, certificateId, accountId, leaseAction, runtimeEpoch, reconciliationGeneration], map: "live_practical_account_fence_lease_binding_key")
+  @@map("live_practical_account_fence")
+}
+
+/// Durable source of truth for a practical recovery certificate. The durable
+/// status (not any in-memory object) is the one-shot arbiter: ISSUED moves
+/// to exactly one terminal status, once, by a conditional update, and never
+/// back.
+model LivePracticalCertificate {
+  certificateId String @id @map("certificate_id") @db.Char(64)
+
+  accountId                  String @map("account_id") @db.VarChar(128)
+  /// Lowercase 64-hex digest of the provider account identity (Phase 18 policy). Never the raw identity.
+  providerAccountFingerprint String @map("provider_account_fingerprint") @db.Char(64)
+  runtimeEpoch               String @map("runtime_epoch") @db.VarChar(64)
+  reconciliationGeneration   Int    @map("reconciliation_generation")
+  streamIncarnation          Int    @map("stream_incarnation")
+  evidenceDigest             String @map("evidence_digest") @db.Char(64)
+  issuedAtMs                 BigInt @map("issued_at_ms")
+  /// Absolute; fixed at issuance; never extended.
+  expiresAtMs                BigInt @map("expires_at_ms")
+
+  status         LivePracticalCertificateStatus @default(ISSUED)
+  terminalAtMs   BigInt?                        @map("terminal_at_ms")
+  /// Invalidation reason for REVOKED / EXPIRED. Null while ISSUED and for CONSUMED.
+  terminalReason String?                        @map("terminal_reason") @db.VarChar(64)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  account          LivePracticalAccountState     @relation("LivePracticalCertificateAccount", fields: [accountId], references: [accountId], onDelete: Restrict, onUpdate: Restrict, map: "live_practical_certificate_account_fkey")
+  currentFor       LivePracticalAccountState?    @relation("LivePracticalCurrentCertificate")
+  lease            LivePracticalMutationLease?
+  certifiedEpisode LivePracticalRecoveryEpisode? @relation("LivePracticalCertifiedEpisode")
+
+  @@index([accountId, status], map: "live_practical_certificate_account_status_idx")
+  /// Referenced by the lease's composite certificate-binding foreign key.
+  @@unique([certificateId, accountId, runtimeEpoch, reconciliationGeneration], map: "live_practical_certificate_lease_binding_key")
+  @@map("live_practical_certificate")
+}
+
+/// One practical mutation lease per consumed certificate (UNIQUE
+/// certificate_id). Stage 1B1 records leases only: nothing arms or
+/// dispatches one, and a CHECK constraint keeps `armed_at_ms` NULL.
+model LivePracticalMutationLease {
+  leaseId String @id @map("lease_id") @db.VarChar(64)
+
+  accountId                String                      @map("account_id") @db.VarChar(128)
+  certificateId            String                      @unique(map: "live_practical_mutation_lease_certificate_key") @map("certificate_id") @db.Char(64)
+  action                   LivePracticalMutationAction
+  /// Not wired in Stage 1B1 (always NULL).
+  intentId                 String?                     @map("intent_id") @db.VarChar(64)
+  /// Not wired in Stage 1B1 (always NULL).
+  clientOrderId            String?                     @map("client_order_id") @db.VarChar(64)
+  runtimeEpoch             String                      @map("runtime_epoch") @db.VarChar(64)
+  reconciliationGeneration Int                         @map("reconciliation_generation")
+  createdAtMs              BigInt                      @map("created_at_ms")
+  /// Stage 1B1: always NULL (CHECK). Arming belongs to Stage 1B2.
+  armedAtMs                BigInt?                     @map("armed_at_ms")
+  completedAtMs            BigInt?                     @map("completed_at_ms")
+  status                   LivePracticalLeaseStatus    @default(LEASED)
+  /// Bookkeeping only: records what the caller reported. It is not evidence that a provider mutation happened.
+  outcome                  LivePracticalMutationOutcome?
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  account     LivePracticalAccountState  @relation(fields: [accountId], references: [accountId], onDelete: Restrict, onUpdate: Restrict, map: "live_practical_mutation_lease_account_fkey")
+  /// The lease's certificate with the SAME certificate id, account, runtime epoch, and generation (composite FK). The
+  /// certificate's CONSUMED status, and exact-case equality, are re-validated by the repository.
+  certificate LivePracticalCertificate   @relation(fields: [certificateId, accountId, runtimeEpoch, reconciliationGeneration], references: [certificateId, accountId, runtimeEpoch, reconciliationGeneration], onDelete: Restrict, onUpdate: Restrict, map: "live_practical_mutation_lease_certificate_fkey")
+  fence       LivePracticalAccountFence? @relation("LivePracticalFenceLease")
+
+  @@unique([leaseId, certificateId], map: "live_practical_mutation_lease_lease_certificate_key")
+  /// Referenced by the fence's composite lease-binding foreign key.
+  @@unique([leaseId, certificateId, accountId, action, runtimeEpoch, reconciliationGeneration], map: "live_practical_mutation_lease_fence_binding_key")
+  /// The referencing side of the composite lease -> certificate binding FK.
+  @@unique([certificateId, accountId, runtimeEpoch, reconciliationGeneration], map: "live_practical_mutation_lease_certificate_binding_key")
+  @@index([accountId], map: "live_practical_mutation_lease_account_idx")
+  @@map("live_practical_mutation_lease")
+}
+
+/// Append-only history of practical recovery episodes: one episode spans an
+/// account's time in {QUARANTINED, CERTIFYING, PROVIDER_UNAVAILABLE} and ends
+/// CERTIFIED or ESCALATED_TO_MANUAL_REVIEW. Rows are closed, never deleted.
+model LivePracticalRecoveryEpisode {
+  episodeId String @id @map("episode_id") @db.VarChar(64)
+
+  accountId                String                             @map("account_id") @db.VarChar(128)
+  startedAtMs              BigInt                             @map("started_at_ms")
+  endedAtMs                BigInt?                            @map("ended_at_ms")
+  /// Stage 1A `PracticalQuarantineCause`.
+  startCause               String                             @map("start_cause") @db.VarChar(64)
+  status                   LivePracticalRecoveryEpisodeStatus @default(OPEN)
+  runtimeEpoch             String                             @map("runtime_epoch") @db.VarChar(64)
+  /// Fence generation when the episode opened.
+  reconciliationGeneration Int?                               @map("reconciliation_generation")
+  /// Set when the episode ends CERTIFIED.
+  certifiedCertificateId   String?                            @unique(map: "live_practical_recovery_episode_certificate_key") @map("certified_certificate_id") @db.Char(64)
+  /// Set when the episode ends ESCALATED_TO_MANUAL_REVIEW.
+  reviewEpisodeId          String?                            @unique(map: "live_practical_recovery_episode_review_key") @map("review_episode_id") @db.VarChar(64)
+  /// The operator resolution that opened this episode, when opened by OPERATOR_RESOLVED.
+  openedByResolutionId     String?                            @map("opened_by_resolution_id") @db.VarChar(128)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  certifiedCertificate LivePracticalCertificate?   @relation("LivePracticalCertifiedEpisode", fields: [certifiedCertificateId], references: [certificateId], onDelete: Restrict, onUpdate: Restrict, map: "live_practical_recovery_episode_certificate_fkey")
+  reviewEpisode        LivePracticalReviewEpisode? @relation("LivePracticalEscalatedEpisode", fields: [reviewEpisodeId], references: [reviewEpisodeId], onDelete: Restrict, onUpdate: Restrict, map: "live_practical_recovery_episode_review_fkey")
+  currentFor           LivePracticalAccountState?  @relation("LivePracticalCurrentRecoveryEpisode")
+
+  @@index([accountId, startedAtMs], map: "live_practical_recovery_episode_account_idx")
+  @@map("live_practical_recovery_episode")
+}
+
+/// Append-only manual-review episodes. Each entry into MANUAL_REVIEW_REQUIRED
+/// creates a NEW unique review_episode_id; a resolution clears exactly the
+/// episode it was minted for (Stage 1A episode binding), at most once
+/// (UNIQUE resolution_id and OPEN -> RESOLVED conditional update).
+model LivePracticalReviewEpisode {
+  reviewEpisodeId String @id @map("review_episode_id") @db.VarChar(64)
+
+  accountId            String                           @map("account_id") @db.VarChar(128)
+  kind                 LivePracticalReviewEpisodeKind   @default(INVALIDATION)
+  enteredAtMs          BigInt                           @map("entered_at_ms")
+  /// Stage 1A invalidation reason (MANUAL_REVIEW severity), or exactly DURABLE_STATE_MALFORMED for a MALFORMED_STATE episode.
+  reason               String                           @db.VarChar(64)
+  /// MALFORMED_STATE only: the safe problem code that was detected. Never row contents.
+  malformedProblem     String?                          @map("malformed_problem") @db.VarChar(64)
+  /// The runtime that entered the episode. For MALFORMED_STATE: the detecting runtime, never a value repaired from the malformed rows.
+  runtimeEpoch         String                           @map("runtime_epoch") @db.VarChar(64)
+  status               LivePracticalReviewEpisodeStatus @default(OPEN)
+  resolvedAtMs         BigInt?                          @map("resolved_at_ms")
+  resolutionId         String?                          @unique(map: "live_practical_review_episode_resolution_key") @map("resolution_id") @db.VarChar(128)
+  /// Caller-asserted audit label copied from the Stage 1A resolution. Not an authenticated identity.
+  resolutionAssertedBy String?                          @map("resolution_asserted_by") @db.VarChar(128)
+  resolutionNote       String?                          @map("resolution_note") @db.VarChar(512)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  currentFor       LivePracticalAccountState?    @relation("LivePracticalCurrentReviewEpisode")
+  escalatedEpisode LivePracticalRecoveryEpisode? @relation("LivePracticalEscalatedEpisode")
+  latchFor         LivePracticalMalformedLatch?
+
+  @@index([accountId, enteredAtMs], map: "live_practical_review_episode_account_idx")
+  @@map("live_practical_review_episode")
+}
+
+/// Durable manual-review latch for an account whose practical rows are
+/// MALFORMED. Deliberately separate from (and with no foreign key to) the
+/// account rows: those rows may be the malformed ones, so escalation never
+/// rewrites or repairs them. While `current_review_episode_id` is set, the
+/// account is MANUAL_REVIEW_REQUIRED and every operation except escalation
+/// (idempotent) and the episode-bound resolution is refused. One row per
+/// account, ever; resolving clears the pointer, and a later detection sets a
+/// NEW episode.
+model LivePracticalMalformedLatch {
+  accountId String @id @map("account_id") @db.VarChar(128)
+
+  /// The CURRENT unresolved MALFORMED_STATE review episode, or null when not latched.
+  currentReviewEpisodeId String? @unique(map: "live_practical_malformed_latch_review_episode_key") @map("current_review_episode_id") @db.VarChar(64)
+
+  revision  BigInt   @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  currentReviewEpisode LivePracticalReviewEpisode? @relation(fields: [currentReviewEpisodeId], references: [reviewEpisodeId], onDelete: Restrict, onUpdate: Restrict, map: "live_practical_malformed_latch_review_episode_fkey")
+
+  @@map("live_practical_malformed_latch")
+}

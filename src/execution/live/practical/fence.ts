@@ -144,6 +144,27 @@ function validateFence(fence: unknown): PracticalAccountFence {
   return fence as unknown as PracticalAccountFence;
 }
 
+/**
+ * [Stage 1B1] The same strict validator, exposed read-only so the durable
+ * persistence adapter validates every stored fence row with the Stage 1A
+ * rules before use. It never repairs or normalizes: a malformed value throws
+ * PRACTICAL_FENCE_INVALID. It returns a frozen copy, so later changes to the
+ * caller's object cannot affect it. It grants nothing and changes no state.
+ */
+export function readPracticalAccountFence(value: unknown): PracticalAccountFence {
+  const fence = validateFence(value);
+  const mode = fence.mode.kind === 'IDLE'
+    ? IDLE
+    : Object.freeze({ ...fence.mode });
+  return Object.freeze({
+    accountId: fence.accountId,
+    runtimeEpoch: fence.runtimeEpoch,
+    reconciliationGeneration: fence.reconciliationGeneration,
+    revision: fence.revision,
+    mode,
+  });
+}
+
 /** revision + 1, refused rather than ever producing an unsafe integer. */
 function nextRevision(fence: PracticalAccountFence): number {
   if (fence.revision >= Number.MAX_SAFE_INTEGER) invalidFence('Fence revision is exhausted and cannot advance safely', { field: 'revision' });

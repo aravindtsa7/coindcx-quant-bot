@@ -8,7 +8,8 @@ import { buildImportGraph, computeReachable, extractImportSpecifiers } from './s
 // Phase 18B Stage 1A: the practical tree is pure domain. It cannot reach the
 // Phase 18 strict continuity barrier, cannot construct or name the strict
 // continuity capability, cannot reach Prisma, the network, signing, or any
-// CoinDCX module, reads no environment, and is wired into nothing yet — so no
+// CoinDCX module, reads no environment, and is wired into nothing but the
+// Stage 1B1 durable persistence adapter (itself wired into nothing), so no
 // caller can select a strict/practical gate.
 
 const REPO_ROOT = path.resolve(__dirname, '../..');
@@ -111,9 +112,16 @@ describe('no practical module reaches persistence, the network, signing, or Coin
 });
 
 describe('no caller-selectable gate and no premature wiring', () => {
-  it('nothing outside the practical tree imports it yet (no runtime, gateway, or barrier wiring)', () => {
+  it('outside the practical tree, ONLY the Stage 1B1 persistence adapter imports it (no runtime, gateway, or barrier wiring)', () => {
+    // [Stage 1B1] The exact importer set. Widening it (e.g. a runtime or a
+    // gateway) must be an explicit, reviewed edit of this list.
     const importers = files.filter((file) => !file.startsWith(PRACTICAL_ROOT) && (graph.get(file) ?? []).some((dependency) => dependency.startsWith(PRACTICAL_ROOT)));
-    expect(importers).toEqual([]);
+    expect(importers.sort()).toEqual([
+      'src/execution/live/practical-persistence/plan.ts',
+      'src/execution/live/practical-persistence/ports.ts',
+      'src/execution/live/practical-persistence/repository.ts',
+      'src/execution/live/practical-persistence/rows.ts',
+    ]);
   });
 
   it('the barrel exposes exactly the reviewed Stage 1A surface: no gate, selector, or issuance', () => {
@@ -149,6 +157,7 @@ describe('no caller-selectable gate and no premature wiring', () => {
       'practicalActionPermission',
       'practicalStateAfterTransitionFailure',
       'practicalStateForSeverity',
+      'readPracticalAccountFence',
       'releasePracticalMutationLease',
       'requirePracticalLiveSafetyEnablement',
       'revokePracticalRecoveryCertificate',
