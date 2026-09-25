@@ -16,23 +16,56 @@ export const LIVE_EXECUTION_INTENT_IDENTITY_POLICY_ID = 'P17_LIVE_EXECUTION_INTE
 export const LIVE_CLIENT_ORDER_ID_POLICY_ID = 'P17_LIVE_CLIENT_ORDER_ID_V1' as const;
 
 /**
- * Documented client-order-id adapter policy (P17-I06).
+ * Documented client-order-id adapter policy (P17-I06), now provider-backed.
  *
- * CoinDCX's published futures order contract does not establish a
- * `client_order_id` at all. This is therefore a LOCAL deterministic key only;
- * it is never sent or treated as exchange-confirmed. Its stable format remains
- * part of the local identity policy.
+ * CoinDCX support has confirmed that futures order creation supports a
+ * `client_order_id` of at most 36 characters, and that it is idempotent: a
+ * second create with the same id fails with an error code/reason (the exact
+ * code is not yet confirmed; see `COINDCX_DUPLICATE_CLIENT_ORDER_ID_SIGNAL` in
+ * the CoinDCX adapter). This deterministic id is therefore SENT on every
+ * normal create as `client_order_id`, and CoinDCX's List Orders read returns
+ * it, so it can identify the venue order a local intent created.
  *
  *   `p17-` + first 32 lowercase hex characters of a dedicated SHA-256 domain
  *
- * Total length 36; alphabet `[a-z0-9-]`. The digest is taken over a hash domain
- * distinct from the intent identity's, so a client order id can never be
- * mistaken for, or reversed into, an intent id.
+ * Total length 36 (exactly the provider maximum); alphabet `[a-z0-9-]`. The
+ * format and derivation are unchanged from the local-only policy, so every
+ * already-persisted intent keeps its id. The digest is taken over a hash
+ * domain distinct from the intent identity's, so a client order id can never
+ * be mistaken for, or reversed into, an intent id.
+ *
+ * Lifecycle (unchanged, now load-bearing at the venue): the id is derived
+ * from the intent's economic content, persisted with the intent BEFORE the
+ * durable dispatch claim and the pre-wire arm, and immutable afterwards. A
+ * retry of the same logical intent re-derives and re-reads the SAME id; a
+ * different intent gets a different id; and nothing ever generates a fresh or
+ * random id after a timeout (an ambiguous create is never resent at all).
  */
 export const LIVE_CLIENT_ORDER_ID_PREFIX = 'p17-' as const;
 export const LIVE_CLIENT_ORDER_ID_DIGEST_CHARS = 32 as const;
 export const LIVE_CLIENT_ORDER_ID_LENGTH = LIVE_CLIENT_ORDER_ID_PREFIX.length + LIVE_CLIENT_ORDER_ID_DIGEST_CHARS;
 export const LIVE_CLIENT_ORDER_ID_PATTERN = /^p17-[0-9a-f]{32}$/;
+
+/** Provider-confirmed maximum length of a CoinDCX futures `client_order_id`. */
+export const COINDCX_CLIENT_ORDER_ID_MAX_LENGTH = 36 as const;
+
+// Module-load invariant: the frozen format must fit the provider limit.
+if (LIVE_CLIENT_ORDER_ID_LENGTH > COINDCX_CLIENT_ORDER_ID_MAX_LENGTH) {
+  throw new LiveExecutionError('LIVE_INTENT_INVALID', 'The frozen client order id format exceeds the provider client_order_id limit');
+}
+
+/**
+ * Whether `value` may be sent to CoinDCX as a `client_order_id`: at most 36
+ * characters AND the exact frozen Phase17 format. A 37-character value is
+ * refused whatever its content; so is anything not produced by
+ * `deriveLiveClientOrderId`.
+ */
+export function isSendableLiveClientOrderId(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= COINDCX_CLIENT_ORDER_ID_MAX_LENGTH
+    && LIVE_CLIENT_ORDER_ID_PATTERN.test(value);
+}
 
 function assertExactId(value: unknown, label: string): asserts value is string {
   if (typeof value !== 'string' || value.length === 0 || value.trim() !== value) {
@@ -134,7 +167,7 @@ export function deriveLiveClientOrderId(content: LiveExecutionIntentContent): st
     intent: liveExecutionIntentIdentityPreimage(content),
   });
   const clientOrderId = `${LIVE_CLIENT_ORDER_ID_PREFIX}${digest.slice(0, LIVE_CLIENT_ORDER_ID_DIGEST_CHARS)}`;
-  if (!LIVE_CLIENT_ORDER_ID_PATTERN.test(clientOrderId)) {
+  if (!isSendableLiveClientOrderId(clientOrderId)) {
     throw new LiveExecutionError('LIVE_INTENT_INVALID', 'Derived client order id violated the frozen Phase17 format');
   }
   return clientOrderId;

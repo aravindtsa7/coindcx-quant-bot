@@ -370,7 +370,17 @@ export function normalizeOrder(wire: FuturesOrderWire): InrFuturesOrder {
     marginCurrency: 'INR',
     createdAtMs: toSafeIntegerTimestamp(wire.created_at, 'created_at'),
     updatedAtMs: toSafeIntegerTimestamp(wire.updated_at, 'updated_at'),
+    clientOrderId: normalizeClientOrderId(wire.client_order_id),
   };
+}
+
+/**
+ * Exact provider `client_order_id`: a string is kept byte-for-byte (no trim,
+ * no case folding, so distinct ids can never be merged); null, absent, or any
+ * non-string becomes `null`, which matches nothing downstream.
+ */
+export function normalizeClientOrderId(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
 }
 
 export function normalizePositionTransaction(

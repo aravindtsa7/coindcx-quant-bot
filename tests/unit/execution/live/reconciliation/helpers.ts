@@ -10,6 +10,8 @@ import {
   buildResolvedOrderState,
   type LiveOrphanCancellationPort,
   type LiveOrphanCancelResult,
+  providerAccountFingerprint,
+  type LiveProviderAccountIdentityRead,
   type LiveVenueEvidenceProvider,
 } from '../../../../../src/execution/live/reconciliation';
 import type {
@@ -27,6 +29,18 @@ export const PAIR = 'B-BTC_USDT';
 export const OTHER_PAIR = 'B-SOL_USDT';
 export const RUNTIME_IDENTITY = newLiveRuntimeIdentity();
 export const EPOCH = readLiveRuntimeEpoch(RUNTIME_IDENTITY)!;
+
+/**
+ * The provider trading-account binding every fixture runtime is configured
+ * with, derived exactly as production derives it: SHA-256 of a (fake)
+ * users/info `coindcx_id`. The raw fake id never appears in any artifact.
+ */
+export const FAKE_COINDCX_ID = 'fake-coindcx-trading-account-1';
+export const EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT = providerAccountFingerprint(FAKE_COINDCX_ID);
+export const MATCHING_ACCOUNT_IDENTITY: LiveProviderAccountIdentityRead = Object.freeze({
+  kind: 'OBSERVED' as const,
+  fingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
+});
 
 export const T_READ_START = 1_000_000;
 export const T_READ_END = 1_000_500;
@@ -59,6 +73,7 @@ export function venueOrder(overrides: Partial<LiveVenueOrderEvidence> = {}): Liv
     leverage: '5',
     providerCreatedAtMs: T_READ_START - 10_000,
     providerEventTimeMs: T_READ_START - 5_000,
+    clientOrderId: null as string | null,
   };
   return Object.freeze({ ...base, ...overrides });
 }
@@ -170,6 +185,15 @@ export class FakeEvidenceProvider implements LiveVenueEvidenceProvider {
     this.#evidence = evidence;
   }
 
+  /** Separate counter: identity reads are not evidence reads. */
+  public identityCalls = 0;
+  public accountIdentity: LiveProviderAccountIdentityRead = MATCHING_ACCOUNT_IDENTITY;
+
+  public async readAccountIdentity(): Promise<LiveProviderAccountIdentityRead> {
+    this.identityCalls += 1;
+    return this.accountIdentity;
+  }
+
   /** Legacy single-call convenience, unused by the service but kept for direct adapter-style tests. */
   public async readAccountEvidence(): Promise<LiveVenueEvidenceSet> {
     this.calls += 1;
@@ -214,6 +238,15 @@ export class SequencedEvidenceProvider implements LiveVenueEvidenceProvider {
     this.#orderProvenanceSequence = input.ordersProvenance;
     this.#positionSequence = input.positions;
     this.#positionProvenanceSequence = input.positionsProvenance;
+  }
+
+  /** Separate counter: identity reads are not evidence reads. */
+  public identityCalls = 0;
+  public accountIdentity: LiveProviderAccountIdentityRead = MATCHING_ACCOUNT_IDENTITY;
+
+  public async readAccountIdentity(): Promise<LiveProviderAccountIdentityRead> {
+    this.identityCalls += 1;
+    return this.accountIdentity;
   }
 
   public async readOrders(): Promise<{ readonly orders: readonly LiveVenueOrderEvidence[]; readonly provenance: LiveEvidenceProvenance }> {
@@ -289,6 +322,15 @@ export class AlwaysUnstableEvidenceProvider implements LiveVenueEvidenceProvider
     this.#unstablePositions = input.unstablePositions ?? false;
   }
 
+  /** Separate counter: identity reads are not evidence reads. */
+  public identityCalls = 0;
+  public accountIdentity: LiveProviderAccountIdentityRead = MATCHING_ACCOUNT_IDENTITY;
+
+  public async readAccountIdentity(): Promise<LiveProviderAccountIdentityRead> {
+    this.identityCalls += 1;
+    return this.accountIdentity;
+  }
+
   public async readOrders(): Promise<{ readonly orders: readonly LiveVenueOrderEvidence[]; readonly provenance: LiveEvidenceProvenance }> {
     this.orderCalls += 1;
     if (!this.#unstableOrders) return { orders: this.#baseOrders, provenance: this.#ordersProvenance };
@@ -345,6 +387,15 @@ export class LatencyAwareEvidenceProvider implements LiveVenueEvidenceProvider {
     this.#latencyMs = input.latencyMs;
     this.#orders = input.orders;
     this.#positions = input.positions;
+  }
+
+  /** Separate counter: identity reads are not evidence reads. */
+  public identityCalls = 0;
+  public accountIdentity: LiveProviderAccountIdentityRead = MATCHING_ACCOUNT_IDENTITY;
+
+  public async readAccountIdentity(): Promise<LiveProviderAccountIdentityRead> {
+    this.identityCalls += 1;
+    return this.accountIdentity;
   }
 
   public async readOrders(): Promise<{ readonly orders: readonly LiveVenueOrderEvidence[]; readonly provenance: LiveEvidenceProvenance }> {

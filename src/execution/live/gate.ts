@@ -14,6 +14,7 @@
  */
 import { canonicalPositiveLiveDecimal } from './decimal';
 import { LiveExecutionError } from './errors';
+import { isProviderAccountFingerprint } from './reconciliation/account-identity';
 
 export type LiveExecutionDisabledReason =
   | 'NOT_EXPLICITLY_ENABLED'
@@ -21,6 +22,10 @@ export type LiveExecutionDisabledReason =
   | 'UNSUPPORTED_ENVIRONMENT'
   | 'MISSING_CREDENTIALS'
   | 'MISSING_CREDENTIAL_ACCOUNT_ID'
+  /** No configured provider trading-account binding (`COINDCX_EXPECTED_ACCOUNT_FINGERPRINT`). */
+  | 'MISSING_ACCOUNT_IDENTITY_BINDING'
+  /** The configured binding is not a lowercase 64-hex SHA-256 fingerprint. */
+  | 'MALFORMED_ACCOUNT_IDENTITY_BINDING'
   | 'EMPTY_ACCOUNT_ALLOWLIST'
   | 'EMPTY_PAIR_ALLOWLIST'
   | 'MALFORMED_NOTIONAL_CEILING';
@@ -32,6 +37,15 @@ export interface LiveExecutionEnablementRecord {
   readonly maxOrderNotionalInr: string;
   /** Trusted configured boundary for the account owned by these credentials. */
   readonly credentialAccountId: string;
+  /**
+   * The provider trading account this deployment is bound to: SHA-256 hex of
+   * the expected users/info `coindcx_id` (the raw identifier is never
+   * configured). Verified against the live credentials at the start of every
+   * reconciliation run. It identifies an ACCOUNT only — CoinDCX exposes no API
+   * key id or generation, so it cannot distinguish rotated keys, and it
+   * authorizes nothing by itself.
+   */
+  readonly expectedProviderAccountFingerprint: string;
   readonly environment: 'production';
 }
 
@@ -72,6 +86,10 @@ export class LiveExecutionEnablement {
   public get credentialAccountId(): string {
     return this.#record.credentialAccountId;
   }
+
+  public get expectedProviderAccountFingerprint(): string {
+    return this.#record.expectedProviderAccountFingerprint;
+  }
 }
 Object.freeze(LiveExecutionEnablement.prototype);
 Object.freeze(LiveExecutionEnablement);
@@ -90,6 +108,7 @@ export interface LiveExecutionConfigInput {
   readonly COINDCX_API_KEY?: string | undefined;
   readonly COINDCX_API_SECRET?: string | undefined;
   readonly COINDCX_LIVE_ACCOUNT_ID?: string | undefined;
+  readonly COINDCX_EXPECTED_ACCOUNT_FINGERPRINT?: string | undefined;
 }
 
 function disabled(reason: LiveExecutionDisabledReason): LiveExecutionGateResolution {
@@ -126,6 +145,16 @@ export function resolveLiveExecutionGate(config: LiveExecutionConfigInput): Live
     return disabled('MISSING_CREDENTIAL_ACCOUNT_ID');
   }
 
+  // The provider account binding is mandatory: without it no run could ever
+  // verify WHICH trading account the credentials act on. Exact lowercase hex
+  // only — no trimming or case folding that could make two bindings compare
+  // equal.
+  const expectedProviderAccountFingerprint = config.COINDCX_EXPECTED_ACCOUNT_FINGERPRINT;
+  if (typeof expectedProviderAccountFingerprint !== 'string' || expectedProviderAccountFingerprint === '') {
+    return disabled('MISSING_ACCOUNT_IDENTITY_BINDING');
+  }
+  if (!isProviderAccountFingerprint(expectedProviderAccountFingerprint)) return disabled('MALFORMED_ACCOUNT_IDENTITY_BINDING');
+
   const accountAllowlist = parseList(config.LIVE_EXECUTION_ACCOUNT_ALLOWLIST);
   if (accountAllowlist.length === 0) return disabled('EMPTY_ACCOUNT_ALLOWLIST');
   if (!accountAllowlist.includes(credentialAccountId)) return disabled('MISSING_CREDENTIAL_ACCOUNT_ID');
@@ -147,6 +176,7 @@ export function resolveLiveExecutionGate(config: LiveExecutionConfigInput): Live
       pairAllowlist,
       maxOrderNotionalInr,
       credentialAccountId,
+      expectedProviderAccountFingerprint,
       environment: 'production',
     }),
   });

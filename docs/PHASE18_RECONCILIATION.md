@@ -1049,10 +1049,58 @@ between reads. Accordingly:
   refuses every normal Phase 17 live mutation with
   `ACCOUNT_CONTINUITY_NOT_PROVEN`.
 - **Live authorization readiness: NOT READY. LIVE-VENUE VERIFIED: NO.**
-- Nothing from this research is implemented: there is no `/users/info` call,
-  no `coindcx_id` field, no credential fingerprint, and no new proof field,
-  enum, or authorization path. Any partial account attestation would be a
-  separate design decision.
+- Level A (account identity) is now used as a fail-closed **guard** — see
+  §6.4.6. It adds no proof field, no continuity enum member, and no
+  authorization path: an account-identity success can only let a
+  reconciliation run continue to its ordinary checks; it can never make one
+  HEALTHY by itself, and it never changes the continuity capability.
+
+### 6.4.6 Provider-confirmed identity facts and what they are used for
+
+CoinDCX support has confirmed:
+
+1. `coindcx_id` is a **permanent trading-account identifier**. It is
+   unchanged across API-key rotation, and every subaccount has a different
+   one.
+2. There is **no** authenticated API-key unique id, generation/version,
+   creation timestamp, or credential/session-generation identifier.
+3. Futures create supports `client_order_id` (maximum 36 characters). It is
+   idempotent: a second create with the same id fails with an error
+   code/reason. The exact duplicate code is **not yet confirmed**.
+
+Previously established limitations are unchanged: no account-wide monotonic
+sequence, missed private events are dropped (not replayed), no common account
+snapshot/revision/watermark, no HFT API. Level B stays unavailable (fact 2),
+and Level C stays not proven.
+
+**What was implemented (and what was deliberately not):**
+
+- **Account identity guard.** Live enablement now requires
+  `COINDCX_EXPECTED_ACCOUNT_FINGERPRINT`: the lowercase SHA-256 hex of the
+  expected `coindcx_id` (the same digest the read-only provider probe
+  reports). A missing or malformed value keeps live execution DISABLED
+  (`MISSING_ACCOUNT_IDENTITY_BINDING` / `MALFORMED_ACCOUNT_IDENTITY_BINDING`).
+  Every reconciliation run — at startup and on every later run that
+  re-establishes live authorization — reads `/users/info` through the existing
+  Phase 2 read path, reduces `coindcx_id` to that fingerprint at the adapter,
+  and compares it BEFORE any durable read, crash recovery, evidence read,
+  effect, or orphan cancellation. A mismatch (for example another
+  subaccount) completes the run as `MANUAL_REVIEW_REQUIRED`
+  (`RECON_ACCOUNT_IDENTITY_MISMATCH`). A missing, empty, multi-record, or
+  unreadable identity completes it blocked (`RECON_ACCOUNT_IDENTITY_UNVERIFIED`).
+  The raw identifier is never logged, persisted, or placed in findings; only
+  12-character fingerprint prefixes appear in a mismatch finding.
+- **What identity success means.** `ACCOUNT_IDENTITY_VERIFIED` carries
+  `provesAccountContinuity: false`, `provesCurrentReconciliation: false`,
+  `provesReconnectContinuity: false`, and `provesCredentialGeneration: false`
+  as literals. A rotated API key on the same account verifies identically, by
+  design. `currentAccountContinuityCapability()` is untouched and still
+  returns `REST_CURRENT_STATE_OBSERVED`.
+- **`client_order_id`.** It is now sent on every create and used to resolve
+  ambiguous creates by exact match (§8.0). An exact match establishes ORDER
+  identity only.
+- **Not implemented:** any API-key generation or credential-session identity
+  (it does not exist), any continuity proof, and any change to the barrier.
 
 ### 6.5 F18-23: merged bracket envelopes must never be fed to the separability check
 
@@ -1165,9 +1213,63 @@ empty-but-authoritative result.
 
 ## 8. Ambiguous create resolution
 
-Phase 17's deterministic client order id is **LOCAL ONLY**. It is not sent to
-the futures venue and the venue echoes nothing that correlates to it. So Phase 18
-does **not** pretend CoinDCX can be queried by it.
+### 8.0 Exact `client_order_id` resolution (provider-confirmed; supersedes the old local-only rule)
+
+Earlier text in this section said Phase 17's client order id was **LOCAL
+ONLY** and not sent to the venue. That was accurate when written and is
+**corrected** here: the id is now sent as CoinDCX's provider-confirmed
+idempotent `client_order_id` (§6.4.6), and List Orders returns it.
+
+`resolveAmbiguousCreate` now runs two strictly ordered steps:
+
+1. **Exact `client_order_id` match** (`matchVenueOrdersByClientOrderId`):
+   strict string equality, no trim, no case folding. A venue `null` (for
+   example an order created before the id was sent) never matches.
+   - **Two or more** distinct venue orders carry the id →
+     `RECON_CLIENT_ORDER_ID_DUPLICATE_AT_VENUE` (manual review; nothing
+     adopted).
+   - **Exactly one** → `resolveAmbiguousCreateByClientOrderId`. It is adopted
+     only if the provider read is COMPLETE, no other local order claims it,
+     its stated economics do not contradict the intent, it was created inside
+     the persisted submission window, and its status projects onto a
+     permitted state. Otherwise the result is `RECON_AMBIGUOUS_CREATE_UNRESOLVED`
+     or `RECON_AMBIGUOUS_CREATE_CLIENT_ORDER_ID_CONFLICT`, with no effect.
+     Success is `RECON_AMBIGUOUS_CREATE_RESOLVED_BY_CLIENT_ORDER_ID`, whose
+     evidence states `establishes: ORDER_IDENTITY_ONLY`.
+   - **Zero** → step 2.
+2. **No match** → the unchanged time-in-force identity gate
+   (`RECON_AMBIGUOUS_CREATE_IDENTITY_UNOBSERVABLE`). Economic matching alone
+   still never establishes identity.
+
+**Why step 1 may pass where the TIF gate refuses:** the gate exists because
+economic matching cannot prove WHICH venue order a submission created, and
+time-in-force is one of the bindings it cannot observe. A venue order carrying
+this intent's exact 128-bit content-derived id could only have been created by
+this system's own create request, which carried this intent's exact TIF. So
+the id — not economics — is the identity proof, and economics become a
+consistency check. The TIF gate itself is unchanged.
+
+**A duplicate-id create failure alone never resolves anything.** It is a typed
+`DUPLICATE_CLIENT_ORDER_ID` outcome that leaves the order `SUBMISSION_AMBIGUOUS`
+(fault `LIVE_SUBMISSION_DUPLICATE_CLIENT_ORDER_ID`). Only step 1 with exactly
+one match can bind it. Because the exact provider code is not confirmed,
+`COINDCX_DUPLICATE_CLIENT_ORDER_ID_SIGNAL` is `null`, so no response is
+classified as a duplicate today. [PROVIDER-IDEMP-01] Because an unconfirmed
+duplicate rejection may be any 4xx, every create HTTP failure other than the
+exact configured duplicate status + code — every 4xx including 429, every 5xx,
+and any malformed error body — is `AMBIGUOUS` (`SUBMISSION_AMBIGUOUS`, never
+resent), never terminal `REJECTED`. No provider-verified terminal
+create-rejection code exists in this repository, so none is whitelisted, and
+the message text is never read. Cancel classification is unchanged.
+
+An order already bound by exchange id whose venue record carries a different
+non-null `client_order_id` is `RECON_ORDER_CLIENT_ORDER_ID_CONFLICT` (manual
+review).
+
+None of this touches account continuity: the barrier still refuses every
+normal mutation with `ACCOUNT_CONTINUITY_NOT_PROVEN`.
+
+### Economic matching (applies only when no `client_order_id` matched)
 
 An ambiguous create resolves only when authoritative evidence contains
 **exactly one** venue order matching every immutable economic binding this

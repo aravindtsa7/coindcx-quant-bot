@@ -218,6 +218,13 @@ export class CoinDcxClient {
       });
     }
 
+    // More than one user record would make "which account do these
+    // credentials act on" a guess. Refuse rather than silently take the first.
+    if (Array.isArray(parsed.data) && parsed.data.length > 1) {
+      throw new CoinDcxResponseValidationError('User info returned more than one account record', {
+        count: parsed.data.length,
+      });
+    }
     const firstUser = Array.isArray(parsed.data) ? parsed.data[0] : parsed.data;
     if (!firstUser) {
       throw new CoinDcxResponseValidationError('Empty user info received');

@@ -78,6 +78,12 @@ export const EnvSchema = z.object({
   // proof in Phase 17, so deployment must bind credentials to this trusted
   // configured account identity.
   COINDCX_LIVE_ACCOUNT_ID: z.string().optional().default(''),
+  // Provider trading-account binding for live execution: the lowercase
+  // 64-hex SHA-256 of the expected users/info `coindcx_id` (never the raw
+  // identifier). CoinDCX has confirmed `coindcx_id` is permanent across API-key
+  // rotation and distinct per subaccount. Empty (the default) keeps live
+  // execution disabled; see `resolveLiveExecutionGate`.
+  COINDCX_EXPECTED_ACCOUNT_FINGERPRINT: z.string().optional().default(''),
 
   // -------------------------------------------------------------------------
   // Phase 17 — live order mutation. DISABLED BY DEFAULT (P17-I04).

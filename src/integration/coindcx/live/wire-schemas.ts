@@ -1,6 +1,7 @@
 /** Strict current CoinDCX futures order wire contracts. */
 import { isLosslessNumber, LosslessNumber } from 'lossless-json';
 import { z } from 'zod';
+import { COINDCX_CLIENT_ORDER_ID_MAX_LENGTH } from '../../../execution/live/identity';
 
 export const LiveWireNumericSchema = z.union([
   z.string(),
@@ -85,6 +86,12 @@ const LiveOrderEconomicsSchema = z
     settlement_currency_conversion_price: LiveWireNumericSchema.optional().nullable(),
     created_at: LiveWireTimestampSchema,
     updated_at: LiveWireTimestampSchema,
+    // Provider-confirmed on create and observed in List Orders (null on orders
+    // created without one). Typed as unknown so an unexpected type cannot fail
+    // the whole response; the adapter accepts only an exact string equal to
+    // the local id, treats null/absent as "no echo", and treats any other value
+    // as an identity mismatch.
+    client_order_id: z.unknown().optional(),
   })
   .passthrough();
 
@@ -132,6 +139,9 @@ export const LiveCreateRequestSchema = z.object({
     notification: z.literal('no_notification'),
     time_in_force: z.enum(['good_till_cancel', 'fill_or_kill', 'immediate_or_cancel']).optional(),
     margin_currency_short_name: z.literal('INR'),
+    // Mandatory on every normal create: the intent's persisted deterministic
+    // id, within the provider-confirmed 36-character limit.
+    client_order_id: z.string().min(1).max(COINDCX_CLIENT_ORDER_ID_MAX_LENGTH),
   }).strict(),
 }).strict();
 

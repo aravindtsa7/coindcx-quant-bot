@@ -34,12 +34,15 @@ import {
 import { applyLiveOrderObservation, initialLiveOrderState } from '../../../../src/execution/live/state-machine';
 import type { LiveOrderObservation, LiveOrderStateRecord } from '../../../../src/execution/live/types';
 import { LiveExecutionError } from '../../../../src/execution/live/errors';
+import { providerAccountFingerprint } from '../../../../src/execution/live/reconciliation/account-identity';
 import { buildContext, evaluateDecision, genuineResearchApproval, makeKernel, policyFor, PAIR } from '../../dispatch/helpers';
 import { seal } from '../../risk/helpers';
 import type { RiskEvaluationContext } from '../../../../src/risk';
 
 export const LIVE_ACCOUNT = 'account-live-1';
 export const OTHER_ACCOUNT = 'account-live-2';
+/** SHA-256 of a fake users/info `coindcx_id`: the provider-account binding every enabled fixture config carries. */
+export const LIVE_PROVIDER_ACCOUNT_FINGERPRINT = providerAccountFingerprint('fake-coindcx-trading-account-1');
 export const T0 = 1_200_000;
 
 /** A configuration record that genuinely enables live mutation. */
@@ -53,6 +56,7 @@ export function enabledLiveConfig(overrides: Partial<LiveExecutionConfigInput> =
     COINDCX_API_KEY: 'test-key',
     COINDCX_API_SECRET: 'test-secret',
     COINDCX_LIVE_ACCOUNT_ID: LIVE_ACCOUNT,
+    COINDCX_EXPECTED_ACCOUNT_FINGERPRINT: LIVE_PROVIDER_ACCOUNT_FINGERPRINT,
     ...overrides,
   };
 }

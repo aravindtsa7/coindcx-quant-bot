@@ -15,6 +15,11 @@
  *
  * The durable claim is taken BEFORE the wire call, so a crash between claim and
  * response can never present as "never dispatched" on restart.
+ *
+ * The client order id sent to CoinDCX is the one persisted with the intent in
+ * `ensureIntent`, i.e. before the claim, the arm, and the first network
+ * attempt. It is never generated here, and never regenerated after a timeout:
+ * an ambiguous or duplicate-reported create is never resent.
  */
 import { createChildLogger } from '../../monitoring/logger';
 import { readLiveAuthorityForIntent } from './authority';
@@ -140,6 +145,18 @@ export class LiveExecutionService {
         throw new LiveExecutionError('LIVE_PROVIDER_ERROR', 'Live order was refused before dispatch; nothing reached CoinDCX', {
           details: { intentId: order.intentId, reasonCode: result.reasonCode },
         });
+      }
+      case 'DUPLICATE_CLIENT_ORDER_ID': {
+        // Provider-confirmed duplicate: this exact client order id was
+        // accepted by an EARLIER create. That is not this order's success, not
+        // a rejection, and it carries no exchange order id — so it fails
+        // closed exactly like AMBIGUOUS, with its own durable fault code. Only
+        // Phase18 read-side evidence (exactly one venue order carrying this
+        // exact id) may resolve it. Never resent; never re-identified.
+        const ambiguous = markSubmissionAmbiguous(reserved, 'LIVE_SUBMISSION_DUPLICATE_CLIENT_ORDER_ID');
+        const order = await this.#repository.commitState(ambiguous, reserved.revision, reconciliationAuthorization);
+        logger.error({ intentId: order.intentId, reasonCode: result.reasonCode }, 'CoinDCX reported a duplicate client order id; failing closed for Phase18 reconciliation');
+        return Object.freeze({ kind: 'AMBIGUOUS' as const, order, faultCode: 'LIVE_SUBMISSION_DUPLICATE_CLIENT_ORDER_ID' });
       }
       case 'AMBIGUOUS':
       default: {

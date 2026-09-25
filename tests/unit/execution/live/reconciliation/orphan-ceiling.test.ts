@@ -13,6 +13,7 @@ import { newLiveRuntimeIdentity } from '../../../../../src/execution/live/reconc
 import { InMemoryLiveExecutionRepository } from '../helpers';
 import { InMemoryReconciliationRepository } from './in-memory-repository';
 import {
+  EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
   ACCOUNT,
   FakeEvidenceProvider,
   FakeOrphanCancellation,
@@ -141,7 +142,7 @@ function serviceDependencies(orphanPolicy: unknown, port: LiveOrphanCancellation
     executionRepository: new InMemoryLiveExecutionRepository(),
     evidenceProvider: new FakeEvidenceProvider(evidenceSet()),
     runtimeIdentity: RUNTIME_IDENTITY,
-    credentialAccountId: ACCOUNT,
+    credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
     clock: new FixedClock(),
     orphanPolicy: orphanPolicy as OrphanCleanupPolicy,
     orphanCancellation: port,
@@ -190,7 +191,7 @@ function orphanService(options: {
     executionRepository: execution,
     evidenceProvider: new FakeEvidenceProvider(manyOrphans),
     runtimeIdentity: options.fresh === true ? newLiveRuntimeIdentity() : RUNTIME_IDENTITY,
-    credentialAccountId: ACCOUNT,
+    credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
     clock: new FixedClock(),
     orphanPolicy: resolution.policy,
     orphanCancellation: options.port,
@@ -303,7 +304,7 @@ describe('[F18-10] a valid ceiling bounds the wire cancels one reconciliation ru
       executionRepository: new InMemoryLiveExecutionRepository(),
       evidenceProvider: new FakeEvidenceProvider(manyOrphans),
       runtimeIdentity: RUNTIME_IDENTITY,
-      credentialAccountId: ACCOUNT,
+      credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
       clock: new FixedClock(),
       orphanCancellation: port,
     });

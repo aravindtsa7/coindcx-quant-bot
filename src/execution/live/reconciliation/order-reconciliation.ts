@@ -11,15 +11,25 @@
  *
  * THE MATCHING RULE THAT MATTERS MOST (§6):
  *
- * Phase17's deterministic client order id is LOCAL ONLY — it is not sent to the
- * futures venue and the venue echoes nothing that correlates to it. So an
- * ambiguous create CANNOT be resolved by asking CoinDCX about it. It can only
- * be resolved when authoritative evidence contains EXACTLY ONE venue order that
- * matches every immutable economic binding this repository can actually prove.
- * Zero candidates, two candidates, a candidate another local order also claims,
- * an economically conflicting candidate, or an incomplete provider read all
- * leave the order reconciliation-required. There is no "closest match", no
- * scoring, and no probability anywhere in this file.
+ * The deterministic client order id is now sent on every create as CoinDCX's
+ * `client_order_id`, which CoinDCX support has confirmed is supported,
+ * limited to 36 characters, and idempotent (a second create with the same id
+ * fails). The List Orders read returns that field. So an ambiguous create has
+ * exactly ONE automatic resolution path: a COMPLETE provider read containing
+ * EXACTLY ONE venue order whose `client_order_id` is byte-identical to the
+ * local id, whose observable economics agree, and which no other local order
+ * claims (`resolveAmbiguousCreateByClientOrderId`). That establishes ORDER
+ * identity only; it never establishes account continuity.
+ *
+ * Every other case keeps the pre-existing fail-closed rule: with no
+ * `client_order_id` match (for example an order created before the id was
+ * sent, whose venue record carries `null`), resolution by economics alone is
+ * refused outright by the time-in-force identity gate
+ * (`ambiguousCreateIdentityUnobservableReason`), exactly as before. Zero
+ * matches, two matches, a match another local order claims, an economically
+ * conflicting match, or an incomplete provider read all leave the order
+ * reconciliation-required. There is no "closest match", no normalization of
+ * ids, no scoring, and no probability anywhere in this file.
  */
 import { sha256CanonicalJson } from '../../../risk';
 import { canonicalLiveDecimalString, liveDecimal } from '../decimal';
@@ -146,9 +156,12 @@ export function observationFromEvidence(
   return Object.freeze({
     kind,
     clientOrderId: order.clientOrderId,
-    // The futures contract establishes no client-order-id echo, so this stays
-    // null forever. It is never filled in with the local id.
-    exchangeClientOrderId: null,
+    // Only ever the VENUE's own value, and only when it is byte-identical to
+    // the local id. A venue `null` (e.g. an order created before the id was
+    // sent) stays null; it is never filled in with the local id.
+    exchangeClientOrderId: evidence.clientOrderId !== null && evidence.clientOrderId === order.clientOrderId
+      ? evidence.clientOrderId
+      : null,
     exchangeOrderId: evidence.exchangeOrderId,
     pair: evidence.pair,
     side: evidence.side,
@@ -357,6 +370,188 @@ export function ambiguousCreateProofSha256(order: LiveDurableOrderView, candidat
   });
 }
 
+/**
+ * The result of matching one local client order id against venue evidence.
+ *
+ * `UNIQUE_MATCH` carries `establishes: 'ORDER_IDENTITY_ONLY'` as a literal: an
+ * exact `client_order_id` match names which venue order a local intent
+ * created, and nothing more. It is not account continuity, not a current
+ * reconciliation, and not evidence about any other order.
+ */
+export type LiveClientOrderIdMatch =
+  | { readonly kind: 'NO_MATCH' }
+  | { readonly kind: 'UNIQUE_MATCH'; readonly candidate: LiveVenueOrderEvidence; readonly establishes: 'ORDER_IDENTITY_ONLY' }
+  /** More than one distinct venue order carries the id: an invariant violation, never a choice. */
+  | { readonly kind: 'MULTIPLE_MATCHES'; readonly exchangeOrderIds: readonly string[] };
+
+const NO_CLIENT_ORDER_ID_MATCH: LiveClientOrderIdMatch = Object.freeze({ kind: 'NO_MATCH' as const });
+
+/**
+ * Exact `client_order_id` matching. Strict string equality only: no trim, no
+ * case folding, no prefix match, so two ids that differ in any byte are never
+ * merged. A venue `null` never matches anything, and neither does an empty
+ * local id. Records sharing one exchange order id count as one venue order
+ * (the evidence set is already deduplicated by id upstream).
+ */
+export function matchVenueOrdersByClientOrderId(
+  localClientOrderId: string,
+  orders: readonly LiveVenueOrderEvidence[],
+): LiveClientOrderIdMatch {
+  if (typeof localClientOrderId !== 'string' || localClientOrderId.length === 0) return NO_CLIENT_ORDER_ID_MATCH;
+  const byExchangeOrderId = new Map<string, LiveVenueOrderEvidence>();
+  for (const candidate of orders) {
+    if (candidate.clientOrderId === null || candidate.clientOrderId !== localClientOrderId) continue;
+    if (!byExchangeOrderId.has(candidate.exchangeOrderId)) byExchangeOrderId.set(candidate.exchangeOrderId, candidate);
+  }
+  if (byExchangeOrderId.size === 0) return NO_CLIENT_ORDER_ID_MATCH;
+  if (byExchangeOrderId.size > 1) {
+    return Object.freeze({ kind: 'MULTIPLE_MATCHES' as const, exchangeOrderIds: Object.freeze([...byExchangeOrderId.keys()].sort()) });
+  }
+  const [candidate] = [...byExchangeOrderId.values()];
+  return Object.freeze({ kind: 'UNIQUE_MATCH' as const, candidate: candidate!, establishes: 'ORDER_IDENTITY_ONLY' as const });
+}
+
+/** Deterministic proof identity of a resolution established by exact `client_order_id`. */
+export function clientOrderIdResolutionProofSha256(order: LiveDurableOrderView, candidate: LiveVenueOrderEvidence): string {
+  return sha256CanonicalJson({
+    schema: 'P18_AMBIGUOUS_CREATE_CLIENT_ORDER_ID_PROOF_V1',
+    intentId: order.intentId,
+    clientOrderId: order.clientOrderId,
+    exchangeOrderId: candidate.exchangeOrderId,
+    pair: order.pair,
+    side: order.side,
+    wireOrderType: order.wireOrderType,
+    orderedQuantity: canonicalLiveDecimalString(order.orderedQuantity, 'orderedQuantity'),
+    price: order.price === null ? null : canonicalLiveDecimalString(order.price, 'price'),
+  });
+}
+
+/**
+ * Resolves an ambiguous create whose exact `client_order_id` matched exactly
+ * one venue order (see `matchVenueOrdersByClientOrderId`).
+ *
+ * WHY THIS MAY PASS THE TIME-IN-FORCE GATE WHEN ECONOMIC MATCHING MAY NOT: the
+ * TIF gate exists because economic matching cannot prove WHICH venue order a
+ * local submission created, and TIF is one of the bindings it cannot observe.
+ * An exact match on the provider-confirmed idempotent `client_order_id` proves
+ * that directly: the only way a venue order carries this 128-bit
+ * content-derived id is that this system's own create request, carrying this
+ * intent's exact TIF, created it. The economics below are then a consistency
+ * check against a stated contradiction, not the basis of identity.
+ *
+ * Still refused (never adopted):
+ *   - an incomplete provider read: uniqueness of the match cannot be proven;
+ *   - a venue order another local order already owns;
+ *   - a venue order whose stated economics contradict the local intent;
+ *   - a venue order created outside the persisted submission window;
+ *   - a venue status Phase17 never modelled, or a non-permitted state move.
+ */
+export function resolveAmbiguousCreateByClientOrderId(
+  input: AmbiguousCreateResolutionInput,
+  candidate: LiveVenueOrderEvidence,
+): LiveOrderReconciliationOutcome {
+  const { order, evidence } = input;
+  const subject = { pair: order.pair, intentId: order.intentId, exchangeOrderId: candidate.exchangeOrderId };
+
+  if (!evidence.ordersProvenance.complete) {
+    return outcome([buildFinding({
+      category: 'AMBIGUOUS',
+      code: 'RECON_AMBIGUOUS_CREATE_UNRESOLVED',
+      subject,
+      evidence: {
+        reason: 'A venue order carries this exact client order id, but the provider order read could not prove it inspected everything, so the match cannot be proven unique',
+        incompleteReason: evidence.ordersProvenance.incompleteReason,
+        pagesRead: evidence.ordersProvenance.pagesRead,
+      },
+    })], [], [candidate.exchangeOrderId]);
+  }
+
+  if (input.alreadyClaimed.has(candidate.exchangeOrderId)) {
+    return outcome([buildFinding({
+      category: 'MANUAL_REVIEW_REQUIRED',
+      code: 'RECON_AMBIGUOUS_CREATE_CLIENT_ORDER_ID_CONFLICT',
+      subject,
+      evidence: { reason: 'The venue order carrying this client order id is already bound to another local order' },
+    })]);
+  }
+
+  if (!matchesImmutableEconomics(order, candidate)) {
+    return outcome([buildFinding({
+      category: 'MANUAL_REVIEW_REQUIRED',
+      code: 'RECON_AMBIGUOUS_CREATE_CLIENT_ORDER_ID_CONFLICT',
+      subject,
+      evidence: {
+        reason: 'The venue order carrying this exact client order id states economics that contradict the local intent',
+        localPair: order.pair,
+        venuePair: candidate.pair,
+        localSide: order.side,
+        venueSide: candidate.side,
+        localOrderedQuantity: order.orderedQuantity,
+        venueOrderedQuantity: candidate.orderedQuantity,
+        localPrice: order.price,
+        venuePrice: candidate.price,
+        localWireOrderType: order.wireOrderType,
+        venueWireOrderType: candidate.wireOrderType,
+      },
+    })], [], [candidate.exchangeOrderId]);
+  }
+
+  if (!withinSubmissionWindow(order, candidate, input.submissionWindowToleranceMs)) {
+    return outcome([buildFinding({
+      category: 'AMBIGUOUS',
+      code: 'RECON_AMBIGUOUS_CREATE_UNRESOLVED',
+      subject,
+      evidence: {
+        reason: 'The venue order carrying this client order id was created outside this intent\'s persisted submission window',
+        providerCreatedAtMs: candidate.providerCreatedAtMs,
+        localWindowStartMs: order.createdAtMs,
+        localWindowEndMs: order.updatedAtMs,
+      },
+    })], [], [candidate.exchangeOrderId]);
+  }
+
+  const observation = observationFromEvidence(order, candidate);
+  if (observation === null) {
+    return outcome([buildFinding({
+      category: 'AMBIGUOUS',
+      code: 'RECON_AMBIGUOUS_CREATE_UNRESOLVED',
+      subject,
+      evidence: { reason: 'The venue order carrying this client order id reports a status Phase17 never modelled', venueStatus: candidate.venueStatus },
+    })], [], [candidate.exchangeOrderId]);
+  }
+
+  const ordered = liveDecimal(observation.orderedQuantity);
+  const filled = liveDecimal(observation.cumulativeFilledQuantity);
+  const targetState = projectedStateFor(observation.kind, filled.equals(ordered), filled.greaterThan(0));
+  const permitted = LIVE_RECONCILIATION_TRANSITIONS[order.state] ?? [];
+  if (!permitted.includes(targetState)) {
+    return outcome([buildFinding({
+      category: 'MANUAL_REVIEW_REQUIRED',
+      code: 'RECON_ORDER_STATE_CONFLICT',
+      subject,
+      evidence: { localState: order.state, provenVenueState: targetState },
+    })], [], [candidate.exchangeOrderId]);
+  }
+
+  return outcome(
+    [buildFinding({
+      category: 'LOCAL_INCOMPLETE_BUT_PROVABLY_RECONSTRUCTABLE',
+      code: 'RECON_AMBIGUOUS_CREATE_RESOLVED_BY_CLIENT_ORDER_ID',
+      subject,
+      evidence: {
+        proofSha256: clientOrderIdResolutionProofSha256(order, candidate),
+        identityBasis: 'EXACT_CLIENT_ORDER_ID',
+        establishes: 'ORDER_IDENTITY_ONLY',
+        resolvedState: targetState,
+        venueStatus: candidate.venueStatus,
+        cumulativeFilledQuantity: observation.cumulativeFilledQuantity,
+      },
+    })],
+    [{ kind: 'RESOLVE_AMBIGUOUS_CREATE', intentId: order.intentId, observation, targetState }],
+    [candidate.exchangeOrderId],
+  );
+}
+
 export interface AmbiguousCreateResolutionInput {
   readonly order: LiveDurableOrderView;
   readonly evidence: LiveVenueEvidenceSet;
@@ -374,17 +569,24 @@ export interface AmbiguousCreateResolutionInput {
  * Resolves one `SUBMISSION_AMBIGUOUS` (or crash-interrupted
  * `DISPATCH_RESERVED`) order against authoritative evidence (§6).
  *
- * [Wave B3 / F18-21] The PUBLIC entry point. Checks the identity-observability
- * gate FIRST, unconditionally (see `ambiguousCreateIdentityUnobservableReason`
- * — it currently always returns a reason, for every order, regardless of
- * candidates or evidence completeness), before any candidate is even
- * computed. This is reported with its own explicit code rather than falling
- * through to "zero candidates", which would misleadingly suggest more reads
- * might help — TIF unobservability is a permanent limitation of this
- * provider's evidence contract, not evidence this run happened to lack.
+ * The PUBLIC entry point, in two strictly ordered steps:
  *
- * Everything below the gate is currently UNREACHABLE in production (the gate
- * always fires), and is delegated to
+ * 1. Exact `client_order_id` matching (`matchVenueOrdersByClientOrderId`).
+ *    Two or more venue orders carrying the id block for manual review; exactly
+ *    one is handed to `resolveAmbiguousCreateByClientOrderId`, the only path
+ *    that can adopt a venue order. A `null` venue id never matches.
+ *
+ * 2. With NO client-order-id match, the [Wave B3 / F18-21] identity-
+ *    observability gate runs exactly as before, unconditionally (see
+ *    `ambiguousCreateIdentityUnobservableReason` — it always returns a reason,
+ *    for every order, regardless of candidates or evidence completeness).
+ *    This is reported with its own explicit code rather than falling through
+ *    to "zero candidates", which would misleadingly suggest more reads might
+ *    help — TIF unobservability is a permanent limitation of economic
+ *    matching against this provider's evidence contract.
+ *
+ * Everything below the gate is UNREACHABLE in production (the gate always
+ * fires once step 1 found no match), and is delegated to
  * `resolveAmbiguousCreateAgainstObservableCandidates`, kept as its own tested,
  * exported function rather than deleted: the candidate-selection logic it
  * contains remains correct and ready for the day a genuinely authoritative
@@ -395,6 +597,27 @@ export function resolveAmbiguousCreate(input: AmbiguousCreateResolutionInput): L
   const { order } = input;
   const subject = { pair: order.pair, intentId: order.intentId };
 
+  // The provider-confirmed `client_order_id` path comes first, because an
+  // exact match is the one thing that CAN establish identity. Anything other
+  // than exactly one match falls through (NO_MATCH) or blocks (MULTIPLE).
+  const byClientOrderId = matchVenueOrdersByClientOrderId(order.clientOrderId, input.evidence.orders);
+  if (byClientOrderId.kind === 'MULTIPLE_MATCHES') {
+    return outcome([buildFinding({
+      category: 'MANUAL_REVIEW_REQUIRED',
+      code: 'RECON_CLIENT_ORDER_ID_DUPLICATE_AT_VENUE',
+      subject,
+      evidence: {
+        reason: 'More than one venue order carries this exact client order id; the provider idempotency invariant is violated and no choice between them is permitted',
+        candidateExchangeOrderIds: byClientOrderId.exchangeOrderIds,
+      },
+    })], [], byClientOrderId.exchangeOrderIds);
+  }
+  if (byClientOrderId.kind === 'UNIQUE_MATCH') {
+    return resolveAmbiguousCreateByClientOrderId(input, byClientOrderId.candidate);
+  }
+
+  // NO_MATCH: exactly the pre-existing fail-closed behavior. Economics alone
+  // can never establish identity while time-in-force is unobservable.
   const unobservableReason = ambiguousCreateIdentityUnobservableReason(order);
   if (unobservableReason !== null) {
     return outcome([buildFinding({
@@ -621,6 +844,18 @@ export function reconcileIdentifiedOrder(
   }
 
   const venue = matches[0]!;
+
+  // A venue order already bound by exchange id must not report a DIFFERENT
+  // client order id. `null` is not a contradiction (an order created before
+  // the id was sent carries none); any other non-identical value is.
+  if (venue.clientOrderId !== null && venue.clientOrderId !== order.clientOrderId) {
+    return outcome([buildFinding({
+      category: 'MANUAL_REVIEW_REQUIRED',
+      code: 'RECON_ORDER_CLIENT_ORDER_ID_CONFLICT',
+      subject,
+      evidence: { reason: 'The venue order bound to this intent by exchange order id reports a different client order id' },
+    })], [], [exchangeOrderId]);
+  }
 
   // Economics must agree before any state claim is even considered.
   if (!matchesImmutableEconomics(order, venue)) {

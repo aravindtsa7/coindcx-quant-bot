@@ -289,6 +289,11 @@ export function composeLiveExecutionRuntime(input: ComposeLiveExecutionRuntimeIn
     evidenceProvider: input.evidenceProvider ?? createProductionEvidenceProvider(input.config, enablement.credentialAccountId, input.baseUrl),
     runtimeIdentity,
     credentialAccountId: enablement.credentialAccountId,
+    // [Provider identity] From the configuration gate only, never a request
+    // input. Every reconciliation run verifies the credentials' users/info
+    // `coindcx_id` fingerprint against it before anything else, so no run of
+    // this runtime can reach HEALTHY on the wrong trading account.
+    expectedProviderAccountFingerprint: enablement.expectedProviderAccountFingerprint,
     requestTimeoutMs: policy.content.requestTimeoutMs,
     ...(orphanPolicy === undefined
       ? {}

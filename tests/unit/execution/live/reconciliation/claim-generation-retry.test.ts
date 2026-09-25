@@ -9,7 +9,7 @@ import {
 import { LiveReconciliationService, resolveOrphanCleanupPolicy } from '../../../../../src/execution/live/reconciliation';
 import { newLiveRuntimeIdentity } from '../../../../../src/execution/live/reconciliation/barrier';
 import { InMemoryLiveExecutionRepository } from '../helpers';
-import { ACCOUNT, FakeEvidenceProvider, FakeOrphanCancellation, FixedClock, evidenceSet, venueOrder } from './helpers';
+import { ACCOUNT, EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT, FakeEvidenceProvider, FakeOrphanCancellation, FixedClock, evidenceSet, venueOrder } from './helpers';
 
 // [Wave C3.1 / F18-44] `claimGeneration` retries its WHOLE transaction, and
 // only on Prisma's `P2034` (the deadlock-victim / write-conflict error MySQL
@@ -210,7 +210,7 @@ describe('[F18-44] an exhausted claim happens before any evidence read or wire a
     if (policy.status !== 'ENABLED') throw new Error('expected enabled policy');
     const service = new LiveReconciliationService({
       repository, executionRepository: new InMemoryLiveExecutionRepository(), evidenceProvider: provider,
-      runtimeIdentity: newLiveRuntimeIdentity(), credentialAccountId: ACCOUNT, clock: new FixedClock(),
+      runtimeIdentity: newLiveRuntimeIdentity(), credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT, clock: new FixedClock(),
       orphanPolicy: policy.policy, orphanCancellation: port,
     });
 

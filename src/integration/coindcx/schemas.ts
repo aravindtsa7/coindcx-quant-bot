@@ -278,6 +278,11 @@ export const FuturesOrderWireSchema = z
     margin_currency_short_name: z.string(),
     created_at: z.union([z.number(), z.custom<LosslessNumber>(isLosslessNumber)]),
     updated_at: z.union([z.number(), z.custom<LosslessNumber>(isLosslessNumber)]),
+    // Observed by the read-only provider probe (null on orders created without
+    // one) and provider-confirmed on create. Accepted as ANY type so one
+    // unexpected value cannot fail a whole page; `normalizeOrder` keeps only an
+    // exact string and maps everything else to null, which never matches.
+    client_order_id: z.unknown().optional(),
   })
   .passthrough();
 export type FuturesOrderWire = z.infer<typeof FuturesOrderWireSchema>;

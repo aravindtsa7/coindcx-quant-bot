@@ -7,6 +7,9 @@
  * ORDERING IS FIXED AND NEVER VARIES:
  *
  *   claim generation (durable, fenced)
+ *     -> verify provider account identity (users/info coindcx_id fingerprint)
+ *        against configuration; any failure completes the run blocked, having
+ *        read and changed nothing else
  *     -> read authoritative venue evidence
  *     -> validate evidence usability
  *     -> record snapshot identity against the owning run
@@ -58,6 +61,14 @@ import {
   type LiveOrderReconciliationEffect,
 } from './order-reconciliation';
 import { reconcilePosition, type LivePositionReconciliationEffect } from './position-attribution';
+import {
+  accountIdentityFinding,
+  accountIdentityGateSnapshotSha256,
+  requireExpectedProviderAccountFingerprint,
+  verifyProviderAccountIdentity,
+  type LiveProviderAccountIdentityRead,
+  type LiveProviderAccountIdentityVerification,
+} from './account-identity';
 import { OrphanCleanupPolicy, type OrphanCleanupPolicyRecord } from './orphan-policy';
 import type {
   LiveDurableOrderView,
@@ -97,6 +108,14 @@ export interface LiveReconciliationServiceDependencies {
   readonly runtimeIdentity: LiveRuntimeIdentity;
   /** The one account owned by the credentials behind this evidence stream. */
   readonly credentialAccountId: string;
+  /**
+   * The configured provider trading-account fingerprint (SHA-256 of the
+   * expected users/info `coindcx_id`), from the live enablement gate. Every
+   * run verifies the credentials against it BEFORE anything else; a mismatch or
+   * an unverifiable identity completes the run blocked. Required: there is no
+   * default and no way to skip the check.
+   */
+  readonly expectedProviderAccountFingerprint: string;
   readonly clock?: ReconciliationClock | undefined;
   /**
    * Orphan cancellation capability and its policy. BOTH must be present for a
@@ -270,6 +289,7 @@ export class LiveReconciliationService {
   readonly #evidenceProvider: LiveVenueEvidenceProvider;
   readonly #runtimeIdentity: LiveRuntimeIdentity;
   readonly #credentialAccountId: string;
+  readonly #expectedProviderAccountFingerprint: string;
   readonly #clock: ReconciliationClock;
   readonly #orphanCancellation: LiveOrphanCancellationPort | null;
   readonly #orphanPolicy: OrphanCleanupPolicyRecord | null;
@@ -283,6 +303,7 @@ export class LiveReconciliationService {
     this.#evidenceProvider = dependencies.evidenceProvider;
     this.#runtimeIdentity = dependencies.runtimeIdentity;
     this.#credentialAccountId = dependencies.credentialAccountId;
+    this.#expectedProviderAccountFingerprint = requireExpectedProviderAccountFingerprint(dependencies.expectedProviderAccountFingerprint);
     this.#clock = dependencies.clock ?? new SystemReconciliationClock();
     this.#orphanCancellation = dependencies.orphanCancellation ?? null;
     this.#orphanPolicy = readGenuineOrphanPolicy(dependencies.orphanPolicy);
@@ -313,6 +334,26 @@ export class LiveReconciliationService {
     }
     const lease = claim.lease;
     const reconciliationAuthorization = claim.authorization;
+
+    // [Provider identity] FIRST, before any durable read, crash recovery,
+    // evidence read, or effect: prove the configured credentials act on the
+    // provider trading account this deployment is bound to. A mismatch (e.g.
+    // another subaccount) or an unverifiable identity completes this run
+    // blocked with nothing else read or changed. Success proves account
+    // identity at read time ONLY: it is not continuity, not a HEALTHY verdict
+    // (the rest of this run still has to earn that), and not a credential
+    // generation.
+    const identityVerification = await this.#verifyAccountIdentity(accountId);
+    const identityFinding = accountIdentityFinding(identityVerification);
+    if (identityFinding !== null) {
+      const identitySnapshotSha256 = accountIdentityGateSnapshotSha256(identityVerification);
+      await this.#repository.recordSnapshot(lease, identitySnapshotSha256, this.#clock.nowMs(), {
+        validated: false,
+        ordersComplete: false,
+        positionsComplete: false,
+      });
+      return this.#completeWithFindings(lease, [identityFinding], identitySnapshotSha256);
+    }
 
     // From here on, a crash leaves the run RUNNING and the account blocked.
     // Nothing below can unblock the account except `completeRun` at the end.
@@ -1031,6 +1072,18 @@ export class LiveReconciliationService {
       findings.push(stickyOrphanCancelAmbiguousFinding(orphan.pair, orphan.exchangeOrderId, generation, 'LIVE_ORPHAN_CANCEL_AMBIGUOUS'));
     }
     return Object.freeze(findings);
+  }
+
+  /** Reads and verifies provider account identity. A thrown read is UNAVAILABLE, never a pass. */
+  async #verifyAccountIdentity(accountId: string): Promise<LiveProviderAccountIdentityVerification> {
+    let read: LiveProviderAccountIdentityRead;
+    try {
+      read = await this.#evidenceProvider.readAccountIdentity({ accountId, timeoutMs: this.#requestTimeoutMs });
+    } catch (error) {
+      logger.error({ accountId, failure: error instanceof Error ? error.name : 'UNKNOWN' }, 'Provider account identity read failed');
+      read = Object.freeze({ kind: 'UNAVAILABLE' as const, reason: 'IDENTITY_READ_FAILED' });
+    }
+    return verifyProviderAccountIdentity(this.#expectedProviderAccountFingerprint, read);
   }
 
   async #completeWithFindings(

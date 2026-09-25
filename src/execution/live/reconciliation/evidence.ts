@@ -199,6 +199,7 @@ export function venueOrderContentSha256(order: LiveVenueOrderEvidence): string {
     leverage: order.leverage === null ? null : canonicalLiveDecimalString(order.leverage, 'leverage'),
     providerCreatedAtMs: order.providerCreatedAtMs,
     providerEventTimeMs: order.providerEventTimeMs,
+    clientOrderId: order.clientOrderId,
   });
 }
 
@@ -377,6 +378,7 @@ function rawOrderDigestInput(order: LiveVenueOrderEvidence): Readonly<Record<str
     leverage: order.leverage,
     providerCreatedAtMs: order.providerCreatedAtMs,
     providerEventTimeMs: order.providerEventTimeMs,
+    clientOrderId: order.clientOrderId,
   };
 }
 

@@ -10,6 +10,7 @@ import type {
   LivePlaceOrderResult,
 } from '../../../execution/live/gateway';
 import { liveDecimal } from '../../../execution/live/decimal';
+import { isSendableLiveClientOrderId } from '../../../execution/live/identity';
 import type { LiveOrderObservation, LiveOrderObservationKind, LiveOrderSide, LiveTimeInForce } from '../../../execution/live/types';
 import { Clock, SystemClock } from '../clock';
 import { CoinDcxOrderMutationTransport } from './mutation-transport';
@@ -40,6 +41,79 @@ export const COINDCX_ORDER_OBSERVATION_MAX_PAGES = 100;
 const FIXED_POINT = /^-?\d+(?:\.\d+)?$/;
 
 type AnyOrderWire = LiveCreateOrderWire | LiveObservedOrderWire;
+
+/**
+ * The exact provider signal for "a create with this `client_order_id` already
+ * exists". CoinDCX support has confirmed such a create fails with an error
+ * code/reason, but NOT yet which one.
+ */
+export interface CoinDcxDuplicateClientOrderIdSignal {
+  /** Exact HTTP status of the duplicate rejection. */
+  readonly httpStatus: number;
+  /** Exact provider `code` field of the error body, compared as a string. Messages are never inspected. */
+  readonly providerCode: string;
+}
+
+/**
+ * `null` until CoinDCX confirms the exact duplicate error code. While `null`,
+ * NO create failure is ever classified as a duplicate: an unconfirmed guess at
+ * a code or a message string could turn an ordinary rejection into a false
+ * "already accepted" claim, or vice versa. Wiring the confirmed code later is
+ * a one-line change here, and the tests in `order-gateway.test.ts` pin how a
+ * configured signal is matched.
+ */
+export const COINDCX_DUPLICATE_CLIENT_ORDER_ID_SIGNAL: CoinDcxDuplicateClientOrderIdSignal | null = null;
+
+export type CoinDcxCreateFailureClassification = 'DUPLICATE_CLIENT_ORDER_ID' | 'UNCLASSIFIED';
+
+/**
+ * Classifies a create failure against the pinned duplicate signal. Exact
+ * status AND exact provider code only; the error message is never read. With
+ * no confirmed signal, every failure is `UNCLASSIFIED`.
+ */
+export function classifyCreateFailure(
+  statusCode: number,
+  errorBody: unknown,
+  signal: CoinDcxDuplicateClientOrderIdSignal | null = COINDCX_DUPLICATE_CLIENT_ORDER_ID_SIGNAL,
+): CoinDcxCreateFailureClassification {
+  if (signal === null || statusCode !== signal.httpStatus) return 'UNCLASSIFIED';
+  if (errorBody === null || typeof errorBody !== 'object') return 'UNCLASSIFIED';
+  const code = (errorBody as { code?: unknown }).code;
+  const codeText = isLosslessNumber(code) ? code.value : typeof code === 'string' || typeof code === 'number' ? String(code) : null;
+  return codeText !== null && codeText === signal.providerCode ? 'DUPLICATE_CLIENT_ORDER_ID' : 'UNCLASSIFIED';
+}
+
+/**
+ * [PROVIDER-IDEMP-01] The outcome of a CREATE_ORDER HTTP failure (status
+ * >= 400). Fail-closed by construction: there is NO terminal `REJECTED` branch.
+ *
+ * CoinDCX has confirmed that a duplicate `client_order_id` create fails with an
+ * error, but not its status or code, so ANY provider HTTP failure could be
+ * that duplicate — i.e. evidence that an earlier create with this id WAS
+ * accepted. Recording it as terminal `REJECTED` could leave durable state
+ * saying "rejected" while a real venue order exists. This repository holds no
+ * provider-documented, independently verified terminal create-rejection code
+ * (the Phase 17 rule "HTTP 4xx other than 429 is a definite refusal" was a
+ * generic status inference, not provider evidence), so none is whitelisted:
+ *
+ *   - exact configured duplicate status + code  -> DUPLICATE_CLIENT_ORDER_ID
+ *   - everything else (any 4xx incl. 429, any 5xx, malformed body) -> AMBIGUOUS
+ *
+ * The message text is never read. With the signal `null` (today), every
+ * create HTTP failure is AMBIGUOUS. Cancel classification is separate and
+ * unchanged.
+ */
+export function classifyCreateHttpFailure(
+  statusCode: number,
+  errorBody: unknown,
+  signal: CoinDcxDuplicateClientOrderIdSignal | null = COINDCX_DUPLICATE_CLIENT_ORDER_ID_SIGNAL,
+): LivePlaceOrderResult {
+  if (classifyCreateFailure(statusCode, errorBody, signal) === 'DUPLICATE_CLIENT_ORDER_ID') {
+    return { kind: 'DUPLICATE_CLIENT_ORDER_ID', reasonCode: `HTTP_${statusCode}_DUPLICATE_CLIENT_ORDER_ID` };
+  }
+  if (!LiveErrorResponseSchema.safeParse(errorBody).success) return { kind: 'AMBIGUOUS', reasonCode: 'LIVE_ERROR_RESPONSE_INVALID' };
+  return { kind: 'AMBIGUOUS', reasonCode: `HTTP_${statusCode}` };
+}
 
 interface ExpectedOrderIdentity {
   readonly localClientOrderId: string;
@@ -127,6 +201,11 @@ export class CoinDcxLiveFuturesOrderGateway implements CoinDcxFuturesOrderGatewa
   }
 
   public async placeOrder(request: LivePlaceOrderRequest): Promise<LivePlaceOrderResult> {
+    // Mandatory provider idempotency key. Anything that is not the exact
+    // frozen <=36-character format is refused before any socket write.
+    if (!isSendableLiveClientOrderId(request.clientOrderId)) {
+      return { kind: 'PRE_DISPATCH_FAILURE', reasonCode: 'LIVE_CLIENT_ORDER_ID_INVALID' };
+    }
     if (request.timeInForce === 'POST_ONLY') {
       return { kind: 'PRE_DISPATCH_FAILURE', reasonCode: 'UNSUPPORTED_POST_ONLY' };
     }
@@ -147,6 +226,7 @@ export class CoinDcxLiveFuturesOrderGateway implements CoinDcxFuturesOrderGatewa
       total_quantity: request.quantity,
       notification: 'no_notification',
       margin_currency_short_name: 'INR',
+      client_order_id: request.clientOrderId,
     };
     if (request.leverage !== null) order['leverage'] = request.leverage;
     if (tif !== null) order['time_in_force'] = tif;
@@ -263,14 +343,17 @@ export class CoinDcxLiveFuturesOrderGateway implements CoinDcxFuturesOrderGatewa
     if (wire.kind === 'PRE_DISPATCH') return { kind: 'PRE_DISPATCH_FAILURE', reasonCode: wire.reasonCode };
     if (wire.kind === 'UNESTABLISHED') return { kind: 'AMBIGUOUS', reasonCode: wire.reasonCode };
     if (wire.statusCode < 400) return null;
-    if (!LiveErrorResponseSchema.safeParse(wire.data).success) return { kind: 'AMBIGUOUS', reasonCode: 'LIVE_ERROR_RESPONSE_INVALID' };
-    return wire.statusCode < 500 && wire.statusCode !== 429
-      ? { kind: 'REJECTED', reasonCode: `HTTP_${wire.statusCode}`, observation: null }
-      : { kind: 'AMBIGUOUS', reasonCode: `HTTP_${wire.statusCode}` };
+    // [PROVIDER-IDEMP-01] Never terminal REJECTED: see `classifyCreateHttpFailure`.
+    return classifyCreateHttpFailure(wire.statusCode, wire.data);
   }
 
   #translate(order: AnyOrderWire, expected: ExpectedOrderIdentity): LiveOrderObservation | null {
     if (expected.exchangeOrderId !== null && order.id !== expected.exchangeOrderId) return null;
+    // A venue `client_order_id` must be exactly the local id. null/absent is
+    // "no echo" (e.g. an order created before the id was sent); any other
+    // value, including a non-string, is an identity mismatch.
+    const venueClientOrderId = order.client_order_id;
+    if (venueClientOrderId !== undefined && venueClientOrderId !== null && venueClientOrderId !== expected.localClientOrderId) return null;
     if (order.pair !== expected.pair || order.order_type !== expected.wireOrderType) return null;
     if (order.margin_currency_short_name !== expected.marginCurrencyShortName) return null;
     const side: LiveOrderSide = order.side === 'buy' ? 'BUY' : 'SELL';
@@ -315,7 +398,7 @@ export class CoinDcxLiveFuturesOrderGateway implements CoinDcxFuturesOrderGatewa
     return Object.freeze({
       kind,
       clientOrderId: expected.localClientOrderId,
-      exchangeClientOrderId: null,
+      exchangeClientOrderId: typeof venueClientOrderId === 'string' ? venueClientOrderId : null,
       exchangeOrderId: order.id,
       pair: order.pair,
       side,

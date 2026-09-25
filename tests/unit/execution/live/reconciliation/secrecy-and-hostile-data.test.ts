@@ -11,6 +11,7 @@ import { LiveExecutionError } from '../../../../../src/execution/live/errors';
 import { InMemoryLiveExecutionRepository } from '../helpers';
 import { InMemoryReconciliationRepository } from './in-memory-repository';
 import {
+  EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
   ACCOUNT,
   RUNTIME_IDENTITY,
   FakeEvidenceProvider,
@@ -93,7 +94,7 @@ describe('P18 §21 no reconciliation output leaks a credential', () => {
         executionRepository: new InMemoryLiveExecutionRepository(),
         evidenceProvider: new FakeEvidenceProvider(evidence),
         runtimeIdentity: RUNTIME_IDENTITY,
-        credentialAccountId: ACCOUNT,
+        credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
         clock: new FixedClock(),
       });
       const outcome = await service.reconcileAccount(ACCOUNT);

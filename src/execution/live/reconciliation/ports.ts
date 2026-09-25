@@ -26,6 +26,7 @@ import type {
   LiveVenuePositionEvidence,
 } from './types';
 import type { OrphanAmbiguityResolutionRequest } from './orphan-resolution';
+import type { LiveProviderAccountIdentityRead } from './account-identity';
 
 /** Result of one authoritative orders read. */
 export interface LiveVenueOrderReadResult {
@@ -77,6 +78,20 @@ export interface LiveVenueEvidenceProvider {
     readonly accountId: string;
     readonly timeoutMs: number;
   }): Promise<LiveVenuePositionReadResult>;
+
+  /**
+   * Reads the provider trading-account identity the credentials act on
+   * (`users/info` `coindcx_id`), reduced at the integration boundary to its
+   * `providerAccountFingerprint`. The raw identifier must never cross this
+   * port. Implementations report `UNAVAILABLE` (rather than throwing) for a
+   * failed read, a missing/empty identifier, or an unexpected cardinality.
+   * The result identifies an ACCOUNT only: it proves nothing about continuity
+   * and nothing about which API key or key generation is in use.
+   */
+  readAccountIdentity(request: {
+    readonly accountId: string;
+    readonly timeoutMs: number;
+  }): Promise<LiveProviderAccountIdentityRead>;
 }
 
 /**

@@ -141,6 +141,15 @@ export interface LiveVenueOrderEvidence {
   /** Venue-supplied times, clearly labelled as provider clock. */
   readonly providerCreatedAtMs: number;
   readonly providerEventTimeMs: number;
+  /**
+   * The venue's `client_order_id`, EXACTLY as returned (no trim, no case
+   * folding). `null` when the provider supplied null, omitted it, or supplied
+   * a non-string. Orders created before this system sent a `client_order_id`
+   * carry `null`. A `null` never matches any local order, and a non-null value
+   * establishes ORDER identity only (see `matchVenueOrdersByClientOrderId`),
+   * never account continuity.
+   */
+  readonly clientOrderId: string | null;
 }
 
 /** One authoritative venue position observation. */
@@ -211,6 +220,15 @@ export interface LiveReconciliationFinding {
  * operator can name the refusal without reading application state.
  */
 export type LiveReconciliationFindingCode =
+  // --- provider account identity (users/info coindcx_id) -------------------
+  /**
+   * The configured credentials act on a different provider trading account
+   * (fingerprint mismatch, e.g. another subaccount). Checked before any
+   * evidence read or durable effect; blocks the run for manual review.
+   */
+  | 'RECON_ACCOUNT_IDENTITY_MISMATCH'
+  /** The provider trading-account identity was missing, unreadable, or malformed. Blocks the run. */
+  | 'RECON_ACCOUNT_IDENTITY_UNVERIFIED'
   // --- evidence integrity (§5, §13, §14) -----------------------------------
   /** A provider order/position read could not prove it inspected everything. */
   | 'RECON_EVIDENCE_INCOMPLETE'
@@ -272,6 +290,23 @@ export type LiveReconciliationFindingCode =
    * count. Structural, not evidentiary: no amount of re-reading changes it.
    */
   | 'RECON_AMBIGUOUS_CREATE_IDENTITY_UNOBSERVABLE'
+  /**
+   * Exactly one venue order in a COMPLETE read carries this order's exact
+   * `client_order_id`, its observable economics agree, and nothing else claims
+   * it: order identity is established by the provider-confirmed idempotent
+   * client order id. Order identity only; never account continuity.
+   */
+  | 'RECON_AMBIGUOUS_CREATE_RESOLVED_BY_CLIENT_ORDER_ID'
+  /**
+   * A `client_order_id` match that cannot be adopted: the matched venue order
+   * contradicts this order's economics, is already claimed by another local
+   * order, or cannot be projected onto a permitted state.
+   */
+  | 'RECON_AMBIGUOUS_CREATE_CLIENT_ORDER_ID_CONFLICT'
+  /** More than one venue order carries the same `client_order_id`: an invariant violation. */
+  | 'RECON_CLIENT_ORDER_ID_DUPLICATE_AT_VENUE'
+  /** An order already bound to a venue id is reported with a DIFFERENT non-null `client_order_id`. */
+  | 'RECON_ORDER_CLIENT_ORDER_ID_CONFLICT'
   // --- cancellation ambiguity (§7) -----------------------------------------
   | 'RECON_CANCEL_RESOLVED_FROM_VENUE'
   | 'RECON_CANCEL_UNRESOLVED'

@@ -19,6 +19,11 @@
 import type { LiveOrderObservation, LiveOrderSide, LiveTimeInForce } from './types';
 
 export interface LivePlaceOrderRequest {
+  /**
+   * The intent's persisted deterministic id, sent to CoinDCX as
+   * `client_order_id` (mandatory, at most 36 characters). The adapter refuses
+   * to dispatch anything that is not exactly this frozen format.
+   */
   readonly clientOrderId: string;
   readonly pair: string;
   readonly side: LiveOrderSide;
@@ -44,6 +49,18 @@ export type LivePlaceOrderResult =
    * fail closed and must not resend.
    */
   | { readonly kind: 'AMBIGUOUS'; readonly reasonCode: string }
+  /**
+   * CoinDCX positively identified this create as a DUPLICATE of an earlier
+   * create carrying the same `client_order_id` (matched against the exact,
+   * provider-confirmed error signal the adapter pins; never guessed from a
+   * message). This is evidence the id was accepted before, and nothing more:
+   * it is not a success, not a rejection, and it carries no venue order
+   * identity. The caller fails closed exactly as for `AMBIGUOUS`, and only a
+   * read-side proof (exactly one venue order carrying this exact id) may later
+   * resolve it. Until the exact provider code is confirmed, no response is
+   * ever classified this way.
+   */
+  | { readonly kind: 'DUPLICATE_CLIENT_ORDER_ID'; readonly reasonCode: string }
   /** Provably nothing was sent (request rejected locally before any socket write). */
   | { readonly kind: 'PRE_DISPATCH_FAILURE'; readonly reasonCode: string };
 

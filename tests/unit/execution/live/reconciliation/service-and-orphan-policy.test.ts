@@ -9,6 +9,7 @@ import { newLiveRuntimeIdentity } from '../../../../../src/execution/live/reconc
 import { InMemoryLiveExecutionRepository } from '../helpers';
 import { InMemoryReconciliationRepository } from './in-memory-repository';
 import {
+  EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
   ACCOUNT,
   EPOCH,
   FakeEvidenceProvider,
@@ -99,7 +100,7 @@ function buildService(options: {
     executionRepository: execution,
     evidenceProvider: provider,
     runtimeIdentity: RUNTIME_IDENTITY,
-    credentialAccountId: ACCOUNT,
+    credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
     clock: new FixedClock(),
     ...(resolution.status === 'ENABLED' && options.orphanCancellation !== undefined
       ? { orphanPolicy: resolution.policy, orphanCancellation: options.orphanCancellation }
@@ -214,7 +215,7 @@ describe('P18 §9 orphan handling', () => {
 
     const first = new LiveReconciliationService({
       repository: reconciliation, executionRepository: execution, evidenceProvider: provider,
-      runtimeIdentity: RUNTIME_IDENTITY, credentialAccountId: ACCOUNT,
+      runtimeIdentity: RUNTIME_IDENTITY, credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
       clock: new FixedClock(), orphanPolicy: resolution.policy, orphanCancellation: port,
     });
     await first.reconcileAccount(ACCOUNT);
@@ -224,7 +225,7 @@ describe('P18 §9 orphan handling', () => {
     // durable, so the restart must not re-arm it.
     const second = new LiveReconciliationService({
       repository: reconciliation, executionRepository: execution, evidenceProvider: provider,
-      runtimeIdentity: newLiveRuntimeIdentity(), credentialAccountId: ACCOUNT,
+      runtimeIdentity: newLiveRuntimeIdentity(), credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
       clock: new FixedClock(), orphanPolicy: resolution.policy, orphanCancellation: port,
     });
     const outcome = await second.reconcileAccount(ACCOUNT);
@@ -560,7 +561,7 @@ describe('P18 §4 generation fencing at the service level', () => {
     const provider = new FakeEvidenceProvider(evidenceSet());
     const make = () => new LiveReconciliationService({
       repository: reconciliation, executionRepository: execution, evidenceProvider: provider,
-      runtimeIdentity: newLiveRuntimeIdentity(), credentialAccountId: ACCOUNT, clock: new FixedClock(),
+      runtimeIdentity: newLiveRuntimeIdentity(), credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT, clock: new FixedClock(),
     });
 
     // Claim generation 1 and leave it RUNNING by not completing it.

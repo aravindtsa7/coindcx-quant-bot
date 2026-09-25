@@ -105,6 +105,12 @@ export interface InrFuturesOrder {
   readonly marginCurrency: 'INR';
   readonly createdAtMs: number;
   readonly updatedAtMs: number;
+  /**
+   * The provider `client_order_id`, exactly as returned (no trim or case
+   * folding). `null` when the provider returned null, omitted it, or returned
+   * a non-string.
+   */
+  readonly clientOrderId: string | null;
 }
 
 export interface InrFuturesPositionTransaction {

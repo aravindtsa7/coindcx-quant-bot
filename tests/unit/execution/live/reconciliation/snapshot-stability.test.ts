@@ -21,6 +21,7 @@ import { LiveReconciliationService, requireCurrentReconciliation, resolveOrphanC
 import { InMemoryLiveExecutionRepository } from '../helpers';
 import { InMemoryReconciliationRepository } from './in-memory-repository';
 import {
+  EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
   ACCOUNT,
   AlwaysUnstableEvidenceProvider,
   FakeOrphanCancellation,
@@ -50,7 +51,7 @@ function buildService(input: {
     executionRepository: execution,
     evidenceProvider: input.evidenceProvider,
     runtimeIdentity: RUNTIME_IDENTITY,
-    credentialAccountId: ACCOUNT,
+    credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
     clock: new FixedClock(),
     maxSnapshotAttempts: input.maxSnapshotAttempts,
     ...(resolution.status === 'ENABLED' && input.orphanCancellation !== undefined
@@ -84,7 +85,7 @@ describe('P18 Wave B3 §F18-23 real network latency must never produce a false R
       executionRepository: execution,
       evidenceProvider: provider,
       runtimeIdentity: RUNTIME_IDENTITY,
-      credentialAccountId: ACCOUNT,
+      credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
       clock: new FixedClock(),
     });
 
@@ -117,7 +118,7 @@ describe('P18 Wave B3 §F18-23 real network latency must never produce a false R
       executionRepository: new InMemoryLiveExecutionRepository(),
       evidenceProvider: provider,
       runtimeIdentity: RUNTIME_IDENTITY,
-      credentialAccountId: ACCOUNT,
+      credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
       clock: new FixedClock(),
     });
 
@@ -142,7 +143,7 @@ describe('P18 Wave B3 §F18-23 real network latency must never produce a false R
       executionRepository: new InMemoryLiveExecutionRepository(),
       evidenceProvider: provider,
       runtimeIdentity: RUNTIME_IDENTITY,
-      credentialAccountId: ACCOUNT,
+      credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
       clock: new FixedClock(),
     });
 
@@ -161,7 +162,7 @@ describe('P18 Wave B3 §F18-23 real network latency must never produce a false R
       executionRepository: new InMemoryLiveExecutionRepository(),
       evidenceProvider: provider,
       runtimeIdentity: RUNTIME_IDENTITY,
-      credentialAccountId: ACCOUNT,
+      credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
       clock: new FixedClock(),
     });
 
@@ -387,7 +388,7 @@ describe('P18 Wave B §F18-04 maxSnapshotAttempts is validated, not caller-trust
       executionRepository: new InMemoryLiveExecutionRepository(),
       evidenceProvider: provider,
       runtimeIdentity: RUNTIME_IDENTITY,
-      credentialAccountId: ACCOUNT,
+      credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
       clock: new FixedClock(),
       maxSnapshotAttempts,
     });
@@ -525,7 +526,7 @@ describe('P18 Wave B3 §F18-04 CURRENT-STATE reconciliation (Option B): history-
       executionRepository: execution,
       evidenceProvider: provider,
       runtimeIdentity: RUNTIME_IDENTITY,
-      credentialAccountId: ACCOUNT,
+      credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
       clock: new FixedClock(),
       maxSnapshotAttempts: 3,
     });
@@ -598,7 +599,7 @@ describe('P18 Wave B4 §F18-27 a venue order appearing after the final REST read
     });
     const first = new LiveReconciliationService({
       repository: reconciliation, executionRepository: execution, evidenceProvider: cleanProvider,
-      runtimeIdentity: RUNTIME_IDENTITY, credentialAccountId: ACCOUNT, clock: new FixedClock(), maxSnapshotAttempts: 3,
+      runtimeIdentity: RUNTIME_IDENTITY, credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT, clock: new FixedClock(), maxSnapshotAttempts: 3,
     });
     const firstOutcome = await first.reconcileAccount(ACCOUNT);
     if (firstOutcome.kind !== 'COMPLETED') throw new Error('expected completion');
@@ -617,7 +618,7 @@ describe('P18 Wave B4 §F18-27 a venue order appearing after the final REST read
     });
     const second = new LiveReconciliationService({
       repository: reconciliation, executionRepository: execution, evidenceProvider: laterProvider,
-      runtimeIdentity: RUNTIME_IDENTITY, credentialAccountId: ACCOUNT, clock: new FixedClock(), maxSnapshotAttempts: 3,
+      runtimeIdentity: RUNTIME_IDENTITY, credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT, clock: new FixedClock(), maxSnapshotAttempts: 3,
     });
     const secondOutcome = await second.reconcileAccount(ACCOUNT);
     if (secondOutcome.kind !== 'COMPLETED') throw new Error('expected completion');

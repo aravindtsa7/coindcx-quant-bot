@@ -316,6 +316,13 @@ export function applyLiveOrderObservation(
       details: { intentId: current.intentId },
     });
   }
+  // A venue-echoed client order id, when present, must be byte-identical to
+  // the local one. `null` (no echo) is not a contradiction.
+  if (observation.exchangeClientOrderId !== null && observation.exchangeClientOrderId !== current.clientOrderId) {
+    throw new LiveExecutionError('LIVE_ORDER_IDENTITY_MISMATCH', 'Observation carries a different venue client order id than this order', {
+      details: { intentId: current.intentId },
+    });
+  }
 
   const ordered = liveDecimal(current.orderedQuantity);
   const recorded = liveDecimal(current.cumulativeFilledQuantity);

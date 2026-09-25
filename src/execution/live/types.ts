@@ -177,9 +177,12 @@ export interface LiveOrderObservation {
   readonly kind: LiveOrderObservationKind;
   readonly clientOrderId: string;
   /**
-   * CoinDCX futures does not document a client-order-id field. This remains
-   * null until a future verified contract explicitly supplies one; the local
-   * deterministic id above must never be represented as a venue echo.
+   * The VENUE's own `client_order_id` for this order, only when CoinDCX
+   * returned one byte-identical to `clientOrderId`; otherwise null (for
+   * example an order created before the id was sent, or a response that
+   * carried none). The local deterministic id must never be copied in here as
+   * if it were a venue echo, and a non-identical venue value is an identity
+   * mismatch, never stored.
    */
   readonly exchangeClientOrderId: string | null;
   readonly exchangeOrderId: string;

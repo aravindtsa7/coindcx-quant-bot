@@ -25,6 +25,7 @@ import { composeLiveExecutionRuntime, LiveExecutionRuntime } from '../../../src/
 import {
   ACCOUNT,
   AlwaysUnstableEvidenceProvider,
+  EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
   EPOCH,
   FakeEvidenceProvider,
   FakeOrphanCancellation,
@@ -249,6 +250,7 @@ function buildService<P extends MinimalEvidenceProvider = FakeEvidenceProvider>(
     evidenceProvider: provider as never,
     runtimeIdentity,
     credentialAccountId: options.accountId ?? (options.evidence ?? evidenceSet()).accountId,
+    expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
     clock: new FixedClock(),
     maxSnapshotAttempts: options.maxSnapshotAttempts,
     ...(resolution.status === 'ENABLED' && options.orphanCancellation !== undefined
@@ -540,6 +542,7 @@ describe('P18-DB Wave A credential and derived-health defenses', () => {
         LIVE_EXECUTION_ACCOUNT_ALLOWLIST: accountId, LIVE_EXECUTION_PAIR_ALLOWLIST: PAIR,
         LIVE_EXECUTION_MAX_ORDER_NOTIONAL_INR: '10000000',
         COINDCX_API_KEY: 'test-key', COINDCX_API_SECRET: 'test-secret', COINDCX_LIVE_ACCOUNT_ID: accountId,
+        COINDCX_EXPECTED_ACCOUNT_FINGERPRINT: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
       },
       prisma: connectionA,
       coordinator: new RiskAdmissionCoordinator(),

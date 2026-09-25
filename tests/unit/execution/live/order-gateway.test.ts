@@ -1,12 +1,16 @@
 import http from 'node:http';
+import { LosslessNumber } from 'lossless-json';
 import type { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { LiveFetchOrderRequest, LivePlaceOrderRequest } from '../../../../src/execution/live/gateway';
 import { COINDCX_ORDER_MUTATION_ENDPOINTS } from '../../../../src/integration/coindcx/live/endpoints';
 import {
+  COINDCX_DUPLICATE_CLIENT_ORDER_ID_SIGNAL,
   COINDCX_ORDER_OBSERVATION_MAX_PAGES,
   COINDCX_FUTURES_ORDER_CAPABILITIES,
   CoinDcxLiveFuturesOrderGateway,
+  classifyCreateFailure,
+  classifyCreateHttpFailure,
 } from '../../../../src/integration/coindcx/live/order-gateway';
 import { LiveCreateRequestSchema } from '../../../../src/integration/coindcx/live/wire-schemas';
 
@@ -141,7 +145,7 @@ afterAll(async () => venue.stop());
 beforeEach(() => venue.reset());
 
 describe('verified CoinDCX create contract and execution semantics', () => {
-  it('posts the documented order envelope and never sends the local client identity', async () => {
+  it('posts the documented order envelope carrying the persisted client_order_id (provider-confirmed, <=36)', async () => {
     venue.respondJson(200, [order()]);
     expect((await gateway.placeOrder(placeRequest())).kind).toBe('ACCEPTED');
     const captured = venue.requests[0];
@@ -154,9 +158,10 @@ describe('verified CoinDCX create contract and execution semantics', () => {
       order: {
         side: 'buy', pair: PAIR, order_type: 'limit_order', price: '64000.5', stop_price: null,
         total_quantity: '0.5', leverage: '5', notification: 'no_notification', margin_currency_short_name: 'INR',
+        client_order_id: CLIENT_ORDER_ID,
       },
     });
-    expect(JSON.stringify(captured?.body)).not.toContain(CLIENT_ORDER_ID);
+    expect(CLIENT_ORDER_ID).toHaveLength(36);
   });
 
   it('rejects the old flat request shape in the executable contract', () => {
@@ -384,9 +389,11 @@ describe('mutation outcome and cancel contracts', () => {
     expect(venue.requests.slice(1).map((request) => (request.body as { page: string }).page)).toEqual(['1', '2', '3']);
   });
 
-  it('requires a documented error body before classifying a 4xx refusal', async () => {
+  it('[PROVIDER-IDEMP-01] never records an unclassified create 4xx as a terminal refusal', async () => {
+    // Formerly REJECTED. A 4xx may be the unconfirmed duplicate-client_order_id
+    // rejection, i.e. proof an earlier create landed, so it must stay ambiguous.
     venue.respondJson(400, { message: 'invalid quantity' });
-    expect(await gateway.placeOrder(placeRequest())).toEqual({ kind: 'REJECTED', reasonCode: 'HTTP_400', observation: null });
+    expect(await gateway.placeOrder(placeRequest())).toEqual({ kind: 'AMBIGUOUS', reasonCode: 'HTTP_400' });
     venue.respondJson(400, { unexpected: true });
     expect(await gateway.placeOrder(placeRequest())).toEqual({ kind: 'AMBIGUOUS', reasonCode: 'LIVE_ERROR_RESPONSE_INVALID' });
   });
@@ -428,5 +435,180 @@ describe('closed endpoint surface', () => {
     expect(Object.keys(COINDCX_ORDER_MUTATION_ENDPOINTS).sort()).toEqual(['CANCEL_ORDER', 'CREATE_ORDER', 'LIST_ORDERS']);
     expect(Object.isFrozen(COINDCX_ORDER_MUTATION_ENDPOINTS)).toBe(true);
     expect(Object.values(COINDCX_ORDER_MUTATION_ENDPOINTS).every((entry) => entry.method === 'POST')).toBe(true);
+  });
+});
+
+describe('provider-confirmed client_order_id on the create and read paths', () => {
+  it.each([
+    ['37 characters', `${CLIENT_ORDER_ID}a`],
+    ['not the frozen format', 'client-order-1'],
+    ['uppercase', CLIENT_ORDER_ID.toUpperCase()],
+    ['empty', ''],
+  ])('refuses a client order id that is %s before any request is sent', async (_label, clientOrderId) => {
+    const result = await gateway.placeOrder(placeRequest({ clientOrderId }));
+    expect(result).toEqual({ kind: 'PRE_DISPATCH_FAILURE', reasonCode: 'LIVE_CLIENT_ORDER_ID_INVALID' });
+    expect(venue.requests).toHaveLength(0);
+  });
+
+  it('the executable create contract requires client_order_id and enforces the 36-character limit', () => {
+    const envelope = {
+      timestamp: 1,
+      order: {
+        side: 'buy', pair: PAIR, order_type: 'limit_order', price: '1', stop_price: null, total_quantity: '1',
+        notification: 'no_notification', margin_currency_short_name: 'INR', client_order_id: CLIENT_ORDER_ID,
+      },
+    };
+    expect(LiveCreateRequestSchema.safeParse(envelope).success).toBe(true);
+    const { client_order_id: _omitted, ...withoutId } = envelope.order;
+    expect(LiveCreateRequestSchema.safeParse({ ...envelope, order: withoutId }).success).toBe(false);
+    expect(LiveCreateRequestSchema.safeParse({ ...envelope, order: { ...envelope.order, client_order_id: `${CLIENT_ORDER_ID}a` } }).success).toBe(false);
+  });
+
+  it('no duplicate error code is guessed: the pinned signal is null and nothing classifies as duplicate', () => {
+    expect(COINDCX_DUPLICATE_CLIENT_ORDER_ID_SIGNAL).toBeNull();
+    for (const body of [
+      { message: 'Duplicate client_order_id', code: 400 },
+      { message: 'client order id already exists', code: 'DUPLICATE' },
+      { message: 'duplicate' },
+    ]) {
+      expect(classifyCreateFailure(400, body)).toBe('UNCLASSIFIED');
+      expect(classifyCreateFailure(422, body)).toBe('UNCLASSIFIED');
+    }
+  });
+
+  it('an unknown provider error is never assumed to be a duplicate, even when its message says so', async () => {
+    venue.respondJson(400, { message: 'Duplicate client_order_id: order already exists', code: 'E_DUP' });
+    const withStringCode = await gateway.placeOrder(placeRequest());
+    expect(withStringCode.kind).not.toBe('DUPLICATE_CLIENT_ORDER_ID');
+    expect(withStringCode).toEqual({ kind: 'AMBIGUOUS', reasonCode: 'HTTP_400' });
+
+    // A numeric code arrives lossless-parsed; the existing error contract
+    // treats that body as unestablished (AMBIGUOUS). Still never a duplicate.
+    venue.reset();
+    venue.respondJson(400, { message: 'Duplicate client_order_id: order already exists', code: 400 });
+    const withNumericCode = await gateway.placeOrder(placeRequest());
+    expect(withNumericCode.kind).not.toBe('DUPLICATE_CLIENT_ORDER_ID');
+    expect(withNumericCode.kind).toBe('AMBIGUOUS');
+  });
+
+  it('a configured signal (wired later from the confirmed code) matches exact status AND exact code only, never the message', () => {
+    const signal = { httpStatus: 400, providerCode: '4081' };
+    expect(classifyCreateFailure(400, { message: 'anything at all', code: '4081' }, signal)).toBe('DUPLICATE_CLIENT_ORDER_ID');
+    expect(classifyCreateFailure(400, { message: 'anything at all', code: 4081 }, signal)).toBe('DUPLICATE_CLIENT_ORDER_ID');
+    expect(classifyCreateFailure(400, { message: 'x', code: new LosslessNumber('4081') }, signal)).toBe('DUPLICATE_CLIENT_ORDER_ID');
+    expect(classifyCreateFailure(422, { message: 'x', code: '4081' }, signal)).toBe('UNCLASSIFIED');
+    expect(classifyCreateFailure(400, { message: 'x', code: '40810' }, signal)).toBe('UNCLASSIFIED');
+    expect(classifyCreateFailure(400, { message: 'duplicate 4081' }, signal)).toBe('UNCLASSIFIED');
+    expect(classifyCreateFailure(400, null, signal)).toBe('UNCLASSIFIED');
+  });
+
+  it('a create response echoing the exact id is accepted and echoed; a different id is an identity mismatch', async () => {
+    venue.respondJson(200, [order({ client_order_id: CLIENT_ORDER_ID })]);
+    const accepted = await gateway.placeOrder(placeRequest());
+    expect(accepted.kind).toBe('ACCEPTED');
+    if (accepted.kind === 'ACCEPTED') expect(accepted.observation.exchangeClientOrderId).toBe(CLIENT_ORDER_ID);
+
+    for (const echoed of [`p17-${'f'.repeat(32)}`, CLIENT_ORDER_ID.toUpperCase(), 12345]) {
+      venue.reset();
+      venue.respondJson(200, [order({ client_order_id: echoed })]);
+      expect(await gateway.placeOrder(placeRequest())).toEqual({ kind: 'AMBIGUOUS', reasonCode: 'LIVE_ORDER_IDENTITY_MISMATCH' });
+    }
+  });
+
+  it('a create response with a null client_order_id is accepted with no echo (never filled in with the local id)', async () => {
+    venue.respondJson(200, [order({ client_order_id: null })]);
+    const accepted = await gateway.placeOrder(placeRequest());
+    expect(accepted.kind).toBe('ACCEPTED');
+    if (accepted.kind === 'ACCEPTED') expect(accepted.observation.exchangeClientOrderId).toBeNull();
+  });
+
+  it('fetchOrder refuses a venue order whose client_order_id differs, and echoes an identical one', async () => {
+    venue.respondJson(200, [order({ status: 'open', client_order_id: `p17-${'f'.repeat(32)}` })]);
+    expect(await gateway.fetchOrder(fetchRequest())).toEqual({ kind: 'AMBIGUOUS', reasonCode: 'LIVE_ORDER_IDENTITY_MISMATCH' });
+    venue.reset();
+    venue.respondJson(200, [order({ status: 'open', client_order_id: CLIENT_ORDER_ID })]);
+    const found = await gateway.fetchOrder(fetchRequest());
+    expect(found.kind).toBe('FOUND');
+    if (found.kind === 'FOUND') expect(found.observation.exchangeClientOrderId).toBe(CLIENT_ORDER_ID);
+  });
+});
+
+describe('[PROVIDER-IDEMP-01] create HTTP failures are ambiguous unless they are the exact configured duplicate', () => {
+  const FAILURE_STATUSES = [400, 401, 403, 404, 409, 422, 429, 500, 502, 503, 504] as const;
+
+  it.each(FAILURE_STATUSES)('signal null + HTTP %i => AMBIGUOUS through the real adapter, never REJECTED', async (status) => {
+    expect(COINDCX_DUPLICATE_CLIENT_ORDER_ID_SIGNAL).toBeNull();
+    venue.respondJson(status, { message: 'order refused', code: 'E_ANY' });
+    const result = await gateway.placeOrder(placeRequest());
+    expect(result).toEqual({ kind: 'AMBIGUOUS', reasonCode: `HTTP_${status}` });
+    expect(venue.requests).toHaveLength(1);
+  });
+
+  it.each(FAILURE_STATUSES)('a message containing "duplicate" never changes the classification (HTTP %i)', async (status) => {
+    venue.respondJson(status, { message: 'Duplicate client_order_id: an order with this client order id already exists', code: 'DUPLICATE' });
+    expect(await gateway.placeOrder(placeRequest())).toEqual({ kind: 'AMBIGUOUS', reasonCode: `HTTP_${status}` });
+  });
+
+  it('a malformed error body => AMBIGUOUS', async () => {
+    for (const body of [{ unexpected: true }, { message: '' }, [], 'not-an-object', null]) {
+      venue.reset();
+      venue.respondJson(400, body);
+      const result = await gateway.placeOrder(placeRequest());
+      expect(result.kind).toBe('AMBIGUOUS');
+    }
+    venue.reset();
+    venue.respondMalformed();
+    expect((await gateway.placeOrder(placeRequest())).kind).toBe('AMBIGUOUS');
+  });
+
+  it('a transport PRE_DISPATCH (connection refused, nothing sent) remains PRE_DISPATCH_FAILURE', async () => {
+    const closed = http.createServer();
+    await new Promise<void>((resolve) => closed.listen(0, '127.0.0.1', () => resolve()));
+    const port = (closed.address() as AddressInfo).port;
+    await new Promise<void>((resolve) => closed.close(() => resolve()));
+    const unreachable = new CoinDcxLiveFuturesOrderGateway({ apiKey: API_KEY, apiSecret: API_SECRET, baseUrl: `http://127.0.0.1:${port}` });
+    const result = await unreachable.placeOrder(placeRequest());
+    expect(result.kind).toBe('PRE_DISPATCH_FAILURE');
+  });
+
+  describe('with a configured exact signal (the shape the confirmed code will be wired into)', () => {
+    const signal = { httpStatus: 409, providerCode: '4081' };
+
+    it('exact status + exact code => DUPLICATE_CLIENT_ORDER_ID (string, number, or lossless code)', () => {
+      for (const code of ['4081', 4081, new LosslessNumber('4081')]) {
+        expect(classifyCreateHttpFailure(409, { message: 'anything', code }, signal))
+          .toEqual({ kind: 'DUPLICATE_CLIENT_ORDER_ID', reasonCode: 'HTTP_409_DUPLICATE_CLIENT_ORDER_ID' });
+      }
+    });
+
+    it('same status, wrong code => AMBIGUOUS', () => {
+      for (const code of ['4082', '40810', '408', 'DUPLICATE', undefined]) {
+        expect(classifyCreateHttpFailure(409, { message: 'duplicate client order id', code }, signal)).toEqual({ kind: 'AMBIGUOUS', reasonCode: 'HTTP_409' });
+      }
+    });
+
+    it('same code, wrong status => AMBIGUOUS', () => {
+      for (const status of [400, 422, 429, 500]) {
+        expect(classifyCreateHttpFailure(status, { message: 'duplicate client order id', code: '4081' }, signal))
+          .toEqual({ kind: 'AMBIGUOUS', reasonCode: `HTTP_${status}` });
+      }
+    });
+
+    it('a duplicate-sounding message with no matching code => AMBIGUOUS', () => {
+      expect(classifyCreateHttpFailure(409, { message: 'Duplicate client_order_id 4081' }, signal)).toEqual({ kind: 'AMBIGUOUS', reasonCode: 'HTTP_409' });
+    });
+
+    it('a malformed body without the exact code => AMBIGUOUS', () => {
+      expect(classifyCreateHttpFailure(409, { unexpected: true }, signal)).toEqual({ kind: 'AMBIGUOUS', reasonCode: 'LIVE_ERROR_RESPONSE_INVALID' });
+      expect(classifyCreateHttpFailure(409, null, signal)).toEqual({ kind: 'AMBIGUOUS', reasonCode: 'LIVE_ERROR_RESPONSE_INVALID' });
+    });
+  });
+
+  it('there is no terminal REJECTED outcome for any create HTTP failure, with or without a signal', () => {
+    for (const status of [400, 401, 403, 404, 409, 422, 429, 499, 500, 599]) {
+      for (const signal of [null, { httpStatus: 409, providerCode: '4081' }]) {
+        expect(classifyCreateHttpFailure(status, { message: 'x', code: 'y' }, signal).kind).not.toBe('REJECTED');
+      }
+    }
   });
 });

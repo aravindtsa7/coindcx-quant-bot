@@ -51,16 +51,19 @@ export {
 export {
   ambiguousCreateIdentityUnobservableReason,
   ambiguousCreateProofSha256,
+  clientOrderIdResolutionProofSha256,
   detectOrphanVenueOrders,
   isLocallyActive,
   matchesImmutableEconomics,
   matchesProvenEconomicsForAmbiguousCreate,
+  matchVenueOrdersByClientOrderId,
   observationFromEvidence,
   planClaimRecovery,
   reconcileIdentifiedOrder,
   requiresAmbiguousCreateResolution,
   resolveAmbiguousCreate,
   resolveAmbiguousCreateAgainstObservableCandidates,
+  resolveAmbiguousCreateByClientOrderId,
   withinSubmissionWindow,
   LIVE_RECONCILIATION_TRANSITIONS,
   LOCALLY_ACTIVE_STATES,
@@ -69,6 +72,7 @@ export {
   type AmbiguousCreateResolutionInput,
   type LiveClaimRecoveryEffect,
   type LiveClaimRecoveryPlan,
+  type LiveClientOrderIdMatch,
   type LiveOrderReconciliationEffect,
   type LiveOrderReconciliationOutcome,
 } from './order-reconciliation';
@@ -96,6 +100,19 @@ export {
 } from './orphan-policy';
 
 export { GatewayOrphanCancellation } from './gateway-orphan-cancellation';
+
+export {
+  accountIdentityFinding,
+  accountIdentityGateSnapshotSha256,
+  isProviderAccountFingerprint,
+  providerAccountFingerprint,
+  requireExpectedProviderAccountFingerprint,
+  verifyProviderAccountIdentity,
+  LIVE_PROVIDER_ACCOUNT_FINGERPRINT_PATTERN,
+  type LiveProviderAccountIdentityRead,
+  type LiveProviderAccountIdentityVerification,
+  type LiveProviderAccountIdentityVerified,
+} from './account-identity';
 
 export {
   mintOrphanAmbiguityResolutionRequest,

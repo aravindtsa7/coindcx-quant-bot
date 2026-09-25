@@ -66,6 +66,12 @@ describe('P17-I04 live execution is disabled by default', () => {
     ['a whitespace api key', { COINDCX_API_KEY: '   ' }, 'MISSING_CREDENTIALS'],
     ['a missing api secret', { COINDCX_API_SECRET: undefined }, 'MISSING_CREDENTIALS'],
     ['a missing credential account identity', { COINDCX_LIVE_ACCOUNT_ID: '' }, 'MISSING_CREDENTIAL_ACCOUNT_ID'],
+    ['a missing provider account binding', { COINDCX_EXPECTED_ACCOUNT_FINGERPRINT: undefined }, 'MISSING_ACCOUNT_IDENTITY_BINDING'],
+    ['an empty provider account binding', { COINDCX_EXPECTED_ACCOUNT_FINGERPRINT: '' }, 'MISSING_ACCOUNT_IDENTITY_BINDING'],
+    ['a raw (unhashed) provider account binding', { COINDCX_EXPECTED_ACCOUNT_FINGERPRINT: 'fake-coindcx-trading-account-1' }, 'MALFORMED_ACCOUNT_IDENTITY_BINDING'],
+    ['an uppercase provider account binding', { COINDCX_EXPECTED_ACCOUNT_FINGERPRINT: 'A'.repeat(64) }, 'MALFORMED_ACCOUNT_IDENTITY_BINDING'],
+    ['a padded provider account binding', { COINDCX_EXPECTED_ACCOUNT_FINGERPRINT: ` ${'a'.repeat(64)}` }, 'MALFORMED_ACCOUNT_IDENTITY_BINDING'],
+    ['a truncated provider account binding', { COINDCX_EXPECTED_ACCOUNT_FINGERPRINT: 'a'.repeat(63) }, 'MALFORMED_ACCOUNT_IDENTITY_BINDING'],
     ['an empty account allowlist', { LIVE_EXECUTION_ACCOUNT_ALLOWLIST: '' }, 'EMPTY_ACCOUNT_ALLOWLIST'],
     ['a comma-only account allowlist', { LIVE_EXECUTION_ACCOUNT_ALLOWLIST: ' , , ' }, 'EMPTY_ACCOUNT_ALLOWLIST'],
     ['an empty pair allowlist', { LIVE_EXECUTION_PAIR_ALLOWLIST: '' }, 'EMPTY_PAIR_ALLOWLIST'],
@@ -126,6 +132,7 @@ describe('P17 enablement is non-forgeable and allowlist-bound', () => {
       pairAllowlist: [],
       maxOrderNotionalInr: '1',
       credentialAccountId: 'account-live-1',
+      expectedProviderAccountFingerprint: 'a'.repeat(64),
       environment: 'production',
     })).toThrow(LiveExecutionError);
   });

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import Decimal from 'decimal.js';
 import { InMemoryLiveExecutionRepository } from '../helpers';
 import {
   LiveRuntimeIdentity,
@@ -19,7 +20,7 @@ import {
   CoinDcxReconciliationEvidenceAdapter,
 } from '../../../../../src/integration/coindcx/live/reconciliation-evidence-adapter';
 import { InMemoryReconciliationRepository } from './in-memory-repository';
-import { ACCOUNT, FakeEvidenceProvider, FixedClock, evidenceSet } from './helpers';
+import { ACCOUNT, EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT, FakeEvidenceProvider, FixedClock, evidenceSet } from './helpers';
 
 describe('P18 Wave A opaque runtime and reconciliation authority', () => {
   it('rejects constructor misuse, cloning, structural fakes, and prototype-only objects', () => {
@@ -71,7 +72,7 @@ describe('P18 Wave A opaque runtime and reconciliation authority', () => {
       executionRepository: execution,
       evidenceProvider: provider,
       runtimeIdentity: firstIdentity,
-      credentialAccountId: ACCOUNT,
+      credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
       clock: new FixedClock(),
     });
     await first.reconcileAccount(ACCOUNT);
@@ -87,7 +88,7 @@ describe('P18 Wave A opaque runtime and reconciliation authority', () => {
       executionRepository: execution,
       evidenceProvider: provider,
       runtimeIdentity: secondIdentity,
-      credentialAccountId: ACCOUNT,
+      credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
       clock: new FixedClock(),
     });
     await second.reconcileAccount(ACCOUNT);
@@ -107,7 +108,7 @@ describe('P18 Wave A credential account binding', () => {
       executionRepository: new InMemoryLiveExecutionRepository(),
       evidenceProvider: provider,
       runtimeIdentity: newLiveRuntimeIdentity(),
-      credentialAccountId: ACCOUNT,
+      credentialAccountId: ACCOUNT, expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
       clock: new FixedClock(),
     });
 
@@ -206,5 +207,64 @@ describe('P18 Wave B2 §F18-22 maxPages construction-time validation', () => {
     expect(positions.provenance.pagesRead).toBeGreaterThan(0);
     expect(counts.orderCalls).toBe(2);
     expect(counts.positionCalls).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Provider account identity and client_order_id at the evidence adapter.
+// The client is an in-memory stub (`client as never`); nothing reaches CoinDCX.
+// ---------------------------------------------------------------------------
+
+describe('evidence adapter: provider account identity read', () => {
+  const RAW_COINDCX_ID = 'fake-coindcx-trading-account-1';
+
+  function identityAdapter(getUserInfoSafe: () => Promise<unknown>) {
+    const client = { getUserInfoSafe, listInrFuturesOrders: async () => [], listInrFuturesPositions: async () => [] };
+    return new CoinDcxReconciliationEvidenceAdapter({ client: client as never, credentialAccountId: ACCOUNT, clock: new FixedClock() });
+  }
+
+  it('returns only the fingerprint of the users/info coindcx_id, never the raw identifier', async () => {
+    const adapter = identityAdapter(async () => ({ authenticated: true, coindcxId: RAW_COINDCX_ID }));
+    const read = await adapter.readAccountIdentity({ accountId: ACCOUNT, timeoutMs: 10 });
+    expect(read).toEqual({ kind: 'OBSERVED', fingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT });
+    expect(JSON.stringify(read)).not.toContain(RAW_COINDCX_ID);
+  });
+
+  it('a failed read or an empty coindcx_id is UNAVAILABLE, never OBSERVED', async () => {
+    const failing = identityAdapter(async () => { throw new Error('users/info failed'); });
+    expect(await failing.readAccountIdentity({ accountId: ACCOUNT, timeoutMs: 10 })).toEqual({ kind: 'UNAVAILABLE', reason: 'ACCOUNT_IDENTITY_READ_FAILED' });
+    const empty = identityAdapter(async () => ({ authenticated: true, coindcxId: '' }));
+    expect(await empty.readAccountIdentity({ accountId: ACCOUNT, timeoutMs: 10 })).toEqual({ kind: 'UNAVAILABLE', reason: 'ACCOUNT_IDENTITY_MISSING' });
+  });
+
+  it('refuses to read identity for a different local account before any provider call', async () => {
+    let calls = 0;
+    const adapter = identityAdapter(async () => { calls += 1; return { authenticated: true, coindcxId: RAW_COINDCX_ID }; });
+    await expect(adapter.readAccountIdentity({ accountId: 'account-b', timeoutMs: 10 })).rejects.toThrow(/different account/);
+    expect(calls).toBe(0);
+  });
+
+  it('maps the provider client_order_id into order evidence exactly (null stays null)', async () => {
+    const baseOrder = {
+      id: 'venue-1', pair: 'B-BTC_USDT', side: 'buy', status: 'open', orderType: 'limit_order',
+      priceUsdt: new Decimal('64000.5'), stopPriceUsdt: null, avgPriceUsdt: new Decimal('0'),
+      totalQuantity: new Decimal('0.5'), remainingQuantity: new Decimal('0.5'), cancelledQuantity: new Decimal('0'),
+      feeAmountUsdt: null, settlementCurrencyConversionPriceInrPerUsdt: null, makerFeePercent: null, takerFeePercent: null,
+      leverage: new Decimal('5'), stage: null, positionMarginType: null, marginCurrency: 'INR', createdAtMs: 1, updatedAtMs: 2,
+    };
+    const batches = [[
+      { ...baseOrder, id: 'venue-1', clientOrderId: `p17-${'a'.repeat(32)}` },
+      { ...baseOrder, id: 'venue-2', clientOrderId: null },
+    ]];
+    const client = {
+      listInrFuturesOrders: async (request: { side: string; page: string }) => (request.side === 'buy' && request.page === '1' ? batches[0] : []),
+      listInrFuturesPositions: async () => [],
+    };
+    const adapter = new CoinDcxReconciliationEvidenceAdapter({ client: client as never, credentialAccountId: ACCOUNT, clock: new FixedClock() });
+    const { orders } = await adapter.readOrders({ accountId: ACCOUNT, pairs: [], timeoutMs: 10 });
+    expect(orders.map((order) => [order.exchangeOrderId, order.clientOrderId])).toEqual([
+      ['venue-1', `p17-${'a'.repeat(32)}`],
+      ['venue-2', null],
+    ]);
   });
 });

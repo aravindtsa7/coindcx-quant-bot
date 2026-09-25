@@ -28,6 +28,10 @@ import type {
   LiveVenuePositionEvidence,
 } from '../../../execution/live/reconciliation/types';
 import type { LiveVenueEvidenceProvider } from '../../../execution/live/reconciliation/ports';
+import {
+  providerAccountFingerprint,
+  type LiveProviderAccountIdentityRead,
+} from '../../../execution/live/reconciliation/account-identity';
 import { createChildLogger } from '../../../monitoring/logger';
 import { Clock, SystemClock } from '../clock';
 import type { CoinDcxClient } from '../client';
@@ -139,6 +143,9 @@ function toOrderEvidence(order: InrFuturesOrder): LiveVenueOrderEvidence | null 
     leverage: exact(order.leverage),
     providerCreatedAtMs: order.createdAtMs,
     providerEventTimeMs: order.updatedAtMs,
+    // Exact provider value (already reduced to string-or-null by the Phase 2
+    // normalizer). Never normalized here, never defaulted to the local id.
+    clientOrderId: order.clientOrderId,
   });
 }
 
@@ -235,6 +242,36 @@ export class CoinDcxReconciliationEvidenceAdapter implements LiveVenueEvidencePr
     }
     const positions = await this.#readPositions();
     return { positions: positions.records, provenance: positions.provenance };
+  }
+
+  /**
+   * Port method: the provider trading-account identity behind these
+   * credentials, as a fingerprint only.
+   *
+   * Uses the existing Phase 2 `users/info` read (no new endpoint or signing
+   * site). The raw `coindcx_id` is reduced to `providerAccountFingerprint`
+   * immediately and is never logged, returned, or stored. A failed read, an
+   * empty identifier, or more than one user record is `UNAVAILABLE`, which the
+   * reconciler treats as a blocking failure, never as a pass.
+   */
+  public async readAccountIdentity(request: {
+    readonly accountId: string;
+    readonly timeoutMs: number;
+  }): Promise<LiveProviderAccountIdentityRead> {
+    if (request.accountId !== this.#credentialAccountId) {
+      throw new LiveExecutionError('LIVE_AUTHORITY_INVALID', 'Evidence credentials are bound to a different account');
+    }
+    let providerAccountIdentifier: string;
+    try {
+      providerAccountIdentifier = (await this.#client.getUserInfoSafe()).coindcxId;
+    } catch (error) {
+      logger.error({ failure: (error as Error).name }, 'CoinDCX account identity read failed');
+      return Object.freeze({ kind: 'UNAVAILABLE' as const, reason: 'ACCOUNT_IDENTITY_READ_FAILED' });
+    }
+    if (typeof providerAccountIdentifier !== 'string' || providerAccountIdentifier.length === 0) {
+      return Object.freeze({ kind: 'UNAVAILABLE' as const, reason: 'ACCOUNT_IDENTITY_MISSING' });
+    }
+    return Object.freeze({ kind: 'OBSERVED' as const, fingerprint: providerAccountFingerprint(providerAccountIdentifier) });
   }
 
   /**

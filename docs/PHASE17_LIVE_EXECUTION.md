@@ -160,16 +160,47 @@ Selection remains by exact exchange `id`; duplicate matches on the same or
 different pages are an identity-ambiguity fault. Array position is never
 identity.
 
-### 3.2 LOCAL-only client identity
+### 3.2 Client identity (`client_order_id`, provider-confirmed in Phase 18)
 
-The official futures Create Order, List Orders, and Cancel Order contracts do
-not establish a `client_order_id` field, maximum length, acceptance, echo, or
-correlation guarantee. Similarly named spot API fields are not futures evidence.
+When Phase 17 shipped, the official futures Create Order, List Orders, and
+Cancel Order contracts did not establish a `client_order_id` field, so
+`p17-<32 hex>` was kept as a deterministic LOCAL idempotency key only and was
+not sent.
 
-Phase 17 retains `p17-<32 hex>` only as a deterministic local idempotency key.
-It is not sent on futures create/cancel/list requests and is never described as
-exchange-confirmed. Provider observations carry `exchangeClientOrderId: null`;
-the exchange-confirmed identity is `id`.
+That has since changed (Phase 18, provider-identity wave). CoinDCX support has
+confirmed that futures create supports `client_order_id`, maximum 36
+characters, and that it is idempotent: a second create with the same id fails
+with an error code/reason (the exact code is not yet confirmed). The read-only
+provider probe observed the field in List Orders (`null` on orders created
+without one). Therefore:
+
+- The unchanged 36-character `p17-<32 hex>` id is now sent on every normal
+  create as `client_order_id` (mandatory in `LiveCreateRequestSchema`). Its
+  format and derivation did not change, so already-persisted intents keep
+  their ids.
+- It is derived from the intent's economic content and persisted with the
+  intent before the dispatch claim, the pre-wire arm, and the first network
+  attempt. A retry of the same intent reuses it; a different intent gets a
+  different one; nothing regenerates it after a timeout, and an ambiguous
+  create is still never resent.
+- The adapter refuses (`PRE_DISPATCH_FAILURE`, nothing sent) any id that is
+  not exactly the frozen format within 36 characters.
+- `exchangeClientOrderId` carries the venue's own value only when it is
+  byte-identical to the local id; a different non-null venue value is an
+  identity mismatch. `null` stays `null` and is never filled with the local id.
+- A duplicate-id create failure has a typed outcome
+  (`DUPLICATE_CLIENT_ORDER_ID`) that fails closed as `SUBMISSION_AMBIGUOUS`,
+  never success or `REJECTED`. The exact provider signal
+  (`COINDCX_DUPLICATE_CLIENT_ORDER_ID_SIGNAL`) is `null` until CoinDCX confirms
+  the code, so today no response is classified as a duplicate.
+- Because any create HTTP failure could be that unconfirmed duplicate, every
+  create HTTP failure other than the exact configured duplicate signal is
+  `AMBIGUOUS` — there is no terminal `REJECTED` for a create HTTP failure
+  (PROVIDER-IDEMP-01, see §7's outcome table).
+
+Cancel still binds the exchange-confirmed `id`, and fetch still selects by
+`id`. See `docs/PHASE18_RECONCILIATION.md` §8.0 for how reconciliation may use
+the id to identify an ambiguous create.
 
 ### 3.3 Unsupported semantics and remaining unknowns
 
@@ -359,8 +390,10 @@ Outcome classification in the transport is what makes this precise:
 | :--- | :--- | :--- |
 | Socket never connected (DNS failure, connection refused) | `PRE_DISPATCH` | Claim released; the intent stays retryable |
 | Timeout, reset, aborted, oversized or unparseable body after connect | `UNESTABLISHED` | `SUBMISSION_AMBIGUOUS`; never resent |
-| HTTP 4xx other than 429 | definite refusal | `REJECTED`, terminal |
-| HTTP 429 or 5xx | `AMBIGUOUS` | Fails closed — the contract does not establish that a throttled or errored mutation was not processed |
+| Create: exact configured duplicate `client_order_id` status + code | `DUPLICATE_CLIENT_ORDER_ID` | `SUBMISSION_AMBIGUOUS`; never resent (signal is `null` until CoinDCX confirms the code) |
+| Create: any other HTTP failure (every 4xx including 429, every 5xx, malformed error body) | `AMBIGUOUS` | `SUBMISSION_AMBIGUOUS`; never resent. [Phase 18 PROVIDER-IDEMP-01] Superseded the original "4xx other than 429 is a definite refusal → `REJECTED`" rule: that was a generic status inference, not provider evidence, and an unconfirmed duplicate-`client_order_id` rejection may be a 4xx that proves an earlier create landed. No provider-verified terminal create-rejection code exists in this repository, so none is whitelisted. |
+| Cancel: HTTP 4xx other than 429 | definite refusal | `CANCEL_REJECTED` (cancel classification unchanged) |
+| Cancel: HTTP 429 or 5xx | `AMBIGUOUS` | Fails closed — the contract does not establish that a throttled or errored mutation was not processed |
 
 The 429 choice is deliberately conservative and is a known operational
 trade-off: a rate-limited create-order permanently parks that intent for Phase
