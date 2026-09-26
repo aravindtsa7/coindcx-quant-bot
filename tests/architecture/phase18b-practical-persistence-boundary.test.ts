@@ -23,6 +23,7 @@ const SRC_ROOT = path.join(REPO_ROOT, 'src');
 const PERSISTENCE_ROOT = 'src/execution/live/practical-persistence/';
 const PRACTICAL_ROOT = 'src/execution/live/practical/';
 const REPOSITORY = `${PERSISTENCE_ROOT}repository.ts`;
+const SHADOW_RUNTIME = 'src/integration/coindcx/live/practical-shadow-runtime.ts';
 const MIGRATIONS_ROOT = path.join(REPO_ROOT, 'prisma/migrations');
 const STAGE_1B1_MIGRATION = '20260925000000_phase18b_practical_persistence';
 
@@ -112,18 +113,26 @@ describe('no provider, network, gateway, dispatch, or arm reachability (no new r
     }
   });
 
-  it('nothing in src/ imports the persistence ADAPTER; only the Checkpoint B read-only recovery core imports the PORT (not wired into any runtime)', () => {
+  it('only the Checkpoint B recovery core and the Checkpoint C shadow collector import the PORT; only the shadow-only composition root imports the ADAPTER (for loadAccount)', () => {
     const importers = files.filter((file) => !file.startsWith(PERSISTENCE_ROOT) && (graph.get(file) ?? []).some((dependency) => dependency.startsWith(PERSISTENCE_ROOT)));
     // [Checkpoint B] The exact, reviewed widening: the recovery core depends on the Prisma-free PORT only.
     expect(importers.sort()).toEqual([
       'src/execution/live/practical-recovery/ports.ts',
       'src/execution/live/practical-recovery/service.ts',
       'src/execution/live/practical-recovery/tripwire.ts',
+      // [Checkpoint C] the read-only shadow collector (a `loadAccount`-only Pick of the PORT).
+      'src/execution/live/practical-shadow/collector.ts',
+      // [Checkpoint C] the shadow-only composition root: constructs the ADAPTER and exposes loadAccount only.
+      SHADOW_RUNTIME,
     ]);
-    for (const importer of importers) {
+    for (const importer of importers.filter((file) => file !== SHADOW_RUNTIME)) {
       expect((graph.get(importer) ?? []).filter((dependency) => dependency.startsWith(PERSISTENCE_ROOT)), importer).toEqual([`${PERSISTENCE_ROOT}ports.ts`]);
     }
-    expect(files.filter((file) => file !== REPOSITORY && (graph.get(file) ?? []).includes(REPOSITORY))).toEqual([]);
+    expect((graph.get(SHADOW_RUNTIME) ?? []).filter((dependency) => dependency.startsWith(PERSISTENCE_ROOT))).toEqual([REPOSITORY]);
+    expect(files.filter((file) => file !== REPOSITORY && (graph.get(file) ?? []).includes(REPOSITORY))).toEqual([SHADOW_RUNTIME]);
+    // The shadow runtime uses the adapter for ONE read: loadAccount.
+    const runtime = sourceOf(SHADOW_RUNTIME);
+    expect([...runtime.matchAll(/practicalRepository\.(\w+)/g)].map((match) => match[1])).toEqual(['loadAccount']);
   });
 
   it('the port and adapter state plainly that a lease is not dispatch authority and that Stage 1B2 must join the Phase 17 dispatch claim', () => {
@@ -360,10 +369,12 @@ function statementsOf(sql: string): string[] {
 describe('the Stage 1B1 migration', () => {
   it('is a later-timestamped forward migration, now FROZEN: pinned in the freeze test under its exact name and accepted hash', () => {
     const directories = readdirSync(MIGRATIONS_ROOT).filter((name) => statSync(path.join(MIGRATIONS_ROOT, name)).isDirectory()).sort();
-    expect(directories.at(-1)).toBe(STAGE_1B1_MIGRATION);
-    expect(directories.filter((name) => name.includes('phase18b'))).toEqual([STAGE_1B1_MIGRATION]);
+    // [Checkpoint C] exactly one later, additive forward migration follows it, itself now FROZEN.
+    expect(directories.slice(directories.indexOf(STAGE_1B1_MIGRATION) + 1)).toEqual(['20260926000000_phase18b_practical_shadow_calibration']);
+    expect(directories.filter((name) => name.includes('phase18b'))).toEqual([STAGE_1B1_MIGRATION, '20260926000000_phase18b_practical_shadow_calibration']);
     const freezeTest = readFileSync(path.join(REPO_ROOT, 'tests/architecture/phase18-migration-freeze.test.ts'), 'utf8');
     expect(freezeTest).toContain(`'${STAGE_1B1_MIGRATION}': '734e3d01758667cf652c1a57745fc3c2bca9476599459b820f752a20eb054f99',`);
+    expect(freezeTest).toContain("'20260926000000_phase18b_practical_shadow_calibration': '6cf2095f5d05be54c248fe43e113e67156af9f783ce4fb21948722fcaa6811e9',");
     expect(readdirSync(path.join(MIGRATIONS_ROOT, STAGE_1B1_MIGRATION))).toEqual(['migration.sql']);
   });
 

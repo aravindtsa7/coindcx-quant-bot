@@ -129,6 +129,11 @@ describe('no caller-selectable gate and no premature wiring', () => {
       'src/execution/live/practical-recovery/telemetry.ts',
       'src/execution/live/practical-recovery/timing.ts',
       'src/execution/live/practical-recovery/tripwire.ts',
+      // [Checkpoint C] the shadow/paper core reads Stage 1A policy DATA only (ceilings, timing
+      // candidates, action permission, config parsing); pinned by phase18b-practical-shadow-boundary.
+      'src/execution/live/practical-shadow/campaign.ts',
+      'src/execution/live/practical-shadow/classification.ts',
+      'src/execution/live/practical-shadow/config.ts',
     ]);
   });
 

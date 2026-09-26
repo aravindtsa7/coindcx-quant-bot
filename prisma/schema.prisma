@@ -1495,3 +1495,190 @@ model LivePracticalMalformedLatch {
 
   @@map("live_practical_malformed_latch")
 }
+
+// =============================================================================
+// Phase 18B Checkpoint C: shadow calibration + paper safety simulation
+// =============================================================================
+//
+// OBSERVATIONAL ONLY. Nothing in these tables is practical authority: no row
+// here is, or can become, a practical recovery certificate, a mutation lease,
+// a dispatch claim, or Phase 18 continuity. They hold only safe calibration
+// metadata (codes, counts, timings, digests) from read-only shadow collection
+// and hypothetical paper safety decisions (see the migration header).
+
+enum LivePracticalShadowCampaignStatus {
+  ACTIVE
+  COMPLETED
+  ABORTED
+}
+
+enum LivePracticalShadowEvaluationStatus {
+  CLAIMED
+  COMPLETED
+  ABORTED
+}
+
+enum LivePracticalShadowRestStability {
+  PASS
+  FAIL
+}
+
+enum LivePracticalShadowStreamReadiness {
+  PROVEN_READY
+  UNPROVEN
+  RECONCILIATION_REQUIRED
+  DISCONNECTED
+}
+
+enum LivePracticalShadowPaperAction {
+  CANCEL
+  OPEN
+  CLOSE
+}
+
+enum LivePracticalShadowRolloutStage {
+  STAGE_5A_CANCEL_ONLY
+  STAGE_5B_OPEN_CLOSE_FUTURE
+}
+
+enum LivePracticalShadowPaperOutcome {
+  WOULD_BLOCK
+  WOULD_REACH_AUTHORITY_GATE
+}
+
+/// How a campaign's software version was established. Only a CLEAN git
+/// source tree at an exact commit is accepted (no dirty/development mode).
+enum LivePracticalShadowSourceProvenance {
+  GIT_CLEAN_COMMIT
+}
+
+/// One row per account that ever ran a shadow campaign: the pointer to its
+/// single ACTIVE campaign (UNIQUE), changed only by compare-and-set on
+/// `revision` under `SELECT ... FOR UPDATE`.
+model LivePracticalShadowAccount {
+  accountId        String  @id @map("account_id") @db.VarChar(128)
+  activeCampaignId String? @unique(map: "live_practical_shadow_account_active_campaign_key") @map("active_campaign_id") @db.VarChar(64)
+  revision         BigInt  @default(0)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  activeCampaign LivePracticalShadowCampaign?  @relation("LivePracticalShadowActiveCampaign", fields: [activeCampaignId], references: [campaignId], onDelete: Restrict, onUpdate: Restrict, map: "live_practical_shadow_account_active_campaign_fkey")
+  campaigns      LivePracticalShadowCampaign[] @relation("LivePracticalShadowAccountCampaigns")
+
+  @@map("live_practical_shadow_account")
+}
+
+/// A long-running shadow calibration campaign, bound to one account,
+/// provider fingerprint, CLEAN source commit, and configuration digest. A
+/// campaign is resumed only by a worker presenting the SAME binding; an
+/// operator may abort it explicitly by exact account + campaign id.
+model LivePracticalShadowCampaign {
+  campaignId String @id @map("campaign_id") @db.VarChar(64)
+
+  accountId                  String                              @map("account_id") @db.VarChar(128)
+  /// Lowercase 64-hex digest of the provider account identity (Phase 18 policy). Never the raw identity.
+  providerAccountFingerprint String                              @map("provider_account_fingerprint") @db.Char(64)
+  /// The exact CLEAN source commit (lowercase 40-hex) the campaign was started from (CHECK).
+  softwareVersion            String                              @map("software_version") @db.Char(40)
+  sourceProvenance           LivePracticalShadowSourceProvenance @map("source_provenance")
+  configDigest               String                              @map("config_digest") @db.Char(64)
+  /// The safe, canonical configuration snapshot the digest covers (cadence, window, versions, timing values).
+  configJson                 String                              @map("config_json") @db.Text
+  evidenceSchemaVersion      String                              @map("evidence_schema_version") @db.VarChar(64)
+
+  status       LivePracticalShadowCampaignStatus @default(ACTIVE)
+  /// The worker that currently owns collection. A resume by another worker takes ownership (compare-and-set).
+  workerId     String                            @map("worker_id") @db.VarChar(64)
+  nextSequence Int                               @default(1) @map("next_sequence")
+  startedAtMs  BigInt                            @map("started_at_ms")
+  endedAtMs    BigInt?                           @map("ended_at_ms")
+  endReason    String?                           @map("end_reason") @db.VarChar(64)
+  revision     BigInt                            @default(0)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  account        LivePracticalShadowAccount         @relation("LivePracticalShadowAccountCampaigns", fields: [accountId], references: [accountId], onDelete: Restrict, onUpdate: Restrict, map: "live_practical_shadow_campaign_account_fkey")
+  activeFor      LivePracticalShadowAccount?        @relation("LivePracticalShadowActiveCampaign")
+  evaluations    LivePracticalShadowEvaluation[]
+  paperDecisions LivePracticalShadowPaperDecision[]
+
+  @@index([accountId, status], map: "live_practical_shadow_campaign_account_status_idx")
+  @@map("live_practical_shadow_campaign")
+}
+
+/// One shadow evaluation window. CLAIMED by exactly one worker, then
+/// COMPLETED (with its safe evidence and classification) or ABORTED (a
+/// crash/restart, never counted by calibration). Completion is a
+/// compare-and-set from CLAIMED by the claiming worker, so one evaluation is
+/// counted at most once.
+model LivePracticalShadowEvaluation {
+  evaluationId String @id @map("evaluation_id") @db.VarChar(64)
+  campaignId   String @map("campaign_id") @db.VarChar(64)
+  sequence     Int
+  workerId     String @map("worker_id") @db.VarChar(64)
+  runtimeEpoch String @map("runtime_epoch") @db.VarChar(64)
+
+  status       LivePracticalShadowEvaluationStatus @default(CLAIMED)
+  claimedAtMs  BigInt                              @map("claimed_at_ms")
+  finishedAtMs BigInt?                             @map("finished_at_ms")
+  abortReason  String?                             @map("abort_reason") @db.VarChar(64)
+
+  /// Result columns: all set exactly when COMPLETED (CHECK).
+  startedAtMs              BigInt?                             @map("started_at_ms")
+  endedAtMs                BigInt?                             @map("ended_at_ms")
+  reconciliationGeneration Int?                                @map("reconciliation_generation")
+  streamIncarnation        Int?                                @map("stream_incarnation")
+  streamReadiness          LivePracticalShadowStreamReadiness? @map("stream_readiness")
+  restStability            LivePracticalShadowRestStability?   @map("rest_stability")
+  restFailure              String?                             @map("rest_failure") @db.VarChar(64)
+  /// Hypothetical: whether EVERY authority prerequisite would hold. Never authority. TRUE requires PROVEN_READY and REST PASS (CHECK).
+  authorityEligible        Boolean?                            @map("authority_eligible")
+  primaryBlocker           String?                             @map("primary_blocker") @db.VarChar(64)
+  blockersJson             String?                             @map("blockers_json") @db.Text
+  evidenceSchemaVersion    String?                             @map("evidence_schema_version") @db.VarChar(64)
+  evidenceDigest           String?                             @map("evidence_digest") @db.Char(64)
+  /// Safe canonical evidence metadata (codes, counts, timings, digests only).
+  evidenceJson             String?                             @map("evidence_json") @db.MediumText
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  campaign       LivePracticalShadowCampaign        @relation(fields: [campaignId], references: [campaignId], onDelete: Restrict, onUpdate: Restrict, map: "live_practical_shadow_evaluation_campaign_fkey")
+  paperDecisions LivePracticalShadowPaperDecision[]
+
+  @@unique([campaignId, sequence], map: "live_practical_shadow_evaluation_sequence_key")
+  /// Target of the composite paper-decision foreign key: a paper row names its evaluation AND that evaluation's campaign.
+  @@unique([evaluationId, campaignId], map: "live_practical_shadow_evaluation_campaign_key")
+  @@index([campaignId, status], map: "live_practical_shadow_evaluation_campaign_status_idx")
+  @@map("live_practical_shadow_evaluation")
+}
+
+/// A HYPOTHETICAL paper safety decision for one evaluation. It executes
+/// nothing and can never become a certificate, lease, dispatch claim, or
+/// gateway call. WOULD_REACH_AUTHORITY_GATE requires PROVEN_READY, REST PASS,
+/// and every authority prerequisite (CHECK).
+model LivePracticalShadowPaperDecision {
+  paperDecisionId           String                             @id @map("paper_decision_id") @db.VarChar(64)
+  evaluationId              String                             @map("evaluation_id") @db.VarChar(64)
+  campaignId                String                             @map("campaign_id") @db.VarChar(64)
+  requestedAction           LivePracticalShadowPaperAction     @map("requested_action")
+  rolloutStage              LivePracticalShadowRolloutStage    @map("rollout_stage")
+  restStability             LivePracticalShadowRestStability   @map("rest_stability")
+  streamReadiness           LivePracticalShadowStreamReadiness @map("stream_readiness")
+  authorityPrerequisitesMet Boolean                            @map("authority_prerequisites_met")
+  outcome                   LivePracticalShadowPaperOutcome
+  blockersJson              String                             @map("blockers_json") @db.Text
+  policyVersion             String                             @map("policy_version") @db.VarChar(64)
+  createdAtMs               BigInt                             @map("created_at_ms")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  evaluation LivePracticalShadowEvaluation @relation(fields: [evaluationId, campaignId], references: [evaluationId, campaignId], onDelete: Restrict, onUpdate: Restrict, map: "live_practical_shadow_paper_decision_evaluation_fkey")
+  campaign   LivePracticalShadowCampaign   @relation(fields: [campaignId], references: [campaignId], onDelete: Restrict, onUpdate: Restrict, map: "live_practical_shadow_paper_decision_campaign_fkey")
+
+  @@unique([evaluationId, requestedAction, rolloutStage], map: "live_practical_shadow_paper_decision_intent_key")
+  @@index([campaignId], map: "live_practical_shadow_paper_decision_campaign_idx")
+  @@map("live_practical_shadow_paper_decision")
+}
