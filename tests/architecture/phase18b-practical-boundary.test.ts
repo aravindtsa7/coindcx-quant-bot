@@ -9,7 +9,8 @@ import { buildImportGraph, computeReachable, extractImportSpecifiers } from './s
 // Phase 18 strict continuity barrier, cannot construct or name the strict
 // continuity capability, cannot reach Prisma, the network, signing, or any
 // CoinDCX module, reads no environment, and is wired into nothing but the
-// Stage 1B1 durable persistence adapter (itself wired into nothing), so no
+// Stage 1B1 durable persistence adapter and the Checkpoint B read-only
+// recovery core (both themselves wired into nothing), so no
 // caller can select a strict/practical gate.
 
 const REPO_ROOT = path.resolve(__dirname, '../..');
@@ -121,6 +122,13 @@ describe('no caller-selectable gate and no premature wiring', () => {
       'src/execution/live/practical-persistence/ports.ts',
       'src/execution/live/practical-persistence/repository.ts',
       'src/execution/live/practical-persistence/rows.ts',
+      // [Checkpoint B] the read-only recovery core (itself wired into nothing).
+      'src/execution/live/practical-recovery/observation.ts',
+      'src/execution/live/practical-recovery/private-events.ts',
+      'src/execution/live/practical-recovery/service.ts',
+      'src/execution/live/practical-recovery/telemetry.ts',
+      'src/execution/live/practical-recovery/timing.ts',
+      'src/execution/live/practical-recovery/tripwire.ts',
     ]);
   });
 
@@ -177,17 +185,19 @@ describe('no caller-selectable gate and no premature wiring', () => {
 
 // Every value that grants practical authority is minted at exactly one
 // internal boundary. Each boundary's PRODUCTION importer set is pinned here,
-// exactly. In Stage 1A every set is empty. A later stage adds its trusted
-// caller (composition root, recovery service, operator-resolution adapter)
+// exactly. In Stage 1A every set was empty; Checkpoint B adds exactly the
+// recovery service to the certificate issuer. A later stage adds its trusted
+// caller (composition root, operator-resolution adapter)
 // by editing this table, which makes the widening an explicit, reviewed diff.
 const AUTHORITY_ISSUERS: readonly { readonly symbol: string; readonly definedIn: string; readonly allowedProductionImporters: readonly string[] }[] = [
   { symbol: 'issuePracticalLiveSafetyEnablement', definedIn: `${PRACTICAL_ROOT}policy.ts`, allowedProductionImporters: [] },
   { symbol: 'mintPracticalManualReviewResolution', definedIn: `${PRACTICAL_ROOT}state-machine.ts`, allowedProductionImporters: [] },
-  { symbol: 'issuePracticalRecoveryCertificate', definedIn: `${PRACTICAL_ROOT}certificate.ts`, allowedProductionImporters: [] },
+  // [Checkpoint B] The first reviewed production importer: the read-only recovery service, and nothing else.
+  { symbol: 'issuePracticalRecoveryCertificate', definedIn: `${PRACTICAL_ROOT}certificate.ts`, allowedProductionImporters: ['src/execution/live/practical-recovery/service.ts'] },
 ];
 
 describe('authority issuance boundaries are internal and pinned (P18B-1A-01, P18B-1A-02)', () => {
-  it.each(AUTHORITY_ISSUERS)('$symbol: production src references it from exactly the allowed set (Stage 1A: none)', ({ symbol, definedIn, allowedProductionImporters }) => {
+  it.each(AUTHORITY_ISSUERS)('$symbol: production src references it from exactly the allowed set', ({ symbol, definedIn, allowedProductionImporters }) => {
     expect(codeOf(definedIn)).toMatch(new RegExp(`export function ${symbol}\\(`));
     const referencing = files.filter((file) => file !== definedIn && codeOf(file).includes(symbol)).sort();
     expect(referencing).toEqual([...allowedProductionImporters].sort());

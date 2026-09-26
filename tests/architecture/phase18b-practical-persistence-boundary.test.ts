@@ -12,7 +12,8 @@ import { buildImportGraph, computeReachable, extractImportSpecifiers } from './s
 //     imports Prisma, and the Stage 1A practical domain stays Prisma-free.
 //   - Nothing in src/ uses the adapter yet: no runtime, gateway, dispatch, or
 //     arm wiring, and so no route from "certificate consumed + lease acquired"
-//     to any provider mutation.
+//     to any provider mutation. [Checkpoint B] The read-only recovery core
+//     imports the Prisma-free PORT only (never the adapter, never the lease path).
 //   - No strict-continuity bridge, no issuer widening.
 //   - The new migration is additive, frozen after final review (pinned in
 //     phase18-migration-freeze.test.ts), and stores no secret.
@@ -111,9 +112,18 @@ describe('no provider, network, gateway, dispatch, or arm reachability (no new r
     }
   });
 
-  it('nothing in src/ imports the persistence adapter or its port yet (not wired)', () => {
+  it('nothing in src/ imports the persistence ADAPTER; only the Checkpoint B read-only recovery core imports the PORT (not wired into any runtime)', () => {
     const importers = files.filter((file) => !file.startsWith(PERSISTENCE_ROOT) && (graph.get(file) ?? []).some((dependency) => dependency.startsWith(PERSISTENCE_ROOT)));
-    expect(importers).toEqual([]);
+    // [Checkpoint B] The exact, reviewed widening: the recovery core depends on the Prisma-free PORT only.
+    expect(importers.sort()).toEqual([
+      'src/execution/live/practical-recovery/ports.ts',
+      'src/execution/live/practical-recovery/service.ts',
+      'src/execution/live/practical-recovery/tripwire.ts',
+    ]);
+    for (const importer of importers) {
+      expect((graph.get(importer) ?? []).filter((dependency) => dependency.startsWith(PERSISTENCE_ROOT)), importer).toEqual([`${PERSISTENCE_ROOT}ports.ts`]);
+    }
+    expect(files.filter((file) => file !== REPOSITORY && (graph.get(file) ?? []).includes(REPOSITORY))).toEqual([]);
   });
 
   it('the port and adapter state plainly that a lease is not dispatch authority and that Stage 1B2 must join the Phase 17 dispatch claim', () => {
