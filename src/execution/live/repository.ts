@@ -18,7 +18,7 @@
  *   - observation validation, dedup insertion, and projection update share one
  *     row-locking transaction, so no event can outrun its financial effect.
  */
-import type { PrismaClient } from '@prisma/client';
+import type { Prisma, PrismaClient } from '@prisma/client';
 import { sha256CanonicalJson } from '../../risk';
 import { canonicalLiveDecimalString, liveDecimal } from './decimal';
 import { LiveExecutionError } from './errors';
@@ -561,6 +561,204 @@ async function readVerifiedOrder(client: IntentReadClient, intentId: string): Pr
   return Object.freeze({ order, verifiedIntent });
 }
 
+// ---------------------------------------------------------------------------
+// [P18B Stage 1B2 Wave 2A] Transaction-scoped Phase17 CANCEL primitives.
+//
+// These are the EXISTING Phase17 cancel transitions (claim, pre-wire arm,
+// completion), moved verbatim out of the public repository methods so that
+// they can later be composed inside ONE caller-owned MySQL transaction.
+//
+// THEY ARE NOT AUTHORITY, AND THEY PERFORM NO AUTHORITY CHECK. Each one
+// assumes that its caller has ALREADY established its own reviewed authority
+// inside the SAME transaction `tx`, before calling it. The strict Tier-A path
+// is the public `PrismaLiveExecutionRepository` methods below, which open the
+// transaction, run `assertReconciliationFence(... 'HEALTHY')` first, and only
+// then call these. Nothing here accepts, reads, mints, or forwards a
+// reconciliation authorization, a practical certificate, an enablement, a
+// tier selector, a gateway, or a network client; nothing here opens a
+// transaction, performs I/O other than the caller's own `tx`, or reads the
+// environment.
+//
+// Deliberately NOT on the `LiveExecutionRepository` port and NOT exported from
+// any barrel. Their importer set is pinned by architecture test (empty in
+// Wave 2A; only the reviewed Stage 1B2 Prisma adapter may be added later).
+//
+// Lock order, SQL, compare-and-set predicates, results, and errors (including
+// their precedence) are exactly those of the pre-extraction methods.
+// ---------------------------------------------------------------------------
+
+/**
+ * UNSAFE WITHOUT A CALLER-OWNED FENCE. The existing Phase17 cancel claim:
+ * locks `live_order`, integrity-verifies the order against its sealed intent,
+ * requires `trustedAccountId` to own it exactly, and then either reports it
+ * NOT_CANCELLABLE / ALREADY_CLAIMED (no write) or takes the claim
+ * (state CANCEL_REQUESTED, cancelState CANCEL_RESERVED, cancelGeneration + 1,
+ * cancelExchangeOrderId = the authoritative exchange order id, unarmed,
+ * revision + 1).
+ */
+export async function claimCancelWithinCallerFencedTransaction(
+  tx: Prisma.TransactionClient,
+  intentId: string,
+  trustedAccountId: string,
+): Promise<ClaimCancelOutcome> {
+  await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;
+  // [F17-R03] A cancellation claim is a wire mutation authorization whose
+  // only ownership proof is `accountId`, an immutable mirror column — so it
+  // is verified against the sealed intent before it is compared.
+  const verified = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
+  if (verified === null) {
+    throw new LiveExecutionError('LIVE_INTENT_INVALID', 'Cannot cancel an intent that was never durably recorded', { details: { intentId } });
+  }
+  const current = verified.order;
+  if (current.accountId !== trustedAccountId) {
+    throw new LiveExecutionError('LIVE_AUTHORITY_INVALID', 'Configured credential account does not own this durable live order', {
+      details: { intentId, accountId: current.accountId },
+    });
+  }
+  if (['CREATED', 'DISPATCH_RESERVED', 'SUBMISSION_AMBIGUOUS', 'FILLED', 'CANCELLED', 'REJECTED', 'RECONCILIATION_REQUIRED'].includes(current.state)) {
+    return { kind: 'NOT_CANCELLABLE' as const, order: current, generation: current.cancelGeneration };
+  }
+  if (current.exchangeOrderId === null) {
+    throw new LiveExecutionError('LIVE_ORDER_IDENTITY_MISMATCH', 'Cannot cancel without an authoritative exchange order id', { details: { intentId } });
+  }
+  if (current.cancelState !== 'NONE') {
+    return { kind: 'ALREADY_CLAIMED' as const, order: current, generation: current.cancelGeneration };
+  }
+  const generation = current.cancelGeneration + 1;
+  const updated = await tx.liveOrder.update({ where: { intentId }, data: {
+    state: 'CANCEL_REQUESTED',
+    cancelState: 'CANCEL_RESERVED',
+    cancelGeneration: generation,
+    cancelExchangeOrderId: current.exchangeOrderId,
+    cancelFaultCode: null,
+    cancelClaimedAt: new Date(),
+    cancelWireArmed: false,
+    revision: { increment: 1 },
+  } });
+  const claimedOrder = toStateRecord(updated as unknown as LiveOrderRow);
+  assertOrderProjectionMatchesIntent(claimedOrder, verified.verifiedIntent);
+  return { kind: 'CLAIMED' as const, order: claimedOrder, generation };
+}
+
+/**
+ * UNSAFE WITHOUT A CALLER-OWNED FENCE. The existing Phase17 pre-wire cancel
+ * arm: locks `live_order` then `live_execution_intent`, integrity-verifies the
+ * order, and flips `cancelWireArmed` false -> true (revision + 1) only for an
+ * unarmed CANCEL_RESERVED claim at exactly `expectedRevision`, then re-reads
+ * the committed order through the same verified read.
+ *
+ * `fencedAccountId` is the account the caller's own fence is bound to (null
+ * when the caller's fence is not account-bound, exactly as before). It is
+ * checked at the same point, with the same error, as before the extraction.
+ */
+export async function armCancelWireWithinCallerFencedTransaction(
+  tx: Prisma.TransactionClient,
+  intentId: string,
+  expectedRevision: number,
+  fencedAccountId: string | null,
+): Promise<LiveOrderStateRecord> {
+  await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;
+  await tx.$executeRaw`SELECT intent_id FROM live_execution_intent WHERE intent_id = ${intentId} FOR UPDATE`;
+  const verified = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
+  if (verified === null) {
+    throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Live order vanished while arming the cancel wire attempt', { details: { intentId } });
+  }
+  const current = verified.order;
+  if (fencedAccountId !== null && current.accountId !== fencedAccountId) {
+    throw new LiveExecutionError('LIVE_RECONCILIATION_REQUIRED', 'Reconciliation authorization belongs to a different account');
+  }
+  if (current.cancelState !== 'CANCEL_RESERVED' || current.cancelWireArmed || current.revision !== expectedRevision) {
+    throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Cannot arm a cancel wire attempt outside an unarmed CANCEL_RESERVED claim at the expected revision', {
+      details: { intentId, expectedRevision },
+    });
+  }
+  const updated = await tx.liveOrder.updateMany({
+    where: {
+      intentId, cancelState: 'CANCEL_RESERVED', cancelWireArmed: false, revision: expectedRevision,
+      clientOrderId: current.clientOrderId, accountId: current.accountId, pair: current.pair,
+      orderedQuantity: canonicalLiveDecimalString(current.orderedQuantity, 'orderedQuantity'),
+    },
+    data: { cancelWireArmed: true, revision: { increment: 1 } },
+  });
+  if (updated.count !== 1) {
+    throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Concurrent modification: cancel wire arm claim moved before it could commit', {
+      details: { intentId, expectedRevision },
+    });
+  }
+  const committed = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
+  if (committed === null) {
+    throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Live order vanished after arming the cancel wire attempt', { details: { intentId } });
+  }
+  return committed.order;
+}
+
+/**
+ * UNSAFE WITHOUT A CALLER-OWNED FENCE. The existing Phase17 cancel completion:
+ * locks `live_order` then `live_execution_intent`, integrity-verifies the
+ * order, and moves the claim of exactly `generation` out of CANCEL_RESERVED
+ * (ACKNOWLEDGED -> CANCEL_ACKNOWLEDGED, AMBIGUOUS -> CANCEL_AMBIGUOUS plus
+ * order fault LIVE_CANCEL_AMBIGUOUS, REJECTED -> CANCEL_REJECTED), recording
+ * `faultCode`, clearing `cancelWireArmed`, revision + 1. A claim already in
+ * exactly that terminal cancel state for `generation` is returned unchanged.
+ *
+ * `fencedAccountId` behaves exactly as in `armCancelWireWithinCallerFencedTransaction`.
+ */
+export async function completeCancelAttemptWithinCallerFencedTransaction(
+  tx: Prisma.TransactionClient,
+  intentId: string,
+  generation: number,
+  outcome: CompleteCancelAttemptOutcome,
+  faultCode: string | null,
+  fencedAccountId: string | null,
+): Promise<LiveOrderStateRecord> {
+  await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;
+  await tx.$executeRaw`SELECT intent_id FROM live_execution_intent WHERE intent_id = ${intentId} FOR UPDATE`;
+  const verified = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
+  if (verified === null) {
+    throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Live order vanished while completing cancellation', { details: { intentId } });
+  }
+  const current = verified.order;
+  if (fencedAccountId !== null && current.accountId !== fencedAccountId) throw new LiveExecutionError('LIVE_RECONCILIATION_REQUIRED', 'Reconciliation authorization belongs to a different account');
+  const cancelState = outcome === 'ACKNOWLEDGED' ? 'CANCEL_ACKNOWLEDGED'
+    : outcome === 'AMBIGUOUS' ? 'CANCEL_AMBIGUOUS' : 'CANCEL_REJECTED';
+  if (current.cancelGeneration === generation && current.cancelState === cancelState) return current;
+  if (current.cancelGeneration !== generation || current.cancelState !== 'CANCEL_RESERVED') {
+    throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Cancellation claim ownership changed before completion', { details: { intentId, generation } });
+  }
+  const updated = await tx.liveOrder.updateMany({
+    where: {
+      intentId,
+      state: current.state,
+      revision: current.revision,
+      clientOrderId: current.clientOrderId,
+      accountId: current.accountId,
+      pair: current.pair,
+      orderedQuantity: canonicalLiveDecimalString(current.orderedQuantity, 'orderedQuantity'),
+      cancelGeneration: generation,
+      cancelState: 'CANCEL_RESERVED',
+    },
+    data: {
+      cancelState,
+      cancelFaultCode: faultCode,
+      ...(outcome === 'AMBIGUOUS' ? { faultCode: 'LIVE_CANCEL_AMBIGUOUS' } : {}),
+      // [F18-18] This transition always leaves CANCEL_RESERVED (the
+      // precondition above requires it), so any wire-arm proof is no
+      // longer meaningful and must not survive as a contradictory `true`
+      // against a non-reserved cancel state.
+      cancelWireArmed: false,
+      revision: { increment: 1 },
+    },
+  });
+  if (updated.count !== 1) {
+    throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Cancellation claim ownership changed before completion', { details: { intentId, generation } });
+  }
+  const committed = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
+  if (committed === null) {
+    throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Live order vanished after completing cancellation', { details: { intentId } });
+  }
+  return committed.order;
+}
+
 /**
  * Production Prisma-backed repository.
  *
@@ -803,40 +1001,9 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
   /** [P18 Wave A2 / F18-14] The cancel-mutation equivalent of `armDispatchWire`. */
   public async armCancelWire(intentId: string, expectedRevision: number, reconciliationAuthorization?: unknown): Promise<LiveOrderStateRecord> {
     return this.#prisma.$transaction(async (tx) => {
+      // Strict Tier-A fence FIRST, in the same transaction, before any live_order lock or read.
       const fence = await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, null, 'HEALTHY');
-      await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;
-      await tx.$executeRaw`SELECT intent_id FROM live_execution_intent WHERE intent_id = ${intentId} FOR UPDATE`;
-      const verified = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
-      if (verified === null) {
-        throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Live order vanished while arming the cancel wire attempt', { details: { intentId } });
-      }
-      const current = verified.order;
-      if (fence !== null && current.accountId !== fence.accountId) {
-        throw new LiveExecutionError('LIVE_RECONCILIATION_REQUIRED', 'Reconciliation authorization belongs to a different account');
-      }
-      if (current.cancelState !== 'CANCEL_RESERVED' || current.cancelWireArmed || current.revision !== expectedRevision) {
-        throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Cannot arm a cancel wire attempt outside an unarmed CANCEL_RESERVED claim at the expected revision', {
-          details: { intentId, expectedRevision },
-        });
-      }
-      const updated = await tx.liveOrder.updateMany({
-        where: {
-          intentId, cancelState: 'CANCEL_RESERVED', cancelWireArmed: false, revision: expectedRevision,
-          clientOrderId: current.clientOrderId, accountId: current.accountId, pair: current.pair,
-          orderedQuantity: canonicalLiveDecimalString(current.orderedQuantity, 'orderedQuantity'),
-        },
-        data: { cancelWireArmed: true, revision: { increment: 1 } },
-      });
-      if (updated.count !== 1) {
-        throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Concurrent modification: cancel wire arm claim moved before it could commit', {
-          details: { intentId, expectedRevision },
-        });
-      }
-      const committed = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
-      if (committed === null) {
-        throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Live order vanished after arming the cancel wire attempt', { details: { intentId } });
-      }
-      return committed.order;
+      return armCancelWireWithinCallerFencedTransaction(tx, intentId, expectedRevision, fence === null ? null : fence.accountId);
     });
   }
 
@@ -973,44 +1140,9 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
 
   public async claimCancel(intentId: string, trustedAccountId: string, reconciliationAuthorization?: unknown): Promise<ClaimCancelOutcome> {
     return this.#prisma.$transaction(async (tx) => {
+      // Strict Tier-A fence FIRST, in the same transaction, before any live_order lock or read.
       await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, trustedAccountId, 'HEALTHY');
-      await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;
-      // [F17-R03] A cancellation claim is a wire mutation authorization whose
-      // only ownership proof is `accountId`, an immutable mirror column — so it
-      // is verified against the sealed intent before it is compared.
-      const verified = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
-      if (verified === null) {
-        throw new LiveExecutionError('LIVE_INTENT_INVALID', 'Cannot cancel an intent that was never durably recorded', { details: { intentId } });
-      }
-      const current = verified.order;
-      if (current.accountId !== trustedAccountId) {
-        throw new LiveExecutionError('LIVE_AUTHORITY_INVALID', 'Configured credential account does not own this durable live order', {
-          details: { intentId, accountId: current.accountId },
-        });
-      }
-      if (['CREATED', 'DISPATCH_RESERVED', 'SUBMISSION_AMBIGUOUS', 'FILLED', 'CANCELLED', 'REJECTED', 'RECONCILIATION_REQUIRED'].includes(current.state)) {
-        return { kind: 'NOT_CANCELLABLE' as const, order: current, generation: current.cancelGeneration };
-      }
-      if (current.exchangeOrderId === null) {
-        throw new LiveExecutionError('LIVE_ORDER_IDENTITY_MISMATCH', 'Cannot cancel without an authoritative exchange order id', { details: { intentId } });
-      }
-      if (current.cancelState !== 'NONE') {
-        return { kind: 'ALREADY_CLAIMED' as const, order: current, generation: current.cancelGeneration };
-      }
-      const generation = current.cancelGeneration + 1;
-      const updated = await tx.liveOrder.update({ where: { intentId }, data: {
-        state: 'CANCEL_REQUESTED',
-        cancelState: 'CANCEL_RESERVED',
-        cancelGeneration: generation,
-        cancelExchangeOrderId: current.exchangeOrderId,
-        cancelFaultCode: null,
-        cancelClaimedAt: new Date(),
-        cancelWireArmed: false,
-        revision: { increment: 1 },
-      } });
-      const claimedOrder = toStateRecord(updated as unknown as LiveOrderRow);
-      assertOrderProjectionMatchesIntent(claimedOrder, verified.verifiedIntent);
-      return { kind: 'CLAIMED' as const, order: claimedOrder, generation };
+      return claimCancelWithinCallerFencedTransaction(tx, intentId, trustedAccountId);
     });
   }
 
@@ -1022,53 +1154,9 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
     reconciliationAuthorization?: unknown,
   ): Promise<LiveOrderStateRecord> {
     return this.#prisma.$transaction(async (tx) => {
+      // Strict Tier-A fence FIRST, in the same transaction, before any live_order lock or read.
       const fence = await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, null, 'HEALTHY');
-      await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;
-      await tx.$executeRaw`SELECT intent_id FROM live_execution_intent WHERE intent_id = ${intentId} FOR UPDATE`;
-      const verified = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
-      if (verified === null) {
-        throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Live order vanished while completing cancellation', { details: { intentId } });
-      }
-      const current = verified.order;
-      if (fence !== null && current.accountId !== fence.accountId) throw new LiveExecutionError('LIVE_RECONCILIATION_REQUIRED', 'Reconciliation authorization belongs to a different account');
-      const cancelState = outcome === 'ACKNOWLEDGED' ? 'CANCEL_ACKNOWLEDGED'
-        : outcome === 'AMBIGUOUS' ? 'CANCEL_AMBIGUOUS' : 'CANCEL_REJECTED';
-      if (current.cancelGeneration === generation && current.cancelState === cancelState) return current;
-      if (current.cancelGeneration !== generation || current.cancelState !== 'CANCEL_RESERVED') {
-        throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Cancellation claim ownership changed before completion', { details: { intentId, generation } });
-      }
-      const updated = await tx.liveOrder.updateMany({
-        where: {
-          intentId,
-          state: current.state,
-          revision: current.revision,
-          clientOrderId: current.clientOrderId,
-          accountId: current.accountId,
-          pair: current.pair,
-          orderedQuantity: canonicalLiveDecimalString(current.orderedQuantity, 'orderedQuantity'),
-          cancelGeneration: generation,
-          cancelState: 'CANCEL_RESERVED',
-        },
-        data: {
-          cancelState,
-          cancelFaultCode: faultCode,
-          ...(outcome === 'AMBIGUOUS' ? { faultCode: 'LIVE_CANCEL_AMBIGUOUS' } : {}),
-          // [F18-18] This transition always leaves CANCEL_RESERVED (the
-          // precondition above requires it), so any wire-arm proof is no
-          // longer meaningful and must not survive as a contradictory `true`
-          // against a non-reserved cancel state.
-          cancelWireArmed: false,
-          revision: { increment: 1 },
-        },
-      });
-      if (updated.count !== 1) {
-        throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Cancellation claim ownership changed before completion', { details: { intentId, generation } });
-      }
-      const committed = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
-      if (committed === null) {
-        throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Live order vanished after completing cancellation', { details: { intentId } });
-      }
-      return committed.order;
+      return completeCancelAttemptWithinCallerFencedTransaction(tx, intentId, generation, outcome, faultCode, fence === null ? null : fence.accountId);
     });
   }
 
