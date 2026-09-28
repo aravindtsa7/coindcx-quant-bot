@@ -39,8 +39,9 @@ const MIGRATIONS_ROOT = path.join(REPO_ROOT, 'prisma/migrations');
 const { graph, files } = buildImportGraph(SRC_ROOT, REPO_ROOT);
 const shadowFiles = files.filter((file) => file.startsWith(SHADOW_ROOT)).sort();
 
+/** The file's logical LF source: identical on a CRLF (Windows autocrlf) and an LF checkout. */
 function sourceOf(file: string): string {
-  return readFileSync(path.join(REPO_ROOT, file), 'utf8');
+  return readFileSync(path.join(REPO_ROOT, file), 'utf8').replace(/\r\n/g, '\n');
 }
 
 function codeOf(file: string): string {
@@ -354,11 +355,14 @@ describe('the Checkpoint C migration', () => {
     return readFileSync(path.join(MIGRATIONS_ROOT, MIGRATION, 'migration.sql'), 'utf8');
   }
 
-  it('is the newest migration, FROZEN under its exact name and accepted hash', () => {
+  it('is FROZEN under its exact name and accepted hash; the ONLY later migration is the Stage 1B2 lease-shape migration', () => {
     const directories = readdirSync(MIGRATIONS_ROOT).filter((name) => statSync(path.join(MIGRATIONS_ROOT, name)).isDirectory()).sort();
-    expect(directories.at(-1)).toBe(MIGRATION);
+    // [Stage 1B2] Exactly one reviewed forward migration follows Checkpoint C, itself FROZEN under its exact name and accepted hash.
+    expect(directories.slice(directories.indexOf(MIGRATION) + 1)).toEqual(['20260927000000_phase18b_practical_mutation_safety']);
     expect(readdirSync(path.join(MIGRATIONS_ROOT, MIGRATION))).toEqual(['migration.sql']);
     expect(sourceOf('tests/architecture/phase18-migration-freeze.test.ts')).toContain(`'${MIGRATION}': '6cf2095f5d05be54c248fe43e113e67156af9f783ce4fb21948722fcaa6811e9',`);
+    expect(sourceOf('tests/architecture/phase18-migration-freeze.test.ts'))
+      .toContain("'20260927000000_phase18b_practical_mutation_safety': '02f9d0112f3a3287e1f7dae37afd326026e550f5aed21d143e6f4f6f69ea243b',");
   });
 
   it('is purely additive: it creates and constrains only live_practical_shadow_* tables and references nothing else', () => {

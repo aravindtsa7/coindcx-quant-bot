@@ -100,17 +100,26 @@ describe('no provider, network, gateway, dispatch, or arm reachability (no new r
     }
   });
 
-  it('names no mutation, arming, signing, or network primitive, and never writes armed_at_ms', () => {
+  it('names no mutation, arming, signing, or network primitive, and never writes armed_at_ms or an order binding', () => {
     for (const file of persistenceFiles) {
       const code = codeOf(file);
       for (const forbidden of [
         'placeOrder', 'cancelOrder', 'armDispatchWire', 'armCancelWire', 'armOrphanCancelWire', 'createOrder',
         'fetch(', 'axios', 'socket.io', 'HmacSha256Signer', 'X-AUTH', '/exchange/v1', 'process.env', 'Date.now', 'new Date(',
-        'armedAtMs:', 'armed_at_ms =', 'intentId:', 'clientOrderId:',
+        'armed_at_ms =', 'intent_id =', 'client_order_id =', 'cancel_generation =',
       ]) {
         expect(code.includes(forbidden), `${file} names ${forbidden}`).toBe(false);
       }
     }
+    // [Stage 1B2 Wave 1] The port and the row parser now NAME the order binding and arm time in order to READ and
+    // validate them (closed-world lease shape). The Stage 1B1 ADAPTER still writes none of them: every lease it
+    // inserts is UNBOUND and unarmed, and it only SELECTs the new columns.
+    const adapter = codeOf(REPOSITORY);
+    for (const forbidden of ['armedAtMs:', 'intentId:', 'clientOrderId:', 'cancelGeneration:', 'orderBinding:']) {
+      expect(adapter.includes(forbidden), `the Stage 1B1 adapter names ${forbidden}`).toBe(false);
+    }
+    expect(adapter).toContain('intent_id AS intentId, client_order_id AS clientOrderId, cancel_generation AS cancelGeneration,');
+    expect(adapter).toContain('armed_at_ms AS armedAtMs');
   });
 
   it('only the Checkpoint B recovery core and the Checkpoint C shadow collector import the PORT; only the shadow-only composition root imports the ADAPTER (for loadAccount)', () => {
@@ -369,12 +378,15 @@ function statementsOf(sql: string): string[] {
 describe('the Stage 1B1 migration', () => {
   it('is a later-timestamped forward migration, now FROZEN: pinned in the freeze test under its exact name and accepted hash', () => {
     const directories = readdirSync(MIGRATIONS_ROOT).filter((name) => statSync(path.join(MIGRATIONS_ROOT, name)).isDirectory()).sort();
-    // [Checkpoint C] exactly one later, additive forward migration follows it, itself now FROZEN.
-    expect(directories.slice(directories.indexOf(STAGE_1B1_MIGRATION) + 1)).toEqual(['20260926000000_phase18b_practical_shadow_calibration']);
-    expect(directories.filter((name) => name.includes('phase18b'))).toEqual([STAGE_1B1_MIGRATION, '20260926000000_phase18b_practical_shadow_calibration']);
+    // [Checkpoint C] a later, additive forward migration follows it, itself now FROZEN; [Stage 1B2] then exactly one
+    // more forward migration (the order-bound lease shape), also FROZEN after independent review.
+    const later = ['20260926000000_phase18b_practical_shadow_calibration', '20260927000000_phase18b_practical_mutation_safety'];
+    expect(directories.slice(directories.indexOf(STAGE_1B1_MIGRATION) + 1)).toEqual(later);
+    expect(directories.filter((name) => name.includes('phase18b'))).toEqual([STAGE_1B1_MIGRATION, ...later]);
     const freezeTest = readFileSync(path.join(REPO_ROOT, 'tests/architecture/phase18-migration-freeze.test.ts'), 'utf8');
     expect(freezeTest).toContain(`'${STAGE_1B1_MIGRATION}': '734e3d01758667cf652c1a57745fc3c2bca9476599459b820f752a20eb054f99',`);
     expect(freezeTest).toContain("'20260926000000_phase18b_practical_shadow_calibration': '6cf2095f5d05be54c248fe43e113e67156af9f783ce4fb21948722fcaa6811e9',");
+    expect(freezeTest).toContain("'20260927000000_phase18b_practical_mutation_safety': '02f9d0112f3a3287e1f7dae37afd326026e550f5aed21d143e6f4f6f69ea243b',");
     expect(readdirSync(path.join(MIGRATIONS_ROOT, STAGE_1B1_MIGRATION))).toEqual(['migration.sql']);
   });
 

@@ -121,6 +121,27 @@ export interface PracticalDurableCertificateRecord {
   readonly terminalReason: PracticalInvalidationReason | null;
 }
 
+/**
+ * [Stage 1B2] The durable order a lease is bound to. Every field is read from
+ * the lease row and is DATA, not authority: whoever acts on it must still
+ * re-verify it, with exact string equality, against the locked,
+ * digest-verified Phase 17 order in the same transaction.
+ */
+export interface PracticalLeaseOrderBinding {
+  readonly intentId: string;
+  /** The verified durable order's client order id (never a caller-selected value). */
+  readonly clientOrderId: string;
+  /** The Phase 17 `cancel_generation` of the ONE cancel claim this lease owns. */
+  readonly cancelGeneration: number;
+}
+
+/**
+ * A durable lease has exactly one of two closed shapes (the database CHECKs
+ * them and `parsePracticalLeaseRow` re-validates every read):
+ *   - UNBOUND (Stage 1B1 bookkeeping): `orderBinding === null`, never armed;
+ *   - ORDER-BOUND (Stage 1B2): action CANCEL only, possibly armed.
+ * Holding either shape is not dispatch authority.
+ */
 export interface PracticalMutationLeaseRecord {
   readonly leaseId: string;
   readonly accountId: string;
@@ -129,6 +150,14 @@ export interface PracticalMutationLeaseRecord {
   readonly runtimeEpoch: string;
   readonly reconciliationGeneration: number;
   readonly createdAtMs: number;
+  /** [Stage 1B2] Null for an unbound Stage 1B1 lease. */
+  readonly orderBinding: PracticalLeaseOrderBinding | null;
+  /**
+   * [Stage 1B2] When the pre-wire arm committed (order-bound leases only).
+   * Non-null means a wire mutation MAY have left the process; it is never
+   * evidence that one did, or did not.
+   */
+  readonly armedAtMs: number | null;
   readonly status: PracticalLeaseStatus;
   readonly completedAtMs: number | null;
   /** Bookkeeping of what the caller reported; NOT evidence that a provider mutation happened. */

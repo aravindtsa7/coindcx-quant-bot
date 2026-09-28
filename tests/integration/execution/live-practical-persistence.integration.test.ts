@@ -1,5 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { URL } from 'node:url';
 import { Prisma, PrismaClient } from '@prisma/client';
@@ -548,7 +549,7 @@ describe('P18B-1B1-DB durable certificate terminal CAS', () => {
     }
   });
 
-  it('the database itself allows at most one lease per certificate, and never an armed lease', async () => {
+  it('the database itself allows at most one lease per certificate, and an UNBOUND Stage 1B1 lease can never be armed', async () => {
     if (skip()) return;
     const accountId = freshAccount();
     const { certificate } = await leased(accountId);
@@ -556,8 +557,10 @@ describe('P18B-1B1-DB durable certificate terminal CAS', () => {
       leaseId: lid(accountId, 'lease-dup'), accountId, certificateId: certificate.certificateId, action: 'CANCEL', runtimeEpoch: EPOCH,
       reconciliationGeneration: 1, createdAtMs: BigInt(T0), status: 'LEASED',
     } })).rejects.toMatchObject({ code: 'P2002' });
+    // [Stage 1B2] The Stage 1B1 "never armed" CHECK was lifted by the Stage 1B2 forward migration; for an UNBOUND
+    // lease (every lease Stage 1B1 creates) its replacement, armed_bound_chk, still refuses any arm time.
     await expect(connectionA.$executeRaw`UPDATE live_practical_mutation_lease SET armed_at_ms = ${BigInt(T0)} WHERE account_id = ${accountId}`)
-      .rejects.toThrow(/live_practical_mutation_lease_not_armed_chk/);
+      .rejects.toThrow(/live_practical_mutation_lease_armed_bound_chk/);
   });
 
   it('a genuine certificate for another account, a structural look-alike, or a clone is refused', async () => {
@@ -1594,11 +1597,33 @@ describe('P18B-1B1-DB migration parity', () => {
     expect(diff.stdout.split('\n').filter((line) => /live_practical/.test(line))).toEqual([]);
   }, 60_000);
 
-  it('every Stage 1B1 CHECK constraint is present in the migrated database', async () => {
+  it('the migrated database retains the Stage 1B1 CHECKs except the explicitly lifted never-armed check and carries the Stage 1B2 replacements', async () => {
     if (skip()) return;
     const rows = await connectionA.$queryRaw<{ name: string }[]>`SELECT CONSTRAINT_NAME AS name FROM information_schema.CHECK_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = ${SHADOW_DB_NAME} AND CONSTRAINT_NAME LIKE 'live\\_practical\\_%'`;
-    expect(rows.length).toBe(28);
-    expect(rows.map((row) => row.name)).toContain('live_practical_mutation_lease_not_armed_chk');
-    expect(rows.map((row) => row.name)).toContain(INVALIDATION_REASON_CHK);
+    const names = rows.map((row) => row.name).sort();
+    // The Stage 1B1 CHECKs, read from the immutable Stage 1B1 migration itself (28 of them).
+    const stage1b1Sql = readFileSync(path.join(REPO_ROOT, 'prisma/migrations/20260925000000_phase18b_practical_persistence/migration.sql'), 'utf8');
+    const stage1b1Checks = [...stage1b1Sql.matchAll(/ADD CONSTRAINT `([a-z_]+_chk)` CHECK/g)].map((match) => match[1]!);
+    expect(stage1b1Checks).toHaveLength(28);
+    const LIFTED = 'live_practical_mutation_lease_not_armed_chk';
+    expect(stage1b1Checks).toContain(LIFTED);
+    const stage1b2Replacements = [
+      'live_practical_mutation_lease_binding_chk',
+      'live_practical_mutation_lease_bound_action_chk',
+      'live_practical_mutation_lease_cancel_generation_chk',
+      'live_practical_mutation_lease_armed_bound_chk',
+      'live_practical_mutation_lease_armed_time_chk',
+      'live_practical_mutation_lease_bound_completed_time_chk',
+      'live_practical_mutation_lease_bound_outcome_chk',
+    ];
+    // Final migration set: 28 Stage 1B1 - 1 explicitly lifted + 7 Stage 1B2 replacements = 34, exactly.
+    expect(names).toHaveLength(34);
+    expect(names).toEqual([...stage1b1Checks.filter((name) => name !== LIFTED), ...stage1b2Replacements].sort());
+    expect(names).not.toContain(LIFTED);
+    // Every other Stage 1B1 CHECK, including the invalidation-reason and unrelated safety CHECKs, remains.
+    expect(names).toContain(INVALIDATION_REASON_CHK);
+    for (const kept of ['live_practical_account_fence_mode_chk', 'live_practical_certificate_terminal_at_chk', 'live_practical_mutation_lease_outcome_chk', 'live_practical_mutation_lease_completed_chk']) {
+      expect(names).toContain(kept);
+    }
   });
 });

@@ -39,19 +39,30 @@ const FROZEN_MIGRATIONS: Readonly<Record<string, string>> = Object.freeze({
   '20260925000000_phase18b_practical_persistence': '734e3d01758667cf652c1a57745fc3c2bca9476599459b820f752a20eb054f99',
   // Phase 18B Checkpoint C (shadow calibration + paper safety simulation), frozen after final source + SQL review (P18B-C-01..08 closed).
   '20260926000000_phase18b_practical_shadow_calibration': '6cf2095f5d05be54c248fe43e113e67156af9f783ce4fb21948722fcaa6811e9',
+  // Phase 18B Stage 1B2 (order-bound mutation lease shape), frozen after independent source, SQL, manifest, real-MySQL, and hash review.
+  '20260927000000_phase18b_practical_mutation_safety': '02f9d0112f3a3287e1f7dae37afd326026e550f5aed21d143e6f4f6f69ea243b',
 });
 
 const PHASE18_MIGRATIONS = Object.keys(FROZEN_MIGRATIONS).filter((name) => name.includes('_phase18_'));
 const PHASE18B_STAGE_1B1_MIGRATION = '20260925000000_phase18b_practical_persistence';
 const PHASE18B_SHADOW_MIGRATION = '20260926000000_phase18b_practical_shadow_calibration';
 const PHASE18B_SHADOW_MIGRATION_SHA256 = '6cf2095f5d05be54c248fe43e113e67156af9f783ce4fb21948722fcaa6811e9';
+const PHASE18B_STAGE_1B2_MIGRATION = '20260927000000_phase18b_practical_mutation_safety';
+const PHASE18B_STAGE_1B2_MIGRATION_SHA256 = '02f9d0112f3a3287e1f7dae37afd326026e550f5aed21d143e6f4f6f69ea243b';
 /** Every accepted Phase18B migration, in order. Anything else named phase18b is NOT covered by these pins. */
-const ACCEPTED_PHASE18B_MIGRATIONS = [PHASE18B_STAGE_1B1_MIGRATION, PHASE18B_SHADOW_MIGRATION];
+const ACCEPTED_PHASE18B_MIGRATIONS = [PHASE18B_STAGE_1B1_MIGRATION, PHASE18B_SHADOW_MIGRATION, PHASE18B_STAGE_1B2_MIGRATION];
+/** The newest accepted Phase18B migration: any later phase18b directory must sort after it. */
+const NEWEST_ACCEPTED_PHASE18B_MIGRATION = PHASE18B_STAGE_1B2_MIGRATION;
 /**
  * SHA-256 of JSON.stringify([[directory, sha256], ...]) over the twelve pins that
  * preceded Checkpoint C, in order: freezing Checkpoint C changed none of them.
  */
 const PRE_CHECKPOINT_C_PINS_DIGEST = 'b7cc6df3cc89d1f1ddebf45f5b677e7eb8b0b30b41f9a8fb028ba0e7b813716c';
+/**
+ * SHA-256 of JSON.stringify([[directory, sha256], ...]) over the thirteen pins that
+ * preceded the Stage 1B2 freeze, in order: freezing Stage 1B2 changed none of them.
+ */
+const PRE_STAGE_1B2_PINS_DIGEST = 'aa50a60d03738a4cb59a21c2b7a93f82e900c7883cf592422015d4d9cec816dc';
 const MIGRATION_DIRECTORY = /^\d{14}_[a-z0-9_]+$/;
 
 function migrationDirectories(): string[] {
@@ -74,10 +85,16 @@ describe('[F18-19] accepted migrations are frozen', () => {
     ]);
   });
 
-  it('pins exactly the accepted Phase18B migrations (Stage 1B1, Checkpoint C) under their exact names and hashes, and no other', () => {
+  it('pins exactly the accepted Phase18B migrations (Stage 1B1, Checkpoint C, Stage 1B2) under their exact names and hashes, and no other', () => {
+    expect(ACCEPTED_PHASE18B_MIGRATIONS).toEqual([
+      '20260925000000_phase18b_practical_persistence',
+      '20260926000000_phase18b_practical_shadow_calibration',
+      '20260927000000_phase18b_practical_mutation_safety',
+    ]);
     expect(Object.keys(FROZEN_MIGRATIONS).filter((name) => name.includes('phase18b'))).toEqual(ACCEPTED_PHASE18B_MIGRATIONS);
     expect(FROZEN_MIGRATIONS[PHASE18B_STAGE_1B1_MIGRATION]).toBe('734e3d01758667cf652c1a57745fc3c2bca9476599459b820f752a20eb054f99');
     expect(FROZEN_MIGRATIONS[PHASE18B_SHADOW_MIGRATION]).toBe(PHASE18B_SHADOW_MIGRATION_SHA256);
+    expect(FROZEN_MIGRATIONS[PHASE18B_STAGE_1B2_MIGRATION]).toBe(PHASE18B_STAGE_1B2_MIGRATION_SHA256);
     for (const directory of ACCEPTED_PHASE18B_MIGRATIONS) expect(migrationDirectories()).toContain(directory);
   });
 
@@ -105,21 +122,57 @@ describe('[F18-19] accepted migrations are frozen', () => {
     }
   });
 
+  it('the Stage 1B2 pin is an EXACT directory-name lookup: no variant, prefix, or pattern is covered', () => {
+    for (const variant of [
+      `${PHASE18B_STAGE_1B2_MIGRATION}_v2`,
+      PHASE18B_STAGE_1B2_MIGRATION.toUpperCase(),
+      '20260927000000_phase18b_practical_mutation',
+      '20260928000000_phase18b_practical_mutation_safety',
+      ` ${PHASE18B_STAGE_1B2_MIGRATION}`,
+    ]) {
+      expect(Object.prototype.hasOwnProperty.call(FROZEN_MIGRATIONS, variant), variant).toBe(false);
+    }
+  });
+
+  it('a one-byte change to the Stage 1B2 migration no longer matches its pin', () => {
+    const text = readFileSync(path.join(MIGRATIONS_ROOT, PHASE18B_STAGE_1B2_MIGRATION, 'migration.sql'), 'utf8').replace(/\r\n/g, '\n');
+    const sha = (value: string): string => createHash('sha256').update(value).digest('hex');
+    expect(sha(text)).toBe(PHASE18B_STAGE_1B2_MIGRATION_SHA256);
+    const middle = Math.floor(text.length / 2);
+    const flipped = `${text.slice(0, middle)}${String.fromCharCode(text.charCodeAt(middle) ^ 1)}${text.slice(middle + 1)}`;
+    const loosenedGeneration = text.replace('`cancel_generation` >= 1', '`cancel_generation` >= 0');
+    const loosenedCompletion = text.replace('COALESCE(`armed_at_ms`, `created_at_ms`)', 'COALESCE(`armed_at_ms`, 0)');
+    for (const changed of [flipped, `${text} `, text.slice(0, -1), loosenedGeneration, loosenedCompletion]) {
+      expect(changed).not.toBe(text);
+      expect(sha(changed)).not.toBe(PHASE18B_STAGE_1B2_MIGRATION_SHA256);
+    }
+  });
+
   it('a later Phase18B migration is never covered by the accepted pins: it is unfrozen and must sort after every accepted one', () => {
     // The pins are exact directory-name lookups (no prefix or pattern match), so another
     // phase18b directory is a separate, not-yet-accepted migration and must sort after them.
     for (const directory of migrationDirectories().filter((name) => name.includes('phase18b') && !ACCEPTED_PHASE18B_MIGRATIONS.includes(name))) {
       expect(Object.prototype.hasOwnProperty.call(FROZEN_MIGRATIONS, directory), directory).toBe(false);
-      expect(directory > PHASE18B_SHADOW_MIGRATION, `${directory} must sort after ${PHASE18B_SHADOW_MIGRATION}`).toBe(true);
+      expect(directory > NEWEST_ACCEPTED_PHASE18B_MIGRATION, `${directory} must sort after ${NEWEST_ACCEPTED_PHASE18B_MIGRATION}`).toBe(true);
     }
   });
 
   it('freezing Checkpoint C changed none of the older pins (same names, same hashes, same order)', () => {
     const entries = Object.entries(FROZEN_MIGRATIONS);
-    expect(entries.at(-1)).toEqual([PHASE18B_SHADOW_MIGRATION, PHASE18B_SHADOW_MIGRATION_SHA256]);
-    const older = entries.slice(0, -1);
+    // Checkpoint C is the 13th pin (index 12); every later pin was appended after it.
+    expect(entries[12]).toEqual([PHASE18B_SHADOW_MIGRATION, PHASE18B_SHADOW_MIGRATION_SHA256]);
+    const older = entries.slice(0, 12);
     expect(older).toHaveLength(12);
     expect(createHash('sha256').update(JSON.stringify(older)).digest('hex')).toBe(PRE_CHECKPOINT_C_PINS_DIGEST);
+  });
+
+  it('freezing Stage 1B2 changed none of the older pins (same names, same hashes, same order)', () => {
+    const entries = Object.entries(FROZEN_MIGRATIONS);
+    expect(entries).toHaveLength(14);
+    expect(entries.at(-1)).toEqual([PHASE18B_STAGE_1B2_MIGRATION, PHASE18B_STAGE_1B2_MIGRATION_SHA256]);
+    const older = entries.slice(0, -1);
+    expect(older).toHaveLength(13);
+    expect(createHash('sha256').update(JSON.stringify(older)).digest('hex')).toBe(PRE_STAGE_1B2_PINS_DIGEST);
   });
 
   it.each(Object.entries(FROZEN_MIGRATIONS))('%s is byte-identical to its accepted content', (directory, sha256) => {

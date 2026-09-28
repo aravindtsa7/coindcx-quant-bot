@@ -31,8 +31,9 @@ const BARRIER = 'src/execution/live/reconciliation/barrier.ts';
 const { graph, files } = buildImportGraph(SRC_ROOT, REPO_ROOT);
 const recoveryFiles = files.filter((file) => file.startsWith(RECOVERY_ROOT)).sort();
 
+/** The file's logical LF source: identical on a CRLF (Windows autocrlf) and an LF checkout. */
 function sourceOf(file: string): string {
-  return readFileSync(path.join(REPO_ROOT, file), 'utf8');
+  return readFileSync(path.join(REPO_ROOT, file), 'utf8').replace(/\r\n/g, '\n');
 }
 
 function codeOf(file: string): string {

@@ -260,6 +260,34 @@ export function parsePracticalCertificateRow(value: unknown): PracticalDurableCe
   return record;
 }
 
+/** Width of the lease's `intent_id` and `client_order_id` columns (and of the Phase 17 columns they bind to). */
+const LEASE_ORDER_ID_MAX_LENGTH = 64;
+
+/** Outcomes an ARMED order-bound (cancel) lease may complete with. DUPLICATE_CLIENT_ORDER_ID is create-only. */
+const ARMED_BOUND_LEASE_OUTCOMES: readonly PracticalMutationOutcome[] = Object.freeze(['ACCEPTED', 'REJECTED', 'AMBIGUOUS', 'PRE_DISPATCH_FAILURE']);
+
+function leaseOrderId(row: Readonly<Record<string, unknown>>, name: string, problem: PracticalMalformedProblem): string | null {
+  const value = nullableExactId(row, name, problem);
+  if (value !== null && value.length > LEASE_ORDER_ID_MAX_LENGTH) malformed(problem, 'A durable order identifier is longer than its column', name);
+  return value;
+}
+
+/**
+ * Parses a lease row into exactly one of the two closed shapes, never
+ * repairing it:
+ *   - UNBOUND (Stage 1B1 bookkeeping): intentId, clientOrderId, and
+ *     cancelGeneration all null, and never armed; any recorded outcome;
+ *   - ORDER-BOUND (Stage 1B2): all three set (exact ids that fit their
+ *     columns, a positive cancel generation), action CANCEL only;
+ *     armedAtMs, when set, is not before createdAtMs, and completedAtMs is
+ *     not before armedAtMs (or, if never armed, not before createdAtMs);
+ *     a completed UNARMED bound lease records only
+ *     PRE_DISPATCH_FAILURE, a completed ARMED one only ACCEPTED, REJECTED,
+ *     AMBIGUOUS, or PRE_DISPATCH_FAILURE.
+ * A partial binding, an armed unbound lease, or any other combination is
+ * MALFORMED (LEASE_ROW_INVALID). The binding it returns is still DATA: the
+ * caller re-verifies it against the verified Phase 17 order.
+ */
 export function parsePracticalLeaseRow(value: unknown): PracticalMutationLeaseRecord {
   const problem = 'LEASE_ROW_INVALID';
   const row = asRecord(value, problem);
@@ -267,8 +295,11 @@ export function parsePracticalLeaseRow(value: unknown): PracticalMutationLeaseRe
   if (!isPracticalMutationAction(action)) malformed(problem, 'Unknown durable lease action', 'action');
   const outcome = field(row, 'outcome', problem);
   if (outcome !== null && !(PRACTICAL_MUTATION_OUTCOMES as readonly unknown[]).includes(outcome)) malformed(problem, 'Unknown durable lease outcome', 'outcome');
-  requireCoupled(field(row, 'armedAtMs', problem) === null, problem, 'A Stage 1B1 lease can never be armed');
-  requireCoupled(field(row, 'intentId', problem) === null && field(row, 'clientOrderId', problem) === null, problem, 'A Stage 1B1 lease carries no intent or client order id');
+  const intentId = leaseOrderId(row, 'intentId', problem);
+  const clientOrderId = leaseOrderId(row, 'clientOrderId', problem);
+  const cancelGeneration = field(row, 'cancelGeneration', problem) === null ? null : positiveInteger(row, 'cancelGeneration', problem);
+  const bound = intentId !== null;
+  requireCoupled(bound === (clientOrderId !== null) && bound === (cancelGeneration !== null), problem, 'A lease order binding must carry intent, client order id, and cancel generation together or not at all');
   const record = Object.freeze({
     leaseId: exactId(row, 'leaseId', problem),
     accountId: exactId(row, 'accountId', problem),
@@ -277,12 +308,30 @@ export function parsePracticalLeaseRow(value: unknown): PracticalMutationLeaseRe
     runtimeEpoch: exactId(row, 'runtimeEpoch', problem),
     reconciliationGeneration: positiveInteger(row, 'reconciliationGeneration', problem),
     createdAtMs: safeInteger(row, 'createdAtMs', problem),
+    orderBinding: bound ? Object.freeze({ intentId: intentId!, clientOrderId: clientOrderId!, cancelGeneration: cancelGeneration! }) : null,
+    armedAtMs: nullableSafeInteger(row, 'armedAtMs', problem),
     status: oneOf(row, 'status', ['LEASED', 'COMPLETED'] as const, problem),
     completedAtMs: nullableSafeInteger(row, 'completedAtMs', problem),
     outcome: outcome as PracticalMutationOutcome | null,
   });
   requireCoupled((record.status === 'LEASED') === (record.completedAtMs === null && record.outcome === null), problem, 'Lease completion fields do not match its status');
   requireCoupled(record.status === 'LEASED' || (record.completedAtMs !== null && record.outcome !== null), problem, 'A completed lease must record time and outcome');
+  // An unbound (Stage 1B1) lease can never be armed.
+  requireCoupled(record.armedAtMs === null || bound, problem, 'An unbound (Stage 1B1) lease can never be armed');
+  if (bound) {
+    requireCoupled(record.action === 'CANCEL', problem, 'Only a CANCEL lease can be order-bound');
+    requireCoupled(record.armedAtMs === null || record.armedAtMs >= record.createdAtMs, problem, 'A lease cannot be armed before it was created');
+    // Completion never predates the arm or, for a never-armed lease, the creation.
+    const completionNotBefore = record.armedAtMs === null ? record.createdAtMs : record.armedAtMs;
+    requireCoupled(record.completedAtMs === null || record.completedAtMs >= completionNotBefore, problem, 'An order-bound lease cannot complete before it was armed, or created if never armed');
+    if (record.outcome !== null) {
+      requireCoupled(
+        record.armedAtMs === null ? record.outcome === 'PRE_DISPATCH_FAILURE' : ARMED_BOUND_LEASE_OUTCOMES.includes(record.outcome),
+        problem,
+        'An order-bound lease outcome is impossible for its arm state',
+      );
+    }
+  }
   return record;
 }
 

@@ -843,9 +843,14 @@ model LiveOrder {
 
   intent LiveExecutionIntent @relation(fields: [intentId], references: [intentId], onDelete: Restrict, onUpdate: Restrict, map: "live_order_intent_fkey")
   events LiveOrderEvent[]
+  /// [P18B Stage 1B2] Practical mutation leases bound to this exact order (single composite binding; relation only, no column).
+  practicalMutationLeases LivePracticalMutationLease[] @relation("LivePracticalLeaseOrderBinding")
 
   @@index([accountId, state], map: "live_order_account_state_idx")
   @@index([exchangeOrderId], map: "live_order_exchange_order_idx")
+  /// [P18B Stage 1B2] Referenced by the practical lease's ONE composite order-binding foreign key. Purely additive:
+  /// `intent_id` stays the primary key and `client_order_id` keeps its own UNIQUE index, both unchanged.
+  @@unique([intentId, clientOrderId, accountId], map: "live_order_practical_binding_key")
   @@map("live_order")
 }
 
@@ -1369,22 +1374,31 @@ model LivePracticalCertificate {
 }
 
 /// One practical mutation lease per consumed certificate (UNIQUE
-/// certificate_id). Stage 1B1 records leases only: nothing arms or
-/// dispatches one, and a CHECK constraint keeps `armed_at_ms` NULL.
+/// certificate_id). Two closed shapes (CHECK-enforced, re-validated on every
+/// read):
+///   - UNBOUND (Stage 1B1 bookkeeping): intent_id, client_order_id, and
+///     cancel_generation all NULL, and never armed;
+///   - ORDER-BOUND (Stage 1B2): all three set, action CANCEL only, bound to
+///     exactly one live_order row by ONE composite foreign key on
+///     (intent_id, client_order_id, account_id), and at most one lease per
+///     Phase 17 cancel claim (UNIQUE intent_id, cancel_generation).
+/// Arming (armed_at_ms) is permitted only for an order-bound lease.
 model LivePracticalMutationLease {
   leaseId String @id @map("lease_id") @db.VarChar(64)
 
   accountId                String                      @map("account_id") @db.VarChar(128)
   certificateId            String                      @unique(map: "live_practical_mutation_lease_certificate_key") @map("certificate_id") @db.Char(64)
   action                   LivePracticalMutationAction
-  /// Not wired in Stage 1B1 (always NULL).
+  /// Stage 1B2 order binding (NULL for an unbound Stage 1B1 lease).
   intentId                 String?                     @map("intent_id") @db.VarChar(64)
-  /// Not wired in Stage 1B1 (always NULL).
+  /// Stage 1B2 order binding: the client order id of the verified durable order, never a caller value.
   clientOrderId            String?                     @map("client_order_id") @db.VarChar(64)
+  /// Stage 1B2 order binding: the Phase 17 `cancel_generation` of the one cancel claim this lease owns.
+  cancelGeneration         Int?                        @map("cancel_generation")
   runtimeEpoch             String                      @map("runtime_epoch") @db.VarChar(64)
   reconciliationGeneration Int                         @map("reconciliation_generation")
   createdAtMs              BigInt                      @map("created_at_ms")
-  /// Stage 1B1: always NULL (CHECK). Arming belongs to Stage 1B2.
+  /// Stage 1B2: set once, only on an order-bound lease, by the pre-wire arm (CHECK).
   armedAtMs                BigInt?                     @map("armed_at_ms")
   completedAtMs            BigInt?                     @map("completed_at_ms")
   status                   LivePracticalLeaseStatus    @default(LEASED)
@@ -1398,8 +1412,15 @@ model LivePracticalMutationLease {
   /// certificate's CONSUMED status, and exact-case equality, are re-validated by the repository.
   certificate LivePracticalCertificate   @relation(fields: [certificateId, accountId, runtimeEpoch, reconciliationGeneration], references: [certificateId, accountId, runtimeEpoch, reconciliationGeneration], onDelete: Restrict, onUpdate: Restrict, map: "live_practical_mutation_lease_certificate_fkey")
   fence       LivePracticalAccountFence? @relation("LivePracticalFenceLease")
+  /// [Stage 1B2] ONE structural binding to exactly one live_order row on (intent, client order, account). Defense in
+  /// depth only: the collation is case-insensitive, so the repository re-compares all three with exact equality.
+  order       LiveOrder?                 @relation("LivePracticalLeaseOrderBinding", fields: [intentId, clientOrderId, accountId], references: [intentId, clientOrderId, accountId], onDelete: Restrict, onUpdate: Restrict, map: "live_practical_mutation_lease_order_fkey")
 
   @@unique([leaseId, certificateId], map: "live_practical_mutation_lease_lease_certificate_key")
+  /// [Stage 1B2] At most one lease per Phase 17 cancel claim.
+  @@unique([intentId, cancelGeneration], map: "live_practical_mutation_lease_intent_cancel_key")
+  /// [Stage 1B2] The referencing side of the composite order-binding foreign key.
+  @@index([intentId, clientOrderId, accountId], map: "live_practical_mutation_lease_order_binding_idx")
   /// Referenced by the fence's composite lease-binding foreign key.
   @@unique([leaseId, certificateId, accountId, action, runtimeEpoch, reconciliationGeneration], map: "live_practical_mutation_lease_fence_binding_key")
   /// The referencing side of the composite lease -> certificate binding FK.

@@ -135,7 +135,7 @@ async function readCertificateRow(tx: Tx, certificateId: string, lock: boolean):
 
 async function readLeaseRow(tx: Tx, leaseId: string, lock: boolean): Promise<unknown> {
   const rows = await tx.$queryRaw<unknown[]>(Prisma.sql`SELECT lease_id AS leaseId, account_id AS accountId, certificate_id AS certificateId,
-    action, intent_id AS intentId, client_order_id AS clientOrderId, runtime_epoch AS runtimeEpoch,
+    action, intent_id AS intentId, client_order_id AS clientOrderId, cancel_generation AS cancelGeneration, runtime_epoch AS runtimeEpoch,
     reconciliation_generation AS reconciliationGeneration, created_at_ms AS createdAtMs, armed_at_ms AS armedAtMs,
     completed_at_ms AS completedAtMs, status, outcome
     FROM live_practical_mutation_lease WHERE lease_id = ${leaseId}${lockClause(lock)}`);

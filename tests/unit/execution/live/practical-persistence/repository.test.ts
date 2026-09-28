@@ -102,7 +102,7 @@ describe('input validation happens before any durable access', () => {
 
 describe('exact identity under the case-insensitive collation', () => {
   const leaseRow = (leaseId: string) => ({
-    leaseId, accountId: 'account-live-1', certificateId: 'c'.repeat(64), action: 'CANCEL', intentId: null, clientOrderId: null,
+    leaseId, accountId: 'account-live-1', certificateId: 'c'.repeat(64), action: 'CANCEL', intentId: null, clientOrderId: null, cancelGeneration: null,
     runtimeEpoch: 'epoch-a', reconciliationGeneration: 1, createdAtMs: 10n, armedAtMs: null, completedAtMs: null, status: 'LEASED', outcome: null,
   });
 

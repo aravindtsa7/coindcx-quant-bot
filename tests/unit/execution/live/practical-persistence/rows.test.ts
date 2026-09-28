@@ -49,7 +49,7 @@ const reviewRow = (overrides: Record<string, unknown> = {}) => ({
 /** The certificate behind a held lease: CONSUMED by the one-shot that created the lease. */
 const consumedCertificateRow = (overrides: Record<string, unknown> = {}) => certificateRow({ status: 'CONSUMED', terminalAtMs: 15n, ...overrides });
 const leaseRow = (overrides: Record<string, unknown> = {}) => ({
-  leaseId: 'lease-1', accountId: ACCOUNT, certificateId: CERT, action: 'CANCEL', intentId: null, clientOrderId: null,
+  leaseId: 'lease-1', accountId: ACCOUNT, certificateId: CERT, action: 'CANCEL', intentId: null, clientOrderId: null, cancelGeneration: null,
   runtimeEpoch: 'epoch-a', reconciliationGeneration: 1, createdAtMs: 10n, armedAtMs: null, completedAtMs: null,
   status: 'LEASED', outcome: null, ...overrides,
 });
@@ -182,8 +182,8 @@ describe('certificate, lease, and episode rows', () => {
     }
   });
 
-  it('a lease row can never be armed or carry an intent in Stage 1B1', () => {
-    expect(parsePracticalLeaseRow(leaseRow())).toMatchObject({ status: 'LEASED', outcome: null });
+  it('an UNBOUND (Stage 1B1) lease row can never be armed or carry a partial order binding', () => {
+    expect(parsePracticalLeaseRow(leaseRow())).toMatchObject({ status: 'LEASED', outcome: null, orderBinding: null, armedAtMs: null });
     expect(() => parsePracticalLeaseRow(leaseRow({ armedAtMs: 11n }))).toThrow(/can never be armed/);
     expect(() => parsePracticalLeaseRow(leaseRow({ intentId: 'intent-1' }))).toThrow(MALFORMED);
     expect(() => parsePracticalLeaseRow(leaseRow({ status: 'COMPLETED' }))).toThrow(MALFORMED);
@@ -458,5 +458,132 @@ describe('the malformed-state latch (P18B-1B1-01)', () => {
     }
     expect(() => parsePracticalReviewEpisodeRow(reviewRow({ malformedProblem: 'FENCE_ROW_INVALID' }))).toThrow(MALFORMED);
     expect(() => parsePracticalReviewEpisodeRow(reviewRow({ reason: 'DURABLE_STATE_MALFORMED' }))).toThrow(MALFORMED);
+  });
+});
+
+describe('[Stage 1B2] the lease row is closed-world: exactly UNBOUND (Stage 1B1) or ORDER-BOUND (Stage 1B2)', () => {
+  const BINDING = { intentId: 'intent-1', clientOrderId: 'P17-client-order-1', cancelGeneration: 1 };
+  const boundLeaseRow = (overrides: Record<string, unknown> = {}) => leaseRow({ ...BINDING, ...overrides });
+  const show = (value: unknown): string => JSON.stringify(value, (_k, v: unknown) => (typeof v === 'bigint' ? `${String(v)}n` : v));
+
+  it('an unarmed LEASED order-bound lease parses with its binding as frozen data', () => {
+    const lease = parsePracticalLeaseRow(boundLeaseRow());
+    expect(lease).toMatchObject({ status: 'LEASED', action: 'CANCEL', armedAtMs: null, outcome: null, orderBinding: BINDING });
+    expect(Object.isFrozen(lease)).toBe(true);
+    expect(Object.isFrozen(lease.orderBinding)).toBe(true);
+  });
+
+  it('an ARMED order-bound lease parses with its arm time (LEASED or COMPLETED)', () => {
+    expect(parsePracticalLeaseRow(boundLeaseRow({ armedAtMs: 10n }))).toMatchObject({ armedAtMs: 10, status: 'LEASED' });
+    expect(parsePracticalLeaseRow(boundLeaseRow({ armedAtMs: 11n, status: 'COMPLETED', completedAtMs: 11n, outcome: 'AMBIGUOUS' })))
+      .toMatchObject({ armedAtMs: 11, completedAtMs: 11, outcome: 'AMBIGUOUS' });
+  });
+
+  it('a partial order binding is MALFORMED (never completed, never dropped)', () => {
+    for (const overrides of [
+      { intentId: null }, { clientOrderId: null }, { cancelGeneration: null },
+      { intentId: null, clientOrderId: null }, { intentId: null, cancelGeneration: null }, { clientOrderId: null, cancelGeneration: null },
+    ]) {
+      expect(() => parsePracticalLeaseRow(boundLeaseRow(overrides)), show(overrides)).toThrow(MALFORMED);
+    }
+    expect(() => parsePracticalLeaseRow(leaseRow({ clientOrderId: 'P17-client-order-1' }))).toThrow(MALFORMED);
+    expect(() => parsePracticalLeaseRow(leaseRow({ cancelGeneration: 1 }))).toThrow(MALFORMED);
+  });
+
+  it('only a CANCEL lease can be order-bound: OPEN and CLOSE are MALFORMED', () => {
+    for (const action of ['OPEN', 'CLOSE']) {
+      expect(() => parsePracticalLeaseRow(boundLeaseRow({ action })), action).toThrow(/Only a CANCEL lease can be order-bound/);
+      // The same actions stay parseable on an UNBOUND Stage 1B1 row (unchanged compatibility; the Stage 1A policy refuses them upstream).
+      expect(parsePracticalLeaseRow(leaseRow({ action }))).toMatchObject({ action, orderBinding: null });
+    }
+  });
+
+  it('an unbound lease can never be armed; a bound one is never armed before it was created, nor completed before it was armed', () => {
+    expect(() => parsePracticalLeaseRow(leaseRow({ armedAtMs: 11n }))).toThrow(/unbound \(Stage 1B1\) lease can never be armed/);
+    expect(() => parsePracticalLeaseRow(boundLeaseRow({ armedAtMs: 9n }))).toThrow(/armed before it was created/);
+    expect(() => parsePracticalLeaseRow(boundLeaseRow({ armedAtMs: 12n, status: 'COMPLETED', completedAtMs: 11n, outcome: 'AMBIGUOUS' })))
+      .toThrow(/cannot complete before it was armed, or created if never armed/);
+  });
+
+  it('[Wave 1.6] an order-bound completion never predates the arm, or the creation when never armed', () => {
+    const COMPLETION_TIME = /cannot complete before it was armed, or created if never armed/;
+    // 1. unarmed, completed one millisecond before creation: refused.
+    expect(() => parsePracticalLeaseRow(boundLeaseRow({ createdAtMs: 100n, status: 'COMPLETED', completedAtMs: 99n, outcome: 'PRE_DISPATCH_FAILURE' })))
+      .toThrow(COMPLETION_TIME);
+    // 2. unarmed, completed at the creation instant: accepted.
+    expect(parsePracticalLeaseRow(boundLeaseRow({ createdAtMs: 100n, status: 'COMPLETED', completedAtMs: 100n, outcome: 'PRE_DISPATCH_FAILURE' })))
+      .toMatchObject({ createdAtMs: 100, armedAtMs: null, completedAtMs: 100, outcome: 'PRE_DISPATCH_FAILURE' });
+    // 3. armed, completed one millisecond before the arm (though after creation): refused.
+    expect(() => parsePracticalLeaseRow(boundLeaseRow({ createdAtMs: 100n, armedAtMs: 110n, status: 'COMPLETED', completedAtMs: 109n, outcome: 'AMBIGUOUS' })))
+      .toThrow(COMPLETION_TIME);
+    // 4. armed, completed at the arm instant: accepted.
+    expect(parsePracticalLeaseRow(boundLeaseRow({ createdAtMs: 100n, armedAtMs: 110n, status: 'COMPLETED', completedAtMs: 110n, outcome: 'AMBIGUOUS' })))
+      .toMatchObject({ createdAtMs: 100, armedAtMs: 110, completedAtMs: 110 });
+    // Legacy UNBOUND timing semantics are unchanged in this wave: an unbound completion is not time-coupled.
+    expect(parsePracticalLeaseRow(leaseRow({ createdAtMs: 100n, status: 'COMPLETED', completedAtMs: 99n, outcome: 'PRE_DISPATCH_FAILURE' })))
+      .toMatchObject({ orderBinding: null, completedAtMs: 99 });
+  });
+
+  it('a completed UNARMED order-bound lease records ONLY PRE_DISPATCH_FAILURE (nothing can have reached the wire)', () => {
+    const completed = (outcome: string) => boundLeaseRow({ status: 'COMPLETED', completedAtMs: 12n, outcome });
+    expect(parsePracticalLeaseRow(completed('PRE_DISPATCH_FAILURE'))).toMatchObject({ outcome: 'PRE_DISPATCH_FAILURE', armedAtMs: null });
+    for (const outcome of ['ACCEPTED', 'REJECTED', 'AMBIGUOUS', 'DUPLICATE_CLIENT_ORDER_ID']) {
+      expect(() => parsePracticalLeaseRow(completed(outcome)), outcome).toThrow(/impossible for its arm state/);
+    }
+  });
+
+  it('a completed ARMED order-bound lease records ACCEPTED, REJECTED, AMBIGUOUS, or PRE_DISPATCH_FAILURE; never DUPLICATE_CLIENT_ORDER_ID', () => {
+    const completed = (outcome: string) => boundLeaseRow({ armedAtMs: 11n, status: 'COMPLETED', completedAtMs: 12n, outcome });
+    for (const outcome of ['ACCEPTED', 'REJECTED', 'AMBIGUOUS', 'PRE_DISPATCH_FAILURE']) {
+      expect(parsePracticalLeaseRow(completed(outcome))).toMatchObject({ outcome });
+    }
+    expect(() => parsePracticalLeaseRow(completed('DUPLICATE_CLIENT_ORDER_ID'))).toThrow(/impossible for its arm state/);
+    expect(() => parsePracticalLeaseRow(completed('SUCCESS'))).toThrow(MALFORMED);
+  });
+
+  it('legacy UNBOUND leases keep their Stage 1B1 semantics: any known outcome, never armed', () => {
+    for (const outcome of ['ACCEPTED', 'REJECTED', 'AMBIGUOUS', 'DUPLICATE_CLIENT_ORDER_ID', 'PRE_DISPATCH_FAILURE']) {
+      expect(parsePracticalLeaseRow(leaseRow({ status: 'COMPLETED', completedAtMs: 12n, outcome }))).toMatchObject({ outcome, orderBinding: null, armedAtMs: null });
+    }
+  });
+
+  it('binding identifiers must be exact, non-empty, and fit their 64-character columns; the cancel generation a positive safe integer', () => {
+    for (const overrides of [
+      { intentId: '' }, { intentId: ' intent-1' }, { intentId: 'intent-1 ' }, { intentId: 'i'.repeat(65) }, { intentId: 7 },
+      { clientOrderId: '' }, { clientOrderId: 'P17-client-order-1\t' }, { clientOrderId: 'c'.repeat(65) }, { clientOrderId: {} },
+      { cancelGeneration: 0 }, { cancelGeneration: -1 }, { cancelGeneration: 1.5 }, { cancelGeneration: '1' },
+      { cancelGeneration: BigInt(Number.MAX_SAFE_INTEGER) + 1n },
+      { armedAtMs: -1n }, { armedAtMs: 'soon' },
+    ]) {
+      expect(() => parsePracticalLeaseRow(boundLeaseRow(overrides)), show(overrides)).toThrow(MALFORMED);
+    }
+    expect(parsePracticalLeaseRow(boundLeaseRow({ intentId: 'i'.repeat(64), clientOrderId: 'c'.repeat(64) }))).toMatchObject({
+      orderBinding: { intentId: 'i'.repeat(64), clientOrderId: 'c'.repeat(64), cancelGeneration: 1 },
+    });
+  });
+
+  it('a row missing any Stage 1B2 column is MALFORMED (never defaulted to unbound)', () => {
+    for (const column of ['intentId', 'clientOrderId', 'cancelGeneration', 'armedAtMs']) {
+      const row: Record<string, unknown> = leaseRow();
+      delete row[column];
+      expect(() => parsePracticalLeaseRow(row), column).toThrow(MALFORMED);
+    }
+  });
+
+  it('account assembly carries an order-bound lease under its leased fence, and a malformed bound lease fails the whole load closed', () => {
+    const LEASED_FENCE = { mode: 'MUTATION_LEASED', leaseId: 'lease-1', certificateId: CERT, leaseAction: 'CANCEL' };
+    const mutating = (lease: unknown) => quarantinedRows({
+      state: stateRow({ state: 'MUTATING', currentRecoveryEpisodeId: null }), recoveryEpisode: null, fence: fenceRow(LEASED_FENCE),
+      lease, leasedCertificate: consumedCertificateRow(),
+    });
+    expect(toPracticalAccountLoad(ACCOUNT, mutating(boundLeaseRow({ armedAtMs: 12n })))).toMatchObject({
+      kind: 'FOUND', account: { state: 'MUTATING', currentLease: { leaseId: 'lease-1', armedAtMs: 12, orderBinding: BINDING } },
+    });
+    const load = toPracticalAccountLoad(ACCOUNT, mutating(boundLeaseRow({ cancelGeneration: null })));
+    expect(load).toEqual({ kind: 'MALFORMED', problem: 'LEASE_ROW_INVALID', reviewEpisodeId: null });
+    expect(practicalStartupStateFromLoad(load)).toBe('MANUAL_REVIEW_REQUIRED');
+    // The fence -> lease check is unchanged by the order binding: a COMPLETED bound lease under a leased fence is inconsistent.
+    expect(toPracticalAccountLoad(ACCOUNT, mutating(boundLeaseRow({ armedAtMs: 11n, status: 'COMPLETED', completedAtMs: 12n, outcome: 'AMBIGUOUS' }))))
+      .toEqual({ kind: 'MALFORMED', problem: 'ROWS_INCONSISTENT', reviewEpisodeId: null });
   });
 });
