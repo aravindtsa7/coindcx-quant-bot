@@ -11,8 +11,10 @@ import { buildImportGraph, computeReachable } from './support/import-graph';
 //
 //   - defined and exported ONLY by src/execution/live/repository.ts, never on
 //     the LiveExecutionRepository port and never from any barrel;
-//   - imported by NO src/ module in Wave 2A (the future Stage 1B2 Prisma
-//     adapter is the only importer that may be added, by review);
+//   - imported by NO src/ module in Wave 2A; [Wave 2B1] exactly ONE reviewed
+//     importer was then added: the Stage 1B2 Prisma adapter
+//     (practical-mutation/repository.ts), for claim and arm only, never
+//     completion, and it fences the arm with the exact account (never null);
 //   - their bodies run no fence, open no transaction, and accept no authority
 //     object, certificate, enablement, tier selector, gateway, or network client;
 //   - the PUBLIC strict Tier-A methods still open the transaction and run
@@ -24,6 +26,7 @@ import { buildImportGraph, computeReachable } from './support/import-graph';
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const SRC_ROOT = path.join(REPO_ROOT, 'src');
 const REPOSITORY = 'src/execution/live/repository.ts';
+const MUTATION_ADAPTER = 'src/execution/live/practical-mutation/repository.ts';
 const PRIMITIVES = [
   'claimCancelWithinCallerFencedTransaction',
   'armCancelWireWithinCallerFencedTransaction',
@@ -96,9 +99,21 @@ describe('the primitives are defined once, by the Phase17 Prisma adapter module 
 });
 
 describe('the primitives are NOT a public authority surface', () => {
-  it('no src/ module imports or names them in Wave 2A (the future Stage 1B2 adapter must be added here by review)', () => {
+  it('[Wave 2B1] exactly ONE other src/ module names them: the reviewed Stage 1B2 adapter, for claim and arm only, never completion', () => {
     const naming = files.filter((file) => file !== REPOSITORY && PRIMITIVES.some((name) => codeOf(file).includes(name)));
-    expect(naming).toEqual([]);
+    expect(naming).toEqual([MUTATION_ADAPTER]);
+    const adapter = codeOf(MUTATION_ADAPTER);
+    expect(adapter.includes('completeCancelAttemptWithinCallerFencedTransaction'), 'the adapter never names completion').toBe(false);
+    // One import, one call each.
+    expect(adapter).toContain("import {\n  armCancelWireWithinCallerFencedTransaction,\n  claimCancelWithinCallerFencedTransaction,\n  type ClaimCancelOutcome,\n} from '../repository';");
+    expect(adapter.match(/claimCancelWithinCallerFencedTransaction\(/g)).toHaveLength(1);
+    expect(adapter.match(/armCancelWireWithinCallerFencedTransaction\(/g)).toHaveLength(1);
+    // The claim is fenced with the exact trusted practical account.
+    expect(adapter).toContain('claim = await claimCancelWithinCallerFencedTransaction(tx, intentId, accountId);');
+    // The Tier-B arm's 4th argument is the exact account id, NEVER null.
+    expect(adapter).toContain('armCancelWireWithinCallerFencedTransaction(tx, handle.intentId, handle.orderRevisionAfterClaim, requireExactAccountId(lease.accountId, handle.accountId));');
+    expect(adapter).not.toMatch(/armCancelWireWithinCallerFencedTransaction\([^)]*\bnull\b/);
+    expect(adapter).toContain('function requireExactAccountId(value: string, expected: string): string {');
   });
 
   it('no barrel exports them, statically or at runtime, and the LiveExecutionRepository port does not declare them', () => {
@@ -164,7 +179,10 @@ describe('reachability: no practical module, no new integration importer, no net
       'src/execution/live/service.ts',
       // The single approved Phase17 production root (pre-existing; it imports the public repository class only).
       'src/integration/coindcx/live/production-runtime.ts',
-    ]);
+    ].concat(
+      // [Wave 2B1] The reviewed Stage 1B2 adapter (the two claim/arm primitives only; it is itself wired into nothing).
+      MUTATION_ADAPTER,
+    ).sort());
     expect(codeOf('src/integration/coindcx/live/production-runtime.ts')).toContain("import { PrismaLiveExecutionRepository, type LiveExecutionRepository } from '../../../execution/live/repository';");
   });
 

@@ -152,3 +152,53 @@ describe('transaction retry is narrow', () => {
     expect(() => transitionPracticalAccountState('MANUAL_REVIEW_REQUIRED', { kind: 'OPERATOR_RESOLUTION', accountId: 'a', reviewEpisodeId: 'e', resolution })).toThrow(/already used/);
   });
 });
+
+describe('[Stage 1B2 Wave 2B1] the Stage 1B1 release refuses an ORDER-BOUND lease before any write', () => {
+  const CERTIFICATE_ID = 'c'.repeat(64);
+  const leaseRow = (bound: boolean, armedAtMs: bigint | null) => ({
+    leaseId: 'lease-bound', accountId: 'account-live-1', certificateId: CERTIFICATE_ID, action: 'CANCEL',
+    intentId: bound ? 'a'.repeat(64) : null, clientOrderId: bound ? `p17-${'b'.repeat(32)}` : null, cancelGeneration: bound ? 1 : null,
+    runtimeEpoch: 'epoch-a', reconciliationGeneration: 1, createdAtMs: 10n, armedAtMs, completedAtMs: null, status: 'LEASED', outcome: null,
+  });
+  const rowsFor = (lease: Record<string, unknown>) => (query: unknown): Promise<unknown> => {
+    const sql = (query as { sql: string }).sql;
+    if (sql.includes('FROM live_practical_malformed_latch')) return Promise.resolve([]);
+    if (sql.includes('FROM live_practical_account_state')) {
+      return Promise.resolve([{ accountId: 'account-live-1', state: 'MUTATING', currentRecoveryEpisodeId: null, currentReviewEpisodeId: null, currentCertificateId: null, revision: 5n }]);
+    }
+    if (sql.includes('FROM live_practical_account_fence')) {
+      return Promise.resolve([{
+        accountId: 'account-live-1', runtimeEpoch: 'epoch-a', reconciliationGeneration: 1, revision: 4n, mode: 'MUTATION_LEASED', runId: null,
+        leaseId: 'lease-bound', certificateId: CERTIFICATE_ID, leaseAction: 'CANCEL',
+      }]);
+    }
+    if (sql.includes('FROM live_practical_certificate')) {
+      return Promise.resolve([{
+        certificateId: CERTIFICATE_ID, accountId: 'account-live-1', providerAccountFingerprint: 'f'.repeat(64), runtimeEpoch: 'epoch-a', reconciliationGeneration: 1,
+        streamIncarnation: 1, evidenceDigest: 'e'.repeat(64), issuedAtMs: 1n, expiresAtMs: 100n, status: 'CONSUMED', terminalAtMs: 10n, terminalReason: null,
+      }]);
+    }
+    if (sql.includes('FROM live_practical_mutation_lease')) return Promise.resolve([lease]);
+    throw new Error(`unexpected query ${sql}`);
+  };
+  const expected = { accountId: 'account-live-1', runtimeEpoch: 'epoch-a', reconciliationGeneration: 1, revision: 4 };
+
+  it.each([
+    ['unarmed', null],
+    ['armed', 20n],
+  ] as const)('an %s order-bound lease is refused for every outcome, with no write attempted', async (_name, armedAtMs) => {
+    for (const outcome of ['ACCEPTED', 'REJECTED', 'AMBIGUOUS', 'DUPLICATE_CLIENT_ORDER_ID', 'PRE_DISPATCH_FAILURE'] as const) {
+      // The fake transaction has ONLY $queryRaw: any write (#apply) would fail with a TypeError instead of the typed refusal.
+      const { client } = fakeClient(rowsFor(leaseRow(true, armedAtMs)));
+      await expect(new PrismaPracticalSafetyRepository(client).releaseLease({ accountId: 'account-live-1', expected, leaseId: 'lease-bound', outcome, nowMs: 30 }), outcome)
+        .rejects.toThrow(/PRACTICAL_PERSISTENCE_CONFLICT.*order-bound \(Stage 1B2\) lease is completed only by the Stage 1B2 completion path/);
+    }
+  });
+
+  it('an UNBOUND lease still passes the guard and reaches the write step (behavior unchanged)', async () => {
+    const { client } = fakeClient(rowsFor(leaseRow(false, null)));
+    // No write delegates exist on this fake: reaching #apply proves the guard let the unbound lease through.
+    await expect(new PrismaPracticalSafetyRepository(client).releaseLease({ accountId: 'account-live-1', expected, leaseId: 'lease-bound', outcome: 'ACCEPTED', nowMs: 30 }))
+      .rejects.toThrow(TypeError);
+  });
+});

@@ -24,6 +24,7 @@ const PERSISTENCE_ROOT = 'src/execution/live/practical-persistence/';
 const PRACTICAL_ROOT = 'src/execution/live/practical/';
 const REPOSITORY = `${PERSISTENCE_ROOT}repository.ts`;
 const SHADOW_RUNTIME = 'src/integration/coindcx/live/practical-shadow-runtime.ts';
+const MUTATION_ADAPTER = 'src/execution/live/practical-mutation/repository.ts';
 const MIGRATIONS_ROOT = path.join(REPO_ROOT, 'prisma/migrations');
 const STAGE_1B1_MIGRATION = '20260925000000_phase18b_practical_persistence';
 
@@ -111,21 +112,44 @@ describe('no provider, network, gateway, dispatch, or arm reachability (no new r
         expect(code.includes(forbidden), `${file} names ${forbidden}`).toBe(false);
       }
     }
-    // [Stage 1B2 Wave 1] The port and the row parser now NAME the order binding and arm time in order to READ and
-    // validate them (closed-world lease shape). The Stage 1B1 ADAPTER still writes none of them: every lease it
-    // inserts is UNBOUND and unarmed, and it only SELECTs the new columns.
+    // [Stage 1B2 Wave 1] The port and the row parser NAME the order binding and arm time in order to READ and
+    // validate them (closed-world lease shape).
+    // [Stage 1B2 Wave 2B1] Reviewed widening: the binding and the arm time are now WRITTEN, but only by the
+    // internal caller-owned Stage 1B2 scope (#openScope) and by #apply's lease insert when, and only when, that scope
+    // passes a binding. EVERY Stage 1B1 public method still writes none of them: consume passes `null` (UNBOUND).
     const adapter = codeOf(REPOSITORY);
-    for (const forbidden of ['armedAtMs:', 'intentId:', 'clientOrderId:', 'cancelGeneration:', 'orderBinding:']) {
-      expect(adapter.includes(forbidden), `the Stage 1B1 adapter names ${forbidden}`).toBe(false);
+    for (const method of [
+      'initializeAccount', 'adoptForNewRuntime', 'startCertification', 'finishCertification', 'failCertification', 'recordProviderRecovered',
+      'invalidate', 'enterManualReview', 'revokeCertificate', 'expireCertificate', 'consumeCertificateAndLease', 'releaseLease',
+      'escalateMalformedAccount', 'resolveManualReview',
+    ]) {
+      const source = methodSource(method);
+      for (const forbidden of ['armedAtMs:', 'intentId:', 'clientOrderId:', 'cancelGeneration:', 'orderBinding:']) {
+        expect(source.includes(forbidden), `the Stage 1B1 public method ${method} names ${forbidden}`).toBe(false);
+      }
     }
+    expect(methodSource('consumeCertificateAndLease')).toContain('return this.#consumePrepared(tx, current, prepared, null);');
+    // The binding columns are written in exactly two statements: the scope-only bound insert inside #apply (guarded:
+    // non-null binding, CANCEL only), and the scope's arm compare-and-set WHERE.
+    const bindingColumns = /intentId: binding\.intentId, clientOrderId: binding\.clientOrderId, cancelGeneration: binding\.cancelGeneration/g;
+    expect(adapter.match(bindingColumns)).toHaveLength(2);
+    expect(privateMethodSource('#apply').match(bindingColumns)).toHaveLength(1);
+    expect(privateMethodSource('#apply')).toContain("if (binding !== null && extras.insertLease.action !== 'CANCEL') conflict(");
+    expect(privateMethodSource('#openScope').match(bindingColumns)).toHaveLength(1);
+    // armed_at_ms is written in exactly ONE place: the scope's arm CAS, conditioned on armedAtMs IS NULL.
+    expect(adapter.match(/armedAtMs: BigInt\(/g)).toHaveLength(1);
+    expect(privateMethodSource('#openScope')).toContain('data: { armedAtMs: BigInt(nowMs) },');
+    expect(privateMethodSource('#openScope')).toContain("status: 'LEASED', armedAtMs: null, completedAtMs: null,");
     expect(adapter).toContain('intent_id AS intentId, client_order_id AS clientOrderId, cancel_generation AS cancelGeneration,');
     expect(adapter).toContain('armed_at_ms AS armedAtMs');
   });
 
-  it('only the Checkpoint B recovery core and the Checkpoint C shadow collector import the PORT; only the shadow-only composition root imports the ADAPTER (for loadAccount)', () => {
+  it('only the Checkpoint B recovery core and the Checkpoint C shadow collector import the PORT; only the shadow-only composition root (for loadAccount) and the Stage 1B2 mutation adapter (the caller-owned scope) import the ADAPTER', () => {
     const importers = files.filter((file) => !file.startsWith(PERSISTENCE_ROOT) && (graph.get(file) ?? []).some((dependency) => dependency.startsWith(PERSISTENCE_ROOT)));
     // [Checkpoint B] The exact, reviewed widening: the recovery core depends on the Prisma-free PORT only.
     expect(importers.sort()).toEqual([
+      // [Stage 1B2 Wave 2B1] the order-bound CANCEL store: the PORT (types/errors) and the ADAPTER (its caller-owned scope).
+      MUTATION_ADAPTER,
       'src/execution/live/practical-recovery/ports.ts',
       'src/execution/live/practical-recovery/service.ts',
       'src/execution/live/practical-recovery/tripwire.ts',
@@ -134,11 +158,18 @@ describe('no provider, network, gateway, dispatch, or arm reachability (no new r
       // [Checkpoint C] the shadow-only composition root: constructs the ADAPTER and exposes loadAccount only.
       SHADOW_RUNTIME,
     ]);
-    for (const importer of importers.filter((file) => file !== SHADOW_RUNTIME)) {
+    for (const importer of importers.filter((file) => file !== SHADOW_RUNTIME && file !== MUTATION_ADAPTER)) {
       expect((graph.get(importer) ?? []).filter((dependency) => dependency.startsWith(PERSISTENCE_ROOT)), importer).toEqual([`${PERSISTENCE_ROOT}ports.ts`]);
     }
     expect((graph.get(SHADOW_RUNTIME) ?? []).filter((dependency) => dependency.startsWith(PERSISTENCE_ROOT))).toEqual([REPOSITORY]);
-    expect(files.filter((file) => file !== REPOSITORY && (graph.get(file) ?? []).includes(REPOSITORY))).toEqual([SHADOW_RUNTIME]);
+    expect((graph.get(MUTATION_ADAPTER) ?? []).filter((dependency) => dependency.startsWith(PERSISTENCE_ROOT)).sort()).toEqual([`${PERSISTENCE_ROOT}ports.ts`, REPOSITORY]);
+    expect(files.filter((file) => file !== REPOSITORY && (graph.get(file) ?? []).includes(REPOSITORY)).sort()).toEqual([MUTATION_ADAPTER, SHADOW_RUNTIME]);
+    // The mutation adapter takes EXACTLY the repository class and the caller-owned hook (plus the scope type), and
+    // builds exactly ONE repository, from its own root client.
+    const mutationAdapter = sourceOf(MUTATION_ADAPTER).replace(/\r\n/g, '\n');
+    expect(mutationAdapter).toContain("import {\n  PrismaPracticalSafetyRepository,\n  withLockedPracticalAccountWithinCallerTransaction,\n  type PracticalLockedAccountScope,\n} from '../practical-persistence/repository';");
+    expect(mutationAdapter.match(/new PrismaPracticalSafetyRepository\(/g)).toHaveLength(1);
+    expect(mutationAdapter).toContain('this.#practical = new PrismaPracticalSafetyRepository(this.#prisma, newId);');
     // The shadow runtime uses the adapter for ONE read: loadAccount.
     const runtime = sourceOf(SHADOW_RUNTIME);
     expect([...runtime.matchAll(/practicalRepository\.(\w+)/g)].map((match) => match[1])).toEqual(['loadAccount']);
@@ -187,6 +218,16 @@ describe('no strict-continuity bridge and no issuer widening', () => {
     expect(callers).toEqual([]);
   });
 });
+
+/** The source text of one PRIVATE repository method (`async #name(`), up to the next class member or the class end. */
+function privateMethodSource(name: string): string {
+  const code = codeOf(REPOSITORY);
+  const start = code.indexOf(`async ${name}(`);
+  expect(start, name).toBeGreaterThan(0);
+  const rest = code.slice(start + 1);
+  const next = rest.search(/\n( {2}(public |async #|#[a-zA-Z]+\(|static \{)|\})/);
+  return code.slice(start, next === -1 ? undefined : start + 1 + next);
+}
 
 /** The source text of one public repository method, up to the next class member (public or private). */
 function methodSource(name: string): string {
@@ -297,11 +338,20 @@ describe('[P18B-1B1-05] a held lease rests on its exact CONSUMED certificate: as
   });
 
   it('consume self-checks the committed chain (CONSUMED certificate + exact lease + exact fence) AFTER its writes, before returning', () => {
-    const consume = methodSource('consumeCertificateAndLease');
+    // [Stage 1B2 Wave 2B1] The self-check moved VERBATIM (with the public method's validation, into #prepareConsumption,
+    // and its writes and self-check, into #consumePrepared) so Stage 1B2 reuses it unchanged. The public method calls both.
+    const consume = privateMethodSource('#consumePrepared');
     const lastWrite = consume.lastIndexOf('this.#apply(');
-    for (const check of ["leasedCertificate.status !== 'CONSUMED'", 'isPracticalLeaseBoundToFence(currentLease, account.fence)', 'isPracticalCertificateBoundToLease(leasedCertificate, currentLease)']) {
+    for (const check of [
+      "leasedCertificate.status !== 'CONSUMED'", 'isPracticalLeaseBoundToFence(currentLease, account.fence)', 'isPracticalCertificateBoundToLease(leasedCertificate, currentLease)',
+      // The binding is exactly the one requested (null for Stage 1B1), and a freshly consumed lease is never armed.
+      'sameOrderBinding(currentLease.orderBinding, orderBinding)', 'currentLease.armedAtMs !== null',
+    ]) {
       expect(consume.lastIndexOf(check), check).toBeGreaterThan(lastWrite);
     }
+    const publicConsume = methodSource('consumeCertificateAndLease');
+    expect(publicConsume.indexOf('this.#prepareConsumption(')).toBeGreaterThan(publicConsume.indexOf('const current = await lockAccount(tx, accountId);'));
+    expect(publicConsume.indexOf('return this.#consumePrepared(tx, current, prepared, null);')).toBeGreaterThan(publicConsume.indexOf('this.#prepareConsumption('));
   });
 
   it('the migration binds lease -> certificate on certificate, account, epoch, and generation (one composite FK, the only lease->certificate FK)', () => {

@@ -76,6 +76,7 @@ import {
   type PracticalCertificationFailure,
   type PracticalDurableCertificateRecord,
   type PracticalLeaseAcquisition,
+  type PracticalLeaseOrderBinding,
   type PracticalManualReviewEntry,
   type PracticalMutationLeaseRecord,
   type PracticalRecordLoad,
@@ -320,6 +321,22 @@ function sameCertificate(durable: PracticalDurableCertificateRecord, presented: 
     && durable.expiresAtMs === presented.expiresAtMs;
 }
 
+/** The validated, not-yet-written result of the one-shot's validation steps (never leaves this module). */
+interface PreparedConsumption {
+  readonly kind: 'READY';
+  readonly durable: PracticalDurableCertificateRecord;
+  readonly leasedFence: PracticalAccountFence;
+  readonly leaseId: string;
+  readonly action: PracticalMutationAction;
+  readonly nowMs: number;
+}
+
+/** Exact equality of two optional lease order bindings (null only equals null). */
+function sameOrderBinding(left: PracticalLeaseOrderBinding | null, right: PracticalLeaseOrderBinding | null): boolean {
+  if (left === null || right === null) return left === right;
+  return left.intentId === right.intentId && left.clientOrderId === right.clientOrderId && left.cancelGeneration === right.cancelGeneration;
+}
+
 /** Stage 1B integration contract: a caught Stage 1A transition failure persists the fail-closed state, never a hard-coded one. */
 function transitionOrFailClosed(current: PracticalAccountStateName, event: PracticalTransitionEvent): PracticalAccountStateName {
   try {
@@ -368,6 +385,12 @@ function isRetryableDeadlock(error: unknown): boolean {
 // ---------------------------------------------------------------------------
 // The repository
 // ---------------------------------------------------------------------------
+
+// [Stage 1B2 Wave 2B1] Module-private access paths into the repository's private members, assigned
+// ONCE by the class's static initialization block below. They are never exported: the only way to
+// reach them is `withLockedPracticalAccountWithinCallerTransaction` at the bottom of this module.
+let openLockedAccountScope!: (repository: PrismaPracticalSafetyRepository, tx: Tx, accountId: string) => Promise<LockedAccountScopeHandle>;
+let isGenuinePracticalRepository!: (value: unknown) => boolean;
 
 export class PrismaPracticalSafetyRepository implements PracticalSafetyRepository {
   readonly #prisma: PrismaClient;
@@ -721,55 +744,98 @@ export class PrismaPracticalSafetyRepository implements PracticalSafetyRepositor
     return this.#transaction(async (tx) => {
       // 1. lock account (state, fence, current pointers), 2. lock the presented certificate.
       const current = await lockAccount(tx, accountId);
-      const durable = await this.#lockOwnedCertificate(tx, accountId, presented.certificateId);
-      // 3. strict validation against the DURABLE row (the only one-shot authority).
-      if (!sameCertificate(durable, presented)) unusable('The presented certificate differs from the durable record', { certificateId: durable.certificateId });
-      if (durable.status !== 'ISSUED') unusable('The certificate is no longer ISSUED', { certificateId: durable.certificateId, status: durable.status });
-      this.#requireCurrent(current, durable.certificateId);
-      // Stage 1A fence CAS: exact account, epoch, generation, revision; mode IDLE.
-      const leasedFence = beginPracticalMutationLease(current.fence, expected, { leaseId, certificateId: durable.certificateId, action: input.action });
-      if (durable.runtimeEpoch !== current.fence.runtimeEpoch || durable.reconciliationGeneration !== current.fence.reconciliationGeneration) {
-        unusable('The certificate is bound to a different runtime epoch or generation than the fence', { certificateId: durable.certificateId });
-      }
-      // Validity window, from the DURABLE row and the supplied trusted time. Outside it,
-      // the certificate is durably terminated (Stage 1A semantics) and no lease is taken.
-      if (nowMs < durable.issuedAtMs || nowMs >= durable.expiresAtMs) {
-        const expired = nowMs >= durable.expiresAtMs;
-        const reason: PracticalInvalidationReason = expired ? 'CERTIFICATE_EXPIRED' : 'CLOCK_ANOMALY';
-        const account = await this.#apply(tx, current, {
-          nextState: transitionPracticalAccountState(current.state, { kind: 'INVALIDATED', reason }),
-          nextFence: null,
-          openCause: reason,
-          reason,
-          certificateTermination: expired ? 'EXPIRED' : 'REVOKED',
-        }, nowMs);
-        return Object.freeze({ kind: 'CERTIFICATE_TERMINATED' as const, certificate: await this.#reloadCertificate(tx, durable.certificateId), account });
-      }
-      const nextState = transitionPracticalAccountState(current.state, { kind: 'MUTATION_LEASED' });
-      // 4. ISSUED -> CONSUMED, 5. insert the lease, 6. IDLE -> MUTATION_LEASED (+ revision): see #apply order.
-      const account = await this.#apply(tx, current, {
-        nextState, nextFence: leasedFence, openCause: 'RUNTIME_STARTUP', reason: null, certificateTermination: 'CONSUMED',
-      }, nowMs, {
-        insertLease: { leaseId, certificateId: durable.certificateId, action: input.action },
-      });
-      // Post-consume self-check on the locked re-read (#apply's final strict account read): the committed
-      // result must be exactly fence -> this LEASED lease -> this CONSUMED certificate, or everything rolls back.
-      const { currentLease, leasedCertificate } = account;
-      if (account.state !== 'MUTATING'
-        || account.fence.mode.kind !== 'MUTATION_LEASED'
-        || account.fence.mode.leaseId !== leaseId
-        || account.fence.mode.certificateId !== durable.certificateId
-        || currentLease === null
-        || currentLease.leaseId !== leaseId
-        || leasedCertificate === null
-        || leasedCertificate.certificateId !== durable.certificateId
-        || leasedCertificate.status !== 'CONSUMED'
-        || !isPracticalLeaseBoundToFence(currentLease, account.fence)
-        || !isPracticalCertificateBoundToLease(leasedCertificate, currentLease)) {
-        conflict('The consumed certificate, the lease, and the fence did not re-read as one exact chain', { leaseId });
-      }
-      return Object.freeze({ kind: 'LEASED' as const, lease: currentLease, certificate: leasedCertificate, account });
+      const prepared = await this.#prepareConsumption(tx, current, { expected, presented, leaseId, action: input.action, nowMs });
+      if (prepared.kind === 'CERTIFICATE_TERMINATED') return prepared;
+      // [Stage 1B1] Always UNBOUND: this public primitive never binds a lease to an order.
+      return this.#consumePrepared(tx, current, prepared, null);
     });
+  }
+
+  /**
+   * Steps 2-3 of the one-shot (lock and strictly validate the presented
+   * certificate, the fence CAS, the durable validity window). Writes nothing,
+   * EXCEPT that a certificate outside its durable validity window is durably
+   * terminated (Stage 1A semantics) and no lease is taken. Moved verbatim out
+   * of `consumeCertificateAndLease` so Stage 1B2 reuses it unchanged.
+   */
+  async #prepareConsumption(
+    tx: Tx,
+    current: PracticalAccountSnapshot,
+    input: {
+      readonly expected: PracticalFenceExpectation;
+      readonly presented: PracticalRecoveryCertificateRecord;
+      readonly leaseId: string;
+      readonly action: PracticalMutationAction;
+      readonly nowMs: number;
+    },
+  ): Promise<PreparedConsumption | { readonly kind: 'CERTIFICATE_TERMINATED'; readonly certificate: PracticalDurableCertificateRecord; readonly account: PracticalAccountSnapshot }> {
+    const { expected, presented, leaseId, action, nowMs } = input;
+    const accountId = current.accountId;
+    const durable = await this.#lockOwnedCertificate(tx, accountId, presented.certificateId);
+    // 3. strict validation against the DURABLE row (the only one-shot authority).
+    if (!sameCertificate(durable, presented)) unusable('The presented certificate differs from the durable record', { certificateId: durable.certificateId });
+    if (durable.status !== 'ISSUED') unusable('The certificate is no longer ISSUED', { certificateId: durable.certificateId, status: durable.status });
+    this.#requireCurrent(current, durable.certificateId);
+    // Stage 1A fence CAS: exact account, epoch, generation, revision; mode IDLE.
+    const leasedFence = beginPracticalMutationLease(current.fence, expected, { leaseId, certificateId: durable.certificateId, action });
+    if (durable.runtimeEpoch !== current.fence.runtimeEpoch || durable.reconciliationGeneration !== current.fence.reconciliationGeneration) {
+      unusable('The certificate is bound to a different runtime epoch or generation than the fence', { certificateId: durable.certificateId });
+    }
+    // Validity window, from the DURABLE row and the supplied trusted time. Outside it,
+    // the certificate is durably terminated (Stage 1A semantics) and no lease is taken.
+    if (nowMs < durable.issuedAtMs || nowMs >= durable.expiresAtMs) {
+      const expired = nowMs >= durable.expiresAtMs;
+      const reason: PracticalInvalidationReason = expired ? 'CERTIFICATE_EXPIRED' : 'CLOCK_ANOMALY';
+      const account = await this.#apply(tx, current, {
+        nextState: transitionPracticalAccountState(current.state, { kind: 'INVALIDATED', reason }),
+        nextFence: null,
+        openCause: reason,
+        reason,
+        certificateTermination: expired ? 'EXPIRED' : 'REVOKED',
+      }, nowMs);
+      return Object.freeze({ kind: 'CERTIFICATE_TERMINATED' as const, certificate: await this.#reloadCertificate(tx, durable.certificateId), account });
+    }
+    return Object.freeze({ kind: 'READY' as const, durable, leasedFence, leaseId, action, nowMs });
+  }
+
+  /**
+   * Steps 4-6 of the one-shot and the post-consume self-check. Moved verbatim
+   * out of `consumeCertificateAndLease`; the only additions are the lease's
+   * `orderBinding` (null for Stage 1B1: UNBOUND) and its exact re-check.
+   */
+  async #consumePrepared(
+    tx: Tx,
+    current: PracticalAccountSnapshot,
+    prepared: PreparedConsumption,
+    orderBinding: PracticalLeaseOrderBinding | null,
+  ): Promise<{ readonly kind: 'LEASED'; readonly lease: PracticalMutationLeaseRecord; readonly certificate: PracticalDurableCertificateRecord; readonly account: PracticalAccountSnapshot }> {
+    const { durable, leasedFence, leaseId, action, nowMs } = prepared;
+    const nextState = transitionPracticalAccountState(current.state, { kind: 'MUTATION_LEASED' });
+    // 4. ISSUED -> CONSUMED, 5. insert the lease, 6. IDLE -> MUTATION_LEASED (+ revision): see #apply order.
+    const account = await this.#apply(tx, current, {
+      nextState, nextFence: leasedFence, openCause: 'RUNTIME_STARTUP', reason: null, certificateTermination: 'CONSUMED',
+    }, nowMs, {
+      insertLease: { leaseId, certificateId: durable.certificateId, action, orderBinding },
+    });
+    // Post-consume self-check on the locked re-read (#apply's final strict account read): the committed
+    // result must be exactly fence -> this LEASED lease -> this CONSUMED certificate, or everything rolls back.
+    const { currentLease, leasedCertificate } = account;
+    if (account.state !== 'MUTATING'
+      || account.fence.mode.kind !== 'MUTATION_LEASED'
+      || account.fence.mode.leaseId !== leaseId
+      || account.fence.mode.certificateId !== durable.certificateId
+      || currentLease === null
+      || currentLease.leaseId !== leaseId
+      || leasedCertificate === null
+      || leasedCertificate.certificateId !== durable.certificateId
+      || leasedCertificate.status !== 'CONSUMED'
+      || !isPracticalLeaseBoundToFence(currentLease, account.fence)
+      || !isPracticalCertificateBoundToLease(leasedCertificate, currentLease)
+      || !sameOrderBinding(currentLease.orderBinding, orderBinding)
+      || currentLease.armedAtMs !== null) {
+      conflict('The consumed certificate, the lease, and the fence did not re-read as one exact chain', { leaseId });
+    }
+    return Object.freeze({ kind: 'LEASED' as const, lease: currentLease, certificate: leasedCertificate, account });
   }
 
   public async releaseLease(input: {
@@ -802,6 +868,11 @@ export class PrismaPracticalSafetyRepository implements PracticalSafetyRepositor
       const leaseRow = await readLeaseRow(tx, leaseId, true);
       if (leaseRow === null) conflict('The leased fence names a lease that has no durable record', { leaseId });
       const lease = parsePracticalLeaseRow(leaseRow);
+      // [Stage 1B2] An ORDER-BOUND lease owns a Phase 17 cancel claim (and possibly an armed wire attempt). Only the
+      // Stage 1B2 completion / recovery path may complete it; this Stage 1B1 release refuses it before any write.
+      if (lease.orderBinding !== null) {
+        conflict('An order-bound (Stage 1B2) lease is completed only by the Stage 1B2 completion path; the Stage 1B1 release refuses it', { leaseId });
+      }
       if (lease.leaseId !== leaseId || !isPracticalLeaseBoundToFence(lease, current.fence)) {
         conflict('The durable lease is not a LEASED lease bound to the leased fence on every field', { leaseId });
       }
@@ -972,6 +1043,192 @@ export class PrismaPracticalSafetyRepository implements PracticalSafetyRepositor
     });
   }
 
+  // ----- [Stage 1B2 Wave 2B1] the caller-owned transaction scope ------------
+
+  static {
+    openLockedAccountScope = (repository, tx, accountId) => repository.#openScope(tx, accountId);
+    isGenuinePracticalRepository = (value) => typeof value === 'object' && value !== null && #prisma in value;
+  }
+
+  /**
+   * Opens the Stage 1B2 scope over ONE account inside the CALLER's
+   * transaction. TRANSACTION-CLIENT INVARIANT: every database read and write
+   * reachable from here (the lock-order account read, the certificate
+   * lock/reload, `#prepareConsumption`, `#consumePrepared`, `#apply`,
+   * `#invalidateLocked`, the lease-coupling read, and the arm CAS) goes
+   * through the supplied `tx`, and only `tx`. Nothing here uses the
+   * repository's own client, opens a transaction, or nests one. The
+   * repository contributes only pure helpers and validated id generation.
+   */
+  async #openScope(tx: Tx, accountId: string): Promise<LockedAccountScopeHandle> {
+    // The SAME lock order, strict parsers, latch evaluation, and exact-account check as every Stage 1B1 operation.
+    const current = await lockAccount(tx, accountId);
+    const lifecycle: { closed: boolean; busy: boolean; finished: boolean; prepared: boolean; armable: ArmableOrderBoundCancel | null } = {
+      closed: false, busy: false, finished: false, prepared: false, armable: null,
+    };
+    const preparations = new WeakMap<object, PreparedConsumption>();
+
+    const run = async <R>(terminal: boolean, operation: () => Promise<R>): Promise<R> => {
+      if (lifecycle.closed) throw new PracticalPersistenceError('PRACTICAL_PERSISTENCE_FAULT', 'The practical scope is closed: its caller transaction work has completed');
+      if (lifecycle.busy) throw new PracticalPersistenceError('PRACTICAL_PERSISTENCE_FAULT', 'The practical scope refuses overlapping calls');
+      if (lifecycle.finished) conflict('The practical scope already performed its one terminal change', { accountId });
+      lifecycle.busy = true;
+      // A terminal operation is final once ATTEMPTED: a failure mid-write must roll the caller's transaction back.
+      if (terminal) lifecycle.finished = true;
+      try {
+        return await operation();
+      } finally {
+        lifecycle.busy = false;
+      }
+    };
+    const takePreparation = (preparation: unknown): PreparedConsumption => {
+      const prepared = typeof preparation === 'object' && preparation !== null ? preparations.get(preparation) : undefined;
+      if (prepared === undefined) conflict('The preparation does not belong to this scope, or was already used', { accountId });
+      preparations.delete(preparation as object);
+      return prepared;
+    };
+
+    const scope: PracticalLockedAccountScope = Object.freeze({
+      account: current,
+
+      prepareCancelConsumption: (input: { readonly expected: PracticalFenceExpectation; readonly certificate: unknown; readonly trustedNowMs: number }) => run(false, async () => {
+        if (lifecycle.prepared || lifecycle.armable !== null) conflict('A scope prepares at most one consumption, and never after an arm check', { accountId });
+        lifecycle.prepared = true;
+        if (typeof input !== 'object' || input === null) invalidInput('Consumption input is required', { field: 'input' });
+        const expected = requireExpectation(accountId, input.expected);
+        const nowMs = requireTime(input.trustedNowMs, 'trustedNowMs');
+        const presented = genuineCertificateRecord(input.certificate);
+        if (PracticalRecoveryCertificate.status(input.certificate as PracticalRecoveryCertificate) !== 'ISSUED') {
+          unusable('Only an ISSUED in-memory certificate can be consumed', { certificateId: presented.certificateId });
+        }
+        const permission = practicalActionPermission('STAGE_5A_CANCEL_ONLY', 'CANCEL');
+        if (!permission.permitted) throw new PracticalLiveSafetyError('PRACTICAL_ACTION_NOT_PERMITTED', 'CANCEL is not permitted in the rollout stage', { reason: permission.reason });
+        const leaseId = this.#newDurableId('leaseId', 64);
+        const prepared = await this.#prepareConsumption(tx, current, { expected, presented, leaseId, action: 'CANCEL', nowMs });
+        if (prepared.kind === 'CERTIFICATE_TERMINATED') {
+          lifecycle.finished = true;
+          return prepared;
+        }
+        const preparation: PracticalCancelConsumptionPreparation = Object.freeze({ certificate: prepared.durable });
+        preparations.set(preparation, prepared);
+        return Object.freeze({ kind: 'READY' as const, preparation });
+      }),
+
+      consumeIntoOrderBoundCancelLease: (preparation: PracticalCancelConsumptionPreparation, binding: PracticalLeaseOrderBinding) => run(true, async () => {
+        const prepared = takePreparation(preparation);
+        const orderBinding = requireOrderBinding(binding);
+        const leased = await this.#consumePrepared(tx, current, prepared, orderBinding);
+        return Object.freeze({ lease: leased.lease, certificate: leased.certificate, account: leased.account });
+      }),
+
+      invalidateBeforeConsumption: (preparation: PracticalCancelConsumptionPreparation, reason: PracticalPreConsumptionInvalidationReason) => run(true, async () => {
+        const prepared = takePreparation(preparation);
+        if (!(PRACTICAL_PRE_CONSUMPTION_INVALIDATION_REASONS as readonly unknown[]).includes(reason)) {
+          invalidInput('A pre-consumption invalidation reason must be one of the reviewed Stage 1A reasons', { field: 'reason' });
+        }
+        const account = await this.#invalidateLocked(tx, current, reason, prepared.nowMs);
+        const certificate = await this.#reloadCertificate(tx, prepared.durable.certificateId);
+        if (account.state !== 'QUARANTINED'
+          || certificate.certificateId !== prepared.durable.certificateId
+          || certificate.status !== 'REVOKED'
+          || certificate.terminalReason !== reason
+          || account.fence.mode.kind !== 'IDLE'
+          || account.fence.revision !== current.fence.revision
+          || account.currentLease !== null) {
+          conflict('The pre-consumption invalidation did not re-read as exactly a revoked certificate and a quarantined, unleased account', { accountId });
+        }
+        return account;
+      }),
+
+      requireArmableOrderBoundCancelLease: (expected: PracticalArmableCancelExpectation) => run(false, async () => {
+        if (lifecycle.prepared || lifecycle.armable !== null) conflict('A scope checks at most one arm, and never after a consumption was prepared', { accountId });
+        const exact = requireArmableExpectation(expected);
+        const fence = current.fence;
+        if (current.state !== 'MUTATING') conflict('The account is not MUTATING', { accountId, state: current.state });
+        if (fence.mode.kind !== 'MUTATION_LEASED'
+          || fence.mode.leaseId !== exact.leaseId
+          || fence.mode.certificateId !== exact.certificate.certificateId
+          || fence.mode.action !== 'CANCEL'
+          || fence.accountId !== accountId
+          || fence.runtimeEpoch !== exact.runtimeEpoch
+          || fence.reconciliationGeneration !== exact.reconciliationGeneration) {
+          conflict('The fence does not name exactly this CANCEL lease and certificate', { accountId, field: 'fence' });
+        }
+        const lease = current.currentLease;
+        const snapshotCertificate = current.leasedCertificate;
+        if (lease === null || snapshotCertificate === null) conflict('The leased fence has no lease or certificate', { accountId });
+        if (lease.leaseId !== exact.leaseId
+          || lease.accountId !== accountId
+          || lease.certificateId !== exact.certificate.certificateId
+          || lease.action !== 'CANCEL'
+          || lease.runtimeEpoch !== exact.runtimeEpoch
+          || lease.reconciliationGeneration !== exact.reconciliationGeneration
+          || lease.createdAtMs !== exact.leaseCreatedAtMs
+          || lease.status !== 'LEASED'
+          || lease.armedAtMs !== null
+          || lease.completedAtMs !== null
+          || lease.outcome !== null
+          || lease.orderBinding === null
+          || !sameOrderBinding(lease.orderBinding, exact.binding)) {
+          conflict('The durable lease is not exactly this unarmed, order-bound CANCEL lease', { accountId, field: 'lease' });
+        }
+        // FULL certificate re-proof on a fresh LOCKED read of a row the account read already locked (no new lock order).
+        const certificate = await reproveConsumedCertificate(tx, accountId, exact.certificate);
+        if (!sameDurableCertificate(certificate, snapshotCertificate)) conflict('The two locked reads of the leased certificate disagree', { accountId, field: 'certificate' });
+        // The lease is the ONLY lease resting on this certificate (the lease row is already locked).
+        await requireOnlyLeaseOfCertificate(tx, exact.certificate.certificateId, exact.leaseId);
+        lifecycle.armable = Object.freeze({ expected: exact, lease, certificate });
+        return Object.freeze({ lease, certificate });
+      }),
+
+      armOrderBoundCancelLease: (armedAtMs: number) => run(true, async () => {
+        const armable = lifecycle.armable;
+        if (armable === null) conflict('The arm requires a prior exact arm check in the same scope', { accountId });
+        const nowMs = requireTime(armedAtMs, 'armedAtMs');
+        const { lease, expected: exact } = armable;
+        const binding = lease.orderBinding;
+        if (binding === null) conflict('Only an order-bound lease can be armed', { accountId });
+        if (nowMs < lease.createdAtMs) conflict('A lease cannot be armed before it was created', { accountId });
+        // Armed exactly once, under the COMPLETE binding (defense in depth over the exact checks above).
+        const updated = await tx.livePracticalMutationLease.updateMany({
+          where: {
+            leaseId: lease.leaseId, accountId, certificateId: lease.certificateId, action: 'CANCEL',
+            runtimeEpoch: lease.runtimeEpoch, reconciliationGeneration: lease.reconciliationGeneration,
+            intentId: binding.intentId, clientOrderId: binding.clientOrderId, cancelGeneration: binding.cancelGeneration,
+            status: 'LEASED', armedAtMs: null, completedAtMs: null,
+          },
+          data: { armedAtMs: BigInt(nowMs) },
+        });
+        if (updated.count !== 1) conflict('The lease was armed or changed concurrently', { accountId });
+        // Strict locked re-read of the whole account and a second full certificate re-proof.
+        const after = await lockAccount(tx, accountId);
+        const armedLease = after.currentLease;
+        if (after.state !== 'MUTATING'
+          || after.stateRevision !== current.stateRevision
+          || !sameFence(after.fence, current.fence)
+          || armedLease === null
+          || after.leasedCertificate === null
+          || armedLease.leaseId !== lease.leaseId
+          || armedLease.certificateId !== lease.certificateId
+          || armedLease.accountId !== lease.accountId
+          || armedLease.action !== 'CANCEL'
+          || armedLease.runtimeEpoch !== lease.runtimeEpoch
+          || armedLease.reconciliationGeneration !== lease.reconciliationGeneration
+          || armedLease.createdAtMs !== lease.createdAtMs
+          || armedLease.status !== 'LEASED'
+          || armedLease.armedAtMs !== nowMs
+          || armedLease.completedAtMs !== null
+          || !sameOrderBinding(armedLease.orderBinding, binding)) {
+          conflict('The armed lease did not re-read as exactly this lease, armed once', { accountId });
+        }
+        const certificate = await reproveConsumedCertificate(tx, accountId, exact.certificate);
+        if (!sameDurableCertificate(certificate, after.leasedCertificate)) conflict('The armed lease no longer rests on its exact certificate', { accountId });
+        return Object.freeze({ lease: armedLease, certificate, account: after });
+      }),
+    });
+    return Object.freeze({ scope, close: () => { lifecycle.closed = true; } });
+  }
+
   // ----- internals -----------------------------------------------------------
 
   async #invalidateLocked(tx: Tx, current: PracticalAccountSnapshot, reason: PracticalInvalidationReason, nowMs: number): Promise<PracticalAccountSnapshot> {
@@ -1013,7 +1270,13 @@ export class PrismaPracticalSafetyRepository implements PracticalSafetyRepositor
     request: PracticalAccountChangeRequest,
     nowMs: number,
     extras: {
-      readonly insertLease?: { readonly leaseId: string; readonly certificateId: string; readonly action: PracticalMutationAction };
+      readonly insertLease?: {
+        readonly leaseId: string;
+        readonly certificateId: string;
+        readonly action: PracticalMutationAction;
+        /** null = UNBOUND (Stage 1B1). Non-null only from the Stage 1B2 caller-owned scope (CANCEL only). */
+        readonly orderBinding: PracticalLeaseOrderBinding | null;
+      };
       readonly completeLease?: { readonly lease: PracticalMutationLeaseRecord; readonly outcome: PracticalMutationOutcome };
     } = {},
   ): Promise<PracticalAccountSnapshot> {
@@ -1034,6 +1297,8 @@ export class PrismaPracticalSafetyRepository implements PracticalSafetyRepositor
       exactlyOne(updated.count, 'The certificate left ISSUED concurrently');
     }
     if (extras.insertLease !== undefined) {
+      const binding = extras.insertLease.orderBinding;
+      if (binding !== null && extras.insertLease.action !== 'CANCEL') conflict('Only a CANCEL lease can be bound to an order', { leaseId: extras.insertLease.leaseId });
       try {
         await tx.livePracticalMutationLease.create({ data: {
           leaseId: extras.insertLease.leaseId,
@@ -1044,6 +1309,8 @@ export class PrismaPracticalSafetyRepository implements PracticalSafetyRepositor
           reconciliationGeneration: fenceAfter.reconciliationGeneration,
           createdAtMs: now,
           status: 'LEASED',
+          // [Stage 1B2] UNBOUND leases write no binding column at all (unchanged Stage 1B1 insert).
+          ...(binding === null ? {} : { intentId: binding.intentId, clientOrderId: binding.clientOrderId, cancelGeneration: binding.cancelGeneration }),
         } });
       } catch (error) {
         if (isPrismaCode(error, 'P2002')) conflict('A lease with this id, or for this certificate, already exists', { leaseId: extras.insertLease.leaseId });
@@ -1057,6 +1324,8 @@ export class PrismaPracticalSafetyRepository implements PracticalSafetyRepositor
         where: {
           leaseId: lease.leaseId, accountId: current.accountId, certificateId: lease.certificateId, action: lease.action,
           runtimeEpoch: lease.runtimeEpoch, reconciliationGeneration: lease.reconciliationGeneration, status: 'LEASED',
+          // [Stage 1B2] Defense in depth: this Stage 1B1 completion can never match an ORDER-BOUND lease.
+          intentId: null,
         },
         data: { status: 'COMPLETED', outcome: extras.completeLease.outcome, completedAtMs: now },
       });
@@ -1140,5 +1409,243 @@ export class PrismaPracticalSafetyRepository implements PracticalSafetyRepositor
     }
 
     return lockAccount(tx, current.accountId);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// [Stage 1B2 Wave 2B1] The caller-owned transaction hook
+//
+// INTERNAL. NOT on the PracticalSafetyRepository port, NOT exported from any
+// barrel, and imported in src/ ONLY by the Stage 1B2 Prisma adapter
+// (`../practical-mutation/repository.ts`), which is architecture-pinned.
+// It lets that adapter compose the EXISTING Stage 1B1 validation and writes
+// inside ONE caller-owned transaction that also holds the Phase 17 rows, so
+// that consuming the certificate, taking the order-bound lease, and taking
+// the Phase 17 cancel claim are ONE atomic decision (no split-brain window).
+//
+// It mints nothing and takes no authority: no enablement, no runtime
+// identity, no strict reconciliation authorization. It exposes no Prisma
+// delegate, no raw row, and not the transaction client: only the narrow scope
+// operations below, over data read under lock in the fixed Stage 1B1 order.
+// ---------------------------------------------------------------------------
+
+/** The existing Stage 1A reasons (all QUARANTINE severity) a scope may invalidate with before consumption. */
+export type PracticalPreConsumptionInvalidationReason = 'PREFLIGHT_MISMATCH' | 'GENERATION_CHANGED' | 'RUNTIME_EPOCH_CHANGED' | 'CONFIG_CHANGED';
+export const PRACTICAL_PRE_CONSUMPTION_INVALIDATION_REASONS: readonly PracticalPreConsumptionInvalidationReason[] = Object.freeze([
+  'PREFLIGHT_MISMATCH', 'GENERATION_CHANGED', 'RUNTIME_EPOCH_CHANGED', 'CONFIG_CHANGED',
+] as const);
+
+/** Opaque, scope-bound, single-use result of a validated consumption. Only its certificate is readable (as data). */
+export interface PracticalCancelConsumptionPreparation {
+  /** The locked durable ISSUED certificate the consumption would consume. */
+  readonly certificate: PracticalDurableCertificateRecord;
+}
+
+export type PracticalCancelConsumptionPreparationResult =
+  | { readonly kind: 'READY'; readonly preparation: PracticalCancelConsumptionPreparation }
+  | { readonly kind: 'CERTIFICATE_TERMINATED'; readonly certificate: PracticalDurableCertificateRecord; readonly account: PracticalAccountSnapshot };
+
+/** The full immutable snapshot an arm re-proves against the locked durable CONSUMED certificate. */
+export interface PracticalConsumedCertificateExpectation {
+  readonly certificateId: string;
+  readonly accountId: string;
+  readonly providerAccountFingerprint: string;
+  readonly runtimeEpoch: string;
+  readonly reconciliationGeneration: number;
+  readonly streamIncarnation: number;
+  readonly evidenceDigest: string;
+  readonly issuedAtMs: number;
+  readonly expiresAtMs: number;
+  /** The durable `terminal_at_ms` written by the consumption. */
+  readonly consumedAtMs: number;
+}
+
+export interface PracticalArmableCancelExpectation {
+  readonly leaseId: string;
+  readonly runtimeEpoch: string;
+  readonly reconciliationGeneration: number;
+  readonly leaseCreatedAtMs: number;
+  readonly binding: PracticalLeaseOrderBinding;
+  readonly certificate: PracticalConsumedCertificateExpectation;
+}
+
+export interface PracticalLockedAccountScope {
+  /** READ-ONLY: the FOUND account exactly as locked when the scope opened. */
+  readonly account: PracticalAccountSnapshot;
+  /**
+   * ACQUIRE, read-only: the Stage 1B1 one-shot's validation (genuine ISSUED
+   * presented certificate equal to the durable row, current certificate,
+   * exact IDLE fence CAS, epoch/generation binding, durable validity window)
+   * with a fresh validated lease id, action fixed to CANCEL. The one
+   * exception is the existing Stage 1B1 behavior outside the validity
+   * window: the certificate is durably terminated and the scope is finished.
+   */
+  prepareCancelConsumption(input: {
+    readonly expected: PracticalFenceExpectation;
+    readonly certificate: unknown;
+    readonly trustedNowMs: number;
+  }): Promise<PracticalCancelConsumptionPreparationResult>;
+  /** ACQUIRE, terminal write: ISSUED -> CONSUMED, one ORDER-BOUND CANCEL lease, MUTATING, MUTATION_LEASED, strict self-check. */
+  consumeIntoOrderBoundCancelLease(
+    preparation: PracticalCancelConsumptionPreparation,
+    binding: PracticalLeaseOrderBinding,
+  ): Promise<{ readonly lease: PracticalMutationLeaseRecord; readonly certificate: PracticalDurableCertificateRecord; readonly account: PracticalAccountSnapshot }>;
+  /** ACQUIRE, terminal write: the existing invalidation plan; the current certificate REVOKED(reason); the fence untouched. */
+  invalidateBeforeConsumption(preparation: PracticalCancelConsumptionPreparation, reason: PracticalPreConsumptionInvalidationReason): Promise<PracticalAccountSnapshot>;
+  /** ARM, read-only: exact MUTATING account, fence, unarmed order-bound lease, and a FULL re-proof of the CONSUMED certificate. */
+  requireArmableOrderBoundCancelLease(expected: PracticalArmableCancelExpectation): Promise<{
+    readonly lease: PracticalMutationLeaseRecord;
+    readonly certificate: PracticalDurableCertificateRecord;
+  }>;
+  /** ARM, terminal write: armedAtMs set once under the complete-binding CAS, then a strict locked re-read and certificate re-proof. */
+  armOrderBoundCancelLease(armedAtMs: number): Promise<{
+    readonly lease: PracticalMutationLeaseRecord;
+    readonly certificate: PracticalDurableCertificateRecord;
+    readonly account: PracticalAccountSnapshot;
+  }>;
+}
+
+interface LockedAccountScopeHandle {
+  readonly scope: PracticalLockedAccountScope;
+  readonly close: () => void;
+}
+
+interface ArmableOrderBoundCancel {
+  readonly expected: PracticalArmableCancelExpectation;
+  readonly lease: PracticalMutationLeaseRecord;
+  readonly certificate: PracticalDurableCertificateRecord;
+}
+
+function requireOrderBinding(value: unknown): PracticalLeaseOrderBinding {
+  if (typeof value !== 'object' || value === null) invalidInput('An order binding is required', { field: 'binding' });
+  const binding = value as Record<string, unknown>;
+  const intentId = requireId(binding['intentId'], 'binding.intentId', 64);
+  const clientOrderId = requireId(binding['clientOrderId'], 'binding.clientOrderId', 64);
+  const cancelGeneration = binding['cancelGeneration'];
+  if (!isNonNegativeSafeInteger(cancelGeneration) || cancelGeneration < 1) invalidInput('binding.cancelGeneration must be a positive safe integer', { field: 'binding.cancelGeneration' });
+  return Object.freeze({ intentId, clientOrderId, cancelGeneration });
+}
+
+function requireArmableExpectation(value: unknown): PracticalArmableCancelExpectation {
+  if (typeof value !== 'object' || value === null) invalidInput('An arm expectation is required', { field: 'expected' });
+  const expected = value as Record<string, unknown>;
+  const certificate = expected['certificate'];
+  if (typeof certificate !== 'object' || certificate === null) invalidInput('The arm expectation must carry the certificate snapshot', { field: 'expected.certificate' });
+  const snapshot = certificate as Record<string, unknown>;
+  const generation = expected['reconciliationGeneration'];
+  if (!isNonNegativeSafeInteger(generation)) invalidInput('reconciliationGeneration must be a non-negative safe integer', { field: 'reconciliationGeneration' });
+  const certificateGeneration = snapshot['reconciliationGeneration'];
+  const streamIncarnation = snapshot['streamIncarnation'];
+  if (!isNonNegativeSafeInteger(certificateGeneration)) invalidInput('certificate.reconciliationGeneration must be a non-negative safe integer', { field: 'certificate.reconciliationGeneration' });
+  if (!isNonNegativeSafeInteger(streamIncarnation)) invalidInput('certificate.streamIncarnation must be a non-negative safe integer', { field: 'certificate.streamIncarnation' });
+  return Object.freeze({
+    leaseId: requireId(expected['leaseId'], 'leaseId', 64),
+    runtimeEpoch: requireId(expected['runtimeEpoch'], 'runtimeEpoch', 64),
+    reconciliationGeneration: generation,
+    leaseCreatedAtMs: requireTime(expected['leaseCreatedAtMs'], 'leaseCreatedAtMs'),
+    binding: requireOrderBinding(expected['binding']),
+    certificate: Object.freeze({
+      certificateId: requireDigestId(snapshot['certificateId'], 'certificate.certificateId'),
+      accountId: requireId(snapshot['accountId'], 'certificate.accountId', 128),
+      providerAccountFingerprint: requireDigestId(snapshot['providerAccountFingerprint'], 'certificate.providerAccountFingerprint'),
+      runtimeEpoch: requireId(snapshot['runtimeEpoch'], 'certificate.runtimeEpoch', 64),
+      reconciliationGeneration: certificateGeneration,
+      streamIncarnation,
+      evidenceDigest: requireDigestId(snapshot['evidenceDigest'], 'certificate.evidenceDigest'),
+      issuedAtMs: requireTime(snapshot['issuedAtMs'], 'certificate.issuedAtMs'),
+      expiresAtMs: requireTime(snapshot['expiresAtMs'], 'certificate.expiresAtMs'),
+      consumedAtMs: requireTime(snapshot['consumedAtMs'], 'certificate.consumedAtMs'),
+    }),
+  });
+}
+
+/** Exact equality of two durable certificate records on EVERY field (immutable and lifecycle). */
+function sameDurableCertificate(left: PracticalDurableCertificateRecord, right: PracticalDurableCertificateRecord): boolean {
+  return left.certificateId === right.certificateId
+    && left.accountId === right.accountId
+    && left.providerAccountFingerprint === right.providerAccountFingerprint
+    && left.runtimeEpoch === right.runtimeEpoch
+    && left.reconciliationGeneration === right.reconciliationGeneration
+    && left.streamIncarnation === right.streamIncarnation
+    && left.evidenceDigest === right.evidenceDigest
+    && left.issuedAtMs === right.issuedAtMs
+    && left.expiresAtMs === right.expiresAtMs
+    && left.status === right.status
+    && left.terminalAtMs === right.terminalAtMs
+    && left.terminalReason === right.terminalReason;
+}
+
+/** Exact equality of two fence records (bindings, revision, and every mode field). */
+function sameFence(left: PracticalAccountFence, right: PracticalAccountFence): boolean {
+  if (left.accountId !== right.accountId || left.runtimeEpoch !== right.runtimeEpoch
+    || left.reconciliationGeneration !== right.reconciliationGeneration || left.revision !== right.revision || left.mode.kind !== right.mode.kind) {
+    return false;
+  }
+  if (left.mode.kind === 'MUTATION_LEASED' && right.mode.kind === 'MUTATION_LEASED') {
+    return left.mode.leaseId === right.mode.leaseId && left.mode.certificateId === right.mode.certificateId && left.mode.action === right.mode.action;
+  }
+  if (left.mode.kind === 'CERTIFYING' && right.mode.kind === 'CERTIFYING') return left.mode.runId === right.mode.runId;
+  return true;
+}
+
+/**
+ * The FULL immutable-certificate re-proof: a fresh locked read, strictly
+ * parsed, then exact JavaScript equality on every durable immutable field,
+ * plus CONSUMED, no terminal reason, and the exact consumption instant. A
+ * certificate id that matched only under the database collation fails the
+ * exact id comparison; a case-variant digest fails the strict parser.
+ */
+async function reproveConsumedCertificate(tx: Tx, accountId: string, expected: PracticalConsumedCertificateExpectation): Promise<PracticalDurableCertificateRecord> {
+  const row = await readCertificateRow(tx, expected.certificateId, true);
+  if (row === null) conflict('The leased certificate has no durable record', { accountId });
+  const certificate = parsePracticalCertificateRow(row);
+  const mismatched = ([
+    ['certificateId', certificate.certificateId === expected.certificateId],
+    ['accountId', certificate.accountId === expected.accountId && certificate.accountId === accountId],
+    ['providerAccountFingerprint', certificate.providerAccountFingerprint === expected.providerAccountFingerprint],
+    ['runtimeEpoch', certificate.runtimeEpoch === expected.runtimeEpoch],
+    ['reconciliationGeneration', certificate.reconciliationGeneration === expected.reconciliationGeneration],
+    ['streamIncarnation', certificate.streamIncarnation === expected.streamIncarnation],
+    ['evidenceDigest', certificate.evidenceDigest === expected.evidenceDigest],
+    ['issuedAtMs', certificate.issuedAtMs === expected.issuedAtMs],
+    ['expiresAtMs', certificate.expiresAtMs === expected.expiresAtMs],
+    ['status', certificate.status === 'CONSUMED'],
+    ['terminalReason', certificate.terminalReason === null],
+    ['terminalAtMs', certificate.terminalAtMs === expected.consumedAtMs],
+  ] as const).filter(([, same]) => !same).map(([field]) => field);
+  if (mismatched.length > 0) conflict('The durable CONSUMED certificate does not exactly equal the acquired snapshot', { accountId, mismatched });
+  return certificate;
+}
+
+/** Exactly ONE lease rests on the certificate, and it is exactly this lease (a row the account read already locked). */
+async function requireOnlyLeaseOfCertificate(tx: Tx, certificateId: string, leaseId: string): Promise<void> {
+  const rows = await tx.$queryRaw<unknown[]>(Prisma.sql`SELECT lease_id AS leaseId, certificate_id AS certificateId
+    FROM live_practical_mutation_lease WHERE certificate_id = ${certificateId} FOR UPDATE`);
+  if (!Array.isArray(rows) || rows.length !== 1) conflict('The certificate does not rest under exactly one lease', { field: 'lease' });
+  if (pointerOf(rows[0], 'leaseId') !== leaseId || pointerOf(rows[0], 'certificateId') !== certificateId) {
+    conflict('The lease resting on the certificate is not exactly this lease', { field: 'lease' });
+  }
+}
+
+/**
+ * Runs `work` with the account's Stage 1B1 rows locked, inside the CALLER's
+ * transaction `tx`. Opens no transaction. The scope is closed when `work`
+ * settles: any later call is refused before it touches `tx`.
+ */
+export async function withLockedPracticalAccountWithinCallerTransaction<T>(
+  repository: PrismaPracticalSafetyRepository,
+  tx: Prisma.TransactionClient,
+  accountId: string,
+  work: (scope: PracticalLockedAccountScope) => Promise<T>,
+): Promise<T> {
+  if (!isGenuinePracticalRepository(repository)) invalidInput('A genuine PrismaPracticalSafetyRepository is required', { field: 'repository' });
+  if (typeof tx !== 'object' || tx === null) invalidInput('The caller transaction client is required', { field: 'tx' });
+  requireId(accountId, 'accountId', 128);
+  if (typeof work !== 'function') invalidInput('Scope work is required', { field: 'work' });
+  const handle = await openLockedAccountScope(repository, tx, accountId);
+  try {
+    return await work(handle.scope);
+  } finally {
+    handle.close();
   }
 }

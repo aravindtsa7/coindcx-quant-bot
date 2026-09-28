@@ -150,6 +150,8 @@ describe('SHADOW IS NOT AUTHORITY: no route to a certificate, lease, dispatch, a
       const reach = reachOf(file);
       expect(reach.filter((node) => node.startsWith('src/integration/')), file).toEqual([]);
       expect(reach.filter((node) => node.startsWith('src/dispatch/') || node.startsWith('src/coin-runtime/')), file).toEqual([]);
+      // [Stage 1B2 Wave 2B1] nor the order-bound CANCEL mutation store (acquire / arm).
+      expect(reach.filter((node) => node.startsWith('src/execution/live/practical-mutation/')), file).toEqual([]);
       for (const forbidden of [
         'src/execution/live/gateway.ts', 'src/execution/live/authority.ts', 'src/execution/live/service.ts', 'src/execution/live/repository.ts', 'src/execution/live/gate.ts',
         'src/execution/live/reconciliation/barrier.ts', 'src/execution/live/reconciliation/repository.ts', 'src/execution/live/reconciliation/service.ts',
