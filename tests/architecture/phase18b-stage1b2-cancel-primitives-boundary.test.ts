@@ -136,12 +136,32 @@ describe('the primitives are NOT a public authority surface', () => {
   });
 });
 
+// [P18B Stage 1B2 Wave 2B2a] The ONLY statements permitted between the strict fence and the primitive: the
+// reviewed bound-claim interlock (the primitive's own locks, the verified read, then the non-locking guard).
+// It adds no authority, takes no practical lock, and forwards nothing new to the primitive.
+const ARM_OR_COMPLETE_INTERLOCK = [
+  'await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;',
+  'await tx.$executeRaw`SELECT intent_id FROM live_execution_intent WHERE intent_id = ${intentId} FOR UPDATE`;',
+  'const verified = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);',
+  'if (verified !== null && (fence === null || verified.order.accountId === fence.accountId)) {',
+  'await assertCancelWriteNotLeaseBound(tx as unknown as ReconciliationFenceClient, verified.order);',
+  '}',
+].join('\n');
+const CLAIM_INTERLOCK = [
+  'await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;',
+  'const verified = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);',
+  "if (verified !== null && verified.order.accountId === trustedAccountId && verified.order.cancelState === 'NONE') {",
+  'await assertCancelWriteNotLeaseBound(tx as unknown as ReconciliationFenceClient, verified.order);',
+  '}',
+].join('\n');
+const normalizeLines = (text: string): string => text.split('\n').map((line) => line.trim()).filter(Boolean).join('\n');
+
 describe('the PUBLIC strict Tier-A wrappers still fence FIRST', () => {
   it.each([
-    ['claimCancel', 'claimCancelWithinCallerFencedTransaction', "await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, trustedAccountId, 'HEALTHY');"],
-    ['armCancelWire', 'armCancelWireWithinCallerFencedTransaction', "const fence = await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, null, 'HEALTHY');"],
-    ['completeCancelAttempt', 'completeCancelAttemptWithinCallerFencedTransaction', "const fence = await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, null, 'HEALTHY');"],
-  ])('%s: $transaction -> strict HEALTHY fence -> %s, and nothing else', (method, primitive, fence) => {
+    ['claimCancel', 'claimCancelWithinCallerFencedTransaction', "await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, trustedAccountId, 'HEALTHY');", CLAIM_INTERLOCK],
+    ['armCancelWire', 'armCancelWireWithinCallerFencedTransaction', "const fence = await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, null, 'HEALTHY');", ARM_OR_COMPLETE_INTERLOCK],
+    ['completeCancelAttempt', 'completeCancelAttemptWithinCallerFencedTransaction', "const fence = await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, null, 'HEALTHY');", ARM_OR_COMPLETE_INTERLOCK],
+  ])('%s: $transaction -> strict HEALTHY fence -> [2B2a interlock] -> %s, and nothing else', (method, primitive, fence, interlock) => {
     const source = methodSource(method);
     const transaction = source.indexOf('return this.#prisma.$transaction(async (tx) => {');
     const fenceAt = source.indexOf(fence);
@@ -149,8 +169,8 @@ describe('the PUBLIC strict Tier-A wrappers still fence FIRST', () => {
     expect(transaction).toBeGreaterThan(0);
     expect(fenceAt).toBeGreaterThan(transaction);
     expect(call).toBeGreaterThan(fenceAt);
-    // Between the fence and the primitive there is no other statement, and after it nothing but the close.
-    expect(source.slice(fenceAt + fence.length, call).trim()).toBe('');
+    // Between the fence and the primitive there is EXACTLY the reviewed Wave 2B2a interlock, and after it nothing but the close.
+    expect(normalizeLines(source.slice(fenceAt + fence.length, call))).toBe(interlock);
     expect(source.slice(source.indexOf(';', call) + 1).trim()).toBe('});\n  }'.trim());
     // The wrapper still takes the strict authorization parameter and never a practical one.
     expect(source).toContain('reconciliationAuthorization?: unknown');

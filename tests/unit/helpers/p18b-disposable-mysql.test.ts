@@ -329,7 +329,11 @@ describe('DisposableMysqlLifecycle — provisioning and cleanup', () => {
 
 describe('the Stage 1B2 strict runner and the new suite apply the guard first', () => {
   const RUNNER = 'scripts/run-live-practical-mutation-db-integration.ts';
-  const SUITE = 'tests/integration/execution/live-practical-cancel-mutation.integration.test.ts';
+  // [Wave 2B2a] Every Stage 1B2 suite that provisions a disposable database gets the same pins.
+  const SUITES = [
+    'tests/integration/execution/live-practical-cancel-mutation.integration.test.ts',
+    'tests/integration/execution/live-practical-cancel-interlock.integration.test.ts',
+  ] as const;
 
   function runRunner(databaseUrl: string | undefined): { status: number | null; output: string } {
     const env: NodeJS.ProcessEnv = {};
@@ -367,8 +371,8 @@ describe('the Stage 1B2 strict runner and the new suite apply the guard first', 
     expect(source.slice(guard, spawn)).toContain('process.exit(1)');
   });
 
-  it('the new suite constructs the guarded lifecycle before any command or client, and issues no raw CREATE/DROP', () => {
-    const source = readFileSync(join(ROOT, SUITE), 'utf8');
+  it.each(SUITES)('%s constructs the guarded lifecycle before any command or client, and issues no raw CREATE/DROP', (suite) => {
+    const source = readFileSync(join(ROOT, suite), 'utf8');
     const beforeAllAt = source.indexOf('beforeAll(async () => {');
     const guard = source.indexOf('new DisposableMysqlLifecycle(', beforeAllAt);
     expect(beforeAllAt).toBeGreaterThan(0);
@@ -384,8 +388,8 @@ describe('the Stage 1B2 strict runner and the new suite apply the guard first', 
     expect(source.match(/\.track\(new PrismaClient\(/g)).toHaveLength(3);
   });
 
-  it('the new suite cleans up on the beforeAll failure path and unconditionally in afterAll', () => {
-    const source = readFileSync(join(ROOT, SUITE), 'utf8');
+  it.each(SUITES)('%s cleans up on the beforeAll failure path and unconditionally in afterAll', (suite) => {
+    const source = readFileSync(join(ROOT, suite), 'utf8');
     const beforeAllBody = source.slice(source.indexOf('beforeAll(async () => {'), source.indexOf('afterAll(async () => {'));
     expect(beforeAllBody).toMatch(/catch \(error\) \{\s*dbAvailable = false;[\s\S]*await guarded\.cleanup\(\);/);
     const afterAllBody = source.slice(source.indexOf('afterAll(async () => {'), source.indexOf('function skip()'));

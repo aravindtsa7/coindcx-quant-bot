@@ -310,6 +310,17 @@ export type LiveReconciliationFindingCode =
   // --- cancellation ambiguity (§7) -----------------------------------------
   | 'RECON_CANCEL_RESOLVED_FROM_VENUE'
   | 'RECON_CANCEL_UNRESOLVED'
+  // --- [P18B Stage 1B2 Wave 2B2a] practical CANCEL binding -----------------
+  /** The order's current cancel claim is owned by a LEASED Stage 1B2 practical lease: zero effects. */
+  | 'RECON_CANCEL_CLAIM_PRACTICALLY_BOUND'
+  /**
+   * A completed practical AMBIGUOUS cancel is still CANCEL_AMBIGUOUS. Sticky:
+   * no ordinary clear, fold, observation, or elapsed time resolves it; only a
+   * future reviewed evidence boundary may. Zero effects.
+   */
+  | 'RECON_PRACTICAL_CANCEL_AMBIGUITY_UNRESOLVED'
+  /** The practical cancel binding contradicts the Phase17 cancel claim (split durable state): zero effects. */
+  | 'RECON_PRACTICAL_CANCEL_BINDING_SPLIT'
   // --- orphans (§9) --------------------------------------------------------
   /** An active venue order with no proven local lineage. */
   | 'RECON_ORPHAN_VENUE_ORDER'

@@ -133,7 +133,16 @@ export type LiveExecutionFailureCode =
    * durable resolution. A resolution is minted exactly once per attempt;
    * this is the deterministic outcome for a duplicate/replayed request.
    */
-  | 'LIVE_ORPHAN_RESOLUTION_ALREADY_RESOLVED';
+  | 'LIVE_ORPHAN_RESOLUTION_ALREADY_RESOLVED'
+  /**
+   * [P18B Stage 1B2 Wave 2B2a] A public Phase17/18 write would change the
+   * cancel columns of an order whose CURRENT cancel generation is owned by an
+   * order-bound Stage 1B2 practical lease that is still LEASED, or whose
+   * completed practical AMBIGUOUS outcome is still unresolved. Only the
+   * reviewed Stage 1B2 path (and, for the ambiguity, a future reviewed
+   * evidence boundary) may move that claim. Nothing is written.
+   */
+  | 'LIVE_CANCEL_CLAIM_PRACTICALLY_BOUND';
 
 /** Codes whose meaning is "the exchange may hold an order we cannot account for". */
 export const LIVE_AMBIGUOUS_CODES: readonly LiveExecutionFailureCode[] = Object.freeze([

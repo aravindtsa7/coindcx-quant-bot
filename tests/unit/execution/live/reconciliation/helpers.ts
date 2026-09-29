@@ -154,6 +154,7 @@ export function durableOrder(overrides: Partial<LiveDurableOrderView> = {}): Liv
     dispatchWireArmed: false,
     cancelWireArmed: false,
     revision: 1,
+    practicalCancelBinding: null,
     ...overrides,
   });
 }

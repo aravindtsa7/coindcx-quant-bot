@@ -18,11 +18,16 @@
  *   - observation validation, dedup insertion, and projection update share one
  *     row-locking transaction, so no event can outrun its financial effect.
  */
-import type { Prisma, PrismaClient } from '@prisma/client';
+import { Prisma, type PrismaClient } from '@prisma/client';
 import { sha256CanonicalJson } from '../../risk';
 import { canonicalLiveDecimalString, liveDecimal } from './decimal';
 import { LiveExecutionError } from './errors';
 import type { LiveExecutionIntentRecord } from './intent';
+import {
+  classifyPracticalCancelBinding,
+  currentPracticalCancelBinding,
+  type LivePracticalCancelBindingView,
+} from './practical-cancel-binding';
 import { LiveReconciliationAuthorization, type LiveReconciliationAuthorizationRecord } from './reconciliation/repository';
 import { applyLiveOrderObservation, initialLiveOrderState } from './state-machine';
 import type { LiveCancelAttemptState, LiveOrderObservation, LiveOrderStateName, LiveOrderStateRecord } from './types';
@@ -162,6 +167,13 @@ export interface LiveDurableOrderRow {
   readonly dispatchWireArmed: boolean;
   /** [P18 Wave A2 / F18-14] See `LiveOrderStateRecord.cancelWireArmed`. */
   readonly cancelWireArmed: boolean;
+  /**
+   * [P18B Stage 1B2 Wave 2B2a] The Stage 1B2 practical lease naming this
+   * order's EXACT CURRENT cancel generation, re-proven with exact identity, or
+   * null. ADVISORY planning evidence only: the transaction-time guard in every
+   * public cancel-column write is the authoritative interlock.
+   */
+  readonly practicalCancelBinding: LivePracticalCancelBindingView | null;
 }
 
 /** Stable dedup identity of one exchange observation (P17 §9 repeated event). */
@@ -759,6 +771,162 @@ export async function completeCancelAttemptWithinCallerFencedTransaction(
   return committed.order;
 }
 
+// ---------------------------------------------------------------------------
+// [P18B Stage 1B2 Wave 2B2a] Truthful no-wire release of a cancel claim.
+//
+// Two NAMED primitives, each with ONE fixed wire-arm precondition, so no caller
+// ever chooses a wire-arm boolean. They move exactly generation `generation`'s
+// CANCEL_RESERVED claim to NONE (cancelWireArmed false, cancelFaultCode null,
+// revision + 1), keep the generation, and leave `order.state` untouched —
+// exactly the `reclaimCancelAfterCrash` shape: the frozen transition table has
+// no path from CANCEL_REQUESTED back to ACKNOWLEDGED. This is NOT a provider
+// REJECTED and NOT an acknowledgement: it records that nothing left the
+// process.
+//
+// UNSAFE WITHOUT A CALLER-OWNED FENCE AND A CALLER-PROVEN NO-WIRE FACT. They
+// perform no authority check and cannot tell whether a gateway was called; the
+// caller must already hold that proof (a durable unarmed pair, or a genuine
+// never-dispatched ticket together with a durable armed pair). NOT on the port,
+// NOT in any barrel, and ZERO production importers until the reviewed Stage 1B2
+// adapter (Wave 2B2b) — architecture-pinned.
+// ---------------------------------------------------------------------------
+
+async function releaseCancelClaimWithoutWire(
+  tx: Prisma.TransactionClient,
+  intentId: string,
+  generation: number,
+  fencedAccountId: string,
+  requiredCancelWireArmed: boolean,
+): Promise<LiveOrderStateRecord> {
+  if (typeof fencedAccountId !== 'string' || fencedAccountId.length === 0) {
+    throw new LiveExecutionError('LIVE_AUTHORITY_INVALID', 'A no-wire cancel release requires the exact fenced account id');
+  }
+  if (!Number.isSafeInteger(generation) || generation < 1) {
+    throw new LiveExecutionError('LIVE_INTENT_INVALID', 'A no-wire cancel release requires an exact claimed cancel generation', { details: { intentId } });
+  }
+  await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;
+  await tx.$executeRaw`SELECT intent_id FROM live_execution_intent WHERE intent_id = ${intentId} FOR UPDATE`;
+  const verified = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
+  if (verified === null) {
+    throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Live order vanished while releasing a no-wire cancel claim', { details: { intentId } });
+  }
+  const current = verified.order;
+  if (current.accountId !== fencedAccountId) {
+    throw new LiveExecutionError('LIVE_AUTHORITY_INVALID', 'The caller-owned fence belongs to a different account', { details: { intentId } });
+  }
+  if (current.cancelState !== 'CANCEL_RESERVED' || current.cancelGeneration !== generation || current.cancelWireArmed !== requiredCancelWireArmed) {
+    throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'The no-wire release requires exactly this CANCEL_RESERVED generation in the required wire-arm state', {
+      details: { intentId, generation },
+    });
+  }
+  const updated = await tx.liveOrder.updateMany({
+    where: {
+      intentId,
+      state: current.state,
+      revision: current.revision,
+      clientOrderId: current.clientOrderId,
+      accountId: current.accountId,
+      pair: current.pair,
+      orderedQuantity: canonicalLiveDecimalString(current.orderedQuantity, 'orderedQuantity'),
+      cancelGeneration: generation,
+      cancelState: 'CANCEL_RESERVED',
+      cancelWireArmed: requiredCancelWireArmed,
+    },
+    data: { cancelState: 'NONE', cancelWireArmed: false, cancelFaultCode: null, revision: { increment: 1 } },
+  });
+  if (updated.count !== 1) {
+    throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Cancellation claim ownership changed before the no-wire release', { details: { intentId, generation } });
+  }
+  const committed = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
+  if (committed === null) {
+    throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Live order vanished after the no-wire cancel release', { details: { intentId } });
+  }
+  return committed.order;
+}
+
+/**
+ * UNSAFE WITHOUT A CALLER-OWNED FENCE. Releases an UNARMED
+ * (`cancelWireArmed === false`) CANCEL_RESERVED claim of exactly `generation`
+ * to NONE. For a durable unarmed pair only.
+ */
+export async function releaseUnarmedCancelClaimWithinCallerFencedTransaction(
+  tx: Prisma.TransactionClient,
+  intentId: string,
+  generation: number,
+  fencedAccountId: string,
+): Promise<LiveOrderStateRecord> {
+  return releaseCancelClaimWithoutWire(tx, intentId, generation, fencedAccountId, false);
+}
+
+/**
+ * UNSAFE WITHOUT A CALLER-OWNED FENCE. Releases an ARMED
+ * (`cancelWireArmed === true`) CANCEL_RESERVED claim of exactly `generation`
+ * to NONE. Only for an armed pair the caller PROVES was never dispatched.
+ */
+export async function releaseArmedUndispatchedCancelClaimWithinCallerFencedTransaction(
+  tx: Prisma.TransactionClient,
+  intentId: string,
+  generation: number,
+  fencedAccountId: string,
+): Promise<LiveOrderStateRecord> {
+  return releaseCancelClaimWithoutWire(tx, intentId, generation, fencedAccountId, true);
+}
+
+// ---------------------------------------------------------------------------
+// [P18B Stage 1B2 Wave 2B2a] The practical CANCEL binding interlock.
+//
+// Every PUBLIC Phase17/18 write that would change a cancel column
+// (cancelState, cancelGeneration, cancelWireArmed, cancelFaultCode,
+// cancelExchangeOrderId) runs this AFTER its `live_order ... FOR UPDATE` and
+// AFTER its first consistent (verified) read, and BEFORE its write.
+//
+// The practical lease row is read WITHOUT any lock (no FOR UPDATE / SHARE), so
+// no transaction here ever takes a practical lock after `live_reconciliation_
+// state` / `live_order` and the global lock order (practical -> recon state ->
+// live_order -> intent) is preserved. The non-locking read is nevertheless
+// exact: every earlier read in these transactions is a locking read, so the
+// REPEATABLE READ snapshot is fixed only by the verified read AFTER the
+// `live_order` lock; every writer of an order-bound lease (Stage 1B2 acquire,
+// arm, completion, recovery) holds that same `live_order` lock until it
+// commits, so the snapshot already contains every committed binding change and
+// none can commit while this transaction holds the lock.
+//
+// It is an INTEGRITY INTERLOCK, never authority: it only refuses.
+// ---------------------------------------------------------------------------
+
+async function readCurrentPracticalCancelBinding(
+  tx: ReconciliationFenceClient,
+  order: LiveOrderStateRecord,
+): Promise<LivePracticalCancelBindingView | null> {
+  // Generation 0 was never claimed, and the frozen CHECK makes a lease for it impossible (cancel_generation >= 1).
+  if (order.cancelGeneration < 1) return null;
+  const rows = await tx.$queryRaw<unknown[]>`SELECT lease_id AS leaseId, account_id AS accountId, intent_id AS intentId,
+      client_order_id AS clientOrderId, cancel_generation AS cancelGeneration, status, outcome, armed_at_ms AS armedAtMs
+    FROM live_practical_mutation_lease WHERE intent_id = ${order.intentId} AND cancel_generation = ${order.cancelGeneration}`;
+  return currentPracticalCancelBinding(rows, {
+    accountId: order.accountId, intentId: order.intentId, clientOrderId: order.clientOrderId, cancelGeneration: order.cancelGeneration,
+  });
+}
+
+async function assertCancelWriteNotLeaseBound(tx: ReconciliationFenceClient, current: LiveOrderStateRecord): Promise<void> {
+  const binding = await readCurrentPracticalCancelBinding(tx, current);
+  const verdict = classifyPracticalCancelBinding(binding, current.cancelState);
+  if (verdict === 'UNBOUND' || verdict === 'HISTORICAL') return;
+  const details = { intentId: current.intentId, cancelGeneration: current.cancelGeneration, verdict };
+  if (verdict === 'SPLIT') {
+    throw new LiveExecutionError('LIVE_DURABLE_INTEGRITY_VIOLATION', 'The practical cancel binding contradicts the Phase17 cancel claim (split durable state)', { details });
+  }
+  throw new LiveExecutionError('LIVE_CANCEL_CLAIM_PRACTICALLY_BOUND', 'This cancel claim is owned by a Stage 1B2 practical lease; ordinary Phase17/18 writes may not move it', { details });
+}
+
+function changesCancelColumns(current: LiveOrderStateRecord, next: LiveOrderStateRecord): boolean {
+  return current.cancelState !== next.cancelState
+    || current.cancelGeneration !== next.cancelGeneration
+    || current.cancelWireArmed !== next.cancelWireArmed
+    || current.cancelFaultCode !== next.cancelFaultCode
+    || current.cancelExchangeOrderId !== next.cancelExchangeOrderId;
+}
+
 /**
  * Production Prisma-backed repository.
  *
@@ -1003,6 +1171,13 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
     return this.#prisma.$transaction(async (tx) => {
       // Strict Tier-A fence FIRST, in the same transaction, before any live_order lock or read.
       const fence = await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, null, 'HEALTHY');
+      // [Wave 2B2a] Bound-claim interlock: same locks as the primitive, then the verified read, then the guard.
+      await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;
+      await tx.$executeRaw`SELECT intent_id FROM live_execution_intent WHERE intent_id = ${intentId} FOR UPDATE`;
+      const verified = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
+      if (verified !== null && (fence === null || verified.order.accountId === fence.accountId)) {
+        await assertCancelWriteNotLeaseBound(tx as unknown as ReconciliationFenceClient, verified.order);
+      }
       return armCancelWireWithinCallerFencedTransaction(tx, intentId, expectedRevision, fence === null ? null : fence.accountId);
     });
   }
@@ -1030,6 +1205,8 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
           details: { intentId: next.intentId, expectedRevision },
         });
       }
+      // [Wave 2B2a] Bound-claim interlock, after the live_order lock and the verified read, before the write.
+      if (changesCancelColumns(current, next)) await assertCancelWriteNotLeaseBound(tx as unknown as ReconciliationFenceClient, current);
       const updated = await tx.liveOrder.updateMany({
         where: {
           intentId: current.intentId,
@@ -1142,6 +1319,12 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
     return this.#prisma.$transaction(async (tx) => {
       // Strict Tier-A fence FIRST, in the same transaction, before any live_order lock or read.
       await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, trustedAccountId, 'HEALTHY');
+      // [Wave 2B2a] Bound-claim interlock on the only claim path that writes (cancelState NONE).
+      await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;
+      const verified = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
+      if (verified !== null && verified.order.accountId === trustedAccountId && verified.order.cancelState === 'NONE') {
+        await assertCancelWriteNotLeaseBound(tx as unknown as ReconciliationFenceClient, verified.order);
+      }
       return claimCancelWithinCallerFencedTransaction(tx, intentId, trustedAccountId);
     });
   }
@@ -1156,6 +1339,13 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
     return this.#prisma.$transaction(async (tx) => {
       // Strict Tier-A fence FIRST, in the same transaction, before any live_order lock or read.
       const fence = await assertReconciliationFence(tx as unknown as ReconciliationFenceClient, reconciliationAuthorization, null, 'HEALTHY');
+      // [Wave 2B2a] Bound-claim interlock: same locks as the primitive, then the verified read, then the guard.
+      await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;
+      await tx.$executeRaw`SELECT intent_id FROM live_execution_intent WHERE intent_id = ${intentId} FOR UPDATE`;
+      const verified = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
+      if (verified !== null && (fence === null || verified.order.accountId === fence.accountId)) {
+        await assertCancelWriteNotLeaseBound(tx as unknown as ReconciliationFenceClient, verified.order);
+      }
       return completeCancelAttemptWithinCallerFencedTransaction(tx, intentId, generation, outcome, faultCode, fence === null ? null : fence.accountId);
     });
   }
@@ -1283,6 +1473,9 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
           details: { intentId: next.intentId, expectedRevision },
         });
       }
+      // [Wave 2B2a] Bound-claim interlock, after the live_order lock and the verified read, before ANY write
+      // (including the observation event insert).
+      if (changesCancelColumns(current, next)) await assertCancelWriteNotLeaseBound(tx as unknown as ReconciliationFenceClient, current);
       if (observation !== null) {
         if (observation.side !== verified.verifiedIntent.intent.content.side) {
           throw new LiveExecutionError('LIVE_ORDER_IDENTITY_MISMATCH', 'Reconciliation observation side does not belong to this live order', {
@@ -1361,7 +1554,7 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
       orderBy: { intentId: 'asc' },
     }) as readonly (LiveOrderRow & { intent: unknown; createdAt: Date; updatedAt: Date })[];
 
-    const views: LiveDurableOrderRow[] = [];
+    const verifiedRows: { readonly row: (typeof rows)[number]; readonly order: LiveOrderStateRecord; readonly verifiedIntent: VerifiedStoredIntent }[] = [];
     for (const row of rows) {
       if (row.intent === null || row.intent === undefined) {
         throw new LiveExecutionError('LIVE_DURABLE_INTEGRITY_VIOLATION', 'Durable live order exists without the immutable intent that authorizes it', {
@@ -1371,6 +1564,12 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
       const verifiedIntent = verifyStoredIntentIntegrity(row.intent);
       const order = toStateRecord(row);
       assertOrderProjectionMatchesIntent(order, verifiedIntent);
+      verifiedRows.push({ row, order, verifiedIntent });
+    }
+    const bindings = await this.#currentPracticalCancelBindings(verifiedRows.map((entry) => entry.order));
+
+    const views: LiveDurableOrderRow[] = [];
+    for (const { row, order, verifiedIntent } of verifiedRows) {
       const { content } = verifiedIntent.intent;
       views.push(Object.freeze({
         intentId: order.intentId,
@@ -1401,9 +1600,50 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
         dispatchWireArmed: order.dispatchWireArmed,
         cancelWireArmed: order.cancelWireArmed,
         revision: order.revision,
+        practicalCancelBinding: bindings.get(order.intentId) ?? null,
       }));
     }
     return Object.freeze(views);
+  }
+
+  /**
+   * [P18B Stage 1B2 Wave 2B2a] The practical lease naming each order's EXACT
+   * CURRENT cancel generation. ADVISORY (unlocked, outside any transaction):
+   * the public-write guard is the authoritative interlock. One read keyed by
+   * the exact `(intent_id, cancel_generation)` pairs; because SQL equality is
+   * case-insensitive and pad-space, every returned row must name one of the
+   * requested intents EXACTLY and re-prove its identity exactly, or the whole
+   * listing fails closed.
+   */
+  async #currentPracticalCancelBindings(orders: readonly LiveOrderStateRecord[]): Promise<ReadonlyMap<string, LivePracticalCancelBindingView>> {
+    const claimed = orders.filter((order) => order.cancelGeneration >= 1);
+    const bindings = new Map<string, LivePracticalCancelBindingView>();
+    if (claimed.length === 0) return bindings;
+    const pairs = Prisma.join(claimed.map((order) => Prisma.sql`(${order.intentId}, ${order.cancelGeneration})`));
+    const rows = await this.#prisma.$queryRaw<unknown[]>(Prisma.sql`SELECT lease_id AS leaseId, account_id AS accountId, intent_id AS intentId,
+        client_order_id AS clientOrderId, cancel_generation AS cancelGeneration, status, outcome, armed_at_ms AS armedAtMs
+      FROM live_practical_mutation_lease WHERE (intent_id, cancel_generation) IN (${pairs})`);
+    if (!Array.isArray(rows)) {
+      throw new LiveExecutionError('LIVE_DURABLE_INTEGRITY_VIOLATION', 'Practical cancel binding read did not return rows');
+    }
+    const byIntent = new Map<string, unknown[]>();
+    for (const order of claimed) byIntent.set(order.intentId, []);
+    for (const row of rows) {
+      const intentId = typeof row === 'object' && row !== null ? (row as Record<string, unknown>)['intentId'] : undefined;
+      const bucket = typeof intentId === 'string' ? byIntent.get(intentId) : undefined;
+      if (bucket === undefined) {
+        // Matched only by collation (case / trailing pad) or otherwise not an exact requested intent.
+        throw new LiveExecutionError('LIVE_DURABLE_INTEGRITY_VIOLATION', 'A practical cancel binding row does not name a requested intent exactly');
+      }
+      bucket.push(row);
+    }
+    for (const order of claimed) {
+      const binding = currentPracticalCancelBinding(byIntent.get(order.intentId) ?? [], {
+        accountId: order.accountId, intentId: order.intentId, clientOrderId: order.clientOrderId, cancelGeneration: order.cancelGeneration,
+      });
+      if (binding !== null) bindings.set(order.intentId, binding);
+    }
+    return bindings;
   }
 
   #intentCreateData(intent: LiveExecutionIntentRecord) {

@@ -5,7 +5,7 @@
  * soft-skippable (the repository's live-DB integration convention), so unit
  * development never depends on a local MySQL being up.
  *
- * This script is the Stage 1B2 ACCEPTANCE path. It runs the three Stage 1B2
+ * This script is the Stage 1B2 ACCEPTANCE path. It runs the four Stage 1B2
  * real-MySQL suites with their strict flags set:
  *
  *   - the frozen mutation-safety migration shape
@@ -13,7 +13,9 @@
  *   - the Wave 2A Phase 17 cancel transaction primitives
  *     (REQUIRE_LIVE_CANCEL_PRIMITIVES_DB_INTEGRATION),
  *   - the Wave 2B1 order-bound practical CANCEL store: atomic acquire and
- *     atomic pre-wire arm (REQUIRE_LIVE_PRACTICAL_CANCEL_STORE_DB_INTEGRATION).
+ *     atomic pre-wire arm (REQUIRE_LIVE_PRACTICAL_CANCEL_STORE_DB_INTEGRATION),
+ *   - the Wave 2B2a Phase17/18 bound-claim interlock and no-wire release
+ *     primitives (REQUIRE_LIVE_PRACTICAL_CANCEL_INTERLOCK_DB_INTEGRATION).
  *
  * Under those flags each suite's `beforeAll` THROWS, failing the run, if it
  * cannot provision its own real, disposable MySQL database (always dropped
@@ -47,6 +49,7 @@ const result = spawnSync(
     'tests/integration/execution/live-practical-mutation-migration.integration.test.ts',
     'tests/integration/execution/live-cancel-transaction-primitives.integration.test.ts',
     'tests/integration/execution/live-practical-cancel-mutation.integration.test.ts',
+    'tests/integration/execution/live-practical-cancel-interlock.integration.test.ts',
   ],
   {
     stdio: 'inherit',
@@ -55,6 +58,7 @@ const result = spawnSync(
       REQUIRE_LIVE_PRACTICAL_MUTATION_DB_INTEGRATION: '1',
       REQUIRE_LIVE_CANCEL_PRIMITIVES_DB_INTEGRATION: '1',
       REQUIRE_LIVE_PRACTICAL_CANCEL_STORE_DB_INTEGRATION: '1',
+      REQUIRE_LIVE_PRACTICAL_CANCEL_INTERLOCK_DB_INTEGRATION: '1',
     },
   },
 );

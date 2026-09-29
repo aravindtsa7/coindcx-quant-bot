@@ -14,6 +14,7 @@
  * reconciliation physically cannot grow a second mutation capability at a call
  * site.
  */
+import type { LivePracticalCancelBindingView } from '../practical-cancel-binding';
 import type { LivePositionOwnershipRecord } from '../repository';
 import type {
   LiveEvidenceProvenance,
@@ -415,6 +416,14 @@ export interface LiveDurableOrderView {
   /** [P18 Wave A2 / F18-14] See `LiveOrderStateRecord.cancelWireArmed`. */
   readonly cancelWireArmed: boolean;
   readonly revision: number;
+  /**
+   * [P18B Stage 1B2 Wave 2B2a] The Stage 1B2 practical lease naming this
+   * order's EXACT CURRENT cancel generation (identity re-proven exactly), or
+   * null. Advisory planning evidence only; the Phase17 public-write guard is
+   * the authoritative interlock. A lease for an older generation never
+   * appears here.
+   */
+  readonly practicalCancelBinding: LivePracticalCancelBindingView | null;
 }
 
 export interface LiveDurableOrderReader {

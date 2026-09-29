@@ -518,6 +518,8 @@ export class InMemoryLiveExecutionRepository implements LiveExecutionRepository 
         dispatchWireArmed: order.dispatchWireArmed,
         cancelWireArmed: order.cancelWireArmed,
         revision: order.revision,
+        // [Wave 2B2a] This in-memory double holds no practical lease rows.
+        practicalCancelBinding: null,
       }));
     }
     return Object.freeze(views);

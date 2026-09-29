@@ -33,6 +33,7 @@
  */
 import { sha256CanonicalJson } from '../../../risk';
 import { canonicalLiveDecimalString, liveDecimal } from '../decimal';
+import { classifyPracticalCancelBinding } from '../practical-cancel-binding';
 import type { LiveOrderObservation, LiveOrderObservationKind, LiveOrderStateName } from '../types';
 import { buildFinding } from './findings';
 import type { LiveDurableOrderView } from './ports';
@@ -595,6 +596,9 @@ export interface AmbiguousCreateResolutionInput {
  */
 export function resolveAmbiguousCreate(input: AmbiguousCreateResolutionInput): LiveOrderReconciliationOutcome {
   const { order } = input;
+  // [P18B Stage 1B2 Wave 2B2a] Defensive: a practically bound order never has an ambiguous create, but if the
+  // view ever says otherwise it gets zero effects (its finding comes from `planClaimRecovery`).
+  if (practicalCancelBindingFinding(order) !== null) return outcome([]);
   const subject = { pair: order.pair, intentId: order.intentId };
 
   // The provider-confirmed `client_order_id` path comes first, because an
@@ -804,6 +808,11 @@ export function reconcileIdentifiedOrder(
 ): LiveOrderReconciliationOutcome {
   const exchangeOrderId = order.exchangeOrderId;
   if (exchangeOrderId === null) return outcome([]);
+  // [P18B Stage 1B2 Wave 2B2a] A practically bound, practically ambiguous, or split cancel claim gets ZERO
+  // effects here: no clear, no fold, whatever the venue shows. Its blocking finding is raised exactly once per
+  // run by `planClaimRecovery` (which every run executes first), so it is not repeated here. The exchange order
+  // id is still claimed, so the venue order is never mistaken for an orphan.
+  if (practicalCancelBindingFinding(order) !== null) return outcome([], [], [exchangeOrderId]);
   const subject = { pair: order.pair, intentId: order.intentId, exchangeOrderId };
 
   const matches = evidence.orders.filter((candidate) => candidate.exchangeOrderId === exchangeOrderId);
@@ -1114,6 +1123,13 @@ export function planClaimRecovery(orders: readonly LiveDurableOrderView[]): Live
   const findings: LiveReconciliationFinding[] = [];
   const effects: LiveClaimRecoveryEffect[] = [];
   for (const order of orders) {
+    // [P18B Stage 1B2 Wave 2B2a] A practically bound / ambiguous / split cancel claim is never reclaimed here:
+    // its blocking finding is raised (exactly once per run, here) and the order gets ZERO effects.
+    const practical = practicalCancelBindingFinding(order);
+    if (practical !== null) {
+      findings.push(practical);
+      continue;
+    }
     if (order.state === 'DISPATCH_RESERVED' && order.exchangeOrderId === null && !order.dispatchWireArmed) {
       effects.push({ kind: 'RECLAIM_DISPATCH', intentId: order.intentId });
       findings.push(buildFinding({
@@ -1138,6 +1154,63 @@ export function planClaimRecovery(orders: readonly LiveDurableOrderView[]): Live
     }
   }
   return Object.freeze({ findings: Object.freeze(findings), effects: Object.freeze(effects) });
+}
+
+/**
+ * [P18B Stage 1B2 Wave 2B2a] The blocking finding for an order whose CURRENT
+ * cancel generation is practically bound, practically ambiguous, or split —
+ * or null when ordinary Phase18 reconciliation may proceed (no binding, or a
+ * historical PRE_DISPATCH_FAILURE binding whose claim is already NONE).
+ *
+ * Pure and deterministic (no time in the evidence), so a repeated run
+ * reasserts the same durable finding. Planning evidence only: the Phase17
+ * public-write guard independently refuses the same writes under lock.
+ */
+export function practicalCancelBindingFinding(order: LiveDurableOrderView): LiveReconciliationFinding | null {
+  const binding = order.practicalCancelBinding;
+  const verdict = classifyPracticalCancelBinding(binding, order.cancelState);
+  if (verdict === 'UNBOUND' || verdict === 'HISTORICAL' || binding === null) return null;
+  const subject = { pair: order.pair, intentId: order.intentId, exchangeOrderId: order.exchangeOrderId };
+  const evidence = {
+    leaseId: binding.leaseId,
+    cancelGeneration: binding.cancelGeneration,
+    leaseStatus: binding.status,
+    leaseOutcome: binding.outcome,
+    leaseArmed: binding.armedAtMs !== null,
+    cancelState: order.cancelState,
+    cancelWireArmed: order.cancelWireArmed,
+  };
+  if (verdict === 'LEASED') {
+    return buildFinding({
+      category: 'AMBIGUOUS',
+      code: 'RECON_CANCEL_CLAIM_PRACTICALLY_BOUND',
+      subject,
+      evidence: {
+        ...evidence,
+        reason: 'This cancel claim is owned by a LEASED Stage 1B2 practical lease; reconciliation neither reclaims, clears, nor folds it',
+      },
+    });
+  }
+  if (verdict === 'PRACTICAL_AMBIGUITY_UNRESOLVED') {
+    return buildFinding({
+      category: 'AMBIGUOUS',
+      code: 'RECON_PRACTICAL_CANCEL_AMBIGUITY_UNRESOLVED',
+      subject,
+      evidence: {
+        ...evidence,
+        reason: 'A completed practical AMBIGUOUS cancel is still CANCEL_AMBIGUOUS; no ordinary clear, fold, observation, or elapsed time resolves it',
+      },
+    });
+  }
+  return buildFinding({
+    category: 'MANUAL_REVIEW_REQUIRED',
+    code: 'RECON_PRACTICAL_CANCEL_BINDING_SPLIT',
+    subject,
+    evidence: {
+      ...evidence,
+      reason: 'The practical cancel binding contradicts the Phase17 cancel claim (split durable state); nothing is repaired automatically',
+    },
+  });
 }
 
 export function isLocallyActive(order: LiveDurableOrderView): boolean {

@@ -87,21 +87,25 @@ describe('the public strict cancel methods refuse BEFORE any statement without g
 });
 
 describe('with genuine current authority the fence still runs FIRST, then the extracted primitive', () => {
-  it.each(PUBLIC_CANCEL_METHODS)('%s: fence locking read -> live_order lock -> verified read (the pre-extraction order)', async (name, call) => {
+  it.each(PUBLIC_CANCEL_METHODS)('%s: fence locking read -> [2B2a interlock: same locks, verified read] -> the primitive (same order)', async (name, call) => {
     const { authorization, row } = await genuineAuthorization();
     const { prisma, calls } = recordingPrisma(row);
-    // The recording double has no durable order, so the primitive stops at its verified read; the ORDER is what is proven.
+    // The recording double has no durable order, so the interlock's verified read finds none (no guard read), and
+    // the primitive stops at its own verified read; the ORDER is what is proven.
     await expect(call(new PrismaLiveExecutionRepository(prisma), authorization)).rejects.toMatchObject({
       code: name === 'claimCancel' ? 'LIVE_INTENT_INVALID' : 'LIVE_PERSISTENCE_FAULT',
     });
     expect(calls[0]).toMatch(/^\$queryRaw SELECT .* FROM live_reconciliation_state WHERE account_id = \? FOR UPDATE$/);
-    expect(calls[1]).toBe('$executeRaw SELECT intent_id FROM live_order WHERE intent_id = ? FOR UPDATE');
+    const lockOrder = '$executeRaw SELECT intent_id FROM live_order WHERE intent_id = ? FOR UPDATE';
+    const lockIntent = '$executeRaw SELECT intent_id FROM live_execution_intent WHERE intent_id = ? FOR UPDATE';
     if (name === 'claimCancel') {
-      // The claim locks live_order only (unchanged), then reads the verified order.
-      expect(calls.slice(2)).toEqual(['liveOrder.findUnique']);
+      // Interlock: live_order lock + verified read; then the claim (unchanged): live_order lock + verified read.
+      expect(calls.slice(1)).toEqual([lockOrder, 'liveOrder.findUnique', lockOrder, 'liveOrder.findUnique']);
     } else {
-      // Arm and completion lock live_order, then live_execution_intent (unchanged), then read the verified order.
-      expect(calls.slice(2)).toEqual(['$executeRaw SELECT intent_id FROM live_execution_intent WHERE intent_id = ? FOR UPDATE', 'liveOrder.findUnique']);
+      // Interlock: live_order, live_execution_intent, verified read; then the primitive (unchanged): the same order.
+      expect(calls.slice(1)).toEqual([lockOrder, lockIntent, 'liveOrder.findUnique', lockOrder, lockIntent, 'liveOrder.findUnique']);
     }
+    // No practical lock and no practical read happened without a durable order.
+    expect(calls.some((statement) => statement.includes('live_practical'))).toBe(false);
   });
 });
