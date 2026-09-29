@@ -44,6 +44,22 @@
  * handed to any gateway. A future, separately reviewed gateway wave must add
  * a durable dispatch-permit boundary; this module grants nothing like it.
  *
+ * UNKNOWN-ACQUIRE RECEIPT [Wave 2B2c]. `PracticalUnknownAcquire` is minted
+ * ONLY when an acquisition's transaction work completed but its COMMIT could
+ * not be confirmed. It is NOT a handle: it can neither arm nor abandon. It
+ * holds the exact record that transaction would have committed (including the
+ * lease id generated inside it), privately, and exposes nothing but `status`.
+ * It is delivered through a module-private WeakMap keyed by the exact error
+ * object (never as an error property, never in details).
+ *   PENDING -> RESOLVING -> SPENT (RESTORED or NOT_COMMITTED), or -> PENDING
+ *   again ONLY after an inconclusive attempt (a database fault, a lock-wait
+ *   timeout, or the read-only resolution's own unknown COMMIT). Once an
+ *   ANOMALY is proven the receipt is permanently mint-disabled:
+ *   RESOLVING -> REFUSED (manual review / malformed latch confirmed) or
+ *   -> ANOMALY_UNESCALATED; ANOMALY_UNESCALATED -> ESCALATING -> REFUSED, or
+ *   back to ANOMALY_UNESCALATED. Neither REFUSED nor ANOMALY_UNESCALATED can
+ *   ever reach PENDING, RESOLVING, or SPENT again, whatever the rows later say.
+ *
  * The in-memory states are a convenience only: the database compare-and-sets
  * and row locks are the one-shot authority across processes.
  */
@@ -56,7 +72,7 @@ import {
   isPositiveSafeInteger,
   type PracticalAuthorizationBasis,
 } from '../practical/types';
-import { PracticalMutationError } from './ports';
+import { PracticalAcquireCommitUnknownError, PracticalMutationError } from './ports';
 
 // ---------------------------------------------------------------------------
 // Records
@@ -131,6 +147,9 @@ export type PracticalAcquiredCancelStatus =
   | 'ABANDON_OUTCOME_UNKNOWN';
 
 export type PracticalArmedCancelStatus = 'ARMED' | 'COMPLETING_NO_WIRE' | 'COMMIT_UNKNOWN' | 'SPENT';
+
+/** [Wave 2B2c] The unknown-acquire receipt lifecycle (see the module header). */
+export type PracticalUnknownAcquireStatus = 'PENDING' | 'RESOLVING' | 'SPENT' | 'REFUSED' | 'ANOMALY_UNESCALATED' | 'ESCALATING';
 
 /** The acquired-handle states an abandon may start from. */
 const ABANDONABLE: readonly PracticalAcquiredCancelStatus[] = Object.freeze(['AVAILABLE', 'ARM_OUTCOME_UNKNOWN', 'ABANDON_OUTCOME_UNKNOWN']);
@@ -395,6 +414,74 @@ export class PracticalArmedCancel {
 Object.freeze(PracticalArmedCancel.prototype);
 Object.freeze(PracticalArmedCancel);
 
+/** [Wave 2B2c] The legal receipt transitions (from -> to). Anything else is refused. */
+const UNKNOWN_ACQUIRE_TRANSITIONS: Readonly<Record<PracticalUnknownAcquireStatus, readonly PracticalUnknownAcquireStatus[]>> = Object.freeze({
+  PENDING: Object.freeze<PracticalUnknownAcquireStatus[]>(['RESOLVING']),
+  RESOLVING: Object.freeze<PracticalUnknownAcquireStatus[]>(['SPENT', 'PENDING', 'REFUSED', 'ANOMALY_UNESCALATED']),
+  ANOMALY_UNESCALATED: Object.freeze<PracticalUnknownAcquireStatus[]>(['ESCALATING']),
+  ESCALATING: Object.freeze<PracticalUnknownAcquireStatus[]>(['REFUSED', 'ANOMALY_UNESCALATED']),
+  SPENT: Object.freeze<PracticalUnknownAcquireStatus[]>([]),
+  REFUSED: Object.freeze<PracticalUnknownAcquireStatus[]>([]),
+});
+
+/**
+ * [Wave 2B2c] The single-use recovery receipt of ONE acquisition attempt whose
+ * COMMIT was unknown. Not a handle, not authority: it only lets the adapter
+ * re-prove the attempt against the locked durable rows. Exposes only `status`.
+ */
+export class PracticalUnknownAcquire {
+  readonly #record: PracticalAcquiredCancelRecord;
+  #status: PracticalUnknownAcquireStatus = 'PENDING';
+  /** Set ONCE when an anomaly is proven; never cleared. A mint-disabled receipt can never reach SPENT or PENDING. */
+  #anomalyProven = false;
+
+  public constructor(issuer: unknown, record: PracticalAcquiredCancelRecord) {
+    if (issuer !== TICKET_ISSUER) {
+      throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'An unknown-acquire receipt may only be issued by the Stage 1B2 adapter after an unknown acquisition COMMIT');
+    }
+    this.#record = validAcquiredRecord(record);
+    Object.freeze(this);
+  }
+
+  /** The lifecycle status of a GENUINE receipt, or null for clones and structural fakes. */
+  public static status(value: unknown): PracticalUnknownAcquireStatus | null {
+    if (typeof value !== 'object' || value === null || !(#status in value)) return null;
+    return (value as PracticalUnknownAcquire).#status;
+  }
+
+  /** Internal lifecycle transition; only this module holds the issuer. Returns the intended record. */
+  public static transition(issuer: unknown, value: unknown, from: PracticalUnknownAcquireStatus, to: PracticalUnknownAcquireStatus): PracticalAcquiredCancelRecord {
+    if (issuer !== TICKET_ISSUER) {
+      throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'Unknown-acquire receipt lifecycle changes are internal to the Stage 1B2 ticket module');
+    }
+    if (typeof value !== 'object' || value === null || !(#status in value)) {
+      throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'A genuine unknown-acquire receipt is required');
+    }
+    const receipt = value as PracticalUnknownAcquire;
+    if (receipt.#status !== from || !UNKNOWN_ACQUIRE_TRANSITIONS[from].includes(to)) {
+      throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', `The unknown-acquire receipt is ${receipt.#status}; ${from} -> ${to} is not allowed`, { status: receipt.#status });
+    }
+    if (to === 'REFUSED' || to === 'ANOMALY_UNESCALATED') receipt.#anomalyProven = true;
+    // Defense in depth over the transition table: a proven anomaly can never mint or become retryable again.
+    if (receipt.#anomalyProven && (to === 'SPENT' || to === 'PENDING' || to === 'RESOLVING')) {
+      throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'The unknown-acquire receipt proved an anomaly and can never mint', { status: receipt.#status });
+    }
+    receipt.#status = to;
+    return receipt.#record;
+  }
+
+  // No custom JSON or inspect surface is needed: every field is private, so JSON.stringify yields {}.
+}
+Object.freeze(PracticalUnknownAcquire.prototype);
+Object.freeze(PracticalUnknownAcquire);
+
+/**
+ * [Wave 2B2c] The receipt of an unknown-acquire error, held OFF the error
+ * object. Module-private: only `issuePracticalUnknownAcquire` writes it and
+ * only `readPracticalUnknownAcquireReceipt` reads it.
+ */
+const UNKNOWN_ACQUIRE_RECEIPTS = new WeakMap<object, PracticalUnknownAcquire>();
+
 // ---------------------------------------------------------------------------
 // INTERNAL issuing and lifecycle boundary (production importer: the Stage 1B2 adapter ONLY)
 // ---------------------------------------------------------------------------
@@ -487,4 +574,66 @@ export function restorePracticalArmedCancel(value: unknown, from: PracticalArmed
 /** [Wave 2B2b] COMPLETING_NO_WIRE -> COMMIT_UNKNOWN (recording the reason) when the COMMIT could not be confirmed. */
 export function markPracticalArmedCancelCommitUnknown(value: unknown, reason: string): void {
   PracticalArmedCancel.transition(TICKET_ISSUER, value, 'COMPLETING_NO_WIRE', 'COMMIT_UNKNOWN', reason);
+}
+
+// ----- [Wave 2B2c] the unknown-acquire receipt ---------------------------------
+
+/**
+ * Mints the receipt of an acquisition whose COMMIT was unknown and binds it to
+ * that exact error object (off the object). Called only by the adapter's
+ * acquire, only for a completed ACQUIRED outcome. Never mints a handle.
+ */
+export function issuePracticalUnknownAcquire(record: PracticalAcquiredCancelRecord, error: PracticalAcquireCommitUnknownError): PracticalUnknownAcquire {
+  if (!(error instanceof PracticalAcquireCommitUnknownError) || UNKNOWN_ACQUIRE_RECEIPTS.has(error)) {
+    throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'A receipt is bound once, to a genuine unknown-acquire error');
+  }
+  const receipt = new PracticalUnknownAcquire(TICKET_ISSUER, record);
+  UNKNOWN_ACQUIRE_RECEIPTS.set(error, receipt);
+  return receipt;
+}
+
+/**
+ * The receipt of a genuine unknown-acquire error, or null (any other value,
+ * including a copy, clone, JSON round-trip, or wrapper of that error).
+ */
+export function readPracticalUnknownAcquireReceipt(error: unknown): PracticalUnknownAcquire | null {
+  if (typeof error !== 'object' || error === null) return null;
+  return UNKNOWN_ACQUIRE_RECEIPTS.get(error) ?? null;
+}
+
+/**
+ * PENDING -> RESOLVING (a full re-proof follows), or ANOMALY_UNESCALATED ->
+ * ESCALATING (only the escalation is retried; nothing is read, nothing can be
+ * minted). Synchronous: a concurrent second call is refused before any durable access.
+ */
+export function beginPracticalUnknownAcquireResolution(value: unknown): {
+  readonly record: PracticalAcquiredCancelRecord;
+  readonly from: 'PENDING' | 'ANOMALY_UNESCALATED';
+} {
+  const from = PracticalUnknownAcquire.status(value);
+  if (from === null) throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'A genuine unknown-acquire receipt is required');
+  if (from !== 'PENDING' && from !== 'ANOMALY_UNESCALATED') {
+    throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', `An unknown-acquire receipt in ${from} cannot be resolved`, { status: from });
+  }
+  const record = PracticalUnknownAcquire.transition(TICKET_ISSUER, value, from, from === 'PENDING' ? 'RESOLVING' : 'ESCALATING');
+  return Object.freeze({ record, from });
+}
+
+/** RESOLVING -> SPENT after a conclusive RESTORED (a handle is minted next) or NOT_COMMITTED. */
+export function finishPracticalUnknownAcquireResolution(value: unknown): void {
+  PracticalUnknownAcquire.transition(TICKET_ISSUER, value, 'RESOLVING', 'SPENT');
+}
+
+/** RESOLVING -> PENDING, ONLY after an INCONCLUSIVE attempt (never after a proven anomaly). */
+export function restorePracticalUnknownAcquire(value: unknown): void {
+  PracticalUnknownAcquire.transition(TICKET_ISSUER, value, 'RESOLVING', 'PENDING');
+}
+
+/**
+ * RESOLVING | ESCALATING -> REFUSED (the manual review / malformed latch is
+ * confirmed durable) or -> ANOMALY_UNESCALATED (it is not). Either way the
+ * receipt is permanently mint-disabled.
+ */
+export function refusePracticalUnknownAcquire(value: unknown, from: 'RESOLVING' | 'ESCALATING', escalated: boolean): void {
+  PracticalUnknownAcquire.transition(TICKET_ISSUER, value, from, escalated ? 'REFUSED' : 'ANOMALY_UNESCALATED');
 }

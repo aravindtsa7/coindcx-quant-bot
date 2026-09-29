@@ -530,3 +530,41 @@ describe('the Stage 1B1 migration', () => {
     expect(createHash('sha256').update(text).digest('hex')).toBe('14272259dc91d1a1c63325f47bf073b75e6a85583f3907de3c11b935e86cebf7');
   });
 });
+
+describe('[Wave 2B2c] the lease-writer set and the read-only unknown-acquire inspection', () => {
+  it('EXACTLY four statements in src/ write live_practical_mutation_lease, all in the Stage 1B1 adapter, and none deletes (no reviewed writer can close an unresolved attempt)', () => {
+    // The proof that a PENDING unknown-acquire receipt's lease can only be LEASED and unarmed rests on this set:
+    // insert (acquire), the arm CAS (needs a genuine handle), the Stage 1B1 completion (refuses any order-bound lease;
+    // WHERE intentId: null), and the no-wire completion (needs a genuine ticket or handle). A new writer breaks this pin.
+    const writers: string[] = [];
+    for (const file of files.filter((candidate) => candidate.startsWith('src/'))) {
+      const code = codeOf(file);
+      for (const match of code.matchAll(/\.livePracticalMutationLease\.(create|createMany|update|updateMany|upsert|delete|deleteMany)\(/g)) {
+        writers.push(`${file}:${match[1]}`);
+      }
+      expect(code, file).not.toMatch(/(UPDATE|DELETE FROM|INSERT INTO|REPLACE INTO)\s+live_practical_mutation_lease/i);
+    }
+    expect(writers.sort()).toEqual([`${REPOSITORY}:create`, `${REPOSITORY}:updateMany`, `${REPOSITORY}:updateMany`, `${REPOSITORY}:updateMany`]);
+    const repository = codeOf(REPOSITORY);
+    // The Stage 1B1 completion can never match an order-bound lease (WHERE intentId: null), and releaseLease refuses one first.
+    expect(repository).toMatch(/runtimeEpoch: lease\.runtimeEpoch, reconciliationGeneration: lease\.reconciliationGeneration, status: 'LEASED',\s+intentId: null,\s+\},\s+data: \{ status: 'COMPLETED', outcome: extras\.completeLease\.outcome, completedAtMs: now \},/);
+    expect(repository).toContain('if (lease.orderBinding !== null) {');
+  });
+
+  it('the inspection is read-only and keeps the Stage 1B1 order: the certificate row, then the lease(s) resting on it, then the attempted lease', () => {
+    const repository = codeOf(REPOSITORY);
+    const start = repository.indexOf('inspectAttemptedOrderBoundCancelLease: (expected: PracticalAttemptedLeaseExpectation) => run(false, async () => {');
+    expect(start).toBeGreaterThan(0);
+    const body = repository.slice(start, repository.indexOf('\n      }),', start));
+    expect(body).not.toMatch(/\.(create|update|updateMany|upsert|delete|deleteMany)\(|\$executeRaw|#apply\(|#invalidateLocked\(/);
+    const certificate = body.indexOf('await readCertificateRow(tx, exact.certificateId, true);');
+    const byCertificate = body.indexOf('await readLeaseIdsOfCertificate(tx, exact.certificateId);');
+    const attempted = body.indexOf('await readLeaseRow(tx, exact.leaseId, true);');
+    expect(certificate).toBeGreaterThan(0);
+    expect(byCertificate).toBeGreaterThan(certificate);
+    expect(attempted).toBeGreaterThan(byCertificate);
+    expect(body).toContain('if (anyCheck()) conflict(');
+    const leaseIds = repository.slice(repository.indexOf('async function readLeaseIdsOfCertificate('), repository.indexOf('async function requireOnlyLeaseOfCertificate('));
+    expect(leaseIds).toContain('FROM live_practical_mutation_lease WHERE certificate_id = ${certificateId} FOR UPDATE');
+  });
+});

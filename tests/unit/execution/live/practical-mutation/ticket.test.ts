@@ -2,23 +2,31 @@ import { describe, expect, it } from 'vitest';
 import { PracticalRecoveryCertificate } from '../../../../../src/execution/live/practical/certificate';
 import { PracticalLiveSafetyEnablement } from '../../../../../src/execution/live/practical/policy';
 import { LiveReconciliationAuthorization } from '../../../../../src/execution/live/reconciliation/repository';
+import { PracticalAcquireCommitUnknownError, PracticalMutationError } from '../../../../../src/execution/live/practical-mutation/ports';
 import * as ticketModule from '../../../../../src/execution/live/practical-mutation/ticket';
 import {
   PracticalAcquiredCancel,
   PracticalArmedCancel,
+  PracticalUnknownAcquire,
   beginPracticalAcquiredCancelAbandon,
   beginPracticalArmedCancelNoWireCompletion,
+  beginPracticalUnknownAcquireResolution,
   finishPracticalAcquiredCancelAbandon,
   finishPracticalArmedCancelNoWireCompletion,
+  finishPracticalUnknownAcquireResolution,
   issuePracticalAcquiredCancel,
   issuePracticalArmedCancel,
+  issuePracticalUnknownAcquire,
   markPracticalAcquiredCancelAbandonOutcomeUnknown,
   markPracticalAcquiredCancelArmOutcomeUnknown,
   markPracticalArmedCancelCommitUnknown,
+  readPracticalUnknownAcquireReceipt,
+  refusePracticalUnknownAcquire,
   releasePracticalAcquiredCancel,
   reservePracticalAcquiredCancel,
   restorePracticalAcquiredCancelAbandon,
   restorePracticalArmedCancel,
+  restorePracticalUnknownAcquire,
   spendPracticalAcquiredCancel,
   type PracticalAcquiredCancelRecord,
   type PracticalArmedCancelRecord,
@@ -276,5 +284,115 @@ describe('[Wave 2B2b] the acquired-handle unknown-arm and abandon lifecycle', ()
     const other = issuePracticalAcquiredCancel(acquiredRecord());
     beginPracticalAcquiredCancelAbandon(other);
     expect(() => restorePracticalAcquiredCancelAbandon(other, 'IN_USE')).toThrow(/started from/);
+  });
+});
+
+describe('[Wave 2B2c] the unknown-acquire receipt', () => {
+  const unknownError = () => new PracticalAcquireCommitUnknownError('acct-w2b1', new Error('connection lost'));
+
+  function pending() {
+    const error = unknownError();
+    const receipt = issuePracticalUnknownAcquire(acquiredRecord(), error);
+    return { error, receipt };
+  }
+
+  it('is delivered OFF the error: only the exact error object reads it; copies, clones, wrappers and plain values do not', () => {
+    const { error, receipt } = pending();
+    expect(readPracticalUnknownAcquireReceipt(error)).toBe(receipt);
+    expect(readPracticalUnknownAcquireReceipt({ ...error })).toBeNull();
+    expect(readPracticalUnknownAcquireReceipt(Object.assign(Object.create(Object.getPrototypeOf(error)), error))).toBeNull();
+    expect(readPracticalUnknownAcquireReceipt(new Error('wrapper', { cause: error }))).toBeNull();
+    expect(readPracticalUnknownAcquireReceipt(structuredClone(error))).toBeNull();
+    expect(readPracticalUnknownAcquireReceipt(JSON.parse(JSON.stringify(error)))).toBeNull();
+    for (const value of [null, undefined, 'error', 1, receipt]) expect(readPracticalUnknownAcquireReceipt(value)).toBeNull();
+    // The error carries no receipt property and no receipt in details.
+    expect(Object.keys(error).sort()).toEqual(['code', 'details', 'name']);
+    expect(error.details).toEqual({ accountId: 'acct-w2b1' });
+    expect(Object.getOwnPropertyNames(error).sort()).toEqual(['cause', 'code', 'details', 'message', 'name', 'stack']);
+  });
+
+  it('is bound once, only to a genuine unknown-acquire error, and is not a handle, a ticket, or strict authority', () => {
+    const { error, receipt } = pending();
+    expect(() => issuePracticalUnknownAcquire(acquiredRecord(), error)).toThrow(/bound once/);
+    expect(() => issuePracticalUnknownAcquire(acquiredRecord(), new PracticalMutationError('PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN', 'look-alike') as never)).toThrow(/bound once/);
+    expect(() => new PracticalUnknownAcquire({ purpose: 'p18b-stage1b2-practical-cancel-ticket' }, acquiredRecord())).toThrow(/Stage 1B2 adapter/);
+    expect(() => issuePracticalUnknownAcquire(acquiredRecord({ leaseCreatedAtMs: 1 }), unknownError())).toThrow(PracticalMutationError);
+    expect(PracticalAcquiredCancel.read(receipt)).toBeNull();
+    expect(PracticalAcquiredCancel.status(receipt)).toBeNull();
+    expect(PracticalArmedCancel.read(receipt)).toBeNull();
+    expect(LiveReconciliationAuthorization.read(receipt)).toBeNull();
+    expect(PracticalUnknownAcquire.status(receipt)).toBe('PENDING');
+    expect(PracticalUnknownAcquire.status({ ...receipt })).toBeNull();
+    expect(PracticalUnknownAcquire.status(Object.create(PracticalUnknownAcquire.prototype))).toBeNull();
+    expect(Object.isFrozen(receipt)).toBe(true);
+    expect(JSON.stringify(receipt)).toBe('{}');
+    expect(Object.keys(receipt)).toEqual([]);
+    expect(() => PracticalUnknownAcquire.transition({}, receipt, 'PENDING', 'RESOLVING')).toThrow(/internal/);
+  });
+
+  it('conclusive path: PENDING -> RESOLVING -> SPENT; then nothing can resolve it again', () => {
+    const { receipt } = pending();
+    const { record, from } = beginPracticalUnknownAcquireResolution(receipt);
+    expect(from).toBe('PENDING');
+    expect(record.leaseId).toBe('lease-w2b1');
+    expect(PracticalUnknownAcquire.status(receipt)).toBe('RESOLVING');
+    expect(() => beginPracticalUnknownAcquireResolution(receipt)).toThrow(/RESOLVING cannot be resolved/);
+    finishPracticalUnknownAcquireResolution(receipt);
+    expect(PracticalUnknownAcquire.status(receipt)).toBe('SPENT');
+    expect(() => beginPracticalUnknownAcquireResolution(receipt)).toThrow(/SPENT cannot be resolved/);
+    expect(() => restorePracticalUnknownAcquire(receipt)).toThrow(PracticalMutationError);
+  });
+
+  it('inconclusive path: RESOLVING -> PENDING (retryable), then a conclusive resolution may still follow', () => {
+    const { receipt } = pending();
+    beginPracticalUnknownAcquireResolution(receipt);
+    restorePracticalUnknownAcquire(receipt);
+    expect(PracticalUnknownAcquire.status(receipt)).toBe('PENDING');
+    beginPracticalUnknownAcquireResolution(receipt);
+    finishPracticalUnknownAcquireResolution(receipt);
+    expect(PracticalUnknownAcquire.status(receipt)).toBe('SPENT');
+  });
+
+  it('a PROVEN anomaly is permanent: REFUSED is terminal; ANOMALY_UNESCALATED only retries the escalation; neither can ever mint or become PENDING', () => {
+    const refused = pending().receipt;
+    beginPracticalUnknownAcquireResolution(refused);
+    refusePracticalUnknownAcquire(refused, 'RESOLVING', true);
+    expect(PracticalUnknownAcquire.status(refused)).toBe('REFUSED');
+    for (const attempt of [
+      () => beginPracticalUnknownAcquireResolution(refused),
+      () => finishPracticalUnknownAcquireResolution(refused),
+      () => restorePracticalUnknownAcquire(refused),
+      () => refusePracticalUnknownAcquire(refused, 'RESOLVING', true),
+    ]) {
+      expect(attempt).toThrow(PracticalMutationError);
+      expect(PracticalUnknownAcquire.status(refused)).toBe('REFUSED');
+    }
+
+    const unescalated = pending().receipt;
+    beginPracticalUnknownAcquireResolution(unescalated);
+    refusePracticalUnknownAcquire(unescalated, 'RESOLVING', false);
+    expect(PracticalUnknownAcquire.status(unescalated)).toBe('ANOMALY_UNESCALATED');
+    expect(() => finishPracticalUnknownAcquireResolution(unescalated)).toThrow(PracticalMutationError);
+    expect(() => restorePracticalUnknownAcquire(unescalated)).toThrow(PracticalMutationError);
+    // A retry is an ESCALATION only: it can go back to ANOMALY_UNESCALATED or on to REFUSED, never to RESOLVING / SPENT / PENDING.
+    expect(beginPracticalUnknownAcquireResolution(unescalated).from).toBe('ANOMALY_UNESCALATED');
+    expect(PracticalUnknownAcquire.status(unescalated)).toBe('ESCALATING');
+    expect(() => finishPracticalUnknownAcquireResolution(unescalated)).toThrow(PracticalMutationError);
+    expect(() => restorePracticalUnknownAcquire(unescalated)).toThrow(PracticalMutationError);
+    expect(() => PracticalUnknownAcquire.transition({ purpose: 'p18b-stage1b2-practical-cancel-ticket' }, unescalated, 'ESCALATING', 'SPENT')).toThrow(PracticalMutationError);
+    refusePracticalUnknownAcquire(unescalated, 'ESCALATING', false);
+    expect(PracticalUnknownAcquire.status(unescalated)).toBe('ANOMALY_UNESCALATED');
+    beginPracticalUnknownAcquireResolution(unescalated);
+    refusePracticalUnknownAcquire(unescalated, 'ESCALATING', true);
+    expect(PracticalUnknownAcquire.status(unescalated)).toBe('REFUSED');
+  });
+
+  it('the ticket module exports the receipt boundary and nothing that exposes its record', () => {
+    expect(Object.keys(ticketModule)).toEqual(expect.arrayContaining([
+      'PracticalUnknownAcquire', 'issuePracticalUnknownAcquire', 'readPracticalUnknownAcquireReceipt', 'beginPracticalUnknownAcquireResolution',
+      'finishPracticalUnknownAcquireResolution', 'restorePracticalUnknownAcquire', 'refusePracticalUnknownAcquire',
+    ]));
+    expect(Object.keys(ticketModule).filter((name) => /RECEIPTS|WeakMap/.test(name))).toEqual([]);
+    expect(Object.getOwnPropertyNames(PracticalUnknownAcquire).filter((name) => !['length', 'name', 'prototype'].includes(name)).sort()).toEqual(['status', 'transition']);
   });
 });

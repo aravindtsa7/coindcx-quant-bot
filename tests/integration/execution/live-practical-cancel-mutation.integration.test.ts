@@ -10,7 +10,8 @@ import { issuePracticalLiveSafetyEnablement, type PracticalLiveSafetyEnablement 
 import type { PracticalAccountSnapshot } from '../../../src/execution/live/practical-persistence/ports';
 import { PrismaPracticalSafetyRepository } from '../../../src/execution/live/practical-persistence/repository';
 import { PrismaPracticalCancelMutationStore } from '../../../src/execution/live/practical-mutation/repository';
-import { PracticalAcquiredCancel, PracticalArmedCancel, issuePracticalAcquiredCancel } from '../../../src/execution/live/practical-mutation/ticket';
+import { PracticalMutationError } from '../../../src/execution/live/practical-mutation/ports';
+import { PracticalAcquiredCancel, PracticalArmedCancel, PracticalUnknownAcquire, issuePracticalAcquiredCancel, readPracticalUnknownAcquireReceipt } from '../../../src/execution/live/practical-mutation/ticket';
 import { providerAccountFingerprint } from '../../../src/execution/live/reconciliation/account-identity';
 import { newLiveRuntimeIdentity, readLiveRuntimeEpoch, requireCurrentReconciliation } from '../../../src/execution/live/reconciliation/barrier';
 import { PrismaLiveReconciliationRepository } from '../../../src/execution/live/reconciliation/repository';
@@ -768,8 +769,14 @@ describe('P18B-W2B1-DB arm: both durable sides, or neither', () => {
     const accountId = freshAccount();
     const { account, certificate } = await certified(accountId);
     const order = await seedOrder(accountId);
-    await expect(store(commitLostClient()).acquireCancelLease(acquireInput(accountId, account, certificate, order.intentId)))
-      .rejects.toMatchObject({ code: 'PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN' });
+    const error = await store(commitLostClient()).acquireCancelLease(acquireInput(accountId, account, certificate, order.intentId)).then(() => null, (thrown: unknown) => thrown);
+    expect(error).toMatchObject({ code: 'PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN' });
+    // [Wave 2B2c] The same throw and details; still NO handle. A single-use receipt is bound OFF the error; only the
+    // reviewed resolution (live-practical-cancel-unknown-acquire suite) can turn it into a handle or a refusal.
+    expect((error as PracticalMutationError).details).toEqual({ accountId });
+    const receipt = readPracticalUnknownAcquireReceipt(error);
+    expect(PracticalUnknownAcquire.status(receipt)).toBe('PENDING');
+    expect(PracticalAcquiredCancel.read(receipt)).toBeNull();
     const rows = await practicalRows(accountId);
     // The commit really happened: a durable LEASED unarmed bound lease with a leased fence, and no handle anywhere.
     expect(rows.fence).toMatchObject({ mode: 'MUTATION_LEASED' });

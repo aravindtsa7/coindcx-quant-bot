@@ -67,7 +67,14 @@ export type PracticalMutationErrorCode =
    */
   | 'PRACTICAL_MUTATION_SPLIT_STATE'
   /** [Wave 2B2b] The lease was already completed by a different operation. Zero change. */
-  | 'PRACTICAL_MUTATION_ALREADY_COMPLETED';
+  | 'PRACTICAL_MUTATION_ALREADY_COMPLETED'
+  /**
+   * [Wave 2B2c] An unknown-acquire resolution proved an ANOMALY: this attempt's
+   * durable rows are not exactly restorable (or could not be read as a valid
+   * account). No handle is minted, no closure is asserted, the receipt can
+   * never mint again, and the account is escalated to manual review.
+   */
+  | 'PRACTICAL_MUTATION_RECOVERY_REFUSED';
 
 /** Credential-free, typed Stage 1B2 mutation error. Details go through the Phase 17 credential guard. */
 export class PracticalMutationError extends Error {
@@ -81,6 +88,24 @@ export class PracticalMutationError extends Error {
     this.code = code;
     this.details = details === undefined ? undefined : Object.freeze({ ...details });
     Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/**
+ * [Wave 2B2c] The unknown-ACQUIRE-commit error. The existing throw contract is
+ * unchanged: the SAME code, `details` exactly `{ accountId }`, nothing minted.
+ *
+ * It carries a genuine single-use recovery receipt, but NOT as a property: the
+ * receipt lives in a module-private WeakMap in `./ticket.ts`, keyed by this
+ * exact error object, and is read only through `readPracticalUnknownAcquireReceipt`.
+ * So the receipt is never in `details`, never an own property, never reached
+ * by `JSON.stringify`, the structured-log redactor (which walks own enumerable
+ * properties), `util.inspect`, or a copy / clone of this error.
+ */
+export class PracticalAcquireCommitUnknownError extends PracticalMutationError {
+  public constructor(accountId: string, cause: unknown) {
+    super('PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN', 'The acquisition COMMIT could not be confirmed; nothing was minted', { accountId }, cause);
+    this.name = 'PracticalAcquireCommitUnknownError';
   }
 }
 
@@ -222,6 +247,59 @@ export type PracticalNoWireCompletion =
   | { readonly kind: 'MALFORMED_LATCHED'; readonly reviewEpisodeId: string };
 
 // ---------------------------------------------------------------------------
+// [Wave 2B2c] Unknown-acquire-commit resolution
+//
+// An acquisition whose transaction work COMPLETED but whose COMMIT could not
+// be confirmed throws `PracticalAcquireCommitUnknownError`; its receipt holds
+// the exact record that transaction would have committed, including the lease
+// id generated inside it. Resolution is ONE read-only transaction that decides
+// from the locked durable rows alone: the attempted lease is exactly present
+// and restorable (RESTORED: the intended handle, unchanged), or provably
+// absent (NOT_COMMITTED). ANY other state is an anomaly: RECOVERY_REFUSED, no
+// handle, no closure asserted, manual review. There is no "already closed"
+// result: no reviewed writer can close this lease while its receipt is unresolved.
+// ---------------------------------------------------------------------------
+
+/** The exact, closed set of resolution input keys. */
+export const PRACTICAL_UNKNOWN_ACQUIRE_RESOLUTION_INPUT_KEYS = Object.freeze(['unknown', 'runtimeIdentity', 'trustedNowMs'] as const);
+
+export interface PracticalUnknownAcquireResolutionInput {
+  /** The genuine PENDING (or ANOMALY_UNESCALATED) receipt read from a `PracticalAcquireCommitUnknownError`. */
+  readonly unknown: unknown;
+  /** The genuine runtime identity of THIS process; its epoch must equal the receipt's. */
+  readonly runtimeIdentity: unknown;
+  /** Used only for the manual-review / malformed-latch timestamp of an anomaly. */
+  readonly trustedNowMs: number;
+}
+
+/** The durable certificate status NOT_COMMITTED reports (a fact about the certificate, never about a closure). */
+export type PracticalUnknownAcquireCertificateStatus = 'ISSUED' | 'EXPIRED' | 'REVOKED' | 'CONSUMED_BY_ANOTHER_LEASE';
+
+export type PracticalUnknownAcquireResolution =
+  /** The attempted acquisition IS durable and exactly restorable: the handle it would have returned (AVAILABLE). */
+  | { readonly kind: 'RESTORED'; readonly acquired: PracticalAcquiredCancel }
+  /** The attempted acquisition provably wrote NOTHING. No handle; nothing else is asserted. */
+  | { readonly kind: 'NOT_COMMITTED'; readonly certificateStatus: PracticalUnknownAcquireCertificateStatus };
+
+/** Why a resolution was refused as an anomaly (`details.reason` of PRACTICAL_MUTATION_RECOVERY_REFUSED). Closed. */
+export type PracticalRecoveryRefusalReason =
+  | 'ACCOUNT_UNREADABLE'
+  | 'LEASE_NOT_LEASED'
+  | 'LEASE_ARMED'
+  | 'LEASE_IDENTITY'
+  | 'FENCE_MISMATCH'
+  | 'CERTIFICATE_MISMATCH'
+  | 'PHASE17_MISSING'
+  | 'PHASE17_IDENTITY'
+  | 'PHASE17_CLAIM'
+  | 'ABSENT_BUT_REFERENCED'
+  | 'ANOMALY_PREVIOUSLY_PROVEN';
+export const PRACTICAL_RECOVERY_REFUSAL_REASONS: readonly PracticalRecoveryRefusalReason[] = Object.freeze([
+  'ACCOUNT_UNREADABLE', 'LEASE_NOT_LEASED', 'LEASE_ARMED', 'LEASE_IDENTITY', 'FENCE_MISMATCH', 'CERTIFICATE_MISMATCH',
+  'PHASE17_MISSING', 'PHASE17_IDENTITY', 'PHASE17_CLAIM', 'ABSENT_BUT_REFERENCED', 'ANOMALY_PREVIOUSLY_PROVEN',
+] as const);
+
+// ---------------------------------------------------------------------------
 // The ports
 // ---------------------------------------------------------------------------
 
@@ -234,6 +312,11 @@ export interface PracticalCancelMutationStore {
 export interface PracticalCancelNoWireStore {
   completeUndispatchedCancel(input: PracticalUndispatchedCompletionInput): Promise<PracticalNoWireCompletion>;
   abandonAcquiredCancel(input: PracticalCancelAbandonInput): Promise<PracticalNoWireCompletion>;
+}
+
+/** [Wave 2B2c] Resolution of an unknown ACQUIRE commit, in-process and within the same runtime epoch only. */
+export interface PracticalUnknownAcquireRecoveryStore {
+  resolveUnknownAcquire(input: PracticalUnknownAcquireResolutionInput): Promise<PracticalUnknownAcquireResolution>;
 }
 
 /** Re-exported for callers that match on the invalidation reason; the set is closed. */

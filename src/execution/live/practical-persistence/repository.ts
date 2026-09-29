@@ -1354,6 +1354,23 @@ export class PrismaPracticalSafetyRepository implements PracticalSafetyRepositor
         await requireOnlyLeaseOfCertificate(tx, exact.certificateId, exact.leaseId);
         return Object.freeze({ lease, certificate });
       }),
+
+      // ----- [Wave 2B2c] unknown-acquire inspection (read-only) -----
+
+      inspectAttemptedOrderBoundCancelLease: (expected: PracticalAttemptedLeaseExpectation) => run(false, async () => {
+        if (anyCheck()) conflict('A scope inspects at most one attempted lease, and never after another check', { accountId });
+        lifecycle.inspected = true;
+        const exact = requireAttemptedExpectation(expected);
+        // CERTIFICATES BEFORE LEASES, the Stage 1B1 order (see `readAccountRows`): the attempt's certificate row,
+        // then the lease resting on it, then the attempted lease id. Locking reads; nothing is written. A missing
+        // row is RETURNED (null), never assumed; a present row is strictly parsed (a malformed row throws MALFORMED).
+        const certificateRow = await readCertificateRow(tx, exact.certificateId, true);
+        const certificate = certificateRow === null ? null : parsePracticalCertificateRow(certificateRow);
+        const certificateLeaseIds = await readLeaseIdsOfCertificate(tx, exact.certificateId);
+        const leaseRow = await readLeaseRow(tx, exact.leaseId, true);
+        const lease = leaseRow === null ? null : parsePracticalLeaseRow(leaseRow);
+        return Object.freeze({ certificate, certificateLeaseIds, lease });
+      }),
     });
     return Object.freeze({ scope, close: () => { lifecycle.closed = true; } });
   }
@@ -1686,6 +1703,36 @@ export interface PracticalLockedAccountScope {
     readonly lease: PracticalMutationLeaseRecord;
     readonly certificate: PracticalDurableCertificateRecord;
   }>;
+  /**
+   * [Wave 2B2c] UNKNOWN-ACQUIRE INSPECTION, read-only: the attempt's
+   * certificate, the lease(s) resting on it, then the attempted lease id, in
+   * that order (certificates before leases), each locked and strictly parsed,
+   * each possibly absent. The caller decides; this grants and writes nothing.
+   */
+  inspectAttemptedOrderBoundCancelLease(expected: PracticalAttemptedLeaseExpectation): Promise<PracticalAttemptedLeaseInspection>;
+}
+
+/** [Wave 2B2c] The attempted lease of an unknown acquisition: its generated lease id and its certificate. */
+export interface PracticalAttemptedLeaseExpectation {
+  readonly leaseId: string;
+  readonly certificateId: string;
+}
+
+/** [Wave 2B2c] What the unknown-acquire inspection read, under lock. Every field may be absent; nothing is inferred. */
+export interface PracticalAttemptedLeaseInspection {
+  readonly certificate: PracticalDurableCertificateRecord | null;
+  /** The EXACT ids of the lease rows resting on the certificate (the unique key allows at most one). */
+  readonly certificateLeaseIds: readonly string[];
+  readonly lease: PracticalMutationLeaseRecord | null;
+}
+
+function requireAttemptedExpectation(value: unknown): PracticalAttemptedLeaseExpectation {
+  if (typeof value !== 'object' || value === null) invalidInput('An attempted-lease expectation is required', { field: 'expected' });
+  const expected = value as Record<string, unknown>;
+  return Object.freeze({
+    leaseId: requireId(expected['leaseId'], 'leaseId', 64),
+    certificateId: requireDigestId(expected['certificateId'], 'certificateId'),
+  });
 }
 
 /** [Wave 2B2b] The exact durable identity a no-wire completion re-proves. The arm state is never part of it. */
@@ -1829,6 +1876,18 @@ async function reproveConsumedCertificate(tx: Tx, accountId: string, expected: P
 }
 
 /** Exactly ONE lease rests on the certificate, and it is exactly this lease (a row the account read already locked). */
+/** [Wave 2B2c] The EXACT ids of the lease rows resting on a certificate, locked (after the certificate row). */
+async function readLeaseIdsOfCertificate(tx: Tx, certificateId: string): Promise<readonly string[]> {
+  const rows = await tx.$queryRaw<unknown[]>(Prisma.sql`SELECT lease_id AS leaseId
+    FROM live_practical_mutation_lease WHERE certificate_id = ${certificateId} FOR UPDATE`);
+  if (!Array.isArray(rows)) conflict('The certificate lease read returned no row set', { field: 'lease' });
+  return Object.freeze(rows.map((row) => {
+    const leaseId = typeof row === 'object' && row !== null ? (row as Record<string, unknown>)['leaseId'] : undefined;
+    if (typeof leaseId !== 'string') conflict('A lease row resting on the certificate has no readable lease id', { field: 'leaseId' });
+    return leaseId;
+  }));
+}
+
 async function requireOnlyLeaseOfCertificate(tx: Tx, certificateId: string, leaseId: string): Promise<void> {
   const rows = await tx.$queryRaw<unknown[]>(Prisma.sql`SELECT lease_id AS leaseId, certificate_id AS certificateId
     FROM live_practical_mutation_lease WHERE certificate_id = ${certificateId} FOR UPDATE`);

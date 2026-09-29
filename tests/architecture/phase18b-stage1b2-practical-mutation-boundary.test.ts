@@ -187,12 +187,18 @@ describe('[8][15][16] no strict authority, no continuity claim, no compensation 
     // [Wave 2B2b] the split-pair manual review (never a repair, never a release).
     expect(codeOf(ADAPTER).match(/this\.#practical\.(\w+)\(/g)).toEqual(['this.#practical.enterManualReview(', 'this.#practical.escalateMalformedAccount(']);
     const adapterCode = codeOf(ADAPTER);
-    const afterRollback = adapterCode.slice(adapterCode.indexOf('async #afterNoWireRollback('), adapterCode.indexOf('async #latchIfMalformed('));
+    const afterRollback = adapterCode.slice(adapterCode.indexOf('async #afterNoWireRollback('), adapterCode.indexOf('async #enterMismatchReview('));
     expect(afterRollback.length).toBeGreaterThan(0);
     expect(afterRollback).toContain("if (error instanceof PracticalMutationError && error.code === 'PRACTICAL_MUTATION_SPLIT_STATE') {");
-    expect(afterRollback).toContain("await this.#practical.enterManualReview({ accountId, reason: 'POST_MUTATION_MISMATCH', nowMs });");
+    expect(afterRollback).toContain('await this.#enterMismatchReview(accountId, nowMs);');
     expect(afterRollback).toContain('throw error;');
+    // [Wave 2B2c] The ONE manual-review entry is shared by the split pair and the recovery anomaly; always POST_MUTATION_MISMATCH.
     expect(codeOf(ADAPTER).match(/enterManualReview\(/g)).toHaveLength(1);
+    expect(functionSource(ADAPTER, 'async #enterMismatchReview(')).toContain("return this.#practical.enterManualReview({ accountId, reason: 'POST_MUTATION_MISMATCH', nowMs });");
+    expect(codeOf(ADAPTER).match(/this\.#enterMismatchReview\(/g)).toHaveLength(2);
+    const escalate = functionSource(ADAPTER, 'async #escalateAnomaly(');
+    expect(escalate).toContain('const entry = await this.#enterMismatchReview(accountId, nowMs);');
+    expect(escalate).toContain('return this.#latchIfMalformed(error, accountId, epoch, nowMs).then(');
   });
 
   it('the strict Phase 18 barrier still refuses with ACCOUNT_CONTINUITY_NOT_PROVEN and takes exactly its four real arguments', () => {
@@ -324,11 +330,13 @@ describe('[11] the caller-owned Stage 1B1 hook uses ONLY the supplied transactio
     expect(adapter.match(/new PrismaPracticalSafetyRepository\(/g)).toHaveLength(1);
     expect(adapter).toContain('this.#practical = new PrismaPracticalSafetyRepository(this.#prisma, newId);');
     expect(adapter.match(/this\.#prisma\.\$transaction\(/g)).toHaveLength(1);
-    // Acquire, arm, and [Wave 2B2b] the one shared no-wire body.
-    expect(adapter.match(/withLockedPracticalAccountWithinCallerTransaction\(this\.#practical, tx, /g)).toHaveLength(3);
-    // Exactly these operation bodies run inside #transaction: acquire, arm, and the no-wire body (completion + abandon).
+    // Acquire, arm, [Wave 2B2b] the one shared no-wire body, and [Wave 2B2c] the read-only resolution.
+    expect(adapter.match(/withLockedPracticalAccountWithinCallerTransaction\(this\.#practical, tx, /g)).toHaveLength(4);
+    // Exactly these operation bodies run inside #transaction: acquire, arm, the no-wire body (completion + abandon),
+    // and [Wave 2B2c] the resolution.
     expect(adapter.match(/this\.#transaction\(\(tx\) => this\.#(acquireWithin|armWithin|noWireWithin)\(tx, context\)\)/g)).toHaveLength(4);
-    expect(adapter.match(/this\.#transaction\(/g)).toHaveLength(4);
+    expect(adapter.match(/this\.#transaction\(\(tx\) => this\.#resolveWithin\(tx, record\)\)/g)).toHaveLength(1);
+    expect(adapter.match(/this\.#transaction\(/g)).toHaveLength(5);
   });
 });
 
@@ -372,9 +380,10 @@ describe('[12][13][14] the classified Phase 17 pre-write claim failures', () => 
 
   it('the adapter has ONE try/catch around a Phase 17 call: exactly the claim, classifier first, then the no-write proof, then the invalidation', () => {
     const adapter = codeOf(ADAPTER);
-    // Exactly seven: #transaction's attempt, acquire's / arm's / [2B2b] undispatched completion's / abandon's outcome
-    // handling, the claim, and the malformed escalation. No try surrounds a no-wire release primitive.
-    expect(adapter.match(/\btry \{/g)).toHaveLength(7);
+    // Exactly nine: #transaction's attempt, acquire's / arm's / [2B2b] undispatched completion's / abandon's /
+    // [2B2c] resolution's outcome handling, the claim, the malformed escalation, and [2B2c] the anomaly escalation
+    // (which never throws). No try surrounds a no-wire release primitive.
+    expect(adapter.match(/\btry \{/g)).toHaveLength(9);
     expect(adapter).not.toMatch(/try \{\s+(const \w+ = )?await release(Unarmed|ArmedUndispatched)CancelClaimWithinCallerFencedTransaction/);
     // The ONLY try around a Phase 17 primitive is the claim (the arm is never caught: any failure rolls back).
     expect(adapter).not.toMatch(/try \{\s+(const \w+ = )?await armCancelWireWithinCallerFencedTransaction/);
@@ -428,6 +437,9 @@ describe('the acquired / armed values are minted ONLY by the adapter, ONLY after
       'markPracticalAcquiredCancelArmOutcomeUnknown', 'beginPracticalAcquiredCancelAbandon', 'finishPracticalAcquiredCancelAbandon', 'restorePracticalAcquiredCancelAbandon',
       'markPracticalAcquiredCancelAbandonOutcomeUnknown', 'beginPracticalArmedCancelNoWireCompletion', 'finishPracticalArmedCancelNoWireCompletion',
       'restorePracticalArmedCancel', 'markPracticalArmedCancelCommitUnknown',
+      // [Wave 2B2c] the unknown-acquire receipt
+      'issuePracticalUnknownAcquire', 'beginPracticalUnknownAcquireResolution', 'finishPracticalUnknownAcquireResolution',
+      'restorePracticalUnknownAcquire', 'refusePracticalUnknownAcquire',
     ]) {
       expect(files.filter((file) => file !== `${MUTATION_ROOT}ticket.ts` && codeOf(file).includes(name)), name).toEqual([ADAPTER]);
     }
@@ -470,5 +482,114 @@ describe('the acquired / armed values are minted ONLY by the adapter, ONLY after
       expect(body.indexOf(begin), method).toBeLessThan(transaction);
       expect(body.indexOf(finish), method).toBeGreaterThan(transaction);
     }
+  });
+});
+
+describe('[Wave 2B2c] unknown-acquire resolution: read-only, exact, single-use, no closure result, non-leaking delivery', () => {
+  const adapter = codeOf(ADAPTER);
+  const between = (from: string, to: string): string => {
+    const start = adapter.indexOf(from);
+    expect(start, from).toBeGreaterThan(0);
+    const end = adapter.indexOf(to, start);
+    expect(end, to).toBeGreaterThan(start);
+    return adapter.slice(start, end);
+  };
+  const resolve = between('public async resolveUnknownAcquire(', 'async #resolveWithin(');
+  const resolveWithin = between('async #resolveWithin(', 'async #escalateAnomaly(');
+
+  it('the resolution transaction is read-only: no write, no Phase 17 write primitive, no reconciliation lock, no enablement', () => {
+    expect(resolveWithin).not.toMatch(/\.(create|createMany|update|updateMany|upsert|delete|deleteMany)\(|\$executeRaw/);
+    expect(resolveWithin).not.toMatch(/claimCancelWithinCallerFencedTransaction|armCancelWireWithinCallerFencedTransaction|release(Unarmed|ArmedUndispatched)CancelClaimWithinCallerFencedTransaction/);
+    expect(resolveWithin).not.toMatch(/completeOrderBoundCancelLeaseNoWire|armOrderBoundCancelLease|consumeIntoOrderBoundCancelLease|invalidateBeforeConsumption|prepareCancelConsumption/);
+    expect(resolveWithin).not.toMatch(/live_reconciliation_state|lockReconciliationState|classifyPracticalReconciliationMismatch|requireCancelEnablement|enterManualReview|escalateMalformedAccount/);
+    // Exactly the inspection and the Phase 17 lock, in that order (practical rows before live_order -> intent).
+    expect(resolveWithin.match(/scope\.\w+\(/g)).toEqual(['scope.inspectAttemptedOrderBoundCancelLease(']);
+    expect(resolveWithin.match(/lockPhase17Order\(/g)).toHaveLength(1);
+    expect(resolveWithin.indexOf('scope.inspectAttemptedOrderBoundCancelLease(')).toBeLessThan(resolveWithin.indexOf('lockPhase17Order('));
+    expect(resolve).not.toMatch(/requireCancelEnablement|enablement/);
+  });
+
+  it('RESTORED is reachable only after EVERY exact check; there is no already-closed result anywhere', () => {
+    const restored = resolveWithin.indexOf("return Object.freeze({ kind: 'RESTORED' as const });");
+    expect(restored).toBeGreaterThan(0);
+    expect(resolveWithin.match(/kind: 'RESTORED'/g)).toHaveLength(1);
+    for (const check of [
+      "if (lease.leaseId !== attempted) recoveryAnomaly('LEASE_IDENTITY', attempted);",
+      "if (lease.status !== 'LEASED' || lease.completedAtMs !== null || lease.outcome !== null) recoveryAnomaly('LEASE_NOT_LEASED', attempted);",
+      "if (lease.armedAtMs !== null) recoveryAnomaly('LEASE_ARMED', attempted);",
+      "if (!sameAttemptedLease(lease, record)) recoveryAnomaly('LEASE_IDENTITY', attempted);",
+      "if (!RESTORABLE_ACCOUNT_STATES.includes(scope.account.state) || !fenceNamesAttempt(fence, record)) recoveryAnomaly('FENCE_MISMATCH', attempted);",
+      '|| !sameCertificateSnapshot(certificate, record.certificate)',
+      "if (order === null) recoveryAnomaly('PHASE17_MISSING', attempted);",
+      '|| order.pair !== record.pair',
+      '|| order.exchangeOrderId !== record.exchangeOrderId',
+      '|| order.cancelExchangeOrderId !== record.exchangeOrderId',
+      "if (order.cancelGeneration !== record.cancelGeneration || order.cancelState !== 'CANCEL_RESERVED' || order.cancelWireArmed) {",
+    ]) {
+      const at = resolveWithin.indexOf(check);
+      expect(at, check).toBeGreaterThan(0);
+      expect(at, check).toBeLessThan(restored);
+    }
+    for (const file of files.filter((candidate) => candidate.startsWith('src/'))) {
+      expect(codeOf(file), file).not.toMatch(/ALREADY_CLOSED/);
+    }
+    expect(codeOf(`${MUTATION_ROOT}ports.ts`)).toContain("| { readonly kind: 'RESTORED'; readonly acquired: PracticalAcquiredCancel }");
+    expect(codeOf(`${MUTATION_ROOT}ports.ts`)).toContain("| { readonly kind: 'NOT_COMMITTED'; readonly certificateStatus: PracticalUnknownAcquireCertificateStatus };");
+  });
+
+  it('the handle is minted only after COMMIT, from the INTENDED record unchanged, after the receipt is spent', () => {
+    expect(adapter.match(/issuePracticalAcquiredCancel\(/g)).toHaveLength(2);
+    const transaction = resolve.indexOf('outcome = await this.#transaction((tx) => this.#resolveWithin(tx, record));');
+    const spend = resolve.indexOf('finishPracticalUnknownAcquireResolution(unknown);');
+    const mint = resolve.indexOf('issuePracticalAcquiredCancel(record)');
+    expect(transaction).toBeGreaterThan(0);
+    expect(spend).toBeGreaterThan(transaction);
+    expect(mint).toBeGreaterThan(spend);
+    expect(resolveWithin).not.toMatch(/issuePracticalAcquiredCancel|Practical\w*UnknownAcquire\w*\(/);
+    // The receipt is minted only in acquire's unknown-commit branch, only for a completed ACQUIRED outcome.
+    const acquire = between('public async acquireCancelLease(', 'async #acquireWithin(');
+    expect(adapter.match(/issuePracticalUnknownAcquire\(/g)).toHaveLength(1);
+    expect(acquire).toContain("if (completed !== undefined && completed.kind === 'ACQUIRED') issuePracticalUnknownAcquire(completed.record, unknownCommit);");
+    expect(acquire.indexOf('issuePracticalUnknownAcquire(')).toBeGreaterThan(acquire.indexOf('if (error instanceof TransactionOutcomeUnknown) {'));
+    expect(acquire.indexOf('throw unknownCommit;')).toBeGreaterThan(acquire.indexOf('issuePracticalUnknownAcquire('));
+  });
+
+  it('a proven anomaly makes the receipt permanently mint-disabled BEFORE the refusal; only inconclusive failures return it to PENDING', () => {
+    // restore: the epoch refusal, the unknown read-only COMMIT, and a database FAULT.
+    expect(resolve.match(/restorePracticalUnknownAcquire\(unknown\);/g)).toHaveLength(3);
+    // refuse: the epoch refusal of an escalating receipt, the retried escalation, and a proven anomaly.
+    expect(resolve.match(/refusePracticalUnknownAcquire\(unknown, /g)).toHaveLength(3);
+    expect(resolve.match(/throw recoveryRefused\(/g)).toHaveLength(2);
+    for (const sequence of [
+      "refusePracticalUnknownAcquire(unknown, 'ESCALATING', escalation.confirmed);\n      throw recoveryRefused('ANOMALY_PREVIOUSLY_PROVEN'",
+      "refusePracticalUnknownAcquire(unknown, 'RESOLVING', escalation.confirmed);\n      throw recoveryRefused(refusalReasonOf(error)",
+    ]) {
+      expect(resolve, sequence).toContain(sequence);
+    }
+    expect(functionSource(ADAPTER, 'function isInconclusiveResolution(')).toContain("return error instanceof PracticalMutationError && error.code === 'PRACTICAL_MUTATION_FAULT';");
+    const ticket = codeOf(`${MUTATION_ROOT}ticket.ts`);
+    expect(ticket).toContain("RESOLVING: Object.freeze<PracticalUnknownAcquireStatus[]>(['SPENT', 'PENDING', 'REFUSED', 'ANOMALY_UNESCALATED']),");
+    expect(ticket).toContain("ANOMALY_UNESCALATED: Object.freeze<PracticalUnknownAcquireStatus[]>(['ESCALATING']),");
+    expect(ticket).toContain("ESCALATING: Object.freeze<PracticalUnknownAcquireStatus[]>(['REFUSED', 'ANOMALY_UNESCALATED']),");
+    expect(ticket).toContain('SPENT: Object.freeze<PracticalUnknownAcquireStatus[]>([]),');
+    expect(ticket).toContain('REFUSED: Object.freeze<PracticalUnknownAcquireStatus[]>([]),');
+    expect(ticket).toContain("if (receipt.#anomalyProven && (to === 'SPENT' || to === 'PENDING' || to === 'RESOLVING')) {");
+  });
+
+  it('D1: the receipt travels OFF the error: never a property, never in details; only ticket.ts holds the WeakMap', () => {
+    const ports = codeOf(`${MUTATION_ROOT}ports.ts`);
+    const classStart = ports.indexOf('export class PracticalAcquireCommitUnknownError');
+    const errorClass = ports.slice(classStart, ports.indexOf('\n}\n', classStart));
+    expect(errorClass).toContain("super('PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN', 'The acquisition COMMIT could not be confirmed; nothing was minted', { accountId }, cause);");
+    expect(errorClass).not.toMatch(/receipt|Receipt|public readonly/);
+    expect(errorClass.match(/this\.\w+ = /g)).toEqual(['this.name = ']);
+    const ticket = codeOf(`${MUTATION_ROOT}ticket.ts`);
+    expect(ticket).toContain('const UNKNOWN_ACQUIRE_RECEIPTS = new WeakMap<object, PracticalUnknownAcquire>();');
+    expect(ticket).not.toMatch(/export const UNKNOWN_ACQUIRE_RECEIPTS|export \{ UNKNOWN_ACQUIRE_RECEIPTS/);
+    expect(files.filter((file) => codeOf(file).includes('UNKNOWN_ACQUIRE_RECEIPTS'))).toEqual([`${MUTATION_ROOT}ticket.ts`]);
+    expect(files.filter((file) => file !== `${MUTATION_ROOT}ticket.ts` && codeOf(file).includes('readPracticalUnknownAcquireReceipt'))).toEqual([]);
+    // The receipt exposes only a static status: no instance getter, no static read of its record.
+    const receiptClass = ticket.slice(ticket.indexOf('export class PracticalUnknownAcquire {'), ticket.indexOf('Object.freeze(PracticalUnknownAcquire.prototype);'));
+    expect(receiptClass).not.toMatch(/\bget \w+\(|public static read\(|toJSON|inspect/);
   });
 });

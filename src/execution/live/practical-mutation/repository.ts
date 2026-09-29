@@ -46,7 +46,7 @@ import { PracticalRecoveryCertificate, type PracticalRecoveryCertificateRecord }
 import type { PracticalFenceExpectation } from '../practical/fence';
 import { PracticalLiveSafetyEnablement, practicalActionPermission } from '../practical/policy';
 import { PRACTICAL_AUTHORIZATION_BASIS, PRACTICAL_DIGEST_PATTERN, isExactId, isNonNegativeSafeInteger } from '../practical/types';
-import { PracticalPersistenceError, type PracticalDurableCertificateRecord, type PracticalMalformedEscalation } from '../practical-persistence/ports';
+import { PracticalPersistenceError, type PracticalDurableCertificateRecord, type PracticalMalformedEscalation, type PracticalMutationLeaseRecord } from '../practical-persistence/ports';
 import {
   PrismaPracticalSafetyRepository,
   withLockedPracticalAccountWithinCallerTransaction,
@@ -58,7 +58,10 @@ import {
   PRACTICAL_CANCEL_ARM_INPUT_KEYS,
   PRACTICAL_NO_DISPATCH_REASONS,
   PRACTICAL_NOT_DISPATCHED_REPORT_KEYS,
+  PRACTICAL_RECOVERY_REFUSAL_REASONS,
   PRACTICAL_UNDISPATCHED_COMPLETION_INPUT_KEYS,
+  PRACTICAL_UNKNOWN_ACQUIRE_RESOLUTION_INPUT_KEYS,
+  PracticalAcquireCommitUnknownError,
   PracticalMutationError,
   type PracticalAcquireInvalidationCause,
   type PracticalAcquireInvalidationReason,
@@ -71,7 +74,12 @@ import {
   type PracticalCancelNoWireStore,
   type PracticalNoDispatchReason,
   type PracticalNoWireCompletion,
+  type PracticalRecoveryRefusalReason,
   type PracticalUndispatchedCompletionInput,
+  type PracticalUnknownAcquireCertificateStatus,
+  type PracticalUnknownAcquireRecoveryStore,
+  type PracticalUnknownAcquireResolution,
+  type PracticalUnknownAcquireResolutionInput,
 } from './ports';
 import {
   classifyPracticalReconciliationMismatch,
@@ -82,20 +90,26 @@ import {
 import {
   beginPracticalAcquiredCancelAbandon,
   beginPracticalArmedCancelNoWireCompletion,
+  beginPracticalUnknownAcquireResolution,
   finishPracticalAcquiredCancelAbandon,
   finishPracticalArmedCancelNoWireCompletion,
+  finishPracticalUnknownAcquireResolution,
   issuePracticalAcquiredCancel,
   issuePracticalArmedCancel,
+  issuePracticalUnknownAcquire,
   markPracticalAcquiredCancelAbandonOutcomeUnknown,
   markPracticalAcquiredCancelArmOutcomeUnknown,
   markPracticalArmedCancelCommitUnknown,
+  refusePracticalUnknownAcquire,
   releasePracticalAcquiredCancel,
   reservePracticalAcquiredCancel,
   restorePracticalAcquiredCancelAbandon,
   restorePracticalArmedCancel,
+  restorePracticalUnknownAcquire,
   spendPracticalAcquiredCancel,
   PracticalAcquiredCancel,
   PracticalArmedCancel,
+  PracticalUnknownAcquire,
   type PracticalAcquiredCancelRecord,
   type PracticalArmedCancelRecord,
 } from './ticket';
@@ -357,7 +371,15 @@ interface ArmContext {
 }
 
 /** How one store transaction ended, so the caller can tell a PROVEN rollback from an unknown commit. */
-class TransactionOutcomeUnknown extends Error {}
+class TransactionOutcomeUnknown extends Error {
+  /** [Wave 2B2c] The value `work` completed with: exactly what the uncertain COMMIT would have made durable. */
+  public readonly completed: unknown;
+
+  public constructor(completed: unknown, cause: unknown) {
+    super('commit outcome unknown', { cause });
+    this.completed = completed;
+  }
+}
 
 function armRefused(message: string, details: Readonly<Record<string, unknown>>): never {
   throw new PracticalMutationError('PRACTICAL_MUTATION_ARM_REFUSED', message, details);
@@ -429,7 +451,8 @@ function requireNotDispatchedReport(value: unknown): PracticalNoDispatchReason {
   return reason as PracticalNoDispatchReason;
 }
 
-function sameCertificateSnapshot(durable: PracticalDurableCertificateRecord, snapshot: PracticalAcquiredCancelRecord['certificate']): boolean {
+/** The certificate's IMMUTABLE issuance identity, exact on every field (whatever its status). */
+function sameCertificateIdentity(durable: PracticalDurableCertificateRecord, snapshot: PracticalAcquiredCancelRecord['certificate']): boolean {
   return durable.certificateId === snapshot.certificateId
     && durable.accountId === snapshot.accountId
     && durable.providerAccountFingerprint === snapshot.providerAccountFingerprint
@@ -438,13 +461,95 @@ function sameCertificateSnapshot(durable: PracticalDurableCertificateRecord, sna
     && durable.streamIncarnation === snapshot.streamIncarnation
     && durable.evidenceDigest === snapshot.evidenceDigest
     && durable.issuedAtMs === snapshot.issuedAtMs
-    && durable.expiresAtMs === snapshot.expiresAtMs
+    && durable.expiresAtMs === snapshot.expiresAtMs;
+}
+
+function sameCertificateSnapshot(durable: PracticalDurableCertificateRecord, snapshot: PracticalAcquiredCancelRecord['certificate']): boolean {
+  return sameCertificateIdentity(durable, snapshot)
     && durable.status === 'CONSUMED'
     && durable.terminalAtMs === snapshot.consumedAtMs
     && durable.terminalReason === null;
 }
 
-export class PrismaPracticalCancelMutationStore implements PracticalCancelMutationStore, PracticalCancelNoWireStore {
+// ---------------------------------------------------------------------------
+// [Wave 2B2c] Unknown-acquire resolution
+// ---------------------------------------------------------------------------
+
+/** What the read-only resolution transaction concluded. The handle itself is minted only after COMMIT. */
+type ResolveOutcome =
+  | { readonly kind: 'RESTORED' }
+  | { readonly kind: 'NOT_COMMITTED'; readonly certificateStatus: PracticalUnknownAcquireCertificateStatus };
+
+/** The account states whose leased fence may still hold a restorable attempted lease (the no-wire set). */
+const RESTORABLE_ACCOUNT_STATES: readonly string[] = Object.freeze(['MUTATING', 'QUARANTINED', 'MANUAL_REVIEW_REQUIRED']);
+
+/** A proven anomaly, thrown inside the read-only transaction (it only rolls back). Mapped after the rollback. */
+function recoveryAnomaly(reason: PracticalRecoveryRefusalReason, leaseId: string): never {
+  throw new PracticalMutationError('PRACTICAL_MUTATION_RECOVERY_REFUSED', 'The attempted acquisition is not exactly restorable', { reason, leaseId });
+}
+
+/** The final refusal of a proven anomaly, after the rollback and the escalation attempt. No handle, no closure asserted. */
+function recoveryRefused(
+  reason: PracticalRecoveryRefusalReason,
+  record: PracticalAcquiredCancelRecord,
+  escalation: { readonly confirmed: boolean; readonly reviewEpisodeId: string | null },
+  cause: unknown,
+): PracticalMutationError {
+  return new PracticalMutationError(
+    'PRACTICAL_MUTATION_RECOVERY_REFUSED',
+    'The unknown acquisition is an anomaly: no handle was minted, no closure is asserted, and the receipt can never mint',
+    { accountId: record.accountId, leaseId: record.leaseId, reason, escalated: escalation.confirmed, reviewEpisodeId: escalation.reviewEpisodeId },
+    cause,
+  );
+}
+
+/** The attempted lease, exact on every immutable field of the intended record (the arm and completion state are checked separately). */
+function sameAttemptedLease(lease: PracticalMutationLeaseRecord, record: PracticalAcquiredCancelRecord): boolean {
+  const binding = lease.orderBinding;
+  return lease.leaseId === record.leaseId
+    && lease.accountId === record.accountId
+    && lease.certificateId === record.certificate.certificateId
+    && lease.action === 'CANCEL'
+    && lease.runtimeEpoch === record.runtimeEpoch
+    && lease.reconciliationGeneration === record.reconciliationGeneration
+    && lease.createdAtMs === record.leaseCreatedAtMs
+    && binding !== null
+    && binding.intentId === record.intentId
+    && binding.clientOrderId === record.clientOrderId
+    && binding.cancelGeneration === record.cancelGeneration;
+}
+
+/** The fence names exactly the attempted lease and certificate. */
+function fenceNamesAttempt(fence: PracticalLockedAccountScope['account']['fence'], record: PracticalAcquiredCancelRecord): boolean {
+  return fence.mode.kind === 'MUTATION_LEASED'
+    && fence.mode.leaseId === record.leaseId
+    && fence.mode.certificateId === record.certificate.certificateId
+    && fence.mode.action === 'CANCEL'
+    && fence.accountId === record.accountId
+    && fence.runtimeEpoch === record.runtimeEpoch
+    && fence.reconciliationGeneration === record.reconciliationGeneration;
+}
+
+/**
+ * INCONCLUSIVE failures of the read-only resolution: a database fault or an
+ * exhausted deadlock retry (which include a lock-wait timeout while the
+ * original COMMIT is still in flight). Nothing was proven; the receipt may be
+ * resolved again. EVERYTHING else a resolution throws is a proven anomaly.
+ */
+function isInconclusiveResolution(error: unknown): boolean {
+  return error instanceof PracticalMutationError && error.code === 'PRACTICAL_MUTATION_FAULT';
+}
+
+/** The refusal reason of a proven anomaly: the classified reason, or an unreadable account / row. */
+function refusalReasonOf(error: unknown): PracticalRecoveryRefusalReason {
+  if (error instanceof PracticalMutationError && error.code === 'PRACTICAL_MUTATION_RECOVERY_REFUSED') {
+    const reason = error.details?.['reason'];
+    if (typeof reason === 'string' && (PRACTICAL_RECOVERY_REFUSAL_REASONS as readonly string[]).includes(reason)) return reason as PracticalRecoveryRefusalReason;
+  }
+  return 'ACCOUNT_UNREADABLE';
+}
+
+export class PrismaPracticalCancelMutationStore implements PracticalCancelMutationStore, PracticalCancelNoWireStore, PracticalUnknownAcquireRecoveryStore {
   readonly #prisma: PrismaClient;
   readonly #practical: PrismaPracticalSafetyRepository;
 
@@ -466,14 +571,16 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
   async #transaction<T>(work: (tx: Tx) => Promise<T>): Promise<T> {
     for (let attempt = 1; ; attempt += 1) {
       let workCompleted = false;
+      let completedValue: T | undefined;
       try {
         return await this.#prisma.$transaction(async (tx) => {
           const value = await work(tx);
+          completedValue = value;
           workCompleted = true;
           return value;
         }, { timeout: TRANSACTION_TIMEOUT_MS });
       } catch (error) {
-        if (workCompleted) throw new TransactionOutcomeUnknown('commit outcome unknown', { cause: error });
+        if (workCompleted) throw new TransactionOutcomeUnknown(completedValue, error);
         if (isRetryableDeadlock(error)) {
           if (attempt >= PRACTICAL_MUTATION_TRANSACTION_MAX_ATTEMPTS) {
             throw new PracticalMutationError('PRACTICAL_MUTATION_FAULT', 'The practical mutation transaction kept failing on a database conflict; nothing was committed', { attempts: attempt }, error);
@@ -513,7 +620,12 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
       outcome = await this.#transaction((tx) => this.#acquireWithin(tx, context));
     } catch (error) {
       if (error instanceof TransactionOutcomeUnknown) {
-        throw new PracticalMutationError('PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN', 'The acquisition COMMIT could not be confirmed; nothing was minted', { accountId }, error.cause);
+        // The unchanged throw contract (same code, details exactly { accountId }, no handle). [Wave 2B2c] For a
+        // completed ACQUIRED outcome, a single-use receipt of the exact intended record is bound OFF the error.
+        const unknownCommit = new PracticalAcquireCommitUnknownError(accountId, error.cause);
+        const completed = error.completed as AcquireOutcome | undefined;
+        if (completed !== undefined && completed.kind === 'ACQUIRED') issuePracticalUnknownAcquire(completed.record, unknownCommit);
+        throw unknownCommit;
       }
       return this.#latchIfMalformed(error, accountId, epoch, nowMs);
     }
@@ -1090,10 +1202,188 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
    */
   async #afterNoWireRollback(error: unknown, accountId: string, epoch: string, nowMs: number): Promise<PracticalNoWireCompletion> {
     if (error instanceof PracticalMutationError && error.code === 'PRACTICAL_MUTATION_SPLIT_STATE') {
-      await this.#practical.enterManualReview({ accountId, reason: 'POST_MUTATION_MISMATCH', nowMs });
+      await this.#enterMismatchReview(accountId, nowMs);
       throw error;
     }
     return this.#latchIfMalformed(error, accountId, epoch, nowMs);
+  }
+
+  /**
+   * The ONE Stage 1B1 manual-review entry of this adapter, always
+   * POST_MUTATION_MISMATCH, always in its own transaction AFTER a rollback:
+   * the [Wave 2B2b] split pair and the [Wave 2B2c] recovery anomaly. It never
+   * repairs, releases, or completes anything. Idempotent (PRESERVED when the
+   * account is already in review).
+   */
+  async #enterMismatchReview(accountId: string, nowMs: number): Promise<{ readonly reviewEpisodeId: string }> {
+    return this.#practical.enterManualReview({ accountId, reason: 'POST_MUTATION_MISMATCH', nowMs });
+  }
+
+  // ----- [Wave 2B2c] unknown-acquire resolution --------------------------------
+
+  /**
+   * Resolves an acquisition whose COMMIT was unknown, from its single-use
+   * receipt, in ONE read-only transaction. RESTORED only when the attempted
+   * lease is exactly present, LEASED, unarmed, and restorable (the intended
+   * handle, unchanged); NOT_COMMITTED only when the attempt provably wrote
+   * nothing. ANY other durable state (including an account the strict parser
+   * rejects) is a proven anomaly: the receipt becomes permanently mint-disabled,
+   * the account is escalated to manual review (or the malformed-state latch),
+   * and RECOVERY_REFUSED is thrown. No Phase 17 write, no reconciliation lock,
+   * no enablement: the restored handle still needs arm's full checks.
+   */
+  public async resolveUnknownAcquire(input: PracticalUnknownAcquireResolutionInput): Promise<PracticalUnknownAcquireResolution> {
+    // A. Before any durable access: closed-world input, a genuine resolvable receipt, this process's epoch.
+    const raw = requireClosedWorld(input, PRACTICAL_UNKNOWN_ACQUIRE_RESOLUTION_INPUT_KEYS);
+    const unknown = raw['unknown'];
+    const status = PracticalUnknownAcquire.status(unknown);
+    if (status === null) authorityInvalid('A genuine unknown-acquire receipt is required', 'unknown');
+    if (status !== 'PENDING' && status !== 'ANOMALY_UNESCALATED') authorityInvalid('The unknown-acquire receipt is being resolved, spent, or refused', 'unknown');
+    const epoch = requireRuntimeEpoch(raw['runtimeIdentity']);
+    const nowMs = requireNowMs(raw['trustedNowMs']);
+
+    // Synchronous: a concurrent second call now sees RESOLVING / ESCALATING and is refused above.
+    const { record, from } = beginPracticalUnknownAcquireResolution(unknown);
+    if (record.runtimeEpoch !== epoch) {
+      if (from === 'PENDING') restorePracticalUnknownAcquire(unknown);
+      else refusePracticalUnknownAcquire(unknown, 'ESCALATING', false);
+      authorityInvalid('The unknown-acquire receipt belongs to a different runtime epoch than this process', 'runtimeIdentity');
+    }
+    if (from === 'ANOMALY_UNESCALATED') {
+      // A PROVEN anomaly: nothing is read and nothing can be minted; only the escalation is retried.
+      const escalation = await this.#escalateAnomaly(record.accountId, epoch, nowMs);
+      refusePracticalUnknownAcquire(unknown, 'ESCALATING', escalation.confirmed);
+      throw recoveryRefused('ANOMALY_PREVIOUSLY_PROVEN', record, escalation, undefined);
+    }
+
+    let outcome: ResolveOutcome;
+    try {
+      outcome = await this.#transaction((tx) => this.#resolveWithin(tx, record));
+    } catch (error) {
+      if (error instanceof TransactionOutcomeUnknown) {
+        // D4: a read-only transaction whose COMMIT is unknown changed nothing and proved nothing: retry later.
+        restorePracticalUnknownAcquire(unknown);
+        throw new PracticalMutationError('PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN', 'The read-only resolution COMMIT could not be confirmed; the receipt is PENDING again', { accountId: record.accountId }, error.cause);
+      }
+      if (isInconclusiveResolution(error)) {
+        restorePracticalUnknownAcquire(unknown);
+        throw error;
+      }
+      // Everything else is a PROVEN anomaly (or an account the strict parser rejects): permanently mint-disabled.
+      const escalation = await this.#escalateAnomaly(record.accountId, epoch, nowMs);
+      refusePracticalUnknownAcquire(unknown, 'RESOLVING', escalation.confirmed);
+      throw recoveryRefused(refusalReasonOf(error), record, escalation, error);
+    }
+    // C. ONLY AFTER COMMIT: spend the receipt; RESTORED mints the INTENDED handle, unchanged (D2 / D3).
+    finishPracticalUnknownAcquireResolution(unknown);
+    if (outcome.kind === 'RESTORED') return Object.freeze({ kind: 'RESTORED' as const, acquired: issuePracticalAcquiredCancel(record) });
+    return Object.freeze({ kind: 'NOT_COMMITTED' as const, certificateStatus: outcome.certificateStatus });
+  }
+
+  /**
+   * B. The ONE read-only resolution transaction. Every statement uses `tx`;
+   * nothing is written. It never reads or locks live_reconciliation_state.
+   *
+   * EXACT LOCK SEQUENCE (all FOR UPDATE; C = the attempt's certificate, L = the
+   * attempted lease). The hook's Stage 1B1 account read comes first, in its
+   * fixed order: latch -> latch episode -> state -> fence -> recovery episode
+   * -> review episode -> CURRENT certificate (CERTIFIED_IDLE only) -> the
+   * fence's LEASED certificate -> the fence's LEASE (certificates before
+   * leases). The inspection then locks C -> the lease(s) resting on C -> L.
+   *   fence names L (committed): account rows -> C (leased) -> L; then C, L
+   *     again (already held) -> live_order -> live_execution_intent.
+   *   fence IDLE (rolled back; CERTIFIED_IDLE): account rows -> C (current)
+   *     -> [no lease]; then C (held) -> leases on C (none) -> L (absent).
+   *   fence names another lease L2 on certificate C2: account rows -> C2 ->
+   *     L2; then C -> leases on C -> L (absent). Here C is locked after L2:
+   *     safe, because every transaction that locks ANY practical certificate
+   *     or lease of this account first holds this account's latch / state /
+   *     fence rows (all Stage 1B1 / 1B2 operations start with the same account
+   *     read), so they serialize on the account rows and no cycle can form;
+   *     the Phase 17/18 interlock and listing read practical rows WITHOUT locks.
+   * Phase 17 rows are locked only on the PRESENT path, after every practical row.
+   */
+  async #resolveWithin(tx: Tx, record: PracticalAcquiredCancelRecord): Promise<ResolveOutcome> {
+    return withLockedPracticalAccountWithinCallerTransaction(this.#practical, tx, record.accountId, async (scope: PracticalLockedAccountScope) => {
+      const attempted = record.leaseId;
+      const { certificate, certificateLeaseIds, lease } = await scope.inspectAttemptedOrderBoundCancelLease({
+        leaseId: attempted, certificateId: record.certificate.certificateId,
+      });
+      const fence = scope.account.fence;
+
+      // C2. ABSENT: the attempt wrote nothing, PROVIDED nothing still refers to it.
+      if (lease === null) {
+        const fenceRefers = fence.mode.kind === 'MUTATION_LEASED' && fence.mode.leaseId === attempted;
+        if (fenceRefers || certificateLeaseIds.includes(attempted)) recoveryAnomaly('ABSENT_BUT_REFERENCED', attempted);
+        if (certificate === null || !sameCertificateIdentity(certificate, record.certificate)) recoveryAnomaly('CERTIFICATE_MISMATCH', attempted);
+        if (certificate.status === 'CONSUMED') {
+          // Consumed by exactly one OTHER lease (a different acquisition won); a consumed certificate with no lease is a deleted lease.
+          if (certificateLeaseIds.length !== 1) recoveryAnomaly('ABSENT_BUT_REFERENCED', attempted);
+          return Object.freeze({ kind: 'NOT_COMMITTED' as const, certificateStatus: 'CONSUMED_BY_ANOTHER_LEASE' as const });
+        }
+        // ISSUED / EXPIRED / REVOKED never had a lease resting on it.
+        if (certificateLeaseIds.length !== 0) recoveryAnomaly('CERTIFICATE_MISMATCH', attempted);
+        return Object.freeze({ kind: 'NOT_COMMITTED' as const, certificateStatus: certificate.status });
+      }
+
+      // C1 / C3. PRESENT. The exact attempted id is the proof of authorship; then status, arm, identity, fence,
+      // certificate, Phase 17 - every check before RESTORED. No reviewed writer can complete or arm this lease
+      // while its receipt is unresolved, so anything but an exactly restorable lease is an anomaly.
+      if (lease.leaseId !== attempted) recoveryAnomaly('LEASE_IDENTITY', attempted);
+      if (lease.status !== 'LEASED' || lease.completedAtMs !== null || lease.outcome !== null) recoveryAnomaly('LEASE_NOT_LEASED', attempted);
+      if (lease.armedAtMs !== null) recoveryAnomaly('LEASE_ARMED', attempted);
+      if (!sameAttemptedLease(lease, record)) recoveryAnomaly('LEASE_IDENTITY', attempted);
+      if (!RESTORABLE_ACCOUNT_STATES.includes(scope.account.state) || !fenceNamesAttempt(fence, record)) recoveryAnomaly('FENCE_MISMATCH', attempted);
+      if (certificate === null
+        || !sameCertificateSnapshot(certificate, record.certificate)
+        || certificateLeaseIds.length !== 1
+        || certificateLeaseIds[0] !== attempted) {
+        recoveryAnomaly('CERTIFICATE_MISMATCH', attempted);
+      }
+
+      // Phase 17 rows in the established order (after every practical row); exact-case identity, then the claim.
+      const order = await lockPhase17Order(tx, record.intentId);
+      if (order === null) recoveryAnomaly('PHASE17_MISSING', attempted);
+      if (order.intentId !== record.intentId
+        || order.accountId !== record.accountId
+        || order.clientOrderId !== record.clientOrderId
+        || order.pair !== record.pair
+        || order.exchangeOrderId !== record.exchangeOrderId
+        || order.cancelExchangeOrderId !== record.exchangeOrderId
+        || order.cancelFaultCode !== null) {
+        recoveryAnomaly('PHASE17_IDENTITY', attempted);
+      }
+      if (order.cancelGeneration !== record.cancelGeneration || order.cancelState !== 'CANCEL_RESERVED' || order.cancelWireArmed) {
+        recoveryAnomaly('PHASE17_CLAIM', attempted);
+      }
+      // D3: order revision drift is permitted; the restored handle keeps the ORIGINAL revision, so arm refuses it.
+      return Object.freeze({ kind: 'RESTORED' as const });
+    });
+  }
+
+  /**
+   * Escalates a PROVEN recovery anomaly, after the rollback. Never throws.
+   * Confirmed means the account is durably in manual review: entered or
+   * PRESERVED, already latched, or latched now by the existing malformed-state
+   * escalation (the strict parser rejected the rows).
+   */
+  async #escalateAnomaly(accountId: string, epoch: string, nowMs: number): Promise<{ readonly confirmed: boolean; readonly reviewEpisodeId: string | null }> {
+    try {
+      const entry = await this.#enterMismatchReview(accountId, nowMs);
+      return Object.freeze({ confirmed: true, reviewEpisodeId: entry.reviewEpisodeId });
+    } catch (error) {
+      if (error instanceof PracticalPersistenceError && error.code === 'PRACTICAL_PERSISTENCE_LATCHED') {
+        const reviewEpisodeId = error.details?.['reviewEpisodeId'];
+        return Object.freeze({ confirmed: true, reviewEpisodeId: typeof reviewEpisodeId === 'string' ? reviewEpisodeId : null });
+      }
+      if (error instanceof PracticalPersistenceError && error.code === 'PRACTICAL_PERSISTENCE_MALFORMED') {
+        return this.#latchIfMalformed(error, accountId, epoch, nowMs).then(
+          (latched) => Object.freeze({ confirmed: true, reviewEpisodeId: latched.reviewEpisodeId }),
+          () => Object.freeze({ confirmed: false, reviewEpisodeId: null }),
+        );
+      }
+      return Object.freeze({ confirmed: false, reviewEpisodeId: null });
+    }
   }
 
   // ----- malformed-state latch (AFTER a rollback; the existing reviewed escalation) ----

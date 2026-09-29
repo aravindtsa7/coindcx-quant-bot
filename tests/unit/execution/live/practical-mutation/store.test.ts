@@ -19,12 +19,14 @@ import * as practicalRepository from '../../../../../src/execution/live/practica
 import * as liveRepository from '../../../../../src/execution/live/repository';
 import { issuePracticalRecoveryCertificate, revokePracticalRecoveryCertificate, PracticalRecoveryCertificate } from '../../../../../src/execution/live/practical/certificate';
 import { issuePracticalLiveSafetyEnablement, type PracticalLiveSafetyEnablement } from '../../../../../src/execution/live/practical/policy';
-import { PracticalMutationError } from '../../../../../src/execution/live/practical-mutation/ports';
+import { PracticalAcquireCommitUnknownError, PracticalMutationError } from '../../../../../src/execution/live/practical-mutation/ports';
 import { PRACTICAL_MUTATION_TRANSACTION_MAX_ATTEMPTS, PrismaPracticalCancelMutationStore } from '../../../../../src/execution/live/practical-mutation/repository';
 import {
   PracticalAcquiredCancel,
   PracticalArmedCancel,
+  PracticalUnknownAcquire,
   issuePracticalAcquiredCancel,
+  readPracticalUnknownAcquireReceipt,
   type PracticalAcquiredCancelRecord,
 } from '../../../../../src/execution/live/practical-mutation/ticket';
 import { providerAccountFingerprint } from '../../../../../src/execution/live/reconciliation/account-identity';
@@ -435,8 +437,27 @@ describe('acquire: retry policy (Stage 1B1 scope) and no compensation after a da
 
   it('a COMMIT that fails after the work completed is COMMIT_OUTCOME_UNKNOWN: nothing is minted, nothing retried or compensated', async () => {
     world.failAtCommit = knownError('P1017');
-    await expect(store().acquireCancelLease(acquireInput())).rejects.toMatchObject({ code: 'PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN' });
+    const error = await store().acquireCancelLease(acquireInput()).then(() => null, (thrown: unknown) => thrown);
+    expect(error).toMatchObject({ code: 'PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN' });
     expect(world.transactions).toBe(1);
+    // [Wave 2B2c] The unchanged contract: the same code, details exactly { accountId }, no handle anywhere on the error.
+    expect(error).toBeInstanceOf(PracticalAcquireCommitUnknownError);
+    expect((error as PracticalAcquireCommitUnknownError).details).toEqual({ accountId: ACCOUNT });
+    expect(Object.keys(error as object).sort()).toEqual(['code', 'details', 'name']);
+    // ...and a genuine PENDING receipt, held OFF the error, that is not a handle.
+    const receipt = readPracticalUnknownAcquireReceipt(error);
+    expect(PracticalUnknownAcquire.status(receipt)).toBe('PENDING');
+    expect(PracticalAcquiredCancel.read(receipt)).toBeNull();
+    expect(readPracticalUnknownAcquireReceipt({ ...(error as object) })).toBeNull();
+  });
+
+  it('[Wave 2B2c] an unknown COMMIT of a non-ACQUIRED outcome (a durable invalidation) gets NO receipt', async () => {
+    world.reconciliation = null;
+    world.failAtCommit = knownError('P1017');
+    const error = await store().acquireCancelLease(acquireInput()).then(() => null, (thrown: unknown) => thrown);
+    expect(error).toBeInstanceOf(PracticalAcquireCommitUnknownError);
+    expect(scope.invalidateBeforeConsumption).toHaveBeenCalledTimes(1);
+    expect(readPracticalUnknownAcquireReceipt(error)).toBeNull();
   });
 });
 
