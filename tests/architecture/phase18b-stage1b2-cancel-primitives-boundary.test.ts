@@ -104,8 +104,16 @@ describe('the primitives are NOT a public authority surface', () => {
     expect(naming).toEqual([MUTATION_ADAPTER]);
     const adapter = codeOf(MUTATION_ADAPTER);
     expect(adapter.includes('completeCancelAttemptWithinCallerFencedTransaction'), 'the adapter never names completion').toBe(false);
-    // One import, one call each.
-    expect(adapter).toContain("import {\n  armCancelWireWithinCallerFencedTransaction,\n  claimCancelWithinCallerFencedTransaction,\n  type ClaimCancelOutcome,\n} from '../repository';");
+    // One import (claim, arm, and [Wave 2B2b] the two named no-wire releases; never completion), one call each.
+    expect(adapter).toContain([
+      'import {',
+      '  armCancelWireWithinCallerFencedTransaction,',
+      '  claimCancelWithinCallerFencedTransaction,',
+      '  releaseArmedUndispatchedCancelClaimWithinCallerFencedTransaction,',
+      '  releaseUnarmedCancelClaimWithinCallerFencedTransaction,',
+      '  type ClaimCancelOutcome,',
+      "} from '../repository';",
+    ].join('\n'));
     expect(adapter.match(/claimCancelWithinCallerFencedTransaction\(/g)).toHaveLength(1);
     expect(adapter.match(/armCancelWireWithinCallerFencedTransaction\(/g)).toHaveLength(1);
     // The claim is fenced with the exact trusted practical account.

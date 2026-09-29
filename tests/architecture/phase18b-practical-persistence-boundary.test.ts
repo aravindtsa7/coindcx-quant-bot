@@ -129,13 +129,22 @@ describe('no provider, network, gateway, dispatch, or arm reachability (no new r
       }
     }
     expect(methodSource('consumeCertificateAndLease')).toContain('return this.#consumePrepared(tx, current, prepared, null);');
-    // The binding columns are written in exactly two statements: the scope-only bound insert inside #apply (guarded:
-    // non-null binding, CANCEL only), and the scope's arm compare-and-set WHERE.
+    // The binding columns appear in exactly three statements: the scope-only bound insert inside #apply (guarded:
+    // non-null binding, CANCEL only), the scope's arm compare-and-set WHERE, and [Wave 2B2b] the scope-only no-wire
+    // completion compare-and-set WHERE inside #apply (a WHERE only: it never writes a binding column).
     const bindingColumns = /intentId: binding\.intentId, clientOrderId: binding\.clientOrderId, cancelGeneration: binding\.cancelGeneration/g;
-    expect(adapter.match(bindingColumns)).toHaveLength(2);
-    expect(privateMethodSource('#apply').match(bindingColumns)).toHaveLength(1);
+    expect(adapter.match(bindingColumns)).toHaveLength(3);
+    expect(privateMethodSource('#apply').match(bindingColumns)).toHaveLength(2);
     expect(privateMethodSource('#apply')).toContain("if (binding !== null && extras.insertLease.action !== 'CANCEL') conflict(");
     expect(privateMethodSource('#openScope').match(bindingColumns)).toHaveLength(1);
+    // [Wave 2B2b] The ONLY bound-lease completion: PRE_DISPATCH_FAILURE, under the full binding + exact arm state.
+    const apply = privateMethodSource('#apply');
+    expect(apply).toContain("if (binding === null || lease.action !== 'CANCEL') conflict('Only an order-bound CANCEL lease can be completed as a no-wire cancel'");
+    expect(apply).toContain("status: 'LEASED', armedAtMs: lease.armedAtMs === null ? null : BigInt(lease.armedAtMs), completedAtMs: null, outcome: null,");
+    expect(apply).toContain("data: { status: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE', completedAtMs: now },");
+    expect(apply.match(/outcome: '(ACCEPTED|REJECTED|AMBIGUOUS|DUPLICATE_CLIENT_ORDER_ID)'/g)).toBeNull();
+    // The Stage 1B1 completion still can never match an order-bound lease.
+    expect(apply).toContain('intentId: null,');
     // armed_at_ms is written in exactly ONE place: the scope's arm CAS, conditioned on armedAtMs IS NULL.
     expect(adapter.match(/armedAtMs: BigInt\(/g)).toHaveLength(1);
     expect(privateMethodSource('#openScope')).toContain('data: { armedAtMs: BigInt(nowMs) },');

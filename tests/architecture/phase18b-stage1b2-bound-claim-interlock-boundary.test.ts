@@ -14,9 +14,11 @@ import { buildImportGraph, computeReachable } from './support/import-graph';
 //     verified read and BEFORE its write; the guard reads the lease WITHOUT any lock (global lock order kept).
 //   - A plain observation fold writes no cancel column, so it can never clear a claim.
 //   - Phase18 planning consults the binding before RECLAIM_CANCEL / CLEAR_CANCEL_CLAIM / claim-clearing folds.
-//   - The two named no-wire release primitives exist with ZERO production importers until Wave 2B2b; neither
-//     is on the port or in any barrel; the Stage 1B2 adapter still never imports Phase17 completion.
-//   - Nothing here implements completion, abandon, recovery, dispatch, permit, ACCEPTED, or REJECTED.
+//   - The two named no-wire release primitives have exactly ONE production importer since Wave 2B2b (the
+//     Stage 1B2 adapter, one derived call each); neither is on the port or in any barrel; the adapter still
+//     never imports Phase17 completion.
+//   - [Wave 2B2b] The listing reads orders, intents, and bindings in ONE explicit REPEATABLE READ transaction.
+//   - Only the no-wire completion and in-process abandon exist: no recovery, dispatch, permit, ACCEPTED, or REJECTED.
 
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const SRC_ROOT = path.join(REPO_ROOT, 'src');
@@ -141,12 +143,31 @@ describe('the transaction-time guard', () => {
 
 describe('the advisory order-view binding', () => {
   it('listAccountOrderViews reads bindings by the exact (intent_id, cancel_generation) pairs and fails closed on a non-exact row', () => {
-    const read = codeOf(REPOSITORY).slice(codeOf(REPOSITORY).indexOf('async #currentPracticalCancelBindings('));
+    const read = functionSource(REPOSITORY, 'async function currentPracticalCancelBindings(');
     expect(read).toContain('WHERE (intent_id, cancel_generation) IN (${pairs})');
     expect(read).toContain('orders.filter((order) => order.cancelGeneration >= 1)');
     expect(read).toContain("'A practical cancel binding row does not name a requested intent exactly'");
-    expect(read.slice(0, read.indexOf('\n  }\n'))).not.toMatch(/FOR UPDATE|FOR SHARE|LOCK IN SHARE MODE/i);
-    expect(methodSource('listAccountOrderViews')).toContain('practicalCancelBinding: bindings.get(order.intentId) ?? null,');
+    expect(read).not.toMatch(/FOR UPDATE|FOR SHARE|LOCK IN SHARE MODE/i);
+    // [Wave 2B2b] The binding read goes through the listing's OWN transaction client, never the root client.
+    expect(read).toContain('const rows = await tx.$queryRaw<unknown[]>(Prisma.sql`SELECT');
+    expect(read).not.toContain('#prisma');
+    const within = codeOf(REPOSITORY).slice(codeOf(REPOSITORY).indexOf('async #listAccountOrderViewsWithin('));
+    expect(within.slice(0, within.indexOf('\n  }\n'))).toContain('practicalCancelBinding: bindings.get(order.intentId) ?? null,');
+  });
+
+  it('[Wave 2B2b] one explicit REPEATABLE READ transaction, plain non-locking reads only, both through the same tx (no false split pair)', () => {
+    const listing = methodSource('listAccountOrderViews');
+    expect(listing).toContain('return this.#prisma.$transaction(');
+    expect(listing).toContain('(tx) => this.#listAccountOrderViewsWithin(tx as unknown as ConsistentListingClient, accountId),');
+    expect(listing).toContain('{ isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead, timeout: 30_000 },');
+    const code = codeOf(REPOSITORY);
+    const within = code.slice(code.indexOf('async #listAccountOrderViewsWithin('));
+    const body = within.slice(0, within.indexOf('\n  }\n'));
+    expect(body).toContain('const rows = await tx.liveOrder.findMany({');
+    expect(body).toContain('const bindings = await currentPracticalCancelBindings(tx, verifiedRows.map((entry) => entry.order));');
+    expect(body).not.toMatch(/#prisma|FOR UPDATE|FOR SHARE|LOCK IN SHARE MODE|\$executeRaw/i);
+    // The binding read is reachable ONLY from the consistent listing (never a separate autocommit statement).
+    expect(code.split('currentPracticalCancelBindings(')).toHaveLength(3); // one definition + one call
   });
 });
 
@@ -182,11 +203,9 @@ describe('Phase18 planning consults the binding before any claim effect', () => 
 });
 
 describe('the two named no-wire release primitives', () => {
-  it.each(NO_WIRE_PRIMITIVES)('%s: exported by live/repository.ts only, with zero src importers, not on the port or any barrel', (name) => {
+  it.each(NO_WIRE_PRIMITIVES)('%s: exported by live/repository.ts only; [Wave 2B2b] exactly ONE src importer (the Stage 1B2 adapter); not on the port or any barrel', (name) => {
     expect(codeOf(REPOSITORY)).toMatch(new RegExp(`export async function ${name}\\(\\n  tx: Prisma\\.TransactionClient,\\n  intentId: string,\\n  generation: number,\\n  fencedAccountId: string,\\n\\): Promise<LiveOrderStateRecord> \\{`));
-    for (const file of files.filter((candidate) => candidate !== REPOSITORY)) {
-      expect(codeOf(file), `${file} names ${name}`).not.toContain(name);
-    }
+    expect(files.filter((candidate) => candidate !== REPOSITORY && codeOf(candidate).includes(name))).toEqual([MUTATION_ADAPTER]);
     expect(name in liveBarrel).toBe(false);
     expect(name in reconciliationBarrel).toBe(false);
     const port = codeOf(REPOSITORY).slice(codeOf(REPOSITORY).indexOf('export interface LiveExecutionRepository {'));
@@ -217,18 +236,70 @@ describe('the two named no-wire release primitives', () => {
   });
 });
 
-describe('scope: Wave 2B2a implements no completion, abandon, recovery, dispatch, permit, ACCEPTED, or REJECTED', () => {
-  it('the Stage 1B2 adapter is unchanged in reach: no completion primitive and no no-wire primitive', () => {
+describe('scope: [Wave 2B2b widened] only the no-wire completion and in-process abandon exist; no recovery, dispatch, permit, ACCEPTED, or REJECTED', () => {
+  it('the Stage 1B2 adapter never names Phase 17 completion; each no-wire primitive is called exactly ONCE, fenced with the exact lease account', () => {
     const adapter = codeOf(MUTATION_ADAPTER);
     expect(adapter).not.toContain('completeCancelAttemptWithinCallerFencedTransaction');
-    for (const name of NO_WIRE_PRIMITIVES) expect(adapter).not.toContain(name);
-    expect(adapter).not.toMatch(/completeCancelLease|abandonAcquiredCancel|recoverOrphanedCancelLease|DispatchPermit/);
+    expect(adapter).not.toMatch(/completeCancelLease|recoverOrphanedCancelLease|DispatchPermit/);
+    // One derived call each, in the shared no-wire body, selected ONLY by the locked coupled durable pair.
+    expect(adapter.match(/await releaseArmedUndispatchedCancelClaimWithinCallerFencedTransaction\(/g)).toHaveLength(1);
+    expect(adapter.match(/await releaseUnarmedCancelClaimWithinCallerFencedTransaction\(/g)).toHaveLength(1);
+    expect(adapter).toContain('const accountForRelease = requireExactAccountId(lease.accountId, ctx.accountId);');
+    expect(adapter).toContain([
+      'const released = leaseArmed',
+      '        ? await releaseArmedUndispatchedCancelClaimWithinCallerFencedTransaction(tx, ctx.intentId, ctx.cancelGeneration, accountForRelease)',
+      '        : await releaseUnarmedCancelClaimWithinCallerFencedTransaction(tx, ctx.intentId, ctx.cancelGeneration, accountForRelease);',
+    ].join('\n'));
+    const noWire = adapter.slice(adapter.indexOf('async #noWireWithin('), adapter.indexOf('async #noWireAlreadyClosed('));
+    const derive = noWire.indexOf('const leaseArmed = lease.armedAtMs !== null;');
+    expect(derive).toBeGreaterThan(0);
+    expect(noWire.indexOf("if (leaseArmed !== before.cancelWireArmed) splitState(")).toBeGreaterThan(derive);
+    expect(noWire.indexOf("if (!leaseArmed) splitState('A committed arm is not durable on either side', details);")).toBeGreaterThan(derive);
+    expect(noWire.indexOf("} else if (ctx.mode === 'ABANDON_AVAILABLE' && leaseArmed) {")).toBeGreaterThan(derive);
+    expect(noWire.indexOf('const released = leaseArmed')).toBeGreaterThan(noWire.indexOf("} else if (ctx.mode === 'ABANDON_AVAILABLE' && leaseArmed) {"));
+    // The no-wire body never reads or locks the reconciliation state, and never names enablement or runtime authority.
+    expect(noWire).not.toMatch(/live_reconciliation_state|lockReconciliationState|classifyPracticalReconciliationMismatch|requireCancelEnablement|requireRuntimeEpoch|readLiveRuntimeEpoch/);
   });
 
-  it('no src module introduces a completion / abandon / recovery / permit surface for the practical cancel', () => {
-    for (const file of files.filter((candidate) => candidate.startsWith('src/'))) {
-      expect(codeOf(file), file).not.toMatch(/completeCancelLease|abandonAcquiredCancel|recoverOrphanedCancelLease|PracticalCancelDispatchPermit|PracticalVerifiedCancelResolution/);
+  it('the idempotent-retry path is read-only and returns ALREADY_COMPLETED only after EVERY exact identity and arm-origin check', () => {
+    const adapter = codeOf(MUTATION_ADAPTER);
+    const start = adapter.indexOf('async #noWireAlreadyClosed(');
+    const closed = adapter.slice(start, adapter.indexOf('async #afterNoWireRollback(', start));
+    // No write of its own: no release primitive, no lease completion, no manual review, no raw statement
+    // (a split it detects is escalated only by #afterNoWireRollback, after the rollback).
+    expect(closed).not.toMatch(/release(Armed|Unarmed)\w*WithinCallerFencedTransaction|completeOrderBoundCancelLeaseNoWire|enterManualReview|\$executeRaw|updateMany/);
+    const success = closed.indexOf("return Object.freeze({ kind: 'ALREADY_COMPLETED' as const });");
+    expect(success).toBeGreaterThan(0);
+    expect(closed.match(/kind: 'ALREADY_COMPLETED'/g)).toHaveLength(1);
+    for (const check of [
+      'const { lease, certificate } = await scope.readOrderBoundCancelLease(expected);',
+      'if (!ctx.certificateMatches(certificate)) completionRefused(',
+      'if (ctx.expectedLeaseCreatedAtMs !== null && lease.createdAtMs !== ctx.expectedLeaseCreatedAtMs) completionRefused(',
+      '? ctx.expectedArmedAtMs !== null && lease.armedAtMs === ctx.expectedArmedAtMs',
+      "? lease.armedAtMs === null",
+      'if (!armPermitted) completionRefused(',
+      '|| order.intentId !== ctx.intentId',
+      '|| order.accountId !== ctx.accountId',
+      '|| order.clientOrderId !== ctx.clientOrderId',
+      '|| order.pair !== ctx.pair',
+      '|| order.exchangeOrderId !== ctx.exchangeOrderId) {',
+      'if (order.cancelFaultCode !== null || order.cancelExchangeOrderId !== ctx.exchangeOrderId) {',
+      "if (!ctx.retry) alreadyCompleted(",
+    ]) {
+      const at = closed.indexOf(check);
+      expect(at, check).toBeGreaterThan(0);
+      expect(at, check).toBeLessThan(success);
     }
+  });
+
+  it('no src module introduces a completion-of-dispatch / recovery / permit surface; the adapter writes no dispatched outcome', () => {
+    for (const file of files.filter((candidate) => candidate.startsWith('src/'))) {
+      expect(codeOf(file), file).not.toMatch(/completeCancelLease|recoverOrphanedCancelLease|PracticalCancelDispatchPermit|PracticalVerifiedCancelResolution/);
+    }
+    const namesNoWireOperations = files.filter((file) => /completeUndispatchedCancel|abandonAcquiredCancel/.test(codeOf(file))).sort();
+    expect(namesNoWireOperations).toEqual(['src/execution/live/practical-mutation/ports.ts', MUTATION_ADAPTER].sort());
+    const adapter = codeOf(MUTATION_ADAPTER);
+    expect(adapter).not.toMatch(/'AMBIGUOUS'|'REJECTED'|'ACCEPTED'|HTTP_|statusCode|\b429\b/);
   });
 
   it('live/repository.ts still reaches no practical module, integration module, gateway, transport, or signer', () => {

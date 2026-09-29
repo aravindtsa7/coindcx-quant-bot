@@ -566,12 +566,17 @@ describe('arm: a PROVEN zero-change refusal leaves the acquired handle reusable'
     expect(PracticalAcquiredCancel.status(handle)).toBe('SPENT');
   });
 
-  it('an UNKNOWN commit outcome conservatively SPENDS the handle and mints NO ticket', async () => {
+  it('[Wave 2B2b] an UNKNOWN commit outcome leaves the handle ARM_OUTCOME_UNKNOWN and mints NO ticket; arm refuses it afterwards', async () => {
     const handle = acquiredHandle();
     world.failAtCommit = knownError('P1017');
     await expect(store().armCancelLease(armInput(handle))).rejects.toMatchObject({ code: 'PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN' });
-    expect(PracticalAcquiredCancel.status(handle)).toBe('SPENT');
+    expect(PracticalAcquiredCancel.status(handle)).toBe('ARM_OUTCOME_UNKNOWN');
     expect(world.transactions).toBe(1);
+    // No ticket can ever follow: a second arm is refused before any durable access.
+    world.failAtCommit = null;
+    await expect(store().armCancelLease(armInput(handle))).rejects.toMatchObject({ code: 'PRACTICAL_MUTATION_AUTHORITY_INVALID' });
+    expect(world.transactions).toBe(1);
+    expect(PracticalAcquiredCancel.status(handle)).toBe('ARM_OUTCOME_UNKNOWN');
   });
 
   it('a concurrent second arm with the SAME in-memory handle is refused while the first is in flight (never a second ticket)', async () => {

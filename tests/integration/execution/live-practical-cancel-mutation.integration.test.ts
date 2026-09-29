@@ -752,14 +752,40 @@ describe('P18B-W2B1-DB arm: both durable sides, or neither', () => {
     expect(statuses).toEqual(['AVAILABLE', 'SPENT']);
   }, 60_000);
 
-  it('an UNKNOWN commit outcome (COMMIT happened, acknowledgement lost) spends the handle and mints NO ticket', async () => {
+  it('[Wave 2B2b] an UNKNOWN commit outcome (COMMIT happened, acknowledgement lost) mints NO ticket and leaves the handle ARM_OUTCOME_UNKNOWN', async () => {
     if (skip()) return;
     const { accountId, order, handle } = await acquired();
     await expect(store(commitLostClient()).armCancelLease(armInput(accountId, handle))).rejects.toMatchObject({ code: 'PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN' });
-    expect(PracticalAcquiredCancel.status(handle)).toBe('SPENT');
-    // Durable truth (here: committed) is left for the later recovery path; the spent handle can never arm again.
+    expect(PracticalAcquiredCancel.status(handle)).toBe('ARM_OUTCOME_UNKNOWN');
+    // Durable truth (here: committed) is decided only by a later abandon; the handle can never arm again (no ticket, ever).
     expect((await orderRow(order.intentId)).cancelWireArmed).toBe(true);
     await expect(store().armCancelLease(armInput(accountId, handle))).rejects.toMatchObject({ code: 'PRACTICAL_MUTATION_AUTHORITY_INVALID' });
+    expect(PracticalAcquiredCancel.status(handle)).toBe('ARM_OUTCOME_UNKNOWN');
+  });
+
+  it('[Wave 2B2b regression] an UNKNOWN acquire commit still mints NOTHING and fails closed: the bound lease stays LEASED, nothing in-process can release it', async () => {
+    if (skip()) return;
+    const accountId = freshAccount();
+    const { account, certificate } = await certified(accountId);
+    const order = await seedOrder(accountId);
+    await expect(store(commitLostClient()).acquireCancelLease(acquireInput(accountId, account, certificate, order.intentId)))
+      .rejects.toMatchObject({ code: 'PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN' });
+    const rows = await practicalRows(accountId);
+    // The commit really happened: a durable LEASED unarmed bound lease with a leased fence, and no handle anywhere.
+    expect(rows.fence).toMatchObject({ mode: 'MUTATION_LEASED' });
+    expect(rows.leases).toHaveLength(1);
+    expect(rows.leases[0]).toMatchObject({ status: 'LEASED', armedAtMs: null, intentId: order.intentId });
+    expect(await orderRow(order.intentId)).toMatchObject({ cancelState: 'CANCEL_RESERVED', cancelWireArmed: false });
+    // Stage 1B1 release refuses the bound lease; adoption by a new runtime is refused while the fence is leased.
+    const current = await practical().loadAccount(accountId);
+    if (current.kind !== 'FOUND') throw new Error('fixture: account');
+    await expect(practical().releaseLease({
+      accountId, expected: expectationOf(current.account), leaseId: rows.leases[0]!.leaseId, outcome: 'PRE_DISPATCH_FAILURE', nowMs: NOW + 5_000,
+    })).rejects.toMatchObject({ code: 'PRACTICAL_PERSISTENCE_CONFLICT' });
+    await expect(practical().adoptForNewRuntime({
+      accountId, previousRuntimeEpoch: EPOCH, expectedFenceRevision: current.account.fence.revision, newRuntimeEpoch: 'epoch-next-runtime', nowMs: NOW + 5_000,
+    })).rejects.toBeInstanceOf(Error);
+    expect((await practicalRows(accountId)).leases[0]).toMatchObject({ status: 'LEASED' });
   });
 });
 

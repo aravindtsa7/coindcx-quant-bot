@@ -24,11 +24,28 @@
  * functions below are exported for the Stage 1B2 Prisma adapter ONLY; their
  * production importer set is architecture-pinned to exactly that file.
  *
- * ACQUIRED-HANDLE LIFECYCLE. AVAILABLE -> IN_USE (reserved at arm entry,
- * held across internal retries) -> AVAILABLE again after a PROVEN zero-change
- * refusal or rollback, or -> SPENT after a committed arm or an UNKNOWN commit
- * outcome. The in-memory state is a convenience only: the database arm
- * compare-and-set and row locks are the one-shot authority across processes.
+ * ACQUIRED-HANDLE LIFECYCLE.
+ *   arm:     AVAILABLE -> IN_USE (reserved at arm entry, held across internal
+ *            retries) -> SPENT after a committed arm (a ticket is minted), or
+ *            -> AVAILABLE again after a PROVEN zero-change refusal or rollback,
+ *            or -> ARM_OUTCOME_UNKNOWN [Wave 2B2b] when the arm COMMIT could
+ *            not be confirmed. No ticket is EVER minted from that state, so no
+ *            gateway call can follow it; only abandon accepts it.
+ *   abandon: AVAILABLE | ARM_OUTCOME_UNKNOWN | ABANDON_OUTCOME_UNKNOWN ->
+ *            ABANDONING -> SPENT after COMMIT, or back to the state it came
+ *            from after a PROVEN rollback, or -> ABANDON_OUTCOME_UNKNOWN (only
+ *            an identical abandon retry accepts it).
+ *
+ * ARMED-TICKET LIFECYCLE [Wave 2B2b]. ARMED -> COMPLETING_NO_WIRE -> SPENT
+ * after a committed no-wire completion, or back to ARMED after a PROVEN
+ * rollback, or -> COMMIT_UNKNOWN (only an identical NOT_DISPATCHED retry with
+ * the SAME reason accepts it). There is NO take and NO dispatch state: in
+ * Wave 2B2 an ARMED ticket is, by construction, a ticket that was never
+ * handed to any gateway. A future, separately reviewed gateway wave must add
+ * a durable dispatch-permit boundary; this module grants nothing like it.
+ *
+ * The in-memory states are a convenience only: the database compare-and-sets
+ * and row locks are the one-shot authority across processes.
  */
 import { LIVE_CLIENT_ORDER_ID_PATTERN } from '../identity';
 import {
@@ -105,7 +122,18 @@ export interface PracticalArmedCancelRecord {
   readonly provesAccountContinuity: false;
 }
 
-export type PracticalAcquiredCancelStatus = 'AVAILABLE' | 'IN_USE' | 'SPENT';
+export type PracticalAcquiredCancelStatus =
+  | 'AVAILABLE'
+  | 'IN_USE'
+  | 'SPENT'
+  | 'ARM_OUTCOME_UNKNOWN'
+  | 'ABANDONING'
+  | 'ABANDON_OUTCOME_UNKNOWN';
+
+export type PracticalArmedCancelStatus = 'ARMED' | 'COMPLETING_NO_WIRE' | 'COMMIT_UNKNOWN' | 'SPENT';
+
+/** The acquired-handle states an abandon may start from. */
+const ABANDONABLE: readonly PracticalAcquiredCancelStatus[] = Object.freeze(['AVAILABLE', 'ARM_OUTCOME_UNKNOWN', 'ABANDON_OUTCOME_UNKNOWN']);
 
 // ---------------------------------------------------------------------------
 // Validation (every issued field; couplings)
@@ -228,6 +256,8 @@ const TICKET_ISSUER = Object.freeze({ purpose: 'p18b-stage1b2-practical-cancel-t
 export class PracticalAcquiredCancel {
   readonly #record: PracticalAcquiredCancelRecord;
   #status: PracticalAcquiredCancelStatus = 'AVAILABLE';
+  /** [Wave 2B2b] The state the first abandon started from; kept for an identical retry after an unknown commit. */
+  #abandonOrigin: 'AVAILABLE' | 'ARM_OUTCOME_UNKNOWN' | null = null;
 
   public constructor(issuer: unknown, record: PracticalAcquiredCancelRecord) {
     if (issuer !== TICKET_ISSUER) {
@@ -265,6 +295,37 @@ export class PracticalAcquiredCancel {
     return handle.#record;
   }
 
+  /**
+   * [Wave 2B2b] Internal: starts (or retries) an abandon. The state the FIRST
+   * abandon started from (AVAILABLE or ARM_OUTCOME_UNKNOWN) is remembered, so
+   * a retry after an unknown abandon commit is judged exactly like the
+   * original attempt (an AVAILABLE handle never permits an armed pair).
+   */
+  public static beginAbandon(issuer: unknown, value: unknown): {
+    readonly record: PracticalAcquiredCancelRecord;
+    readonly from: PracticalAcquiredCancelStatus;
+    readonly origin: 'AVAILABLE' | 'ARM_OUTCOME_UNKNOWN';
+  } {
+    if (issuer !== TICKET_ISSUER) {
+      throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'Acquired-cancel lifecycle changes are internal to the Stage 1B2 ticket module');
+    }
+    if (typeof value !== 'object' || value === null || !(#status in value)) {
+      throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'A genuine acquired practical cancel is required');
+    }
+    const handle = value as PracticalAcquiredCancel;
+    const from = handle.#status;
+    if (!ABANDONABLE.includes(from)) {
+      throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', `An acquired practical cancel in ${from} cannot be abandoned`, { status: from });
+    }
+    if (from === 'ABANDON_OUTCOME_UNKNOWN') {
+      if (handle.#abandonOrigin === null) throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'An abandon retry has no recorded origin', { status: from });
+    } else {
+      handle.#abandonOrigin = from as 'AVAILABLE' | 'ARM_OUTCOME_UNKNOWN';
+    }
+    handle.#status = 'ABANDONING';
+    return Object.freeze({ record: handle.#record, from, origin: handle.#abandonOrigin as 'AVAILABLE' | 'ARM_OUTCOME_UNKNOWN' });
+  }
+
   public get provesAccountContinuity(): false { return false; }
 }
 Object.freeze(PracticalAcquiredCancel.prototype);
@@ -272,7 +333,9 @@ Object.freeze(PracticalAcquiredCancel);
 
 export class PracticalArmedCancel {
   readonly #record: PracticalArmedCancelRecord;
-  #taken = false;
+  #status: PracticalArmedCancelStatus = 'ARMED';
+  /** The NOT_DISPATCHED reason of a completion whose COMMIT was unknown: only the identical retry is accepted. */
+  #unknownReason: string | null = null;
 
   public constructor(issuer: unknown, record: PracticalArmedCancelRecord) {
     if (issuer !== TICKET_ISSUER) {
@@ -282,28 +345,48 @@ export class PracticalArmedCancel {
     Object.freeze(this);
   }
 
-  /** The record of a GENUINE ticket, or null for clones and structural fakes. */
+  /** The record of a GENUINE ticket (whatever its status), or null for clones and structural fakes. */
   public static read(value: unknown): PracticalArmedCancelRecord | null {
     if (typeof value !== 'object' || value === null || !(#record in value)) return null;
     return (value as PracticalArmedCancel).#record;
   }
 
-  public static isTaken(value: unknown): boolean | null {
-    if (typeof value !== 'object' || value === null || !(#taken in value)) return null;
-    return (value as PracticalArmedCancel).#taken;
+  /** The lifecycle status of a GENUINE ticket, or null. */
+  public static status(value: unknown): PracticalArmedCancelStatus | null {
+    if (typeof value !== 'object' || value === null || !(#status in value)) return null;
+    return (value as PracticalArmedCancel).#status;
   }
 
-  /** Internal one-shot take; only this module holds the issuer. */
-  public static take(issuer: unknown, value: unknown): PracticalArmedCancelRecord {
+  /**
+   * Internal lifecycle transition; only this module holds the issuer.
+   * `reason` is required to enter COMMIT_UNKNOWN and, when leaving it,
+   * must equal the recorded reason exactly.
+   */
+  public static transition(
+    issuer: unknown,
+    value: unknown,
+    from: PracticalArmedCancelStatus,
+    to: PracticalArmedCancelStatus,
+    reason: string | null,
+  ): PracticalArmedCancelRecord {
     if (issuer !== TICKET_ISSUER) {
       throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'Armed-cancel lifecycle changes are internal to the Stage 1B2 ticket module');
     }
-    if (typeof value !== 'object' || value === null || !(#taken in value)) {
+    if (typeof value !== 'object' || value === null || !(#status in value)) {
       throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'A genuine armed practical cancel is required');
     }
     const ticket = value as PracticalArmedCancel;
-    if (ticket.#taken) throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'This armed practical cancel was already taken');
-    ticket.#taken = true;
+    if (ticket.#status !== from) {
+      throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', `The armed practical cancel is ${ticket.#status}, not ${from}`, { status: ticket.#status });
+    }
+    if (from === 'COMMIT_UNKNOWN' && to === 'COMPLETING_NO_WIRE' && reason !== ticket.#unknownReason) {
+      throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'After an unknown commit only the identical no-wire completion may be retried', { status: ticket.#status });
+    }
+    if (to === 'COMMIT_UNKNOWN') {
+      if (reason === null) throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'An unknown commit must record its reason', { status: ticket.#status });
+      ticket.#unknownReason = reason;
+    }
+    ticket.#status = to;
     return ticket.#record;
   }
 
@@ -336,15 +419,72 @@ export function releasePracticalAcquiredCancel(value: unknown): void {
   PracticalAcquiredCancel.transition(TICKET_ISSUER, value, 'IN_USE', 'AVAILABLE');
 }
 
-/** IN_USE -> SPENT after a committed arm, or conservatively after an UNKNOWN commit outcome. */
+/** IN_USE -> SPENT after a committed arm (a ticket is minted next). */
 export function spendPracticalAcquiredCancel(value: unknown): void {
   PracticalAcquiredCancel.transition(TICKET_ISSUER, value, 'IN_USE', 'SPENT');
 }
 
+/** [Wave 2B2b] IN_USE -> ARM_OUTCOME_UNKNOWN when the arm COMMIT could not be confirmed. No ticket is minted. */
+export function markPracticalAcquiredCancelArmOutcomeUnknown(value: unknown): void {
+  PracticalAcquiredCancel.transition(TICKET_ISSUER, value, 'IN_USE', 'ARM_OUTCOME_UNKNOWN');
+}
+
 /**
- * One-shot take of an armed ticket, for the LATER (not yet reviewed) mutation
- * service. It has NO production importer in Wave 2B1 (architecture-pinned).
+ * [Wave 2B2b] AVAILABLE | ARM_OUTCOME_UNKNOWN | ABANDON_OUTCOME_UNKNOWN ->
+ * ABANDONING. Returns the record and the state it came from (restored on a
+ * proven rollback). Synchronous: nothing can interleave between the status
+ * read and the transition.
  */
-export function takePracticalArmedCancel(value: unknown): PracticalArmedCancelRecord {
-  return PracticalArmedCancel.take(TICKET_ISSUER, value);
+export function beginPracticalAcquiredCancelAbandon(value: unknown): {
+  readonly record: PracticalAcquiredCancelRecord;
+  readonly from: PracticalAcquiredCancelStatus;
+  readonly origin: 'AVAILABLE' | 'ARM_OUTCOME_UNKNOWN';
+} {
+  return PracticalAcquiredCancel.beginAbandon(TICKET_ISSUER, value);
+}
+
+/** [Wave 2B2b] ABANDONING -> SPENT after a committed (or already-durable) abandon. */
+export function finishPracticalAcquiredCancelAbandon(value: unknown): void {
+  PracticalAcquiredCancel.transition(TICKET_ISSUER, value, 'ABANDONING', 'SPENT');
+}
+
+/** [Wave 2B2b] ABANDONING -> the state it came from, ONLY after a proven zero-change rollback. */
+export function restorePracticalAcquiredCancelAbandon(value: unknown, from: PracticalAcquiredCancelStatus): void {
+  if (!ABANDONABLE.includes(from)) throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'An abandon can only be restored to the state it started from', { status: from });
+  PracticalAcquiredCancel.transition(TICKET_ISSUER, value, 'ABANDONING', from);
+}
+
+/** [Wave 2B2b] ABANDONING -> ABANDON_OUTCOME_UNKNOWN when the abandon COMMIT could not be confirmed. */
+export function markPracticalAcquiredCancelAbandonOutcomeUnknown(value: unknown): void {
+  PracticalAcquiredCancel.transition(TICKET_ISSUER, value, 'ABANDONING', 'ABANDON_OUTCOME_UNKNOWN');
+}
+
+/**
+ * [Wave 2B2b] ARMED -> COMPLETING_NO_WIRE, or COMMIT_UNKNOWN (same reason
+ * only) -> COMPLETING_NO_WIRE. Returns the record and the state it came from.
+ */
+export function beginPracticalArmedCancelNoWireCompletion(value: unknown, reason: string): { readonly record: PracticalArmedCancelRecord; readonly from: PracticalArmedCancelStatus } {
+  const from = PracticalArmedCancel.status(value);
+  if (from === null) throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'A genuine armed practical cancel is required');
+  if (from !== 'ARMED' && from !== 'COMMIT_UNKNOWN') {
+    throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', `An armed practical cancel in ${from} cannot be completed`, { status: from });
+  }
+  const record = PracticalArmedCancel.transition(TICKET_ISSUER, value, from, 'COMPLETING_NO_WIRE', reason);
+  return Object.freeze({ record, from });
+}
+
+/** [Wave 2B2b] COMPLETING_NO_WIRE -> SPENT after a committed (or already-durable) no-wire completion. */
+export function finishPracticalArmedCancelNoWireCompletion(value: unknown): void {
+  PracticalArmedCancel.transition(TICKET_ISSUER, value, 'COMPLETING_NO_WIRE', 'SPENT', null);
+}
+
+/** [Wave 2B2b] COMPLETING_NO_WIRE -> the state it came from, ONLY after a proven zero-change rollback. */
+export function restorePracticalArmedCancel(value: unknown, from: PracticalArmedCancelStatus, reason: string): void {
+  if (from !== 'ARMED' && from !== 'COMMIT_UNKNOWN') throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'A completion can only be restored to the state it started from', { status: from });
+  PracticalArmedCancel.transition(TICKET_ISSUER, value, 'COMPLETING_NO_WIRE', from, from === 'COMMIT_UNKNOWN' ? reason : null);
+}
+
+/** [Wave 2B2b] COMPLETING_NO_WIRE -> COMMIT_UNKNOWN (recording the reason) when the COMMIT could not be confirmed. */
+export function markPracticalArmedCancelCommitUnknown(value: unknown, reason: string): void {
+  PracticalArmedCancel.transition(TICKET_ISSUER, value, 'COMPLETING_NO_WIRE', 'COMMIT_UNKNOWN', reason);
 }

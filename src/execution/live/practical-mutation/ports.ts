@@ -57,7 +57,17 @@ export type PracticalMutationErrorCode =
    * confirmed: the durable outcome is UNKNOWN. Nothing is minted, nothing is
    * compensated; a later recovery path resolves the durable state.
    */
-  | 'PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN';
+  | 'PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN'
+  /** [Wave 2B2b] A no-wire completion / abandon pre-write check failed. The whole transaction rolled back: zero change. */
+  | 'PRACTICAL_MUTATION_COMPLETION_REFUSED'
+  /**
+   * [Wave 2B2b] The locked durable practical lease and the Phase 17 claim
+   * contradict each other (a split pair). Rolled back; the account is then
+   * put into manual review in its own transaction. Never repaired.
+   */
+  | 'PRACTICAL_MUTATION_SPLIT_STATE'
+  /** [Wave 2B2b] The lease was already completed by a different operation. Zero change. */
+  | 'PRACTICAL_MUTATION_ALREADY_COMPLETED';
 
 /** Credential-free, typed Stage 1B2 mutation error. Details go through the Phase 17 credential guard. */
 export class PracticalMutationError extends Error {
@@ -138,7 +148,11 @@ export type PracticalCancelAcquisition =
 export const PRACTICAL_CANCEL_ARM_INPUT_KEYS = Object.freeze(['acquired', 'enablement', 'runtimeIdentity', 'trustedNowMs'] as const);
 
 export interface PracticalCancelArmInput {
-  /** A genuine, AVAILABLE `PracticalAcquiredCancel`. It is spent only by a committed (or commit-unknown) arm. */
+  /**
+   * A genuine, AVAILABLE `PracticalAcquiredCancel`. A committed arm spends it; an
+   * UNKNOWN arm commit leaves it ARM_OUTCOME_UNKNOWN [Wave 2B2b], which only
+   * `abandonAcquiredCancel` accepts (no ticket is ever minted from it).
+   */
   readonly acquired: unknown;
   readonly enablement: unknown;
   readonly runtimeIdentity: unknown;
@@ -149,12 +163,77 @@ export interface PracticalCancelArmInput {
 export type PracticalCancelArm = { readonly kind: 'ARMED'; readonly ticket: PracticalArmedCancel };
 
 // ---------------------------------------------------------------------------
-// The port
+// [Wave 2B2b] No-wire completion and in-process abandon
+//
+// Both close an ALREADY-OWNED order-bound CANCEL attempt that provably never
+// reached a gateway, as PRE_DISPATCH_FAILURE, atomically on both durable
+// sides. They are CLEANUP, not mutation authority: no enablement, HEALTHY
+// reconciliation, dwell, certificate validity, stream, or runtime epoch is
+// required. There is no dispatched outcome here: AMBIGUOUS, REJECTED, and
+// ACCEPTED are not expressible, and there is no gateway input of any kind.
+// ---------------------------------------------------------------------------
+
+/** Why an ARMED ticket was never dispatched (audit only; never interpreted). */
+export type PracticalNoDispatchReason = 'FINAL_STREAM_GUARD_FAILED' | 'DISPATCH_WINDOW_CLOSED' | 'ABORTED_BEFORE_DISPATCH';
+export const PRACTICAL_NO_DISPATCH_REASONS: readonly PracticalNoDispatchReason[] = Object.freeze([
+  'FINAL_STREAM_GUARD_FAILED', 'DISPATCH_WINDOW_CLOSED', 'ABORTED_BEFORE_DISPATCH',
+] as const);
+
+/** The ONLY completion report Wave 2B2b accepts. Its keys are exactly ['kind', 'reason']. */
+export interface PracticalNotDispatchedReport {
+  readonly kind: 'NOT_DISPATCHED';
+  readonly reason: PracticalNoDispatchReason;
+}
+export const PRACTICAL_NOT_DISPATCHED_REPORT_KEYS = Object.freeze(['kind', 'reason'] as const);
+
+/** The exact, closed set of undispatched-completion input keys. */
+export const PRACTICAL_UNDISPATCHED_COMPLETION_INPUT_KEYS = Object.freeze(['armed', 'report', 'trustedNowMs'] as const);
+
+export interface PracticalUndispatchedCompletionInput {
+  /** A genuine `PracticalArmedCancel` that was never dispatched (ARMED), or an identical retry after an unknown commit. */
+  readonly armed: unknown;
+  readonly report: PracticalNotDispatchedReport;
+  readonly trustedNowMs: number;
+}
+
+/** The exact, closed set of abandon input keys. */
+export const PRACTICAL_CANCEL_ABANDON_INPUT_KEYS = Object.freeze(['acquired', 'trustedNowMs'] as const);
+
+export interface PracticalCancelAbandonInput {
+  /** A genuine `PracticalAcquiredCancel` that is AVAILABLE, ARM_OUTCOME_UNKNOWN, or ABANDON_OUTCOME_UNKNOWN (identical retry). */
+  readonly acquired: unknown;
+  readonly trustedNowMs: number;
+}
+
+export type PracticalNoWireCompletion =
+  /**
+   * COMPLETED: committed now. ALREADY_COMPLETED: an identical retry after an
+   * unknown commit found the SAME completion already durable. Either way the
+   * lease is COMPLETED PRE_DISPATCH_FAILURE and the Phase 17 claim is NONE.
+   */
+  | {
+      readonly kind: 'COMPLETED' | 'ALREADY_COMPLETED';
+      readonly outcome: 'PRE_DISPATCH_FAILURE';
+      readonly leaseId: string;
+      readonly intentId: string;
+      readonly cancelGeneration: number;
+    }
+  /** Rolled back, then latched by the existing Stage 1B1 escalation: the account's durable rows are malformed. */
+  | { readonly kind: 'MALFORMED_LATCHED'; readonly reviewEpisodeId: string };
+
+// ---------------------------------------------------------------------------
+// The ports
 // ---------------------------------------------------------------------------
 
 export interface PracticalCancelMutationStore {
   acquireCancelLease(input: PracticalCancelAcquireInput): Promise<PracticalCancelAcquisition>;
   armCancelLease(input: PracticalCancelArmInput): Promise<PracticalCancelArm>;
+}
+
+/** [Wave 2B2b] Truthful no-wire closing of an owned attempt. PRE_DISPATCH_FAILURE only. */
+export interface PracticalCancelNoWireStore {
+  completeUndispatchedCancel(input: PracticalUndispatchedCompletionInput): Promise<PracticalNoWireCompletion>;
+  abandonAcquiredCancel(input: PracticalCancelAbandonInput): Promise<PracticalNoWireCompletion>;
 }
 
 /** Re-exported for callers that match on the invalidation reason; the set is closed. */

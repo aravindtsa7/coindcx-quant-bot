@@ -919,6 +919,58 @@ async function assertCancelWriteNotLeaseBound(tx: ReconciliationFenceClient, cur
   throw new LiveExecutionError('LIVE_CANCEL_CLAIM_PRACTICALLY_BOUND', 'This cancel claim is owned by a Stage 1B2 practical lease; ordinary Phase17/18 writes may not move it', { details });
 }
 
+/** [Wave 2B2b] The two plain reads the consistent listing makes, both through ONE REPEATABLE READ transaction. */
+interface ConsistentListingClient {
+  readonly liveOrder: {
+    findMany(args: { where: { accountId: string }; include: { intent: true }; orderBy: { intentId: 'asc' } }): Promise<unknown>;
+  };
+  $queryRaw<T>(query: Prisma.Sql): Promise<T>;
+}
+
+/**
+ * [P18B Stage 1B2 Wave 2B2a/2B2b] The practical lease naming each order's
+ * EXACT CURRENT cancel generation, read through the listing's OWN consistent
+ * snapshot `tx` (never a separate statement outside it). ADVISORY and
+ * NON-locking: the public-write guard is the authoritative interlock. One read
+ * keyed by the exact `(intent_id, cancel_generation)` pairs; because SQL
+ * equality is case-insensitive and pad-space, every returned row must name one
+ * of the requested intents EXACTLY and re-prove its identity exactly, or the
+ * whole listing fails closed.
+ */
+async function currentPracticalCancelBindings(
+  tx: ConsistentListingClient,
+  orders: readonly LiveOrderStateRecord[],
+): Promise<ReadonlyMap<string, LivePracticalCancelBindingView>> {
+  const claimed = orders.filter((order) => order.cancelGeneration >= 1);
+  const bindings = new Map<string, LivePracticalCancelBindingView>();
+  if (claimed.length === 0) return bindings;
+  const pairs = Prisma.join(claimed.map((order) => Prisma.sql`(${order.intentId}, ${order.cancelGeneration})`));
+  const rows = await tx.$queryRaw<unknown[]>(Prisma.sql`SELECT lease_id AS leaseId, account_id AS accountId, intent_id AS intentId,
+      client_order_id AS clientOrderId, cancel_generation AS cancelGeneration, status, outcome, armed_at_ms AS armedAtMs
+    FROM live_practical_mutation_lease WHERE (intent_id, cancel_generation) IN (${pairs})`);
+  if (!Array.isArray(rows)) {
+    throw new LiveExecutionError('LIVE_DURABLE_INTEGRITY_VIOLATION', 'Practical cancel binding read did not return rows');
+  }
+  const byIntent = new Map<string, unknown[]>();
+  for (const order of claimed) byIntent.set(order.intentId, []);
+  for (const row of rows) {
+    const intentId = typeof row === 'object' && row !== null ? (row as Record<string, unknown>)['intentId'] : undefined;
+    const bucket = typeof intentId === 'string' ? byIntent.get(intentId) : undefined;
+    if (bucket === undefined) {
+      // Matched only by collation (case / trailing pad) or otherwise not an exact requested intent.
+      throw new LiveExecutionError('LIVE_DURABLE_INTEGRITY_VIOLATION', 'A practical cancel binding row does not name a requested intent exactly');
+    }
+    bucket.push(row);
+  }
+  for (const order of claimed) {
+    const binding = currentPracticalCancelBinding(byIntent.get(order.intentId) ?? [], {
+      accountId: order.accountId, intentId: order.intentId, clientOrderId: order.clientOrderId, cancelGeneration: order.cancelGeneration,
+    });
+    if (binding !== null) bindings.set(order.intentId, binding);
+  }
+  return bindings;
+}
+
 function changesCancelColumns(current: LiveOrderStateRecord, next: LiveOrderStateRecord): boolean {
   return current.cancelState !== next.cancelState
     || current.cancelGeneration !== next.cancelGeneration
@@ -1546,9 +1598,24 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
    * [Phase18 §8] Every durable order for one account, each proven against its
    * own sealed intent digest before it is returned. Reconciliation therefore
    * never sees a raw projection row, exactly like every Phase17 path.
+   *
+   * [P18B Stage 1B2 Wave 2B2b] The orders, their intents, and their current
+   * practical bindings are read in ONE explicit REPEATABLE READ transaction,
+   * so they come from ONE consistent snapshot: a Stage 1B2 no-wire completion
+   * that commits between the order read and the binding read can never be
+   * seen half-applied (a false "split" pair). Every read is a plain,
+   * NON-locking read (no FOR UPDATE / FOR SHARE), so the global lock order
+   * is untouched. The isolation level is explicit, never the server default.
    */
   public async listAccountOrderViews(accountId: string): Promise<readonly LiveDurableOrderRow[]> {
-    const rows = await this.#prisma.liveOrder.findMany({
+    return this.#prisma.$transaction(
+      (tx) => this.#listAccountOrderViewsWithin(tx as unknown as ConsistentListingClient, accountId),
+      { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead, timeout: 30_000 },
+    );
+  }
+
+  async #listAccountOrderViewsWithin(tx: ConsistentListingClient, accountId: string): Promise<readonly LiveDurableOrderRow[]> {
+    const rows = await tx.liveOrder.findMany({
       where: { accountId },
       include: { intent: true },
       orderBy: { intentId: 'asc' },
@@ -1566,7 +1633,7 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
       assertOrderProjectionMatchesIntent(order, verifiedIntent);
       verifiedRows.push({ row, order, verifiedIntent });
     }
-    const bindings = await this.#currentPracticalCancelBindings(verifiedRows.map((entry) => entry.order));
+    const bindings = await currentPracticalCancelBindings(tx, verifiedRows.map((entry) => entry.order));
 
     const views: LiveDurableOrderRow[] = [];
     for (const { row, order, verifiedIntent } of verifiedRows) {
@@ -1604,46 +1671,6 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
       }));
     }
     return Object.freeze(views);
-  }
-
-  /**
-   * [P18B Stage 1B2 Wave 2B2a] The practical lease naming each order's EXACT
-   * CURRENT cancel generation. ADVISORY (unlocked, outside any transaction):
-   * the public-write guard is the authoritative interlock. One read keyed by
-   * the exact `(intent_id, cancel_generation)` pairs; because SQL equality is
-   * case-insensitive and pad-space, every returned row must name one of the
-   * requested intents EXACTLY and re-prove its identity exactly, or the whole
-   * listing fails closed.
-   */
-  async #currentPracticalCancelBindings(orders: readonly LiveOrderStateRecord[]): Promise<ReadonlyMap<string, LivePracticalCancelBindingView>> {
-    const claimed = orders.filter((order) => order.cancelGeneration >= 1);
-    const bindings = new Map<string, LivePracticalCancelBindingView>();
-    if (claimed.length === 0) return bindings;
-    const pairs = Prisma.join(claimed.map((order) => Prisma.sql`(${order.intentId}, ${order.cancelGeneration})`));
-    const rows = await this.#prisma.$queryRaw<unknown[]>(Prisma.sql`SELECT lease_id AS leaseId, account_id AS accountId, intent_id AS intentId,
-        client_order_id AS clientOrderId, cancel_generation AS cancelGeneration, status, outcome, armed_at_ms AS armedAtMs
-      FROM live_practical_mutation_lease WHERE (intent_id, cancel_generation) IN (${pairs})`);
-    if (!Array.isArray(rows)) {
-      throw new LiveExecutionError('LIVE_DURABLE_INTEGRITY_VIOLATION', 'Practical cancel binding read did not return rows');
-    }
-    const byIntent = new Map<string, unknown[]>();
-    for (const order of claimed) byIntent.set(order.intentId, []);
-    for (const row of rows) {
-      const intentId = typeof row === 'object' && row !== null ? (row as Record<string, unknown>)['intentId'] : undefined;
-      const bucket = typeof intentId === 'string' ? byIntent.get(intentId) : undefined;
-      if (bucket === undefined) {
-        // Matched only by collation (case / trailing pad) or otherwise not an exact requested intent.
-        throw new LiveExecutionError('LIVE_DURABLE_INTEGRITY_VIOLATION', 'A practical cancel binding row does not name a requested intent exactly');
-      }
-      bucket.push(row);
-    }
-    for (const order of claimed) {
-      const binding = currentPracticalCancelBinding(byIntent.get(order.intentId) ?? [], {
-        accountId: order.accountId, intentId: order.intentId, clientOrderId: order.clientOrderId, cancelGeneration: order.cancelGeneration,
-      });
-      if (binding !== null) bindings.set(order.intentId, binding);
-    }
-    return bindings;
   }
 
   #intentCreateData(intent: LiveExecutionIntentRecord) {

@@ -12,6 +12,13 @@
  *            ONE order-bound CANCEL lease + MUTATING + MUTATION_LEASED -> one COMMIT.
  *   ARM      the same lock order -> Phase 17 cancel wire arm (exact account,
  *            NEVER null) + practical lease armedAtMs -> one COMMIT.
+ *   NO-WIRE  [Wave 2B2b] completeUndispatchedCancel / abandonAcquiredCancel:
+ *            practical locks -> live_order -> live_execution_intent (NO
+ *            live_reconciliation_state) -> the truthful no-wire Phase 17
+ *            release (variant derived from the locked coupled durable pair)
+ *            + the lease COMPLETED PRE_DISPATCH_FAILURE + fence released ->
+ *            one COMMIT. Cleanup of an owned attempt, never mutation
+ *            authority; no dispatched outcome exists here.
  *
  * TIER B ONLY, AND NOT CONTINUITY. The reconciliation-state row is read under
  * lock and compared exactly (see `./preflight.ts`); that is a durable-state
@@ -30,6 +37,8 @@ import { LIVE_CLIENT_ORDER_ID_PATTERN } from '../identity';
 import {
   armCancelWireWithinCallerFencedTransaction,
   claimCancelWithinCallerFencedTransaction,
+  releaseArmedUndispatchedCancelClaimWithinCallerFencedTransaction,
+  releaseUnarmedCancelClaimWithinCallerFencedTransaction,
   type ClaimCancelOutcome,
 } from '../repository';
 import { readLiveRuntimeEpoch } from '../reconciliation/barrier';
@@ -44,16 +53,25 @@ import {
   type PracticalLockedAccountScope,
 } from '../practical-persistence/repository';
 import {
+  PRACTICAL_CANCEL_ABANDON_INPUT_KEYS,
   PRACTICAL_CANCEL_ACQUIRE_INPUT_KEYS,
   PRACTICAL_CANCEL_ARM_INPUT_KEYS,
+  PRACTICAL_NO_DISPATCH_REASONS,
+  PRACTICAL_NOT_DISPATCHED_REPORT_KEYS,
+  PRACTICAL_UNDISPATCHED_COMPLETION_INPUT_KEYS,
   PracticalMutationError,
   type PracticalAcquireInvalidationCause,
   type PracticalAcquireInvalidationReason,
+  type PracticalCancelAbandonInput,
   type PracticalCancelAcquireInput,
   type PracticalCancelAcquisition,
   type PracticalCancelArm,
   type PracticalCancelArmInput,
   type PracticalCancelMutationStore,
+  type PracticalCancelNoWireStore,
+  type PracticalNoDispatchReason,
+  type PracticalNoWireCompletion,
+  type PracticalUndispatchedCompletionInput,
 } from './ports';
 import {
   classifyPracticalReconciliationMismatch,
@@ -62,12 +80,22 @@ import {
   type PracticalClassifiedPreWriteClaimFailureCode,
 } from './preflight';
 import {
+  beginPracticalAcquiredCancelAbandon,
+  beginPracticalArmedCancelNoWireCompletion,
+  finishPracticalAcquiredCancelAbandon,
+  finishPracticalArmedCancelNoWireCompletion,
   issuePracticalAcquiredCancel,
   issuePracticalArmedCancel,
+  markPracticalAcquiredCancelAbandonOutcomeUnknown,
+  markPracticalAcquiredCancelArmOutcomeUnknown,
+  markPracticalArmedCancelCommitUnknown,
   releasePracticalAcquiredCancel,
   reservePracticalAcquiredCancel,
+  restorePracticalAcquiredCancelAbandon,
+  restorePracticalArmedCancel,
   spendPracticalAcquiredCancel,
   PracticalAcquiredCancel,
+  PracticalArmedCancel,
   type PracticalAcquiredCancelRecord,
   type PracticalArmedCancelRecord,
 } from './ticket';
@@ -343,7 +371,80 @@ function selfCheckFailed(message: string, details: Readonly<Record<string, unkno
 // The store
 // ---------------------------------------------------------------------------
 
-export class PrismaPracticalCancelMutationStore implements PracticalCancelMutationStore {
+// ---------------------------------------------------------------------------
+// [Wave 2B2b] No-wire completion / abandon context and refusals
+// ---------------------------------------------------------------------------
+
+/**
+ * Which owned attempt is being closed. It only PERMITS arm states; the release
+ * variant itself is always DERIVED from the locked, coupled durable pair.
+ *   ARMED_TICKET        a genuine ticket that was never dispatched: the durable pair must be armed.
+ *   ABANDON_AVAILABLE   a handle whose arm never committed: the durable pair must be unarmed.
+ *   ABANDON_ARM_UNKNOWN a handle whose arm COMMIT was unknown: either coupled pair (no ticket ever existed).
+ */
+type NoWireMode = 'ARMED_TICKET' | 'ABANDON_AVAILABLE' | 'ABANDON_ARM_UNKNOWN';
+
+interface NoWireContext {
+  readonly mode: NoWireMode;
+  /** An identical retry after an unknown commit: an already-durable identical completion is ALREADY_COMPLETED. */
+  readonly retry: boolean;
+  readonly accountId: string;
+  readonly leaseId: string;
+  readonly certificateId: string;
+  readonly runtimeEpoch: string;
+  readonly reconciliationGeneration: number;
+  readonly intentId: string;
+  readonly clientOrderId: string;
+  readonly cancelGeneration: number;
+  readonly pair: string;
+  readonly exchangeOrderId: string;
+  /** ARMED_TICKET only: the exact durable arm instant the ticket was minted from. */
+  readonly expectedArmedAtMs: number | null;
+  /** Abandon only: the exact lease creation instant the handle was minted from. */
+  readonly expectedLeaseCreatedAtMs: number | null;
+  readonly certificateMatches: (certificate: PracticalDurableCertificateRecord) => boolean;
+  readonly nowMs: number;
+}
+
+type NoWireOutcome = { readonly kind: 'COMPLETED' | 'ALREADY_COMPLETED' };
+
+function completionRefused(message: string, details: Readonly<Record<string, unknown>>): never {
+  throw new PracticalMutationError('PRACTICAL_MUTATION_COMPLETION_REFUSED', message, details);
+}
+
+function splitState(message: string, details: Readonly<Record<string, unknown>>): never {
+  throw new PracticalMutationError('PRACTICAL_MUTATION_SPLIT_STATE', message, details);
+}
+
+function alreadyCompleted(message: string, details: Readonly<Record<string, unknown>>): never {
+  throw new PracticalMutationError('PRACTICAL_MUTATION_ALREADY_COMPLETED', message, details);
+}
+
+/** The ONLY completion report accepted: exactly { kind: 'NOT_DISPATCHED', reason } with a closed reason. */
+function requireNotDispatchedReport(value: unknown): PracticalNoDispatchReason {
+  const report = requireClosedWorld(value, PRACTICAL_NOT_DISPATCHED_REPORT_KEYS);
+  if (report['kind'] !== 'NOT_DISPATCHED') invalidInput('Only a NOT_DISPATCHED report is accepted (no dispatched outcome exists in this store)', 'report.kind');
+  const reason = report['reason'];
+  if (typeof reason !== 'string' || !(PRACTICAL_NO_DISPATCH_REASONS as readonly string[]).includes(reason)) invalidInput('The not-dispatched reason is not one of the closed reasons', 'report.reason');
+  return reason as PracticalNoDispatchReason;
+}
+
+function sameCertificateSnapshot(durable: PracticalDurableCertificateRecord, snapshot: PracticalAcquiredCancelRecord['certificate']): boolean {
+  return durable.certificateId === snapshot.certificateId
+    && durable.accountId === snapshot.accountId
+    && durable.providerAccountFingerprint === snapshot.providerAccountFingerprint
+    && durable.runtimeEpoch === snapshot.runtimeEpoch
+    && durable.reconciliationGeneration === snapshot.reconciliationGeneration
+    && durable.streamIncarnation === snapshot.streamIncarnation
+    && durable.evidenceDigest === snapshot.evidenceDigest
+    && durable.issuedAtMs === snapshot.issuedAtMs
+    && durable.expiresAtMs === snapshot.expiresAtMs
+    && durable.status === 'CONSUMED'
+    && durable.terminalAtMs === snapshot.consumedAtMs
+    && durable.terminalReason === null;
+}
+
+export class PrismaPracticalCancelMutationStore implements PracticalCancelMutationStore, PracticalCancelNoWireStore {
   readonly #prisma: PrismaClient;
   readonly #practical: PrismaPracticalSafetyRepository;
 
@@ -584,15 +685,17 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
     if (epoch !== record.runtimeEpoch) authorityInvalid('The acquired practical cancel belongs to a different runtime epoch than this process', 'runtimeIdentity');
     const context: ArmContext = Object.freeze({ handle: record, epoch, nowMs, policy });
 
-    // IN_USE across every internal retry; released ONLY after a proven rollback, spent after COMMIT or an unknown commit.
+    // IN_USE across every internal retry; released ONLY after a proven rollback, spent after COMMIT, ARM_OUTCOME_UNKNOWN after an unknown commit.
     reservePracticalAcquiredCancel(acquired);
     let armedRecord: PracticalArmedCancelRecord;
     try {
       armedRecord = await this.#transaction((tx) => this.#armWithin(tx, context));
     } catch (error) {
       if (error instanceof TransactionOutcomeUnknown) {
-        spendPracticalAcquiredCancel(acquired);
-        throw new PracticalMutationError('PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN', 'The arm COMMIT could not be confirmed; the handle is spent and no ticket was minted', { leaseId: record.leaseId }, error.cause);
+        // [Wave 2B2b] No ticket is minted, so no gateway call can follow. The durable arm may or may not have
+        // committed; only `abandonAcquiredCancel` accepts this handle, and it decides from the locked durable pair.
+        markPracticalAcquiredCancelArmOutcomeUnknown(acquired);
+        throw new PracticalMutationError('PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN', 'The arm COMMIT could not be confirmed; no ticket was minted and the handle is ARM_OUTCOME_UNKNOWN (only an abandon accepts it)', { leaseId: record.leaseId }, error.cause);
       }
       // `work` threw, so no COMMIT was issued: a proven zero-change rollback. The handle stays usable.
       releasePracticalAcquiredCancel(acquired);
@@ -711,6 +814,286 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
         provesAccountContinuity: false,
       };
     });
+  }
+
+  // ----- [Wave 2B2b] no-wire completion (PRE_DISPATCH_FAILURE only) ------------
+
+  /**
+   * Closes an ARMED order-bound CANCEL whose ticket was NEVER dispatched (in
+   * Wave 2B2 there is no dispatch path at all), as PRE_DISPATCH_FAILURE on
+   * both durable sides in ONE transaction. Cleanup, not authority: no
+   * enablement, reconciliation, dwell, certificate validity, stream, or
+   * runtime epoch is consulted.
+   */
+  public async completeUndispatchedCancel(input: PracticalUndispatchedCompletionInput): Promise<PracticalNoWireCompletion> {
+    // A. Before any durable access: closed-world input, a genuine ticket, the closed report.
+    const raw = requireClosedWorld(input, PRACTICAL_UNDISPATCHED_COMPLETION_INPUT_KEYS);
+    const armed = raw['armed'];
+    const record = PracticalArmedCancel.read(armed);
+    if (record === null) authorityInvalid('A genuine armed practical cancel is required', 'armed');
+    if (record.basis !== PRACTICAL_AUTHORIZATION_BASIS || record.provesAccountContinuity !== false || record.action !== 'CANCEL') {
+      authorityInvalid('The armed practical cancel does not carry the practical-recovery literals', 'armed');
+    }
+    const reason = requireNotDispatchedReport(raw['report']);
+    const nowMs = requireNowMs(raw['trustedNowMs']);
+    const status = PracticalArmedCancel.status(armed);
+    if (status !== 'ARMED' && status !== 'COMMIT_UNKNOWN') authorityInvalid('The armed practical cancel is completing or spent', 'armed');
+    const context: NoWireContext = Object.freeze({
+      mode: 'ARMED_TICKET',
+      retry: status === 'COMMIT_UNKNOWN',
+      accountId: record.accountId,
+      leaseId: record.leaseId,
+      certificateId: record.certificateId,
+      runtimeEpoch: record.runtimeEpoch,
+      reconciliationGeneration: record.reconciliationGeneration,
+      intentId: record.intentId,
+      clientOrderId: record.clientOrderId,
+      cancelGeneration: record.cancelGeneration,
+      pair: record.pair,
+      exchangeOrderId: record.exchangeOrderId,
+      expectedArmedAtMs: record.armedAtMs,
+      expectedLeaseCreatedAtMs: null,
+      certificateMatches: (certificate: PracticalDurableCertificateRecord) => certificate.certificateId === record.certificateId
+        && certificate.streamIncarnation === record.certificateStreamIncarnation
+        && certificate.expiresAtMs === record.certificateExpiresAtMs,
+      nowMs,
+    });
+
+    // COMPLETING_NO_WIRE across every internal retry (an unknown-commit retry must repeat the SAME reason).
+    const { from } = beginPracticalArmedCancelNoWireCompletion(armed, reason);
+    let outcome: NoWireOutcome;
+    try {
+      outcome = await this.#transaction((tx) => this.#noWireWithin(tx, context));
+    } catch (error) {
+      if (error instanceof TransactionOutcomeUnknown) {
+        markPracticalArmedCancelCommitUnknown(armed, reason);
+        throw new PracticalMutationError('PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN', 'The no-wire completion COMMIT could not be confirmed; only the identical completion may be retried', { leaseId: record.leaseId }, error.cause);
+      }
+      // `work` threw, so no COMMIT was issued: a proven zero-change rollback.
+      restorePracticalArmedCancel(armed, from, reason);
+      return this.#afterNoWireRollback(error, record.accountId, record.runtimeEpoch, nowMs);
+    }
+    finishPracticalArmedCancelNoWireCompletion(armed);
+    return Object.freeze({
+      kind: outcome.kind, outcome: 'PRE_DISPATCH_FAILURE' as const, leaseId: record.leaseId, intentId: record.intentId, cancelGeneration: record.cancelGeneration,
+    });
+  }
+
+  /**
+   * Abandons an acquired order-bound CANCEL in-process, as PRE_DISPATCH_FAILURE
+   * on both durable sides in ONE transaction. No ticket was ever minted from
+   * an acquired handle, so no gateway call can have been made for it: the
+   * release variant (unarmed or armed-undispatched) is derived ONLY from the
+   * locked, coupled durable pair, and the handle state only permits it.
+   */
+  public async abandonAcquiredCancel(input: PracticalCancelAbandonInput): Promise<PracticalNoWireCompletion> {
+    const raw = requireClosedWorld(input, PRACTICAL_CANCEL_ABANDON_INPUT_KEYS);
+    const acquired = raw['acquired'];
+    const record = PracticalAcquiredCancel.read(acquired);
+    if (record === null) authorityInvalid('A genuine acquired practical cancel is required', 'acquired');
+    if (record.certificate.basis !== PRACTICAL_AUTHORIZATION_BASIS || record.certificate.provesAccountContinuity !== false || record.action !== 'CANCEL') {
+      authorityInvalid('The acquired practical cancel does not carry the practical-recovery literals', 'acquired');
+    }
+    const nowMs = requireNowMs(raw['trustedNowMs']);
+
+    // The state gate is inside the (synchronous) transition: AVAILABLE | ARM_OUTCOME_UNKNOWN | ABANDON_OUTCOME_UNKNOWN only.
+    const { from, origin } = beginPracticalAcquiredCancelAbandon(acquired);
+    const context: NoWireContext = Object.freeze({
+      mode: origin === 'AVAILABLE' ? 'ABANDON_AVAILABLE' : 'ABANDON_ARM_UNKNOWN',
+      retry: from === 'ABANDON_OUTCOME_UNKNOWN',
+      accountId: record.accountId,
+      leaseId: record.leaseId,
+      certificateId: record.certificate.certificateId,
+      runtimeEpoch: record.runtimeEpoch,
+      reconciliationGeneration: record.reconciliationGeneration,
+      intentId: record.intentId,
+      clientOrderId: record.clientOrderId,
+      cancelGeneration: record.cancelGeneration,
+      pair: record.pair,
+      exchangeOrderId: record.exchangeOrderId,
+      expectedArmedAtMs: null,
+      expectedLeaseCreatedAtMs: record.leaseCreatedAtMs,
+      certificateMatches: (certificate: PracticalDurableCertificateRecord) => sameCertificateSnapshot(certificate, record.certificate),
+      nowMs,
+    });
+    let outcome: NoWireOutcome;
+    try {
+      outcome = await this.#transaction((tx) => this.#noWireWithin(tx, context));
+    } catch (error) {
+      if (error instanceof TransactionOutcomeUnknown) {
+        markPracticalAcquiredCancelAbandonOutcomeUnknown(acquired);
+        throw new PracticalMutationError('PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN', 'The abandon COMMIT could not be confirmed; only the identical abandon may be retried', { leaseId: record.leaseId }, error.cause);
+      }
+      restorePracticalAcquiredCancelAbandon(acquired, from);
+      return this.#afterNoWireRollback(error, record.accountId, record.runtimeEpoch, nowMs);
+    }
+    finishPracticalAcquiredCancelAbandon(acquired);
+    return Object.freeze({
+      kind: outcome.kind, outcome: 'PRE_DISPATCH_FAILURE' as const, leaseId: record.leaseId, intentId: record.intentId, cancelGeneration: record.cancelGeneration,
+    });
+  }
+
+  /**
+   * B. The ONE no-wire transaction. Lock order: practical rows (hook) ->
+   * live_order -> live_execution_intent. It never reads or locks
+   * live_reconciliation_state. Every statement uses `tx`.
+   */
+  async #noWireWithin(tx: Tx, ctx: NoWireContext): Promise<NoWireOutcome> {
+    return withLockedPracticalAccountWithinCallerTransaction(this.#practical, tx, ctx.accountId, async (scope: PracticalLockedAccountScope) => {
+      const expected = {
+        leaseId: ctx.leaseId,
+        certificateId: ctx.certificateId,
+        runtimeEpoch: ctx.runtimeEpoch,
+        reconciliationGeneration: ctx.reconciliationGeneration,
+        binding: { intentId: ctx.intentId, clientOrderId: ctx.clientOrderId, cancelGeneration: ctx.cancelGeneration },
+      };
+      const details = { leaseId: ctx.leaseId };
+      const fence = scope.account.fence;
+      if (fence.mode.kind !== 'MUTATION_LEASED' || fence.mode.leaseId !== ctx.leaseId) {
+        return this.#noWireAlreadyClosed(tx, scope, ctx, expected);
+      }
+
+      // 1. The exact LEASED order-bound lease (arm state RETURNED, not assumed) and its CONSUMED certificate.
+      const { lease, certificate } = await scope.requireLeasedOrderBoundCancelLease(expected);
+      if (!ctx.certificateMatches(certificate)) completionRefused('The lease certificate is not exactly the one this attempt acquired', details);
+      if (ctx.expectedLeaseCreatedAtMs !== null && lease.createdAtMs !== ctx.expectedLeaseCreatedAtMs) completionRefused('The lease was not created by this acquisition', details);
+
+      // 2. Phase 17 rows in the established order; exact-case identity.
+      const before = await lockPhase17Order(tx, ctx.intentId);
+      if (before === null
+        || before.intentId !== ctx.intentId
+        || before.accountId !== ctx.accountId
+        || before.clientOrderId !== ctx.clientOrderId
+        || before.pair !== ctx.pair
+        || before.exchangeOrderId !== ctx.exchangeOrderId
+        || before.cancelExchangeOrderId !== ctx.exchangeOrderId) {
+        completionRefused('The Phase 17 order is not exactly the order this lease is bound to', details);
+      }
+      if (before.cancelGeneration !== ctx.cancelGeneration || before.cancelState !== 'CANCEL_RESERVED') {
+        splitState('The practical lease is LEASED but the Phase 17 claim of its generation is not CANCEL_RESERVED', details);
+      }
+
+      // 3. The locked, COUPLED durable pair is the ONLY source of the release variant.
+      const leaseArmed = lease.armedAtMs !== null;
+      if (leaseArmed !== before.cancelWireArmed) splitState('The practical lease and the Phase 17 claim disagree on whether the wire was armed', details);
+      if (ctx.mode === 'ARMED_TICKET') {
+        if (!leaseArmed) splitState('A committed arm is not durable on either side', details);
+        if (lease.armedAtMs !== ctx.expectedArmedAtMs) completionRefused('The durable arm is not the arm this ticket was minted from', details);
+      } else if (ctx.mode === 'ABANDON_AVAILABLE' && leaseArmed) {
+        splitState('The pair is durably armed although no arm of this handle committed or became unknown', details);
+      }
+
+      // 4. The truthful no-wire Phase 17 release (fenced with the EXACT practical account id), then the practical side.
+      const accountForRelease = requireExactAccountId(lease.accountId, ctx.accountId);
+      const released = leaseArmed
+        ? await releaseArmedUndispatchedCancelClaimWithinCallerFencedTransaction(tx, ctx.intentId, ctx.cancelGeneration, accountForRelease)
+        : await releaseUnarmedCancelClaimWithinCallerFencedTransaction(tx, ctx.intentId, ctx.cancelGeneration, accountForRelease);
+      const completed = await scope.completeOrderBoundCancelLeaseNoWire(ctx.nowMs);
+
+      // 5. BOTH durable sides re-proven before COMMIT.
+      const after = await lockPhase17Order(tx, ctx.intentId);
+      const closed = released.intentId === ctx.intentId
+        && released.accountId === ctx.accountId
+        && released.cancelState === 'NONE'
+        && released.cancelGeneration === ctx.cancelGeneration
+        && released.cancelWireArmed === false
+        && released.cancelFaultCode === null
+        && released.state === before.state
+        && released.revision === before.revision + 1
+        && after !== null
+        && after.cancelState === 'NONE'
+        && after.cancelGeneration === ctx.cancelGeneration
+        && after.cancelWireArmed === false
+        && after.state === before.state
+        && after.revision === before.revision + 1
+        && completed.lease.leaseId === ctx.leaseId
+        && completed.lease.status === 'COMPLETED'
+        && completed.lease.outcome === 'PRE_DISPATCH_FAILURE'
+        && completed.lease.armedAtMs === lease.armedAtMs
+        && completed.account.fence.mode.kind === 'IDLE'
+        && completed.account.state !== 'CERTIFIED_IDLE'
+        && completed.certificate.status === 'CONSUMED';
+      if (!closed) selfCheckFailed('The no-wire completion did not re-read as exactly one released claim and one PRE_DISPATCH_FAILURE lease', details);
+      return Object.freeze({ kind: 'COMPLETED' as const });
+    });
+  }
+
+  /**
+   * The fence no longer holds the lease. ALREADY_COMPLETED is returned only
+   * after the SAME exact proof the completing path makes, re-made against the
+   * durable completion: the exact lease (identity, binding, creation instant)
+   * and CONSUMED certificate this attempt acquired, an arm state its ORIGIN
+   * could have left, and the exact-case Phase 17 order (intent, account, client
+   * order id, pair, exchange order id) whose claim of this generation was
+   * released exactly as the no-wire release leaves it, or has since been
+   * superseded by a LATER generation (whose cancel columns belong to that
+   * claim). Any identity or arm-origin mismatch is COMPLETION_REFUSED (a
+   * rollback with no write); a completed lease over an unreleased claim is a split.
+   */
+  async #noWireAlreadyClosed(
+    tx: Tx,
+    scope: PracticalLockedAccountScope,
+    ctx: NoWireContext,
+    expected: Parameters<PracticalLockedAccountScope['readOrderBoundCancelLease']>[0],
+  ): Promise<NoWireOutcome> {
+    const details = { leaseId: ctx.leaseId };
+    const { lease, certificate } = await scope.readOrderBoundCancelLease(expected);
+    if (lease.status === 'LEASED') splitState('The lease is LEASED but no longer held by its fence', details);
+    if (lease.status !== 'COMPLETED' || lease.outcome !== 'PRE_DISPATCH_FAILURE' || lease.completedAtMs === null) {
+      alreadyCompleted('The lease was already completed with a different outcome', details);
+    }
+
+    // 1. The exact lease and certificate this attempt acquired (the completing path's checks).
+    if (!ctx.certificateMatches(certificate)) completionRefused('The lease certificate is not exactly the one this attempt acquired', details);
+    if (ctx.expectedLeaseCreatedAtMs !== null && lease.createdAtMs !== ctx.expectedLeaseCreatedAtMs) completionRefused('The lease was not created by this acquisition', details);
+
+    // 2. The durable arm state must be one this attempt's ORIGIN could have left.
+    const armPermitted = ctx.mode === 'ARMED_TICKET'
+      ? ctx.expectedArmedAtMs !== null && lease.armedAtMs === ctx.expectedArmedAtMs
+      : ctx.mode === 'ABANDON_AVAILABLE'
+        ? lease.armedAtMs === null
+        : true; // ABANDON_ARM_UNKNOWN: either coupled pair (no ticket ever existed)
+    if (!armPermitted) completionRefused('The completed lease carries an arm state this attempt could not have left', details);
+
+    // 3. The exact Phase 17 order, exact-case (never the collation).
+    const order = await lockPhase17Order(tx, ctx.intentId);
+    if (order === null
+      || order.intentId !== ctx.intentId
+      || order.accountId !== ctx.accountId
+      || order.clientOrderId !== ctx.clientOrderId
+      || order.pair !== ctx.pair
+      || order.exchangeOrderId !== ctx.exchangeOrderId) {
+      completionRefused('The Phase 17 order is not exactly the order this lease is bound to', details);
+    }
+
+    // 4. This generation released exactly as the no-wire release leaves it, or a LATER generation has started.
+    if (order.cancelGeneration === ctx.cancelGeneration) {
+      if (order.cancelState !== 'NONE' || order.cancelWireArmed) {
+        splitState('The lease is COMPLETED PRE_DISPATCH_FAILURE but its Phase 17 claim was not released', details);
+      }
+      if (order.cancelFaultCode !== null || order.cancelExchangeOrderId !== ctx.exchangeOrderId) {
+        completionRefused('The released Phase 17 claim is not exactly the claim this lease was bound to', details);
+      }
+    } else if (order.cancelGeneration < ctx.cancelGeneration) {
+      splitState('The Phase 17 cancel generation is older than the completed lease', details);
+    }
+
+    if (!ctx.retry) alreadyCompleted('The lease was already completed as PRE_DISPATCH_FAILURE by another operation', details);
+    return Object.freeze({ kind: 'ALREADY_COMPLETED' as const });
+  }
+
+  /**
+   * After a PROVEN rollback of a no-wire transaction: a split pair is put into
+   * manual review in its own transaction (the fence stays leased) and the
+   * split error is rethrown; a malformed account is latched; anything else is
+   * rethrown unchanged.
+   */
+  async #afterNoWireRollback(error: unknown, accountId: string, epoch: string, nowMs: number): Promise<PracticalNoWireCompletion> {
+    if (error instanceof PracticalMutationError && error.code === 'PRACTICAL_MUTATION_SPLIT_STATE') {
+      await this.#practical.enterManualReview({ accountId, reason: 'POST_MUTATION_MISMATCH', nowMs });
+      throw error;
+    }
+    return this.#latchIfMalformed(error, accountId, epoch, nowMs);
   }
 
   // ----- malformed-state latch (AFTER a rollback; the existing reviewed escalation) ----

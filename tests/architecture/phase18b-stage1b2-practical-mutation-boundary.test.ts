@@ -105,8 +105,16 @@ describe('[4][5][6][7] the Phase 17 primitives: claim + arm only, strict wrapper
     expect(naming('completeCancelAttemptWithinCallerFencedTransaction')).toEqual([]);
   });
 
-  it('the adapter imports exactly those two primitives (and the claim outcome type) from live/repository.ts', () => {
-    expect(sourceOf(ADAPTER)).toContain("import {\n  armCancelWireWithinCallerFencedTransaction,\n  claimCancelWithinCallerFencedTransaction,\n  type ClaimCancelOutcome,\n} from '../repository';");
+  it('the adapter imports exactly the claim/arm primitives, [Wave 2B2b] the two named no-wire releases, and the claim outcome type from live/repository.ts', () => {
+    expect(sourceOf(ADAPTER)).toContain([
+      'import {',
+      '  armCancelWireWithinCallerFencedTransaction,',
+      '  claimCancelWithinCallerFencedTransaction,',
+      '  releaseArmedUndispatchedCancelClaimWithinCallerFencedTransaction,',
+      '  releaseUnarmedCancelClaimWithinCallerFencedTransaction,',
+      '  type ClaimCancelOutcome,',
+      "} from '../repository';",
+    ].join('\n'));
     const specifiers = extractImportSpecifiers(sourceOf(ADAPTER), ADAPTER);
     expect(specifiers.filter((specifier) => specifier === '../repository')).toHaveLength(1);
     const adapter = codeOf(ADAPTER);
@@ -171,12 +179,20 @@ describe('[8][15][16] no strict authority, no continuity claim, no compensation 
   it('never revokes, expires, invalidates, or releases through the Stage 1B1 public port (no compensation after a failure)', () => {
     for (const file of mutationFiles) {
       const code = codeOf(file);
-      for (const forbidden of ['revokeCertificate(', 'expireCertificate(', '.invalidate(', 'enterManualReview(', 'releaseLease(', 'consumeCertificateAndLease(', 'resolveManualReview(']) {
+      for (const forbidden of ['revokeCertificate(', 'expireCertificate(', '.invalidate(', 'releaseLease(', 'consumeCertificateAndLease(', 'resolveManualReview(']) {
         expect(code.includes(forbidden), `${file} names ${forbidden}`).toBe(false);
       }
     }
-    // The ONE Stage 1B1 public call: the existing malformed-state escalation, after a rollback.
-    expect(codeOf(ADAPTER).match(/this\.#practical\.(\w+)\(/g)).toEqual(['this.#practical.escalateMalformedAccount(']);
+    // The Stage 1B1 public calls, each only AFTER a proven rollback: the existing malformed-state escalation and
+    // [Wave 2B2b] the split-pair manual review (never a repair, never a release).
+    expect(codeOf(ADAPTER).match(/this\.#practical\.(\w+)\(/g)).toEqual(['this.#practical.enterManualReview(', 'this.#practical.escalateMalformedAccount(']);
+    const adapterCode = codeOf(ADAPTER);
+    const afterRollback = adapterCode.slice(adapterCode.indexOf('async #afterNoWireRollback('), adapterCode.indexOf('async #latchIfMalformed('));
+    expect(afterRollback.length).toBeGreaterThan(0);
+    expect(afterRollback).toContain("if (error instanceof PracticalMutationError && error.code === 'PRACTICAL_MUTATION_SPLIT_STATE') {");
+    expect(afterRollback).toContain("await this.#practical.enterManualReview({ accountId, reason: 'POST_MUTATION_MISMATCH', nowMs });");
+    expect(afterRollback).toContain('throw error;');
+    expect(codeOf(ADAPTER).match(/enterManualReview\(/g)).toHaveLength(1);
   });
 
   it('the strict Phase 18 barrier still refuses with ACCOUNT_CONTINUITY_NOT_PROVEN and takes exactly its four real arguments', () => {
@@ -308,9 +324,11 @@ describe('[11] the caller-owned Stage 1B1 hook uses ONLY the supplied transactio
     expect(adapter.match(/new PrismaPracticalSafetyRepository\(/g)).toHaveLength(1);
     expect(adapter).toContain('this.#practical = new PrismaPracticalSafetyRepository(this.#prisma, newId);');
     expect(adapter.match(/this\.#prisma\.\$transaction\(/g)).toHaveLength(1);
-    expect(adapter.match(/withLockedPracticalAccountWithinCallerTransaction\(this\.#practical, tx, /g)).toHaveLength(2);
-    // Exactly the two operation bodies run inside #transaction.
-    expect(adapter.match(/this\.#transaction\(\(tx\) => this\.#(acquireWithin|armWithin)\(tx, context\)\)/g)).toHaveLength(2);
+    // Acquire, arm, and [Wave 2B2b] the one shared no-wire body.
+    expect(adapter.match(/withLockedPracticalAccountWithinCallerTransaction\(this\.#practical, tx, /g)).toHaveLength(3);
+    // Exactly these operation bodies run inside #transaction: acquire, arm, and the no-wire body (completion + abandon).
+    expect(adapter.match(/this\.#transaction\(\(tx\) => this\.#(acquireWithin|armWithin|noWireWithin)\(tx, context\)\)/g)).toHaveLength(4);
+    expect(adapter.match(/this\.#transaction\(/g)).toHaveLength(4);
   });
 });
 
@@ -354,8 +372,10 @@ describe('[12][13][14] the classified Phase 17 pre-write claim failures', () => 
 
   it('the adapter has ONE try/catch around a Phase 17 call: exactly the claim, classifier first, then the no-write proof, then the invalidation', () => {
     const adapter = codeOf(ADAPTER);
-    // Exactly five: #transaction's attempt, acquire's and arm's outcome handling, the claim, and the malformed escalation.
-    expect(adapter.match(/\btry \{/g)).toHaveLength(5);
+    // Exactly seven: #transaction's attempt, acquire's / arm's / [2B2b] undispatched completion's / abandon's outcome
+    // handling, the claim, and the malformed escalation. No try surrounds a no-wire release primitive.
+    expect(adapter.match(/\btry \{/g)).toHaveLength(7);
+    expect(adapter).not.toMatch(/try \{\s+(const \w+ = )?await release(Unarmed|ArmedUndispatched)CancelClaimWithinCallerFencedTransaction/);
     // The ONLY try around a Phase 17 primitive is the claim (the arm is never caught: any failure rolls back).
     expect(adapter).not.toMatch(/try \{\s+(const \w+ = )?await armCancelWireWithinCallerFencedTransaction/);
     const claimTry = adapter.indexOf('try {\n        claim = await claimCancelWithinCallerFencedTransaction(tx, intentId, accountId);\n      } catch (error) {');
@@ -402,12 +422,21 @@ describe('[12][13][14] the classified Phase 17 pre-write claim failures', () => 
 });
 
 describe('the acquired / armed values are minted ONLY by the adapter, ONLY after COMMIT', () => {
-  it('the ticket issuing and lifecycle functions have exactly one production importer: the adapter; the armed-ticket take has none', () => {
-    for (const name of ['issuePracticalAcquiredCancel', 'issuePracticalArmedCancel', 'reservePracticalAcquiredCancel', 'releasePracticalAcquiredCancel', 'spendPracticalAcquiredCancel']) {
+  it('the ticket issuing and lifecycle functions have exactly one production importer: the adapter; [Wave 2B2b] there is no take at all', () => {
+    for (const name of [
+      'issuePracticalAcquiredCancel', 'issuePracticalArmedCancel', 'reservePracticalAcquiredCancel', 'releasePracticalAcquiredCancel', 'spendPracticalAcquiredCancel',
+      'markPracticalAcquiredCancelArmOutcomeUnknown', 'beginPracticalAcquiredCancelAbandon', 'finishPracticalAcquiredCancelAbandon', 'restorePracticalAcquiredCancelAbandon',
+      'markPracticalAcquiredCancelAbandonOutcomeUnknown', 'beginPracticalArmedCancelNoWireCompletion', 'finishPracticalArmedCancelNoWireCompletion',
+      'restorePracticalArmedCancel', 'markPracticalArmedCancelCommitUnknown',
+    ]) {
       expect(files.filter((file) => file !== `${MUTATION_ROOT}ticket.ts` && codeOf(file).includes(name)), name).toEqual([ADAPTER]);
     }
-    expect(files.filter((file) => file !== `${MUTATION_ROOT}ticket.ts` && codeOf(file).includes('takePracticalArmedCancel'))).toEqual([]);
-    expect(codeOf(`${MUTATION_ROOT}ticket.ts`)).not.toMatch(/export const TICKET_ISSUER|export \{ TICKET_ISSUER/);
+    // No take / dispatch surface exists anywhere: an ARMED ticket is, by construction, never dispatched.
+    const ticket = codeOf(`${MUTATION_ROOT}ticket.ts`);
+    expect(ticket).not.toMatch(/export function take|static take\(|isTaken|#taken/);
+    expect(ticket).not.toMatch(/'DISPATCHED'|'PERMITTED'|'PERMIT_PENDING'|DispatchPermit/);
+    expect(files.filter((file) => /takePracticalArmedCancel/.test(codeOf(file)))).toEqual([]);
+    expect(ticket).not.toMatch(/export const TICKET_ISSUER|export \{ TICKET_ISSUER/);
   });
 
   it('minting and spending happen after the awaited #transaction, never inside a transaction callback', () => {
@@ -419,10 +448,27 @@ describe('the acquired / armed values are minted ONLY by the adapter, ONLY after
     expect(arm.indexOf('reservePracticalAcquiredCancel(acquired);')).toBeLessThan(transaction);
     expect(arm.lastIndexOf('spendPracticalAcquiredCancel(acquired);')).toBeGreaterThan(transaction);
     expect(arm.lastIndexOf('issuePracticalArmedCancel(')).toBeGreaterThan(arm.lastIndexOf('spendPracticalAcquiredCancel(acquired);'));
-    for (const body of [adapter.slice(adapter.indexOf('async #acquireWithin('), adapter.indexOf('public async armCancelLease(')), adapter.slice(adapter.indexOf('async #armWithin('), adapter.indexOf('async #latchIfMalformed('))]) {
+    const noWireBody = adapter.slice(adapter.indexOf('async #noWireWithin('), adapter.indexOf('async #afterNoWireRollback('));
+    for (const body of [
+      adapter.slice(adapter.indexOf('async #acquireWithin('), adapter.indexOf('public async armCancelLease(')),
+      adapter.slice(adapter.indexOf('async #armWithin('), adapter.indexOf('public async completeUndispatchedCancel(')),
+      noWireBody,
+    ]) {
       for (const forbidden of ['issuePracticalAcquiredCancel(', 'issuePracticalArmedCancel(', 'spendPracticalAcquiredCancel(', 'reservePracticalAcquiredCancel(', 'releasePracticalAcquiredCancel(']) {
         expect(body.includes(forbidden), forbidden).toBe(false);
       }
+      expect(body).not.toMatch(/Practical(Acquired|Armed)Cancel(Abandon|NoWireCompletion|CommitUnknown|ArmOutcomeUnknown|AbandonOutcomeUnknown)\(/);
+    }
+    // [Wave 2B2b] The ticket / handle transitions of the no-wire operations run OUTSIDE the transaction body.
+    for (const [method, begin, finish] of [
+      ['completeUndispatchedCancel', 'beginPracticalArmedCancelNoWireCompletion(armed, reason);', 'finishPracticalArmedCancelNoWireCompletion(armed);'],
+      ['abandonAcquiredCancel', 'beginPracticalAcquiredCancelAbandon(acquired);', 'finishPracticalAcquiredCancelAbandon(acquired);'],
+    ] as const) {
+      const body = adapter.slice(adapter.indexOf(`public async ${method}(`));
+      const transaction = body.indexOf('outcome = await this.#transaction((tx) => this.#noWireWithin(tx, context));');
+      expect(body.indexOf(begin), method).toBeGreaterThan(0);
+      expect(body.indexOf(begin), method).toBeLessThan(transaction);
+      expect(body.indexOf(finish), method).toBeGreaterThan(transaction);
     }
   });
 });

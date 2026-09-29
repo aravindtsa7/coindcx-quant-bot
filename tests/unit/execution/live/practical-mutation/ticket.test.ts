@@ -2,15 +2,24 @@ import { describe, expect, it } from 'vitest';
 import { PracticalRecoveryCertificate } from '../../../../../src/execution/live/practical/certificate';
 import { PracticalLiveSafetyEnablement } from '../../../../../src/execution/live/practical/policy';
 import { LiveReconciliationAuthorization } from '../../../../../src/execution/live/reconciliation/repository';
+import * as ticketModule from '../../../../../src/execution/live/practical-mutation/ticket';
 import {
   PracticalAcquiredCancel,
   PracticalArmedCancel,
+  beginPracticalAcquiredCancelAbandon,
+  beginPracticalArmedCancelNoWireCompletion,
+  finishPracticalAcquiredCancelAbandon,
+  finishPracticalArmedCancelNoWireCompletion,
   issuePracticalAcquiredCancel,
   issuePracticalArmedCancel,
+  markPracticalAcquiredCancelAbandonOutcomeUnknown,
+  markPracticalAcquiredCancelArmOutcomeUnknown,
+  markPracticalArmedCancelCommitUnknown,
   releasePracticalAcquiredCancel,
   reservePracticalAcquiredCancel,
+  restorePracticalAcquiredCancelAbandon,
+  restorePracticalArmedCancel,
   spendPracticalAcquiredCancel,
-  takePracticalArmedCancel,
   type PracticalAcquiredCancelRecord,
   type PracticalArmedCancelRecord,
 } from '../../../../../src/execution/live/practical-mutation/ticket';
@@ -73,7 +82,8 @@ describe('non-forgeable', () => {
     expect(Object.isFrozen(issuePracticalArmedCancel(armedRecord()))).toBe(true);
     // The lifecycle transitions refuse a caller without the issuer.
     expect(() => PracticalAcquiredCancel.transition({}, issuePracticalAcquiredCancel(acquiredRecord()), 'AVAILABLE', 'SPENT')).toThrow(/internal/);
-    expect(() => PracticalArmedCancel.take({}, issuePracticalArmedCancel(armedRecord()))).toThrow(/internal/);
+    expect(() => PracticalArmedCancel.transition({}, issuePracticalArmedCancel(armedRecord()), 'ARMED', 'SPENT', null)).toThrow(/internal/);
+    expect(() => PracticalAcquiredCancel.beginAbandon({}, issuePracticalAcquiredCancel(acquiredRecord()))).toThrow(/internal/);
   });
 
   it('neither is, reads as, or converts to strict authority, a certificate, or an enablement; neither claims continuity', () => {
@@ -160,12 +170,111 @@ describe('the acquired-handle lifecycle and the one-shot armed ticket', () => {
     }
   });
 
-  it('an armed ticket can be taken exactly once', () => {
+});
+
+describe('[Wave 2B2b] no take, no dispatch state', () => {
+  it('the ticket module exports no take* function and the armed ticket has no take / isTaken / dispatch surface', () => {
+    expect(Object.keys(ticketModule).filter((name) => /^take/i.test(name))).toEqual([]);
+    expect('take' in PracticalArmedCancel).toBe(false);
+    expect('isTaken' in PracticalArmedCancel).toBe(false);
     const ticket = issuePracticalArmedCancel(armedRecord());
-    expect(PracticalArmedCancel.isTaken(ticket)).toBe(false);
-    expect(takePracticalArmedCancel(ticket)).toEqual(armedRecord());
-    expect(PracticalArmedCancel.isTaken(ticket)).toBe(true);
-    expect(() => takePracticalArmedCancel(ticket)).toThrow(/already taken/);
-    expect(() => takePracticalArmedCancel({ ...ticket })).toThrow(/genuine/);
+    expect(PracticalArmedCancel.status(ticket)).toBe('ARMED');
+    // No path leads from ARMED to any dispatch-like state: the only transition targets are the no-wire ones.
+    for (const target of ['DISPATCHED', 'PERMITTED', 'TAKEN']) {
+      expect(() => PracticalArmedCancel.transition({}, ticket, 'ARMED', target as never, null)).toThrow(/internal/);
+    }
+  });
+});
+
+describe('[Wave 2B2b] the armed-ticket no-wire lifecycle', () => {
+  it('ARMED -> COMPLETING_NO_WIRE -> ARMED (proven rollback) -> COMPLETING_NO_WIRE -> SPENT; nothing leaves SPENT', () => {
+    const ticket = issuePracticalArmedCancel(armedRecord());
+    expect(beginPracticalArmedCancelNoWireCompletion(ticket, 'FINAL_STREAM_GUARD_FAILED')).toEqual({ record: armedRecord(), from: 'ARMED' });
+    expect(PracticalArmedCancel.status(ticket)).toBe('COMPLETING_NO_WIRE');
+    // A second concurrent completion in this process is refused while completing.
+    expect(() => beginPracticalArmedCancelNoWireCompletion(ticket, 'FINAL_STREAM_GUARD_FAILED')).toThrow(/COMPLETING_NO_WIRE cannot be completed/);
+    restorePracticalArmedCancel(ticket, 'ARMED', 'FINAL_STREAM_GUARD_FAILED');
+    expect(PracticalArmedCancel.status(ticket)).toBe('ARMED');
+    beginPracticalArmedCancelNoWireCompletion(ticket, 'ABORTED_BEFORE_DISPATCH');
+    finishPracticalArmedCancelNoWireCompletion(ticket);
+    expect(PracticalArmedCancel.status(ticket)).toBe('SPENT');
+    expect(() => beginPracticalArmedCancelNoWireCompletion(ticket, 'ABORTED_BEFORE_DISPATCH')).toThrow(/SPENT cannot be completed/);
+    expect(PracticalArmedCancel.read(ticket)).toEqual(armedRecord());
+  });
+
+  it('COMMIT_UNKNOWN accepts ONLY the identical reason, and can be restored to COMMIT_UNKNOWN after a proven rollback', () => {
+    const ticket = issuePracticalArmedCancel(armedRecord());
+    beginPracticalArmedCancelNoWireCompletion(ticket, 'DISPATCH_WINDOW_CLOSED');
+    markPracticalArmedCancelCommitUnknown(ticket, 'DISPATCH_WINDOW_CLOSED');
+    expect(PracticalArmedCancel.status(ticket)).toBe('COMMIT_UNKNOWN');
+    expect(() => beginPracticalArmedCancelNoWireCompletion(ticket, 'FINAL_STREAM_GUARD_FAILED')).toThrow(/identical/);
+    expect(PracticalArmedCancel.status(ticket)).toBe('COMMIT_UNKNOWN');
+    expect(beginPracticalArmedCancelNoWireCompletion(ticket, 'DISPATCH_WINDOW_CLOSED').from).toBe('COMMIT_UNKNOWN');
+    restorePracticalArmedCancel(ticket, 'COMMIT_UNKNOWN', 'DISPATCH_WINDOW_CLOSED');
+    expect(PracticalArmedCancel.status(ticket)).toBe('COMMIT_UNKNOWN');
+    expect(() => beginPracticalArmedCancelNoWireCompletion(ticket, 'ABORTED_BEFORE_DISPATCH')).toThrow(/identical/);
+    beginPracticalArmedCancelNoWireCompletion(ticket, 'DISPATCH_WINDOW_CLOSED');
+    finishPracticalArmedCancelNoWireCompletion(ticket);
+    expect(PracticalArmedCancel.status(ticket)).toBe('SPENT');
+  });
+
+  it('forged tickets are refused by every transition, and no transition runs outside COMPLETING_NO_WIRE', () => {
+    const ticket = issuePracticalArmedCancel(armedRecord());
+    for (const forged of [{ ...ticket }, JSON.parse(JSON.stringify(ticket)), armedRecord(), null]) {
+      expect(() => beginPracticalArmedCancelNoWireCompletion(forged, 'FINAL_STREAM_GUARD_FAILED')).toThrow(/genuine/);
+      expect(PracticalArmedCancel.status(forged)).toBeNull();
+    }
+    expect(() => finishPracticalArmedCancelNoWireCompletion(ticket)).toThrow(/ARMED, not COMPLETING_NO_WIRE/);
+    expect(() => markPracticalArmedCancelCommitUnknown(ticket, 'FINAL_STREAM_GUARD_FAILED')).toThrow(/ARMED, not COMPLETING_NO_WIRE/);
+    expect(() => restorePracticalArmedCancel(ticket, 'SPENT' as never, 'FINAL_STREAM_GUARD_FAILED')).toThrow(/started from/);
+  });
+});
+
+describe('[Wave 2B2b] the acquired-handle unknown-arm and abandon lifecycle', () => {
+  it('an unknown arm commit leaves ARM_OUTCOME_UNKNOWN: it cannot be reserved (so no ticket can follow), only abandoned', () => {
+    const handle = issuePracticalAcquiredCancel(acquiredRecord());
+    reservePracticalAcquiredCancel(handle);
+    markPracticalAcquiredCancelArmOutcomeUnknown(handle);
+    expect(PracticalAcquiredCancel.status(handle)).toBe('ARM_OUTCOME_UNKNOWN');
+    expect(() => reservePracticalAcquiredCancel(handle)).toThrow(/ARM_OUTCOME_UNKNOWN, not AVAILABLE/);
+    expect(() => spendPracticalAcquiredCancel(handle)).toThrow(/ARM_OUTCOME_UNKNOWN/);
+    expect(beginPracticalAcquiredCancelAbandon(handle)).toEqual({ record: acquiredRecord(), from: 'ARM_OUTCOME_UNKNOWN', origin: 'ARM_OUTCOME_UNKNOWN' });
+    expect(PracticalAcquiredCancel.status(handle)).toBe('ABANDONING');
+    finishPracticalAcquiredCancelAbandon(handle);
+    expect(PracticalAcquiredCancel.status(handle)).toBe('SPENT');
+  });
+
+  it('abandon: AVAILABLE -> ABANDONING -> AVAILABLE (proven rollback) -> ABANDONING -> ABANDON_OUTCOME_UNKNOWN -> retry keeps the ORIGINAL origin', () => {
+    const handle = issuePracticalAcquiredCancel(acquiredRecord());
+    const first = beginPracticalAcquiredCancelAbandon(handle);
+    expect(first).toMatchObject({ from: 'AVAILABLE', origin: 'AVAILABLE' });
+    expect(() => beginPracticalAcquiredCancelAbandon(handle)).toThrow(/ABANDONING cannot be abandoned/);
+    expect(() => reservePracticalAcquiredCancel(handle)).toThrow(/ABANDONING/);
+    restorePracticalAcquiredCancelAbandon(handle, 'AVAILABLE');
+    expect(PracticalAcquiredCancel.status(handle)).toBe('AVAILABLE');
+    beginPracticalAcquiredCancelAbandon(handle);
+    markPracticalAcquiredCancelAbandonOutcomeUnknown(handle);
+    expect(PracticalAcquiredCancel.status(handle)).toBe('ABANDON_OUTCOME_UNKNOWN');
+    expect(() => reservePracticalAcquiredCancel(handle)).toThrow(/ABANDON_OUTCOME_UNKNOWN/);
+    const retry = beginPracticalAcquiredCancelAbandon(handle);
+    expect(retry).toMatchObject({ from: 'ABANDON_OUTCOME_UNKNOWN', origin: 'AVAILABLE' });
+    restorePracticalAcquiredCancelAbandon(handle, 'ABANDON_OUTCOME_UNKNOWN');
+    expect(PracticalAcquiredCancel.status(handle)).toBe('ABANDON_OUTCOME_UNKNOWN');
+    beginPracticalAcquiredCancelAbandon(handle);
+    finishPracticalAcquiredCancelAbandon(handle);
+    expect(PracticalAcquiredCancel.status(handle)).toBe('SPENT');
+    expect(() => beginPracticalAcquiredCancelAbandon(handle)).toThrow(/SPENT cannot be abandoned/);
+  });
+
+  it('IN_USE and SPENT handles cannot be abandoned; forged handles are refused; restore only to an abandonable origin', () => {
+    const handle = issuePracticalAcquiredCancel(acquiredRecord());
+    reservePracticalAcquiredCancel(handle);
+    expect(() => beginPracticalAcquiredCancelAbandon(handle)).toThrow(/IN_USE cannot be abandoned/);
+    spendPracticalAcquiredCancel(handle);
+    expect(() => beginPracticalAcquiredCancelAbandon(handle)).toThrow(/SPENT cannot be abandoned/);
+    for (const forged of [{ ...handle }, acquiredRecord(), null]) expect(() => beginPracticalAcquiredCancelAbandon(forged)).toThrow(/genuine/);
+    const other = issuePracticalAcquiredCancel(acquiredRecord());
+    beginPracticalAcquiredCancelAbandon(other);
+    expect(() => restorePracticalAcquiredCancelAbandon(other, 'IN_USE')).toThrow(/started from/);
   });
 });
