@@ -44,6 +44,10 @@ export default tseslint.config(
     },
   },
   {
+    files: ['scripts/private-stream-diagnostics/**/*.mjs'],
+    languageOptions: { globals: { Buffer: 'readonly' } },
+  },
+  {
     ignores: ['dist/**', 'coverage/**', 'node_modules/**', 'src/generated/**'],
   }
 );

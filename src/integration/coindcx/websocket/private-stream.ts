@@ -1,3 +1,5 @@
+import { PrivateStreamDiagnosticRecorder, type PrivateStreamDiagnosticConfig } from './private-stream-diagnostics';
+import type { ExportHistory, PrivateStreamDiagnosticsV1, SocketAttempt } from './private-stream-diagnostics-schema';
 import pino from 'pino';
 import { Clock, SystemClock } from '../clock';
 import { HmacSha256Signer, RequestSigner } from '../signer';
@@ -46,6 +48,7 @@ export interface PrivateStreamConfig {
   degradedErrorThreshold?: number;
   signer?: RequestSigner;
   logger?: pino.Logger;
+  diagnostics?: PrivateStreamDiagnosticConfig;
 }
 
 interface ReconnectToken {
@@ -79,6 +82,9 @@ export class CoinDcxPrivateAccountStream {
   readonly #backoffConfig: BackoffPolicyConfig;
   readonly #degradedErrorThreshold: number;
   readonly #logger: pino.Logger;
+
+  readonly #diagnostics: PrivateStreamDiagnosticRecorder | null;
+  #diagnosticAttempt: SocketAttempt | null = null;
 
   #generationId = 0;
   #localSequence = 0;
@@ -138,6 +144,9 @@ export class CoinDcxPrivateAccountStream {
     this.#backoffConfig = config.backoffConfig ?? DEFAULT_BACKOFF_CONFIG;
     this.#degradedErrorThreshold = config.degradedErrorThreshold ?? 10;
     this.#logger = config.logger ?? rootLogger;
+    // Invalid diagnostics can only disable observation, never transport.
+    try { this.#diagnostics = config.diagnostics === undefined ? null : new PrivateStreamDiagnosticRecorder(config.diagnostics); }
+    catch { this.#diagnostics = null; }
   }
 
   public get generationId(): number {
@@ -204,6 +213,8 @@ export class CoinDcxPrivateAccountStream {
     this.#cleanupReconnectTimer();
     this.#generationId++;
     const currentGeneration = this.#generationId;
+    const diagnosticAttempt = this.#diagnostics?.attemptStarted(currentGeneration) ?? null;
+    this.#diagnosticAttempt = diagnosticAttempt;
     this.#localSequence = 0;
 
     this.#cleanupOldSocket();
@@ -225,7 +236,8 @@ export class CoinDcxPrivateAccountStream {
       this.#cancelConnectionAttempt = cancel;
 
       this.#connectTimeoutTimer = this.#scheduler.setTimeout(() => {
-        if (currentGeneration !== this.#generationId || this.#isStopped) return;
+        if (currentGeneration !== this.#generationId || this.#isStopped) { this.#diagnostics?.record(diagnosticAttempt, { kind: 'STALE_CALLBACK', callback: 'CONNECT_TIMEOUT' }); return; }
+        this.#diagnostics?.record(diagnosticAttempt, { kind: 'FAILURE', category: 'CONNECT_TIMEOUT' });
         this.#cleanupConnectTimeout();
 
         this.#logger.warn({
@@ -243,11 +255,13 @@ export class CoinDcxPrivateAccountStream {
         const socket = this.#socketFactory.createSocket(this.#endpoint);
         if (currentGeneration !== this.#generationId || this.#isStopped) { socket.disconnect(); return; }
         this.#socket = socket;
+        this.#diagnostics?.record(diagnosticAttempt, { kind: 'SOCKET_CREATED' });
         const ownsSocket = () => currentGeneration === this.#generationId && !this.#isStopped && this.#socket === socket;
 
         const connectListener: SocketEventListener = () => {
           if (!ownsSocket()) {
             this.#staleGenerationDropCount++;
+            this.#diagnostics?.record(diagnosticAttempt, { kind: 'STALE_CALLBACK', callback: 'CONNECT' });
             return;
           }
 
@@ -258,8 +272,11 @@ export class CoinDcxPrivateAccountStream {
 
           // If reconnecting, private event continuity is broken: trigger reconciliation barrier
           const isReconnect = this.#reconnectAttempt > 0 || this.#hadConnected;
+          this.#diagnostics?.record(diagnosticAttempt, { kind: 'CONNECTED', reconnectPath: isReconnect });
           if (isReconnect) {
+            const firstAssertion = !this.#reconciliationRequired;
             this.#reconciliationRequired = true;
+            this.#diagnostics?.record(diagnosticAttempt, { kind: 'RECONCILIATION_REQUIRED', firstAssertion });
             this.#state = 'RECONCILIATION_REQUIRED';
 
             this.#dispatchEnvelope({
@@ -312,12 +329,14 @@ export class CoinDcxPrivateAccountStream {
         const disconnectListener: SocketEventListener = (rawReason: unknown) => {
           if (!ownsSocket()) {
             this.#staleGenerationDropCount++;
+            this.#diagnostics?.record(diagnosticAttempt, { kind: 'STALE_CALLBACK', callback: 'DISCONNECT' });
             return;
           }
 
           this.#disconnectsTotal++;
           this.#lastDisconnectReceivedAtMs = this.#clock.nowMs();
           const category = categorizeDisconnectReason(rawReason);
+          this.#diagnostics?.record(diagnosticAttempt, { kind: 'DISCONNECTED', category });
 
           this.#logger.info({
             module: 'coindcx:private-stream',
@@ -346,10 +365,12 @@ export class CoinDcxPrivateAccountStream {
         const connectErrorListener: SocketEventListener = () => {
           if (!ownsSocket()) {
             this.#staleGenerationDropCount++;
+            this.#diagnostics?.record(diagnosticAttempt, { kind: 'STALE_CALLBACK', callback: 'CONNECT_ERROR' });
             return;
           }
 
           this.#cleanupConnectTimeout();
+          this.#diagnostics?.record(diagnosticAttempt, { kind: 'FAILURE', category: 'CONNECT_ERROR' });
           finish(new CoinDcxSocketError('SOCKET_CONNECT_FAILED'));
           this.#handleConnectionFailure(currentGeneration, new Error('SOCKET_CONNECT_FAILED'));
         };
@@ -357,25 +378,27 @@ export class CoinDcxPrivateAccountStream {
         const errorListener: SocketEventListener = () => {
           if (!ownsSocket()) {
             this.#staleGenerationDropCount++;
+            this.#diagnostics?.record(diagnosticAttempt, { kind: 'STALE_CALLBACK', callback: 'SOCKET_ERROR' });
             return;
           }
 
+          this.#diagnostics?.record(diagnosticAttempt, { kind: 'FAILURE', category: 'SOCKET_ERROR' });
           this.#handleConnectionFailure(currentGeneration, new Error('SOCKET_ERROR'));
         };
 
         // Private notification event listeners
         const positionListener: SocketEventListener = (rawPayload: unknown) => {
-          if (!ownsSocket()) { this.#staleGenerationDropCount++; return; }
+          if (!ownsSocket()) { this.#staleGenerationDropCount++; this.#diagnostics?.record(diagnosticAttempt, { kind: 'STALE_CALLBACK', callback: 'POSITION' }); return; }
           this.#handlePositionUpdate(currentGeneration, rawPayload);
         };
 
         const orderListener: SocketEventListener = (rawPayload: unknown) => {
-          if (!ownsSocket()) { this.#staleGenerationDropCount++; return; }
+          if (!ownsSocket()) { this.#staleGenerationDropCount++; this.#diagnostics?.record(diagnosticAttempt, { kind: 'STALE_CALLBACK', callback: 'ORDER' }); return; }
           this.#handleOrderUpdate(currentGeneration, rawPayload);
         };
 
         const balanceListener: SocketEventListener = (rawPayload: unknown) => {
-          if (!ownsSocket()) { this.#staleGenerationDropCount++; return; }
+          if (!ownsSocket()) { this.#staleGenerationDropCount++; this.#diagnostics?.record(diagnosticAttempt, { kind: 'STALE_CALLBACK', callback: 'BALANCE' }); return; }
           this.#handleBalanceUpdate(currentGeneration, rawPayload);
         };
 
@@ -400,6 +423,7 @@ export class CoinDcxPrivateAccountStream {
         socket.connect();
       } catch (err: unknown) {
         if (currentGeneration !== this.#generationId || this.#isStopped) { finish(new CoinDcxSocketError('SOCKET_CONNECT_CANCELLED')); return; }
+        this.#diagnostics?.record(diagnosticAttempt, { kind: 'FAILURE', category: 'ATTEMPT_EXCEPTION' });
         this.#cleanupConnectTimeout();
         finish(new CoinDcxSocketError('SOCKET_CONNECT_FAILED'));
         this.#handleConnectionFailure(currentGeneration, err);
@@ -418,14 +442,18 @@ export class CoinDcxPrivateAccountStream {
     const authSignature = this.#signer.sign(CANONICAL_AUTH_BODY);
     if (!ownsSocket()) return;
 
+    const diagnosticAttempt = this.#diagnosticAttempt;
+    this.#diagnostics?.record(diagnosticAttempt, { kind: 'JOIN_EMIT_ATTEMPTED' });
     socket.emit('join', {
       channelName: PRIVATE_CHANNEL_NAME,
       authSignature,
       apiKey: this.#apiKey,
     });
+    this.#diagnostics?.record(diagnosticAttempt, { kind: 'JOIN_EMIT_RETURNED' });
     if (!ownsSocket()) return;
 
     this.#authJoinSent = true;
+    this.#diagnostics?.record(diagnosticAttempt, { kind: 'JOIN_MARKED_SENT' });
     if (this.#state !== 'RECONCILIATION_REQUIRED') {
       this.#state = 'AUTH_JOIN_SENT';
     }
@@ -441,12 +469,14 @@ export class CoinDcxPrivateAccountStream {
   #handlePositionUpdate(generation: number, raw: unknown): void {
     if (generation !== this.#generationId || this.#isStopped) {
       this.#staleGenerationDropCount++;
+      this.#diagnostics?.record(null, { kind: 'STALE_CALLBACK', callback: 'NOTIFICATION_GUARD' });
       return;
     }
 
     try {
       const payload = validateAndFilterPositionNotification(raw);
       this.#validNotificationsTotal++;
+      this.#diagnostics?.notification(true);
       this.#lastEventReceivedAtMs = this.#clock.nowMs();
 
       // Invariant: Do not log private record details
@@ -472,6 +502,7 @@ export class CoinDcxPrivateAccountStream {
       });
     } catch {
       this.#invalidEventCount++;
+      this.#diagnostics?.notification(false);
       if (this.#invalidEventCount > this.#degradedErrorThreshold && this.#state !== 'RECONCILIATION_REQUIRED') {
         this.#state = 'DEGRADED';
       }
@@ -481,12 +512,14 @@ export class CoinDcxPrivateAccountStream {
   #handleOrderUpdate(generation: number, raw: unknown): void {
     if (generation !== this.#generationId || this.#isStopped) {
       this.#staleGenerationDropCount++;
+      this.#diagnostics?.record(null, { kind: 'STALE_CALLBACK', callback: 'NOTIFICATION_GUARD' });
       return;
     }
 
     try {
       const payload = validateAndFilterOrderNotification(raw);
       this.#validNotificationsTotal++;
+      this.#diagnostics?.notification(true);
       this.#lastEventReceivedAtMs = this.#clock.nowMs();
 
       this.#logger.debug({
@@ -511,6 +544,7 @@ export class CoinDcxPrivateAccountStream {
       });
     } catch {
       this.#invalidEventCount++;
+      this.#diagnostics?.notification(false);
       if (this.#invalidEventCount > this.#degradedErrorThreshold && this.#state !== 'RECONCILIATION_REQUIRED') {
         this.#state = 'DEGRADED';
       }
@@ -520,12 +554,14 @@ export class CoinDcxPrivateAccountStream {
   #handleBalanceUpdate(generation: number, raw: unknown): void {
     if (generation !== this.#generationId || this.#isStopped) {
       this.#staleGenerationDropCount++;
+      this.#diagnostics?.record(null, { kind: 'STALE_CALLBACK', callback: 'NOTIFICATION_GUARD' });
       return;
     }
 
     try {
       const payload = validateBalanceNotification(raw);
       this.#validNotificationsTotal++;
+      this.#diagnostics?.notification(true);
       this.#lastEventReceivedAtMs = this.#clock.nowMs();
 
       this.#logger.debug({
@@ -549,6 +585,7 @@ export class CoinDcxPrivateAccountStream {
       });
     } catch {
       this.#invalidEventCount++;
+      this.#diagnostics?.notification(false);
       if (this.#invalidEventCount > this.#degradedErrorThreshold && this.#state !== 'RECONCILIATION_REQUIRED') {
         this.#state = 'DEGRADED';
       }
@@ -558,6 +595,7 @@ export class CoinDcxPrivateAccountStream {
   #handleConnectionFailure(generation: number, _err: unknown): void {
     if (generation !== this.#generationId || this.#isStopped) {
       this.#staleGenerationDropCount++;
+      this.#diagnostics?.record(null, { kind: 'STALE_CALLBACK', callback: 'FAILURE_GUARD' });
       return;
     }
 
@@ -565,12 +603,14 @@ export class CoinDcxPrivateAccountStream {
   }
 
   #scheduleReconnect(generation: number): void {
+    const diagnosticAttempt = this.#diagnosticAttempt?.generation === generation ? this.#diagnosticAttempt : null;
     if (generation !== this.#generationId || this.#isStopped) {
       return;
     }
 
     if (this.#reconnectToken !== null) {
       if (this.#reconnectToken.generation === generation) {
+        this.#diagnostics?.record(diagnosticAttempt, { kind: 'RECONNECT_SUPPRESSED' });
         return;
       }
       this.#cleanupReconnectTimer();
@@ -594,19 +634,23 @@ export class CoinDcxPrivateAccountStream {
       }
       if (timerGeneration !== this.#generationId || this.#isStopped) {
         this.#staleGenerationDropCount++;
+        this.#diagnostics?.record(diagnosticAttempt, { kind: 'STALE_CALLBACK', callback: 'RECONNECT_TIMER' });
         return;
       }
+      this.#diagnostics?.record(diagnosticAttempt, { kind: 'RECONNECT_TIMER_FIRED' });
       this.#ensureConnected().catch(() => {});
     }, delayMs);
 
     this.#reconnectToken = { generation: timerGeneration, timerId };
+    this.#diagnostics?.record(diagnosticAttempt, { kind: 'RECONNECT_SCHEDULED', delayMs });
   }
 
   #startPingTask(generation: number, socket: CoinDcxSocket): void {
     this.#cleanupPing();
+    const diagnosticAttempt = this.#diagnosticAttempt;
 
     this.#pingTimer = this.#scheduler.setInterval(() => {
-      if (generation !== this.#generationId || this.#isStopped || this.#socket !== socket) return;
+      if (generation !== this.#generationId || this.#isStopped || this.#socket !== socket) { this.#diagnostics?.record(diagnosticAttempt, { kind: 'STALE_CALLBACK', callback: 'PING_TIMER' }); return; }
 
       if (socket.connected) {
         try {
@@ -687,6 +731,8 @@ export class CoinDcxPrivateAccountStream {
   public stop(): void {
     this.#isStopped = true;
     this.#generationId++;
+    this.#diagnostics?.record(this.#diagnosticAttempt, { kind: 'STOP', resultingGeneration: this.#generationId });
+    this.#diagnosticAttempt = null;
     this.#cleanupConnectTimeout();
     this.#cleanupReconnectTimer();
     this.#cleanupPing();
@@ -694,6 +740,17 @@ export class CoinDcxPrivateAccountStream {
     this.#connectionAttempt = null;
     this.#authJoinSent = false;
     this.#state = 'STOPPED';
+  }
+
+  /** Separate observations only; existing health and metrics are untouched. */
+  public getDiagnosticsSnapshot(reason: PrivateStreamDiagnosticsV1['snapshot']['reason'], history?: ExportHistory): PrivateStreamDiagnosticsV1 | null {
+    return this.#diagnostics?.snapshot(reason, {
+      generation: this.#generationId,
+      activeAttempt: this.#diagnosticAttempt,
+      state: this.#state,
+      authJoinSent: this.#authJoinSent,
+      reconciliationRequired: this.#reconciliationRequired,
+    }, history) ?? null;
   }
 
   public getHealthSnapshot(): PrivateStreamHealthSnapshot {

@@ -63,6 +63,8 @@ import { PrismaLiveReconciliationRepository } from '../../../execution/live/reco
 import { CoinDcxClient } from '../client';
 import { DEFAULT_BASE_URL } from '../transport';
 import { CoinDcxPrivateAccountStream } from '../websocket/private-stream';
+import type { PrivateStreamDiagnosticConfig } from '../websocket/private-stream-diagnostics';
+import { DIAGNOSTICS_LIMITS } from '../websocket/private-stream-diagnostics-schema';
 import { SystemStreamScheduler } from '../websocket/public-stream';
 import { COINDCX_DEFAULT_SOCKET_ENDPOINT, ProductionCoinDcxSocketFactory } from '../websocket/socket-adapter';
 import { CoinDcxReconciliationEvidenceAdapter } from './reconciliation-evidence-adapter';
@@ -84,6 +86,26 @@ export interface PracticalShadowCliContext {
   readonly sourceProbe: () => PracticalShadowSourceProbe;
   /** Stop signal for `start` (SIGINT/SIGTERM in the script). Checked between evaluations. */
   readonly shouldContinue?: (() => boolean) | undefined;
+  /** Optional shadow-only observation; never part of campaign identity or evidence. */
+  readonly diagnosticsFactory?: (commit: string) => PracticalShadowDiagnostics | null;
+}
+
+export interface PracticalShadowDiagnostics {
+  readonly config: PrivateStreamDiagnosticConfig;
+  readonly start: (stream: CoinDcxPrivateAccountStream) => void;
+  readonly finish: () => Promise<unknown>;
+}
+
+async function finishDiagnostics(diagnostics: PracticalShadowDiagnostics | null, context: PracticalShadowCliContext): Promise<void> {
+  if (diagnostics === null) return;
+  let timer: NodeJS.Timeout | undefined;
+  const warn = (category: string) => { try { context.io.err(`[private-stream-diagnostics] ${category}`); } catch { /* Observation only. */ } };
+  try {
+    await Promise.race([
+      Promise.resolve().then(() => diagnostics.finish()).catch(() => { warn('OBSERVER_FAILED'); }),
+      new Promise<void>(resolve => { timer = setTimeout(() => { warn('FINAL_FLUSH_TIMEOUT'); resolve(); }, DIAGNOSTICS_LIMITS.finalFlushTimeoutMs); }),
+    ]);
+  } finally { if (timer !== undefined) clearTimeout(timer); }
 }
 
 const USAGE = 'usage: practical-shadow <start [--new|--resume] | stop | status | report | replay> [--campaign <campaignId>]'
@@ -131,7 +153,7 @@ function shadowIdentity(context: PracticalShadowCliContext): ShadowIdentity | nu
 }
 
 /** Resolves the source provenance; prints the refusal (never the tree's contents) unless CLEAN. */
-function cleanSourceProvenance(context: PracticalShadowCliContext): PracticalShadowSourceProvenance | null {
+function cleanSourceProvenance(context: PracticalShadowCliContext): Extract<PracticalShadowSourceProvenance, { state: 'CLEAN' }> | null {
   let probe: PracticalShadowSourceProbe | null = null;
   try {
     probe = context.sourceProbe();
@@ -166,11 +188,11 @@ function shadowConfig(context: PracticalShadowCliContext, cadenceMs: number): Pr
   }
 }
 
-function readOnlySources(context: PracticalShadowCliContext, config: PracticalShadowConfig, accountId: string, apiKey: string, apiSecret: string): { sources: PracticalShadowSources; stream: CoinDcxPrivateAccountStream } {
+function readOnlySources(context: PracticalShadowCliContext, config: PracticalShadowConfig, accountId: string, apiKey: string, apiSecret: string, diagnostics: PracticalShadowDiagnostics | null): { sources: PracticalShadowSources; stream: CoinDcxPrivateAccountStream } {
   // Exactly the normalized REST origin bound into the campaign's configuration digest.
   const client = new CoinDcxClient({ apiKey, apiSecret, baseUrl: config.provider.restOrigin });
   // Exactly the stream endpoint bound into the campaign's configuration digest.
-  const stream = new CoinDcxPrivateAccountStream({ apiKey, apiSecret, endpoint: config.provider.streamEndpoint, socketFactory: new ProductionCoinDcxSocketFactory() });
+  const stream = new CoinDcxPrivateAccountStream({ apiKey, apiSecret, endpoint: config.provider.streamEndpoint, socketFactory: new ProductionCoinDcxSocketFactory(), ...(diagnostics === null ? {} : { diagnostics: diagnostics.config }) });
   const reconciliationRepository = new PrismaLiveReconciliationRepository(context.prisma);
   const practicalRepository = new PrismaPracticalSafetyRepository(context.prisma);
   return {
@@ -204,7 +226,10 @@ async function commandStart(argv: readonly string[], context: PracticalShadowCli
   if (sourceProvenance === null) return 2;
   const config = shadowConfig(context, identity.cadenceMs);
   if (config === null) return 2;
-  const { sources, stream } = readOnlySources(context, config, identity.accountId, apiKey, apiSecret);
+  let diagnostics: PracticalShadowDiagnostics | null = null;
+  const diagnosticWarning = () => { try { context.io.err('[private-stream-diagnostics] OBSERVER_FAILED'); } catch { /* Observation only. */ } };
+  try { diagnostics = context.diagnosticsFactory?.(sourceProvenance.commit) ?? null; } catch { diagnosticWarning(); }
+  const { sources, stream } = readOnlySources(context, config, identity.accountId, apiKey, apiSecret, diagnostics);
   const runner = new PracticalShadowCampaignRunner({
     store: new PrismaPracticalShadowStore(context.prisma),
     sources,
@@ -229,14 +254,19 @@ async function commandStart(argv: readonly string[], context: PracticalShadowCli
     return 1;
   }
   context.io.out(`[shadow] campaign ${opened.campaign.campaignId} ${opened.kind} (aborted stale evaluations: ${opened.abortedEvaluations})`);
-  await stream.start();
+  try { diagnostics?.start(stream); } catch { diagnosticWarning(); }
   try {
-    const maxRaw = context.env['LIVE_PRACTICAL_SHADOW_MAX_EVALUATIONS']?.trim();
-    const maxEvaluations = maxRaw !== undefined && /^[1-9]\d*$/.test(maxRaw) ? Number(maxRaw) : undefined;
-    const completed = await runner.runLoop({ maxEvaluations, shouldContinue: context.shouldContinue });
-    context.io.out(`[shadow] stopped after ${completed} completed evaluations; the campaign stays ACTIVE and resumable.`);
+    await stream.start();
+    try {
+      const maxRaw = context.env['LIVE_PRACTICAL_SHADOW_MAX_EVALUATIONS']?.trim();
+      const maxEvaluations = maxRaw !== undefined && /^[1-9]\d*$/.test(maxRaw) ? Number(maxRaw) : undefined;
+      const completed = await runner.runLoop({ maxEvaluations, shouldContinue: context.shouldContinue });
+      context.io.out(`[shadow] stopped after ${completed} completed evaluations; the campaign stays ACTIVE and resumable.`);
+    } finally {
+      stream.stop();
+    }
   } finally {
-    stream.stop();
+    await finishDiagnostics(diagnostics, context);
   }
   return 0;
 }

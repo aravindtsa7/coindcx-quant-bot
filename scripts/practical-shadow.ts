@@ -29,6 +29,7 @@ import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { PrismaClient } from '@prisma/client';
 import { runPracticalShadowCli } from '../src/integration/coindcx/live/practical-shadow-runtime';
+import { createShadowDiagnosticsFactory } from './private-stream-diagnostics/config';
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 
@@ -60,6 +61,7 @@ async function main(): Promise<number> {
         status: git(['status', '--porcelain=v1', '--untracked-files=all', '--ignore-submodules=none']),
       }),
       shouldContinue: () => !stopping,
+      diagnosticsFactory: createShadowDiagnosticsFactory({ env: process.env, repoRoot: REPO_ROOT, warn: (category) => console.error(`[private-stream-diagnostics] ${category}`) }),
     });
   } catch (error) {
     // Never print a raw error object: it could carry request context.

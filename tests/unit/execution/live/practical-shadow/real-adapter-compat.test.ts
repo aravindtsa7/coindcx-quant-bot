@@ -39,11 +39,13 @@ function realAdapter(clock: FakeClock) {
 }
 
 describe('P18B Checkpoint C: shadow over the REAL read-only CoinDCX adapters', () => {
-  it('the real REST adapter supplies every shadow read; the real stream is UNPROVEN and stays UNPROVEN; REST data is still recorded; authority is not eligible', async () => {
+  it.each([false, true])('the real REST adapter supplies every shadow read; the real stream stays UNPROVEN and authority ineligible (diagnostics=%s)', async diagnosticsEnabled => {
     const clock = new FakeClock(T0);
     const { adapter, calls } = realAdapter(clock);
     const ctx = createTestStreamContext();
-    const stream = new CoinDcxPrivateAccountStream({ apiKey: 'dummy-key', apiSecret: 'dummy-secret', socketFactory: ctx.socketFactory, clock: ctx.clock, scheduler: ctx.scheduler });
+    const stream = new CoinDcxPrivateAccountStream({ apiKey: 'dummy-key', apiSecret: 'dummy-secret', socketFactory: ctx.socketFactory, clock: ctx.clock, scheduler: ctx.scheduler,
+      ...(diagnosticsEnabled ? { diagnostics: { sessionId: '12345678-1234-4123-8123-123456789abc', sourceCommit: 'a'.repeat(40) } } : {}),
+    });
     await stream.start();
     const reconciliation = new FakeReconciliation(ACCOUNT);
     reconciliation.completeHealthyRun(EPOCH);
