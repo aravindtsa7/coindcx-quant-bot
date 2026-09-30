@@ -386,3 +386,33 @@ describe('INCONCLUSIVE failures leave the receipt PENDING (nothing proven), and 
     expect(world.transactions).toBe(2);
   });
 });
+
+describe('[Wave 2B2d] a receipt superseded by ANOTHER runtime epoch', () => {
+  it.each([
+    ['the fence IDLE at another epoch (a previous-runtime recovery adopted it)', { ...IDLE_FENCE, runtimeEpoch: 'epoch-adopting' }, 'QUARANTINED'],
+    ['a fence at another epoch that still looks exactly restorable', { ...LEASED_FENCE, runtimeEpoch: 'epoch-adopting' }, 'MUTATING'],
+  ] as const)('%s: RUNTIME_SUPERSEDED, receipt permanently REFUSED, nothing inspected, no manual review, no handle', async (_name, fence, state) => {
+    world.account = { state, fence };
+    const unknown = receipt();
+    const error = await refusal(unknown);
+    expect(error.details).toEqual({ accountId: ACCOUNT, leaseId: LEASE_ID, reason: 'RUNTIME_SUPERSEDED', escalated: false, reviewEpisodeId: null });
+    expect(PracticalUnknownAcquire.status(unknown)).toBe('REFUSED');
+    expect(scope.inspectAttemptedOrderBoundCancelLease).not.toHaveBeenCalled();
+    expect(enterManualReview).not.toHaveBeenCalled();
+    expect(escalateMalformed).not.toHaveBeenCalled();
+    expect(world.log).toEqual([`SCOPE open ${ACCOUNT}`]);
+    // Mint-disabled forever, refused before any durable access.
+    world.account = { state: 'MUTATING', fence: LEASED_FENCE };
+    const transactions = world.transactions;
+    await expect(store().resolveUnknownAcquire(input(unknown))).rejects.toMatchObject({ code: 'PRACTICAL_MUTATION_AUTHORITY_INVALID' });
+    expect(world.transactions).toBe(transactions);
+  });
+
+  it('parser-first: a malformed account is still ACCOUNT_UNREADABLE (latched), never classified as superseded', async () => {
+    world.hookError = new PracticalPersistenceError('PRACTICAL_PERSISTENCE_MALFORMED', 'fence names a COMPLETED lease', { accountId: ACCOUNT, problem: 'ROWS_INCONSISTENT' });
+    enterManualReview.mockRejectedValueOnce(new PracticalPersistenceError('PRACTICAL_PERSISTENCE_MALFORMED', 'still malformed', { accountId: ACCOUNT, problem: 'ROWS_INCONSISTENT' }));
+    const unknown = receipt();
+    expect((await refusal(unknown)).details).toMatchObject({ reason: 'ACCOUNT_UNREADABLE', escalated: true, reviewEpisodeId: 'review-latch-1' });
+    expect(PracticalUnknownAcquire.status(unknown)).toBe('REFUSED');
+  });
+});

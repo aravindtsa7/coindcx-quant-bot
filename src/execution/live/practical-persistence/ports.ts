@@ -97,6 +97,34 @@ export class PracticalPersistenceError extends Error {
   }
 }
 
+/**
+ * [Stage 1B2 Wave 2B2d] The closed kinds of a PROVEN durable contradiction
+ * between a lease and its CONSUMED certificate, established from locked rows:
+ *   CERTIFICATE_NOT_BOUND_TO_LEASE  the certificate is not CONSUMED on every
+ *     binding field of the lease, carries a terminal reason, or was not
+ *     consumed at the lease's creation instant;
+ *   CERTIFICATE_LEASE_NOT_UNIQUE    the certificate does not rest under
+ *     exactly this one lease.
+ */
+export type PracticalDurableContradiction = 'CERTIFICATE_NOT_BOUND_TO_LEASE' | 'CERTIFICATE_LEASE_NOT_UNIQUE';
+
+/**
+ * [Stage 1B2 Wave 2B2d] A TYPED `PRACTICAL_PERSISTENCE_CONFLICT`: the SAME
+ * code (every existing handler is unchanged), thrown ONLY where a durable
+ * lease / certificate contradiction is proven. Callers classify it with
+ * `instanceof`, never by message. Every other CONFLICT (lifecycle, CAS,
+ * self-check re-read, concurrent change) stays a plain PracticalPersistenceError.
+ */
+export class PracticalDurableContradictionError extends PracticalPersistenceError {
+  public readonly contradiction: PracticalDurableContradiction;
+
+  public constructor(contradiction: PracticalDurableContradiction, message: string, details?: Readonly<Record<string, unknown>>) {
+    super('PRACTICAL_PERSISTENCE_CONFLICT', message, details === undefined ? { contradiction } : { ...details, contradiction });
+    this.name = 'PracticalDurableContradictionError';
+    this.contradiction = contradiction;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Durable records (strictly validated on every read)
 // ---------------------------------------------------------------------------

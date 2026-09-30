@@ -67,7 +67,9 @@ import {
 import { planPracticalAccountChange, type PracticalAccountChangePlan, type PracticalAccountChangeRequest } from './plan';
 import {
   PRACTICAL_DURABLE_STATE_MALFORMED,
+  PracticalDurableContradictionError,
   PracticalPersistenceError,
+  type PracticalDurableContradiction,
   type PracticalMalformedEscalation,
   type PracticalAccountInitialization,
   type PracticalAccountLoad,
@@ -1268,11 +1270,13 @@ export class PrismaPracticalSafetyRepository implements PracticalSafetyRepositor
         }
         // The CONSUMED certificate the lease rests on, re-proven on a fresh LOCKED read (a row the account read already locked).
         const certificate = parsePracticalCertificateRow(await readCertificateRow(tx, exact.certificateId, true));
-        if (!sameDurableCertificate(certificate, snapshotCertificate)
-          || !isPracticalCertificateBoundToLease(certificate, lease)
+        // Two locked reads of one row disagreeing inside one transaction is operational, not a durable contradiction.
+        if (!sameDurableCertificate(certificate, snapshotCertificate)) conflict('The two locked reads of the leased certificate disagree', { accountId, field: 'certificate' });
+        // [Wave 2B2d] A PROVEN durable contradiction: typed (same CONFLICT code), so a caller never matches a message.
+        if (!isPracticalCertificateBoundToLease(certificate, lease)
           || certificate.terminalReason !== null
           || certificate.terminalAtMs !== lease.createdAtMs) {
-          conflict('The lease does not rest on its exact CONSUMED certificate', { accountId, field: 'certificate' });
+          durableContradiction('CERTIFICATE_NOT_BOUND_TO_LEASE', 'The lease does not rest on its exact CONSUMED certificate', { accountId, field: 'certificate' });
         }
         await requireOnlyLeaseOfCertificate(tx, exact.certificateId, exact.leaseId);
         lifecycle.completable = Object.freeze({ lease, certificate });
@@ -1316,6 +1320,59 @@ export class PrismaPracticalSafetyRepository implements PracticalSafetyRepositor
         const certificateAfter = parsePracticalCertificateRow(await readCertificateRow(tx, certificate.certificateId, true));
         if (!sameDurableCertificate(certificateAfter, certificate) || certificateAfter.status !== 'CONSUMED') {
           conflict('The consumed certificate changed during the no-wire completion', { accountId });
+        }
+        return Object.freeze({ lease: completed, certificate: certificateAfter, account: after });
+      }),
+
+      // [Wave 2B2d] PREVIOUS-RUNTIME recovery: the SAME no-wire completion and, in the SAME write, the Stage 1A
+      // adoption of the (now IDLE) fence by this runtime. No intermediate IDLE-at-the-old-epoch state exists, so every
+      // later operation of an old-epoch process fails its epoch / fence check.
+      completeOrderBoundCancelLeaseNoWireAndAdopt: (trustedNowMs: number, newRuntimeEpoch: string) => run(true, async () => {
+        const completable = lifecycle.completable;
+        if (completable === null) conflict('A previous-runtime recovery requires a prior exact check in the same scope', { accountId });
+        const nowMs = requireTime(trustedNowMs, 'trustedNowMs');
+        const newEpoch = requireId(newRuntimeEpoch, 'newRuntimeEpoch', 64);
+        const { lease, certificate } = completable;
+        const binding = lease.orderBinding;
+        if (binding === null) conflict('Only an order-bound lease can be recovered', { accountId });
+        // Unarmed only (defense in depth over the caller's coupled-pair check; the #apply CAS re-checks armedAtMs null).
+        if (lease.armedAtMs !== null) conflict('An armed lease is never recovered as a no-wire completion', { accountId });
+        const fence = current.fence;
+        if (fence.runtimeEpoch === newEpoch) conflict('The lease belongs to THIS runtime; it is not a previous-runtime lease', { accountId });
+        const completedAtMs = Math.max(nowMs, lease.createdAtMs);
+        // Stage 1A pure steps, composed: release the lease (MUTATION_LEASED -> IDLE), then adopt the IDLE fence.
+        const releasedFence = releasePracticalMutationLease(fence, {
+          accountId, runtimeEpoch: fence.runtimeEpoch, reconciliationGeneration: fence.reconciliationGeneration, revision: fence.revision,
+        }, lease.leaseId);
+        const adoptedFence = adoptPracticalFenceForNewRuntime(releasedFence, {
+          accountId, previousRuntimeEpoch: fence.runtimeEpoch, revision: releasedFence.revision,
+        }, newEpoch);
+        const nextState = practicalAccountStateOnStartup(transitionOrFailClosed(current.state, { kind: 'MUTATION_OUTCOME_RECORDED', outcome: 'PRE_DISPATCH_FAILURE' }));
+        const after = await this.#apply(tx, current, {
+          nextState, nextFence: adoptedFence, openCause: 'RUNTIME_STARTUP', reason: 'RUNTIME_EPOCH_CHANGED',
+        }, completedAtMs, { completeBoundLeaseNoWire: { lease } });
+        const completed = parsePracticalLeaseRow(await readLeaseRow(tx, lease.leaseId, true));
+        if (after.fence.mode.kind !== 'IDLE'
+          || after.fence.runtimeEpoch !== newEpoch
+          || after.fence.revision !== adoptedFence.revision
+          || after.currentLease !== null
+          || after.state === 'CERTIFIED_IDLE'
+          || after.state === 'MUTATING'
+          || completed.leaseId !== lease.leaseId
+          || completed.accountId !== accountId
+          || completed.certificateId !== lease.certificateId
+          || completed.status !== 'COMPLETED'
+          || completed.outcome !== 'PRE_DISPATCH_FAILURE'
+          || completed.completedAtMs !== completedAtMs
+          || completed.armedAtMs !== null
+          || completed.createdAtMs !== lease.createdAtMs
+          || completed.runtimeEpoch !== lease.runtimeEpoch
+          || !sameOrderBinding(completed.orderBinding, binding)) {
+          conflict('The previous-runtime recovery did not re-read as one PRE_DISPATCH_FAILURE completion with the fence adopted by this runtime', { accountId });
+        }
+        const certificateAfter = parsePracticalCertificateRow(await readCertificateRow(tx, certificate.certificateId, true));
+        if (!sameDurableCertificate(certificateAfter, certificate) || certificateAfter.status !== 'CONSUMED') {
+          conflict('The consumed certificate changed during the previous-runtime recovery', { accountId });
         }
         return Object.freeze({ lease: completed, certificate: certificateAfter, account: after });
       }),
@@ -1694,6 +1751,18 @@ export interface PracticalLockedAccountScope {
     readonly account: PracticalAccountSnapshot;
   }>;
   /**
+   * [Wave 2B2d] PREVIOUS-RUNTIME RECOVERY, terminal write: after the same
+   * exact check as the no-wire completion, an UNARMED lease completed as
+   * PRE_DISPATCH_FAILURE through the same compare-and-set AND, in the same
+   * write, the released fence adopted by `newRuntimeEpoch` (Stage 1A adoption;
+   * the account's startup state). Strict re-read.
+   */
+  completeOrderBoundCancelLeaseNoWireAndAdopt(trustedNowMs: number, newRuntimeEpoch: string): Promise<{
+    readonly lease: PracticalMutationLeaseRecord;
+    readonly certificate: PracticalDurableCertificateRecord;
+    readonly account: PracticalAccountSnapshot;
+  }>;
+  /**
    * [Wave 2B2b] IDEMPOTENT-RETRY INSPECTION, read-only: the exact order-bound
    * lease the fence NO LONGER names (any status), locked and strictly parsed,
    * with the exact CONSUMED certificate it rests on (fresh locked read, the
@@ -1891,10 +1960,34 @@ async function readLeaseIdsOfCertificate(tx: Tx, certificateId: string): Promise
 async function requireOnlyLeaseOfCertificate(tx: Tx, certificateId: string, leaseId: string): Promise<void> {
   const rows = await tx.$queryRaw<unknown[]>(Prisma.sql`SELECT lease_id AS leaseId, certificate_id AS certificateId
     FROM live_practical_mutation_lease WHERE certificate_id = ${certificateId} FOR UPDATE`);
-  if (!Array.isArray(rows) || rows.length !== 1) conflict('The certificate does not rest under exactly one lease', { field: 'lease' });
-  if (pointerOf(rows[0], 'leaseId') !== leaseId || pointerOf(rows[0], 'certificateId') !== certificateId) {
-    conflict('The lease resting on the certificate is not exactly this lease', { field: 'lease' });
+  // An unreadable projection proves no durable fact. Validate EVERY row before cardinality or identity classification.
+  if (!Array.isArray(rows)) conflict('The certificate lease read returned no row set', { field: 'lease' });
+  const projected: { leaseId: string; certificateId: string }[] = [];
+  for (const row of rows) {
+    if (typeof row !== 'object' || row === null || Array.isArray(row)) conflict('A certificate lease projection is not a readable row', { field: 'lease' });
+    let storedLeaseId: unknown;
+    let storedCertificateId: unknown;
+    try {
+      // Raw SQL projects own data columns, never inherited properties or accessors.
+      storedLeaseId = Object.getOwnPropertyDescriptor(row, 'leaseId')?.value;
+      storedCertificateId = Object.getOwnPropertyDescriptor(row, 'certificateId')?.value;
+    } catch {
+      conflict('A certificate lease projection is not a readable row', { field: 'lease' });
+    }
+    if (!isExactId(storedLeaseId) || storedLeaseId.length > 64) conflict('A certificate lease projection has no valid lease id', { field: 'leaseId' });
+    if (typeof storedCertificateId !== 'string' || !PRACTICAL_DIGEST_PATTERN.test(storedCertificateId)) conflict('A certificate lease projection has no valid certificate id', { field: 'certificateId' });
+    projected.push({ leaseId: storedLeaseId, certificateId: storedCertificateId });
   }
+  // [Wave 2B2d] Valid locked row sets prove these durable contradictions; code, messages and escalation are unchanged.
+  if (projected.length !== 1) durableContradiction('CERTIFICATE_LEASE_NOT_UNIQUE', 'The certificate does not rest under exactly one lease', { field: 'lease' });
+  if (projected[0]!.leaseId !== leaseId || projected[0]!.certificateId !== certificateId) {
+    durableContradiction('CERTIFICATE_LEASE_NOT_UNIQUE', 'The lease resting on the certificate is not exactly this lease', { field: 'lease' });
+  }
+}
+
+/** [Wave 2B2d] Throws the TYPED durable-contradiction conflict (see `PracticalDurableContradictionError`). */
+function durableContradiction(kind: PracticalDurableContradiction, message: string, details: Readonly<Record<string, unknown>>): never {
+  throw new PracticalDurableContradictionError(kind, message, details);
 }
 
 /**

@@ -237,13 +237,20 @@ describe('the two named no-wire release primitives', () => {
 });
 
 describe('scope: [Wave 2B2b widened] only the no-wire completion and in-process abandon exist; no recovery, dispatch, permit, ACCEPTED, or REJECTED', () => {
-  it('the Stage 1B2 adapter never names Phase 17 completion; each no-wire primitive is called exactly ONCE, fenced with the exact lease account', () => {
+  it('the Stage 1B2 adapter never names Phase 17 completion; each no-wire primitive is called exactly ONCE in the no-wire body ([Wave 2B2d] + the UNARMED one once in the previous-runtime recovery), fenced with the exact lease account', () => {
     const adapter = codeOf(MUTATION_ADAPTER);
     expect(adapter).not.toContain('completeCancelAttemptWithinCallerFencedTransaction');
     expect(adapter).not.toMatch(/completeCancelLease|recoverOrphanedCancelLease|DispatchPermit/);
     // One derived call each, in the shared no-wire body, selected ONLY by the locked coupled durable pair.
     expect(adapter.match(/await releaseArmedUndispatchedCancelClaimWithinCallerFencedTransaction\(/g)).toHaveLength(1);
-    expect(adapter.match(/await releaseUnarmedCancelClaimWithinCallerFencedTransaction\(/g)).toHaveLength(1);
+    // [Wave 2B2d] + exactly ONE unarmed call in the previous-runtime recovery (never the armed-undispatched release there).
+    expect(adapter.match(/await releaseUnarmedCancelClaimWithinCallerFencedTransaction\(/g)).toHaveLength(2);
+    const recover = adapter.slice(adapter.indexOf('async #recoverWithin('), adapter.indexOf('async #afterRecoveryRollback('));
+    expect(recover).toContain('const released = await releaseUnarmedCancelClaimWithinCallerFencedTransaction(tx, binding.intentId, binding.cancelGeneration, requireExactAccountId(lease.accountId, accountId));');
+    expect(recover).not.toMatch(/releaseArmedUndispatchedCancelClaimWithinCallerFencedTransaction|claimCancelWithinCallerFencedTransaction|armCancelWireWithinCallerFencedTransaction/);
+    expect(recover.indexOf("if (leaseArmed) leaseRecoveryRefused('ARMED_ORPHAN_REQUIRES_EVIDENCE', accountId);"))
+      .toBeLessThan(recover.indexOf('const released = await releaseUnarmedCancelClaimWithinCallerFencedTransaction('));
+    expect(recover).not.toMatch(/live_reconciliation_state|lockReconciliationState|classifyPracticalReconciliationMismatch|requireCancelEnablement/);
     expect(adapter).toContain('const accountForRelease = requireExactAccountId(lease.accountId, ctx.accountId);');
     expect(adapter).toContain([
       'const released = leaseArmed',
@@ -272,6 +279,8 @@ describe('scope: [Wave 2B2b widened] only the no-wire completion and in-process 
     expect(success).toBeGreaterThan(0);
     expect(closed.match(/kind: 'ALREADY_COMPLETED'/g)).toHaveLength(1);
     for (const check of [
+      // [Wave 2B2d] a retry superseded by another runtime epoch is refused before anything else.
+      'if (scope.account.fence.runtimeEpoch !== ctx.runtimeEpoch) {',
       'const { lease, certificate } = await scope.readOrderBoundCancelLease(expected);',
       'if (!ctx.certificateMatches(certificate)) completionRefused(',
       'if (ctx.expectedLeaseCreatedAtMs !== null && lease.createdAtMs !== ctx.expectedLeaseCreatedAtMs) completionRefused(',

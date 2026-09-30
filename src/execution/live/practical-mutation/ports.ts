@@ -293,11 +293,84 @@ export type PracticalRecoveryRefusalReason =
   | 'PHASE17_IDENTITY'
   | 'PHASE17_CLAIM'
   | 'ABSENT_BUT_REFERENCED'
-  | 'ANOMALY_PREVIOUSLY_PROVEN';
+  | 'ANOMALY_PREVIOUSLY_PROVEN'
+  /**
+   * [Wave 2B2d] The account's fence was adopted by ANOTHER runtime epoch: this
+   * old-epoch receipt is superseded. Not an anomaly (a reviewed previous-runtime
+   * recovery explains it): REFUSED permanently, no handle, no manual review, no write.
+   */
+  | 'RUNTIME_SUPERSEDED';
 export const PRACTICAL_RECOVERY_REFUSAL_REASONS: readonly PracticalRecoveryRefusalReason[] = Object.freeze([
   'ACCOUNT_UNREADABLE', 'LEASE_NOT_LEASED', 'LEASE_ARMED', 'LEASE_IDENTITY', 'FENCE_MISMATCH', 'CERTIFICATE_MISMATCH',
-  'PHASE17_MISSING', 'PHASE17_IDENTITY', 'PHASE17_CLAIM', 'ABSENT_BUT_REFERENCED', 'ANOMALY_PREVIOUSLY_PROVEN',
+  'PHASE17_MISSING', 'PHASE17_IDENTITY', 'PHASE17_CLAIM', 'ABSENT_BUT_REFERENCED', 'ANOMALY_PREVIOUSLY_PROVEN', 'RUNTIME_SUPERSEDED',
 ] as const);
+
+// ---------------------------------------------------------------------------
+// [Wave 2B2d] Previous-runtime leased-fence recovery (UNARMED only)
+//
+// A MUTATION_LEASED fence left by a PREVIOUS runtime epoch blocks adoption
+// (Stage 1A `adoptPracticalFenceForNewRuntime`). Whether its mutation reached
+// the wire is decided ONLY from the locked durable coupled pair: an UNARMED
+// pair provably never reached a gateway (a ticket is minted only after a
+// committed arm), so it is closed as PRE_DISPATCH_FAILURE and the fence is
+// adopted by this runtime, in ONE commit. An ARMED pair may have been
+// dispatched by any future version: it is never released here (evidence and
+// manual review). Cleanup, never authority: no enablement, no reconciliation.
+// ---------------------------------------------------------------------------
+
+/** The exact, closed set of recovery input keys. The runtime epoch is never an input: it is read from a genuine identity. */
+export const PRACTICAL_PREVIOUS_RUNTIME_RECOVERY_INPUT_KEYS = Object.freeze(['accountId', 'runtimeIdentity', 'trustedNowMs'] as const);
+
+export interface PracticalPreviousRuntimeRecoveryInput {
+  readonly accountId: string;
+  /** The genuine runtime identity of THIS process (non-forgeable; its epoch is the adopting epoch). */
+  readonly runtimeIdentity: unknown;
+  readonly trustedNowMs: number;
+}
+
+/** Why a previous-runtime recovery was refused (`details.reason` of PRACTICAL_MUTATION_RECOVERY_REFUSED). Closed. */
+export type PracticalPreviousRuntimeRefusalReason =
+  /** The leased fence belongs to THIS runtime: it owns its own handle / ticket / receipt paths. No write. */
+  | 'CURRENT_RUNTIME_LEASE'
+  /** A Stage 1B1 lease with no Phase 17 claim: out of scope. No write. */
+  | 'UNBOUND_LEASE'
+  /** Both sides armed: a wire attempt may have been made. Manual review; never released. */
+  | 'ARMED_ORPHAN_REQUIRES_EVIDENCE'
+  /** The lease and the Phase 17 claim disagree on the arm. Manual review. */
+  | 'SPLIT_PAIR'
+  /** The lease, its certificate, or the fence chain is not exactly consistent. Manual review. */
+  | 'LEASE_CERTIFICATE_MISMATCH'
+  /** The bound Phase 17 order does not exist. Manual review. */
+  | 'PHASE17_MISSING'
+  /** The Phase 17 order is not exactly (case included) the bound order. Manual review. */
+  | 'PHASE17_IDENTITY'
+  /** The Phase 17 claim is not CANCEL_RESERVED at the lease's generation. Manual review. */
+  | 'PHASE17_CLAIM';
+export const PRACTICAL_PREVIOUS_RUNTIME_REFUSAL_REASONS: readonly PracticalPreviousRuntimeRefusalReason[] = Object.freeze([
+  'CURRENT_RUNTIME_LEASE', 'UNBOUND_LEASE', 'ARMED_ORPHAN_REQUIRES_EVIDENCE', 'SPLIT_PAIR', 'LEASE_CERTIFICATE_MISMATCH',
+  'PHASE17_MISSING', 'PHASE17_IDENTITY', 'PHASE17_CLAIM',
+] as const);
+/** The refusals that are well-formed durable contradictions: rolled back, then manual review (the shared call site). */
+export const PRACTICAL_PREVIOUS_RUNTIME_ESCALATING_REASONS: readonly PracticalPreviousRuntimeRefusalReason[] = Object.freeze([
+  'ARMED_ORPHAN_REQUIRES_EVIDENCE', 'SPLIT_PAIR', 'LEASE_CERTIFICATE_MISMATCH', 'PHASE17_MISSING', 'PHASE17_IDENTITY', 'PHASE17_CLAIM',
+] as const);
+
+export type PracticalPreviousRuntimeRecovery =
+  /** Reported ONLY after a known COMMIT: the claim released, the lease COMPLETED PRE_DISPATCH_FAILURE, the fence adopted. */
+  | {
+      readonly kind: 'RECOVERED';
+      readonly outcome: 'PRE_DISPATCH_FAILURE';
+      readonly leaseId: string;
+      readonly intentId: string;
+      readonly cancelGeneration: number;
+    }
+  /**
+   * There is no leased fence now. A fact about the CURRENT durable state only, never a claim that anything was closed
+   * (e.g. the retry after an unknown commit). `fenceHeldByThisRuntime`: the fence's epoch is this runtime's.
+   */
+  | { readonly kind: 'NO_LEASED_FENCE'; readonly fenceHeldByThisRuntime: boolean }
+  /** Rolled back, then latched by the existing Stage 1B1 escalation: the account's durable rows are malformed. */
+  | { readonly kind: 'MALFORMED_LATCHED'; readonly reviewEpisodeId: string };
 
 // ---------------------------------------------------------------------------
 // The ports
@@ -317,6 +390,11 @@ export interface PracticalCancelNoWireStore {
 /** [Wave 2B2c] Resolution of an unknown ACQUIRE commit, in-process and within the same runtime epoch only. */
 export interface PracticalUnknownAcquireRecoveryStore {
   resolveUnknownAcquire(input: PracticalUnknownAcquireResolutionInput): Promise<PracticalUnknownAcquireResolution>;
+}
+
+/** [Wave 2B2d] Previous-runtime UNARMED leased-fence recovery. Not wired into any startup path in this wave. */
+export interface PracticalPreviousRuntimeRecoveryStore {
+  recoverPreviousRuntimeCancelLease(input: PracticalPreviousRuntimeRecoveryInput): Promise<PracticalPreviousRuntimeRecovery>;
 }
 
 /** Re-exported for callers that match on the invalidation reason; the set is closed. */

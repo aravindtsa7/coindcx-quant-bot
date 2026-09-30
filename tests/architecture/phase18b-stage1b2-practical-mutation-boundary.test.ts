@@ -195,7 +195,17 @@ describe('[8][15][16] no strict authority, no continuity claim, no compensation 
     // [Wave 2B2c] The ONE manual-review entry is shared by the split pair and the recovery anomaly; always POST_MUTATION_MISMATCH.
     expect(codeOf(ADAPTER).match(/enterManualReview\(/g)).toHaveLength(1);
     expect(functionSource(ADAPTER, 'async #enterMismatchReview(')).toContain("return this.#practical.enterManualReview({ accountId, reason: 'POST_MUTATION_MISMATCH', nowMs });");
-    expect(codeOf(ADAPTER).match(/this\.#enterMismatchReview\(/g)).toHaveLength(2);
+    // The split pair, the 2B2c anomaly, and [Wave 2B2d] the previous-runtime refusal after its rollback.
+    expect(codeOf(ADAPTER).match(/this\.#enterMismatchReview\(/g)).toHaveLength(3);
+    const afterRecoveryStart = adapterCode.indexOf('async #afterRecoveryRollback(');
+    const afterRecovery = adapterCode.slice(afterRecoveryStart, adapterCode.indexOf('async #latchIfMalformed(', afterRecoveryStart));
+    expect(afterRecovery.length).toBeGreaterThan(0);
+    expect(afterRecovery).toContain('if (contradiction || isEscalatingLeaseRecoveryRefusal(error)) {\n      await this.#enterMismatchReview(accountId, nowMs);');
+    expect(afterRecovery).toContain('return this.#latchIfMalformed(error, accountId, epoch, nowMs);');
+    // [review fix] TYPED classification only: the durable contradiction is an `instanceof`, never the conflict code or a message.
+    expect(afterRecovery).toContain('const contradiction = error instanceof PracticalDurableContradictionError;');
+    expect(afterRecovery).toContain("if (contradiction) leaseRecoveryRefused('LEASE_CERTIFICATE_MISMATCH', accountId, error);");
+    expect(afterRecovery).not.toMatch(/PRACTICAL_PERSISTENCE_CONFLICT|\.message\b|\.code\b/);
     const escalate = functionSource(ADAPTER, 'async #escalateAnomaly(');
     expect(escalate).toContain('const entry = await this.#enterMismatchReview(accountId, nowMs);');
     expect(escalate).toContain('return this.#latchIfMalformed(error, accountId, epoch, nowMs).then(');
@@ -330,13 +340,15 @@ describe('[11] the caller-owned Stage 1B1 hook uses ONLY the supplied transactio
     expect(adapter.match(/new PrismaPracticalSafetyRepository\(/g)).toHaveLength(1);
     expect(adapter).toContain('this.#practical = new PrismaPracticalSafetyRepository(this.#prisma, newId);');
     expect(adapter.match(/this\.#prisma\.\$transaction\(/g)).toHaveLength(1);
-    // Acquire, arm, [Wave 2B2b] the one shared no-wire body, and [Wave 2B2c] the read-only resolution.
-    expect(adapter.match(/withLockedPracticalAccountWithinCallerTransaction\(this\.#practical, tx, /g)).toHaveLength(4);
+    // Acquire, arm, [Wave 2B2b] the one shared no-wire body, [Wave 2B2c] the read-only resolution, and [Wave 2B2d] the
+    // previous-runtime recovery.
+    expect(adapter.match(/withLockedPracticalAccountWithinCallerTransaction\(this\.#practical, tx, /g)).toHaveLength(5);
     // Exactly these operation bodies run inside #transaction: acquire, arm, the no-wire body (completion + abandon),
-    // and [Wave 2B2c] the resolution.
+    // [Wave 2B2c] the resolution, and [Wave 2B2d] the recovery.
     expect(adapter.match(/this\.#transaction\(\(tx\) => this\.#(acquireWithin|armWithin|noWireWithin)\(tx, context\)\)/g)).toHaveLength(4);
     expect(adapter.match(/this\.#transaction\(\(tx\) => this\.#resolveWithin\(tx, record\)\)/g)).toHaveLength(1);
-    expect(adapter.match(/this\.#transaction\(/g)).toHaveLength(5);
+    expect(adapter.match(/this\.#transaction\(\(tx\) => this\.#recoverWithin\(tx, accountId, epoch, nowMs\)\)/g)).toHaveLength(1);
+    expect(adapter.match(/this\.#transaction\(/g)).toHaveLength(6);
   });
 });
 
@@ -383,7 +395,8 @@ describe('[12][13][14] the classified Phase 17 pre-write claim failures', () => 
     // Exactly nine: #transaction's attempt, acquire's / arm's / [2B2b] undispatched completion's / abandon's /
     // [2B2c] resolution's outcome handling, the claim, the malformed escalation, and [2B2c] the anomaly escalation
     // (which never throws). No try surrounds a no-wire release primitive.
-    expect(adapter.match(/\btry \{/g)).toHaveLength(9);
+    // [Wave 2B2d] + the recovery's outcome handling: ten.
+    expect(adapter.match(/\btry \{/g)).toHaveLength(10);
     expect(adapter).not.toMatch(/try \{\s+(const \w+ = )?await release(Unarmed|ArmedUndispatched)CancelClaimWithinCallerFencedTransaction/);
     // The ONLY try around a Phase 17 primitive is the claim (the arm is never caught: any failure rolls back).
     expect(adapter).not.toMatch(/try \{\s+(const \w+ = )?await armCancelWireWithinCallerFencedTransaction/);
@@ -558,8 +571,20 @@ describe('[Wave 2B2c] unknown-acquire resolution: read-only, exact, single-use, 
     // restore: the epoch refusal, the unknown read-only COMMIT, and a database FAULT.
     expect(resolve.match(/restorePracticalUnknownAcquire\(unknown\);/g)).toHaveLength(3);
     // refuse: the epoch refusal of an escalating receipt, the retried escalation, and a proven anomaly.
-    expect(resolve.match(/refusePracticalUnknownAcquire\(unknown, /g)).toHaveLength(3);
-    expect(resolve.match(/throw recoveryRefused\(/g)).toHaveLength(2);
+    // refuse: + [Wave 2B2d] RUNTIME_SUPERSEDED (REFUSED with no escalation).
+    expect(resolve.match(/refusePracticalUnknownAcquire\(unknown, /g)).toHaveLength(4);
+    expect(resolve.match(/throw recoveryRefused\(/g)).toHaveLength(3);
+    const superseded = resolve.indexOf('if (isRuntimeSuperseded(error)) {');
+    expect(superseded).toBeGreaterThan(resolve.indexOf('if (isInconclusiveResolution(error)) {'));
+    expect(resolve.indexOf("refusePracticalUnknownAcquire(unknown, 'RESOLVING', true);", superseded)).toBeGreaterThan(superseded);
+    expect(resolve.indexOf("throw recoveryRefused('RUNTIME_SUPERSEDED', record, NOT_ESCALATED, error);", superseded))
+      .toBeGreaterThan(resolve.indexOf("refusePracticalUnknownAcquire(unknown, 'RESOLVING', true);", superseded));
+    // ...and it is decided BEFORE the anomaly escalation (no spurious manual review).
+    expect(superseded).toBeLessThan(resolve.indexOf('const escalation = await this.#escalateAnomaly(record.accountId, epoch, nowMs);\n      refusePracticalUnknownAcquire(unknown, \'RESOLVING\''));
+    // The superseded check comes AFTER the strict account read (parser-first) and BEFORE the inspection.
+    expect(resolveWithin.indexOf('if (scope.account.fence.runtimeEpoch !== record.runtimeEpoch) runtimeSuperseded(attempted);')).toBeGreaterThan(0);
+    expect(resolveWithin.indexOf('if (scope.account.fence.runtimeEpoch !== record.runtimeEpoch) runtimeSuperseded(attempted);'))
+      .toBeLessThan(resolveWithin.indexOf('scope.inspectAttemptedOrderBoundCancelLease('));
     for (const sequence of [
       "refusePracticalUnknownAcquire(unknown, 'ESCALATING', escalation.confirmed);\n      throw recoveryRefused('ANOMALY_PREVIOUSLY_PROVEN'",
       "refusePracticalUnknownAcquire(unknown, 'RESOLVING', escalation.confirmed);\n      throw recoveryRefused(refusalReasonOf(error)",
@@ -591,5 +616,71 @@ describe('[Wave 2B2c] unknown-acquire resolution: read-only, exact, single-use, 
     // The receipt exposes only a static status: no instance getter, no static read of its record.
     const receiptClass = ticket.slice(ticket.indexOf('export class PracticalUnknownAcquire {'), ticket.indexOf('Object.freeze(PracticalUnknownAcquire.prototype);'));
     expect(receiptClass).not.toMatch(/\bget \w+\(|public static read\(|toJSON|inspect/);
+  });
+});
+
+describe('[Wave 2B2d] previous-runtime UNARMED leased-fence recovery: genuine epoch, exact order of checks, one commit, no authority', () => {
+  const adapter = codeOf(ADAPTER);
+  const between = (from: string, to: string): string => {
+    const start = adapter.indexOf(from);
+    expect(start, from).toBeGreaterThan(0);
+    const end = adapter.indexOf(to, start);
+    expect(end, to).toBeGreaterThan(start);
+    return adapter.slice(start, end);
+  };
+  const recover = between('public async recoverPreviousRuntimeCancelLease(', 'async #recoverWithin(');
+  const recoverWithin = between('async #recoverWithin(', 'async #afterRecoveryRollback(');
+
+  it('the adopting epoch comes ONLY from a genuine runtime identity; the input is closed-world and carries no epoch', () => {
+    expect(codeOf(`${MUTATION_ROOT}ports.ts`)).toContain("export const PRACTICAL_PREVIOUS_RUNTIME_RECOVERY_INPUT_KEYS = Object.freeze(['accountId', 'runtimeIdentity', 'trustedNowMs'] as const);");
+    expect(recover).toContain('const raw = requireClosedWorld(input, PRACTICAL_PREVIOUS_RUNTIME_RECOVERY_INPUT_KEYS);');
+    expect(recover).toContain("const epoch = requireRuntimeEpoch(raw['runtimeIdentity']);");
+    expect(functionSource(ADAPTER, 'function requireRuntimeEpoch(')).toContain('const epoch = readLiveRuntimeEpoch(value);');
+    expect(recover.indexOf("const epoch = requireRuntimeEpoch(raw['runtimeIdentity']);")).toBeLessThan(recover.indexOf('outcome = await this.#transaction('));
+    expect(recover).not.toMatch(/enablement|Enablement/);
+  });
+
+  it('in order: previous epoch -> bound -> exact lease/certificate -> exact-case Phase 17 -> claim -> coupled UNARMED pair -> release -> complete + adopt -> re-proof', () => {
+    const order = [
+      "if (fence.mode.kind !== 'MUTATION_LEASED') {",
+      "if (fence.runtimeEpoch === epoch) leaseRecoveryRefused('CURRENT_RUNTIME_LEASE', accountId);",
+      "leaseRecoveryRefused('UNBOUND_LEASE', accountId);",
+      'const { lease } = await scope.requireLeasedOrderBoundCancelLease({',
+      'const order = await lockPhase17Order(tx, binding.intentId);',
+      "if (order === null) leaseRecoveryRefused('PHASE17_MISSING', accountId);",
+      '|| order.clientOrderId !== binding.clientOrderId',
+      "leaseRecoveryRefused('PHASE17_IDENTITY', accountId);",
+      "if (order.cancelGeneration !== binding.cancelGeneration || order.cancelState !== 'CANCEL_RESERVED') leaseRecoveryRefused('PHASE17_CLAIM', accountId);",
+      "if (leaseArmed !== order.cancelWireArmed) leaseRecoveryRefused('SPLIT_PAIR', accountId);",
+      "if (leaseArmed) leaseRecoveryRefused('ARMED_ORPHAN_REQUIRES_EVIDENCE', accountId);",
+      'const released = await releaseUnarmedCancelClaimWithinCallerFencedTransaction(',
+      'const completed = await scope.completeOrderBoundCancelLeaseNoWireAndAdopt(nowMs, epoch);',
+      'const after = await lockPhase17Order(tx, binding.intentId);',
+      "kind: 'RECOVERED' as const",
+    ].map((statement) => {
+      const at = recoverWithin.indexOf(statement);
+      expect(at, statement).toBeGreaterThan(0);
+      return at;
+    });
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // Only these two scope calls; no reconciliation, arm, claim, or armed release; only PRE_DISPATCH_FAILURE.
+    expect(recoverWithin.match(/scope\.\w+\(/g)).toEqual(['scope.requireLeasedOrderBoundCancelLease(', 'scope.completeOrderBoundCancelLeaseNoWireAndAdopt(']);
+    expect(recoverWithin).not.toMatch(/'AMBIGUOUS'|'REJECTED'|'ACCEPTED'|lockReconciliationState|live_reconciliation_state|releaseArmedUndispatched/);
+    expect(recoverWithin.match(/kind: 'RECOVERED'/g)).toHaveLength(1);
+  });
+
+  it('RECOVERED is only returned by the committed transaction; an unknown COMMIT is rethrown; NO_LEASED_FENCE claims no closure', () => {
+    expect(recover).toContain("if (error instanceof TransactionOutcomeUnknown) {\n        throw new PracticalMutationError('PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN'");
+    expect(recover).toContain('return this.#afterRecoveryRollback(error, accountId, epoch, nowMs);');
+    expect(recover.lastIndexOf('return outcome;')).toBeGreaterThan(recover.indexOf('outcome = await this.#transaction('));
+    expect(recoverWithin).toContain("return Object.freeze({ kind: 'NO_LEASED_FENCE' as const, fenceHeldByThisRuntime: fence.runtimeEpoch === epoch });");
+    expect(codeOf(`${MUTATION_ROOT}ports.ts`)).not.toMatch(/ALREADY_RECOVERED|ALREADY_CLOSED/);
+  });
+
+  it('the escalating set is exactly the well-formed contradictions; CURRENT_RUNTIME_LEASE and UNBOUND_LEASE never write', () => {
+    const ports = codeOf(`${MUTATION_ROOT}ports.ts`);
+    expect(ports).toContain("'ARMED_ORPHAN_REQUIRES_EVIDENCE', 'SPLIT_PAIR', 'LEASE_CERTIFICATE_MISMATCH', 'PHASE17_MISSING', 'PHASE17_IDENTITY', 'PHASE17_CLAIM',\n] as const);");
+    const escalating = ports.slice(ports.indexOf('PRACTICAL_PREVIOUS_RUNTIME_ESCALATING_REASONS'), ports.indexOf('export type PracticalPreviousRuntimeRecovery ='));
+    expect(escalating).not.toMatch(/CURRENT_RUNTIME_LEASE|UNBOUND_LEASE/);
   });
 });

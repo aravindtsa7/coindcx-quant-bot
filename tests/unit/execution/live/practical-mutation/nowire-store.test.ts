@@ -123,6 +123,7 @@ interface World {
   failAtCommit: unknown;
   orderReads: (OrderRow | null)[];
   fence: { kind: string; leaseId: string | null };
+  fenceEpoch: string;
 }
 let world: World;
 
@@ -163,7 +164,7 @@ function rootClient(): PrismaClient {
 }
 
 const scope = {
-  get account() { return { fence: { mode: world.fence } }; },
+  get account() { return { fence: { mode: world.fence, runtimeEpoch: world.fenceEpoch } }; },
   requireLeasedOrderBoundCancelLease: vi.fn(),
   completeOrderBoundCancelLeaseNoWire: vi.fn(),
   readOrderBoundCancelLease: vi.fn(),
@@ -176,7 +177,7 @@ const enterManualReview = vi.spyOn(practicalRepository.PrismaPracticalSafetyRepo
 let durableLease = lease(null);
 
 beforeEach(() => {
-  world = { log: [], transactions: 0, failBeforeWork: [], failAtCommit: null, orderReads: [{ ...CLAIMED }], fence: { kind: 'MUTATION_LEASED', leaseId: LEASE_ID } };
+  world = { log: [], transactions: 0, failBeforeWork: [], failAtCommit: null, orderReads: [{ ...CLAIMED }], fence: { kind: 'MUTATION_LEASED', leaseId: LEASE_ID }, fenceEpoch: EPOCH };
   durableLease = lease(null);
   for (const fn of [hook, releaseUnarmed, releaseArmed, scope.requireLeasedOrderBoundCancelLease, scope.completeOrderBoundCancelLeaseNoWire, scope.readOrderBoundCancelLease, enterManualReview]) {
     (fn as ReturnType<typeof vi.fn>).mockReset();
@@ -576,5 +577,42 @@ describe('the idempotent retry re-proves the exact identity and arm origin befor
     expect((await store().abandonAcquiredCancel(abandonInput(handle))).kind).toBe('ALREADY_COMPLETED');
     expectNoWriteAttempted();
     expect(PracticalAcquiredCancel.status(handle)).toBe('SPENT');
+  });
+});
+
+describe('[Wave 2B2d] a retry superseded by ANOTHER runtime epoch is COMPLETION_REFUSED, never ALREADY_COMPLETED', () => {
+  it.each(['ticket COMMIT_UNKNOWN retry', 'abandon ABANDON_OUTCOME_UNKNOWN retry', 'fresh ticket'] as const)('%s: refused before any lease inspection; no write, no review', async (kind) => {
+    const run = async () => {
+      if (kind === 'abandon ABANDON_OUTCOME_UNKNOWN retry') {
+        const handle = issuePracticalAcquiredCancel(acquiredRecord());
+        world.failAtCommit = knownError('P1017');
+        await expect(store().abandonAcquiredCancel(abandonInput(handle))).rejects.toMatchObject({ code: 'PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN' });
+        world.failAtCommit = null;
+        return { status: () => PracticalAcquiredCancel.status(handle), call: () => store().abandonAcquiredCancel(abandonInput(handle)), expected: 'ABANDON_OUTCOME_UNKNOWN' };
+      }
+      const ticket = armedTicketWithDurableArm();
+      if (kind === 'ticket COMMIT_UNKNOWN retry') {
+        world.failAtCommit = knownError('P1017');
+        await expect(store().completeUndispatchedCancel(completeInput(ticket))).rejects.toMatchObject({ code: 'PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN' });
+        world.failAtCommit = null;
+      }
+      return { status: () => PracticalArmedCancel.status(ticket), call: () => store().completeUndispatchedCancel(completeInput(ticket)), expected: kind === 'fresh ticket' ? 'ARMED' : 'COMMIT_UNKNOWN' };
+    };
+    const subject = await run();
+    world.orderReads = [releasedOf(ARMED)];
+    releaseArmed.mockClear();
+    releaseUnarmed.mockClear();
+    scope.completeOrderBoundCancelLeaseNoWire.mockClear();
+    // The durable completion looks exactly identical, but the fence now belongs to ANOTHER runtime epoch (IDLE there).
+    world.fence = { kind: 'IDLE', leaseId: null };
+    world.fenceEpoch = 'epoch-of-the-adopting-runtime';
+    scope.readOrderBoundCancelLease.mockResolvedValue(completedLease(ARMED_AT));
+    await expect(subject.call()).rejects.toMatchObject({ code: 'PRACTICAL_MUTATION_COMPLETION_REFUSED', message: expect.stringMatching(/another runtime epoch/) });
+    expect(scope.readOrderBoundCancelLease).not.toHaveBeenCalled();
+    expect(releaseArmed).not.toHaveBeenCalled();
+    expect(releaseUnarmed).not.toHaveBeenCalled();
+    expect(scope.completeOrderBoundCancelLeaseNoWire).not.toHaveBeenCalled();
+    expect(enterManualReview).not.toHaveBeenCalled();
+    expect(subject.status()).toBe(subject.expected);
   });
 });

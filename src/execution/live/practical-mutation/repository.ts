@@ -19,6 +19,13 @@
  *            + the lease COMPLETED PRE_DISPATCH_FAILURE + fence released ->
  *            one COMMIT. Cleanup of an owned attempt, never mutation
  *            authority; no dispatched outcome exists here.
+ *   RESOLVE  [Wave 2B2c] resolveUnknownAcquire: one READ-ONLY transaction
+ *            deciding an unknown acquire COMMIT from the locked durable rows.
+ *   RECOVER  [Wave 2B2d] recoverPreviousRuntimeCancelLease: a PREVIOUS runtime
+ *            epoch's leased fence whose coupled pair is UNARMED -> the same
+ *            no-wire release + PRE_DISPATCH_FAILURE completion AND the fence
+ *            adopted by this runtime, in one COMMIT. Armed orphans are never
+ *            released (evidence + manual review).
  *
  * TIER B ONLY, AND NOT CONTINUITY. The reconciliation-state row is read under
  * lock and compared exactly (see `./preflight.ts`); that is a durable-state
@@ -46,7 +53,13 @@ import { PracticalRecoveryCertificate, type PracticalRecoveryCertificateRecord }
 import type { PracticalFenceExpectation } from '../practical/fence';
 import { PracticalLiveSafetyEnablement, practicalActionPermission } from '../practical/policy';
 import { PRACTICAL_AUTHORIZATION_BASIS, PRACTICAL_DIGEST_PATTERN, isExactId, isNonNegativeSafeInteger } from '../practical/types';
-import { PracticalPersistenceError, type PracticalDurableCertificateRecord, type PracticalMalformedEscalation, type PracticalMutationLeaseRecord } from '../practical-persistence/ports';
+import {
+  PracticalDurableContradictionError,
+  PracticalPersistenceError,
+  type PracticalDurableCertificateRecord,
+  type PracticalMalformedEscalation,
+  type PracticalMutationLeaseRecord,
+} from '../practical-persistence/ports';
 import {
   PrismaPracticalSafetyRepository,
   withLockedPracticalAccountWithinCallerTransaction,
@@ -58,6 +71,8 @@ import {
   PRACTICAL_CANCEL_ARM_INPUT_KEYS,
   PRACTICAL_NO_DISPATCH_REASONS,
   PRACTICAL_NOT_DISPATCHED_REPORT_KEYS,
+  PRACTICAL_PREVIOUS_RUNTIME_ESCALATING_REASONS,
+  PRACTICAL_PREVIOUS_RUNTIME_RECOVERY_INPUT_KEYS,
   PRACTICAL_RECOVERY_REFUSAL_REASONS,
   PRACTICAL_UNDISPATCHED_COMPLETION_INPUT_KEYS,
   PRACTICAL_UNKNOWN_ACQUIRE_RESOLUTION_INPUT_KEYS,
@@ -74,6 +89,10 @@ import {
   type PracticalCancelNoWireStore,
   type PracticalNoDispatchReason,
   type PracticalNoWireCompletion,
+  type PracticalPreviousRuntimeRecovery,
+  type PracticalPreviousRuntimeRecoveryInput,
+  type PracticalPreviousRuntimeRecoveryStore,
+  type PracticalPreviousRuntimeRefusalReason,
   type PracticalRecoveryRefusalReason,
   type PracticalUndispatchedCompletionInput,
   type PracticalUnknownAcquireCertificateStatus,
@@ -503,6 +522,33 @@ function recoveryRefused(
   );
 }
 
+/** [Wave 2B2d] A previous-runtime recovery refusal (thrown inside the transaction, or after it for a mapped conflict). */
+function leaseRecoveryRefused(reason: PracticalPreviousRuntimeRefusalReason, accountId: string, cause?: unknown): never {
+  throw new PracticalMutationError('PRACTICAL_MUTATION_RECOVERY_REFUSED', 'The previous-runtime leased fence is not a recoverable coupled UNARMED pair', {
+    accountId, reason,
+  }, cause);
+}
+
+function isEscalatingLeaseRecoveryRefusal(error: unknown): boolean {
+  if (!(error instanceof PracticalMutationError) || error.code !== 'PRACTICAL_MUTATION_RECOVERY_REFUSED') return false;
+  const reason = error.details?.['reason'];
+  return typeof reason === 'string' && (PRACTICAL_PREVIOUS_RUNTIME_ESCALATING_REASONS as readonly string[]).includes(reason);
+}
+
+/** [Wave 2B2d] No escalation was attempted (and none is needed): the refusal is explained by an epoch-fenced reviewed actor. */
+const NOT_ESCALATED = Object.freeze({ confirmed: false, reviewEpisodeId: null });
+
+/** [Wave 2B2d] The receipt's account was adopted by another runtime epoch (thrown inside the read-only transaction). */
+function runtimeSuperseded(leaseId: string): never {
+  throw new PracticalMutationError('PRACTICAL_MUTATION_RECOVERY_REFUSED', 'The account was adopted by another runtime epoch: this old-epoch receipt is superseded', {
+    reason: 'RUNTIME_SUPERSEDED', leaseId,
+  });
+}
+
+function isRuntimeSuperseded(error: unknown): boolean {
+  return error instanceof PracticalMutationError && error.code === 'PRACTICAL_MUTATION_RECOVERY_REFUSED' && error.details?.['reason'] === 'RUNTIME_SUPERSEDED';
+}
+
 /** The attempted lease, exact on every immutable field of the intended record (the arm and completion state are checked separately). */
 function sameAttemptedLease(lease: PracticalMutationLeaseRecord, record: PracticalAcquiredCancelRecord): boolean {
   const binding = lease.orderBinding;
@@ -549,7 +595,7 @@ function refusalReasonOf(error: unknown): PracticalRecoveryRefusalReason {
   return 'ACCOUNT_UNREADABLE';
 }
 
-export class PrismaPracticalCancelMutationStore implements PracticalCancelMutationStore, PracticalCancelNoWireStore, PracticalUnknownAcquireRecoveryStore {
+export class PrismaPracticalCancelMutationStore implements PracticalCancelMutationStore, PracticalCancelNoWireStore, PracticalUnknownAcquireRecoveryStore, PracticalPreviousRuntimeRecoveryStore {
   readonly #prisma: PrismaClient;
   readonly #practical: PrismaPracticalSafetyRepository;
 
@@ -1149,6 +1195,11 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
     expected: Parameters<PracticalLockedAccountScope['readOrderBoundCancelLease']>[0],
   ): Promise<NoWireOutcome> {
     const details = { leaseId: ctx.leaseId };
+    // [Wave 2B2d] A fence adopted by ANOTHER runtime epoch supersedes this old-epoch caller: whatever closed the lease
+    // (a previous-runtime recovery), it was not this caller's completion. Refused before any inspection, no write.
+    if (scope.account.fence.runtimeEpoch !== ctx.runtimeEpoch) {
+      completionRefused('The account was adopted by another runtime epoch: this old-epoch retry is superseded', details);
+    }
     const { lease, certificate } = await scope.readOrderBoundCancelLease(expected);
     if (lease.status === 'LEASED') splitState('The lease is LEASED but no longer held by its fence', details);
     if (lease.status !== 'COMPLETED' || lease.outcome !== 'PRE_DISPATCH_FAILURE' || lease.completedAtMs === null) {
@@ -1269,6 +1320,11 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
         restorePracticalUnknownAcquire(unknown);
         throw error;
       }
+      if (isRuntimeSuperseded(error)) {
+        // [Wave 2B2d] Superseded by another runtime: permanently REFUSED (mint-disabled), no manual review, nothing written.
+        refusePracticalUnknownAcquire(unknown, 'RESOLVING', true);
+        throw recoveryRefused('RUNTIME_SUPERSEDED', record, NOT_ESCALATED, error);
+      }
       // Everything else is a PROVEN anomaly (or an account the strict parser rejects): permanently mint-disabled.
       const escalation = await this.#escalateAnomaly(record.accountId, epoch, nowMs);
       refusePracticalUnknownAcquire(unknown, 'RESOLVING', escalation.confirmed);
@@ -1306,6 +1362,9 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
   async #resolveWithin(tx: Tx, record: PracticalAcquiredCancelRecord): Promise<ResolveOutcome> {
     return withLockedPracticalAccountWithinCallerTransaction(this.#practical, tx, record.accountId, async (scope: PracticalLockedAccountScope) => {
       const attempted = record.leaseId;
+      // [Wave 2B2d] After the strict account read (a malformed account still fails first, parser-first), a fence adopted
+      // by ANOTHER runtime epoch supersedes this old-epoch receipt: not an anomaly, nothing is inspected.
+      if (scope.account.fence.runtimeEpoch !== record.runtimeEpoch) runtimeSuperseded(attempted);
       const { certificate, certificateLeaseIds, lease } = await scope.inspectAttemptedOrderBoundCancelLease({
         leaseId: attempted, certificateId: record.certificate.certificateId,
       });
@@ -1384,6 +1443,142 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
       }
       return Object.freeze({ confirmed: false, reviewEpisodeId: null });
     }
+  }
+
+  // ----- [Wave 2B2d] previous-runtime UNARMED leased-fence recovery ------------
+
+  /**
+   * Closes a MUTATION_LEASED fence left by a PREVIOUS runtime epoch when, and
+   * only when, its order-bound lease and Phase 17 claim are a coupled UNARMED
+   * pair (no ticket was ever minted from it, so no gateway call can have been
+   * made): in ONE commit the Phase 17 claim is released, the lease is
+   * COMPLETED PRE_DISPATCH_FAILURE through the existing no-wire writer, and
+   * the fence is adopted by THIS runtime's epoch. RECOVERED is reported only
+   * after a known COMMIT; an unknown COMMIT is rethrown and a retry simply
+   * re-reads (NO_LEASED_FENCE is a fact about the current state, never a
+   * closure claim). Refused with no write: this runtime's own lease, an unbound
+   * lease. Refused, then manual review: an armed orphan (evidence required;
+   * never released), a split pair, any exact-identity / generation mismatch.
+   * A malformed account is latched. Cleanup, never authority: no enablement,
+   * no reconciliation read or lock, no arm, no claim, no dispatch.
+   */
+  public async recoverPreviousRuntimeCancelLease(input: PracticalPreviousRuntimeRecoveryInput): Promise<PracticalPreviousRuntimeRecovery> {
+    // A. Before any durable access. The adopting epoch comes ONLY from a genuine (non-forgeable) runtime identity.
+    const raw = requireClosedWorld(input, PRACTICAL_PREVIOUS_RUNTIME_RECOVERY_INPUT_KEYS);
+    const accountId = requireAccountId(raw['accountId']);
+    const epoch = requireRuntimeEpoch(raw['runtimeIdentity']);
+    const nowMs = requireNowMs(raw['trustedNowMs']);
+    let outcome: PracticalPreviousRuntimeRecovery;
+    try {
+      outcome = await this.#transaction((tx) => this.#recoverWithin(tx, accountId, epoch, nowMs));
+    } catch (error) {
+      if (error instanceof TransactionOutcomeUnknown) {
+        throw new PracticalMutationError('PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN', 'The previous-runtime recovery COMMIT could not be confirmed; a retry re-reads the durable state', { accountId }, error.cause);
+      }
+      return this.#afterRecoveryRollback(error, accountId, epoch, nowMs);
+    }
+    // C. ONLY AFTER COMMIT.
+    return outcome;
+  }
+
+  /**
+   * B. The ONE recovery transaction. Lock order: the Stage 1B1 account read
+   * (hook: ... -> the fence's leased certificate -> the fence's lease), then
+   * live_order -> live_execution_intent. No live_reconciliation_state.
+   */
+  async #recoverWithin(tx: Tx, accountId: string, epoch: string, nowMs: number): Promise<PracticalPreviousRuntimeRecovery> {
+    return withLockedPracticalAccountWithinCallerTransaction(this.#practical, tx, accountId, async (scope: PracticalLockedAccountScope) => {
+      const fence = scope.account.fence;
+      if (fence.mode.kind !== 'MUTATION_LEASED') {
+        return Object.freeze({ kind: 'NO_LEASED_FENCE' as const, fenceHeldByThisRuntime: fence.runtimeEpoch === epoch });
+      }
+      // 1. Only a PREVIOUS runtime's lease; this runtime owns its own handle / ticket / receipt paths.
+      if (fence.runtimeEpoch === epoch) leaseRecoveryRefused('CURRENT_RUNTIME_LEASE', accountId);
+      const held = scope.account.currentLease;
+      if (held === null || fence.mode.action !== 'CANCEL' || held.orderBinding === null) leaseRecoveryRefused('UNBOUND_LEASE', accountId);
+      const binding = held.orderBinding;
+
+      // 2. The exact LEASED order-bound lease on its exact CONSUMED certificate (the 2B2b check; a well-formed
+      //    inconsistency throws a persistence CONFLICT, mapped to LEASE_CERTIFICATE_MISMATCH after the rollback).
+      const { lease } = await scope.requireLeasedOrderBoundCancelLease({
+        leaseId: held.leaseId,
+        certificateId: fence.mode.certificateId,
+        runtimeEpoch: fence.runtimeEpoch,
+        reconciliationGeneration: fence.reconciliationGeneration,
+        binding: { intentId: binding.intentId, clientOrderId: binding.clientOrderId, cancelGeneration: binding.cancelGeneration },
+      });
+
+      // 3. Phase 17 rows in the established order; exact-case identity with the lease binding, then the claim.
+      const order = await lockPhase17Order(tx, binding.intentId);
+      if (order === null) leaseRecoveryRefused('PHASE17_MISSING', accountId);
+      if (order.intentId !== binding.intentId
+        || order.accountId !== accountId
+        || order.clientOrderId !== binding.clientOrderId
+        || order.exchangeOrderId === null
+        || order.cancelExchangeOrderId !== order.exchangeOrderId
+        || order.cancelFaultCode !== null) {
+        leaseRecoveryRefused('PHASE17_IDENTITY', accountId);
+      }
+      if (order.cancelGeneration !== binding.cancelGeneration || order.cancelState !== 'CANCEL_RESERVED') leaseRecoveryRefused('PHASE17_CLAIM', accountId);
+
+      // 4. The COUPLED durable pair decides. Only a coupled UNARMED pair is released; an armed pair needs evidence.
+      const leaseArmed = lease.armedAtMs !== null;
+      if (leaseArmed !== order.cancelWireArmed) leaseRecoveryRefused('SPLIT_PAIR', accountId);
+      if (leaseArmed) leaseRecoveryRefused('ARMED_ORPHAN_REQUIRES_EVIDENCE', accountId);
+
+      // 5. In ONE commit: the truthful no-wire Phase 17 release (exact account), then the lease + fence adoption.
+      const released = await releaseUnarmedCancelClaimWithinCallerFencedTransaction(tx, binding.intentId, binding.cancelGeneration, requireExactAccountId(lease.accountId, accountId));
+      const completed = await scope.completeOrderBoundCancelLeaseNoWireAndAdopt(nowMs, epoch);
+
+      // 6. BOTH durable sides re-proven before COMMIT.
+      const after = await lockPhase17Order(tx, binding.intentId);
+      const closed = released.intentId === binding.intentId
+        && released.accountId === accountId
+        && released.cancelState === 'NONE'
+        && released.cancelGeneration === binding.cancelGeneration
+        && released.cancelWireArmed === false
+        && released.cancelFaultCode === null
+        && released.state === order.state
+        && released.revision === order.revision + 1
+        && after !== null
+        && after.cancelState === 'NONE'
+        && after.cancelGeneration === binding.cancelGeneration
+        && after.cancelWireArmed === false
+        && after.revision === order.revision + 1
+        && completed.lease.leaseId === lease.leaseId
+        && completed.lease.status === 'COMPLETED'
+        && completed.lease.outcome === 'PRE_DISPATCH_FAILURE'
+        && completed.lease.armedAtMs === null
+        && completed.account.fence.mode.kind === 'IDLE'
+        && completed.account.fence.runtimeEpoch === epoch
+        && completed.certificate.status === 'CONSUMED';
+      if (!closed) selfCheckFailed('The previous-runtime recovery did not re-read as one released claim, one PRE_DISPATCH_FAILURE lease, and an adopted fence', { leaseId: lease.leaseId });
+      return Object.freeze({
+        kind: 'RECOVERED' as const, outcome: 'PRE_DISPATCH_FAILURE' as const, leaseId: lease.leaseId, intentId: binding.intentId, cancelGeneration: binding.cancelGeneration,
+      });
+    });
+  }
+
+  /**
+   * After a PROVEN rollback of a recovery: a PROVEN durable contradiction
+   * enters manual review through the ONE shared call site. Two kinds only,
+   * both TYPED (never matched by message): this store's escalating refusals
+   * (armed orphan, split pair, Phase 17 identity / claim / missing row), and
+   * the persistence layer's `PracticalDurableContradictionError` (the lease
+   * and its CONSUMED certificate contradict each other), reported as
+   * LEASE_CERTIFICATE_MISMATCH. A malformed account is latched. EVERY other
+   * failure (a plain persistence CONFLICT from a lifecycle, CAS, concurrent
+   * change or self-check re-read; a fence error such as revision exhaustion;
+   * a database fault) is rethrown UNCHANGED: fail-closed, no review.
+   */
+  async #afterRecoveryRollback(error: unknown, accountId: string, epoch: string, nowMs: number): Promise<PracticalPreviousRuntimeRecovery> {
+    const contradiction = error instanceof PracticalDurableContradictionError;
+    if (contradiction || isEscalatingLeaseRecoveryRefusal(error)) {
+      await this.#enterMismatchReview(accountId, nowMs);
+      if (contradiction) leaseRecoveryRefused('LEASE_CERTIFICATE_MISMATCH', accountId, error);
+      throw error;
+    }
+    return this.#latchIfMalformed(error, accountId, epoch, nowMs);
   }
 
   // ----- malformed-state latch (AFTER a rollback; the existing reviewed escalation) ----

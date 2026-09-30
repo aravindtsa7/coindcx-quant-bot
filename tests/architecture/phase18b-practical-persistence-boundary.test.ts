@@ -568,3 +568,66 @@ describe('[Wave 2B2c] the lease-writer set and the read-only unknown-acquire ins
     expect(leaseIds).toContain('FROM live_practical_mutation_lease WHERE certificate_id = ${certificateId} FOR UPDATE');
   });
 });
+
+describe('[Wave 2B2d] the previous-runtime close-and-adopt scope operation', () => {
+  it('writes ONLY through #apply with the existing no-wire writer, composing Stage 1A release -> adopt, unarmed only, another epoch only', () => {
+    const repository = codeOf(REPOSITORY);
+    const start = repository.indexOf('completeOrderBoundCancelLeaseNoWireAndAdopt: (trustedNowMs: number, newRuntimeEpoch: string) => run(true, async () => {');
+    expect(start).toBeGreaterThan(0);
+    const body = repository.slice(start, repository.indexOf('\n      }),', start));
+    expect(body).not.toMatch(/tx\.livePractical\w+\.(create|update|updateMany|upsert|delete|deleteMany)\(|\$executeRaw/);
+    expect(body.match(/this\.#apply\(/g)).toHaveLength(1);
+    expect(body).toContain('}, completedAtMs, { completeBoundLeaseNoWire: { lease } });');
+    expect(body).toContain('const completable = lifecycle.completable;');
+    expect(body).toContain("if (lease.armedAtMs !== null) conflict('An armed lease is never recovered as a no-wire completion', { accountId });");
+    expect(body).toContain("if (fence.runtimeEpoch === newEpoch) conflict('The lease belongs to THIS runtime; it is not a previous-runtime lease', { accountId });");
+    const release = body.indexOf('const releasedFence = releasePracticalMutationLease(fence, {');
+    const adopt = body.indexOf('const adoptedFence = adoptPracticalFenceForNewRuntime(releasedFence, {');
+    expect(release).toBeGreaterThan(0);
+    expect(adopt).toBeGreaterThan(release);
+    expect(body.indexOf('const after = await this.#apply(tx, current, {')).toBeGreaterThan(adopt);
+    expect(body).toContain("nextState, nextFence: adoptedFence, openCause: 'RUNTIME_STARTUP', reason: 'RUNTIME_EPOCH_CHANGED',");
+    expect(body).toContain("const nextState = practicalAccountStateOnStartup(transitionOrFailClosed(current.state, { kind: 'MUTATION_OUTCOME_RECORDED', outcome: 'PRE_DISPATCH_FAILURE' }));");
+    expect(body).not.toMatch(/'ACCEPTED'|'REJECTED'|'AMBIGUOUS'|DUPLICATE_CLIENT_ORDER_ID/);
+  });
+});
+
+describe('[Wave 2B2d review fix] the TYPED durable lease/certificate contradiction', () => {
+  it('keeps the CONFLICT code, is thrown ONLY through durableContradiction(), at exactly the three proven sites', () => {
+    const ports = codeOf(`${PERSISTENCE_ROOT}ports.ts`);
+    expect(ports).toContain("export type PracticalDurableContradiction = 'CERTIFICATE_NOT_BOUND_TO_LEASE' | 'CERTIFICATE_LEASE_NOT_UNIQUE';");
+    expect(ports).toContain('export class PracticalDurableContradictionError extends PracticalPersistenceError {');
+    expect(ports).toContain("super('PRACTICAL_PERSISTENCE_CONFLICT', message, details === undefined ? { contradiction } : { ...details, contradiction });");
+    const repository = codeOf(REPOSITORY);
+    expect(repository.match(/new PracticalDurableContradictionError\(/g)).toHaveLength(1);
+    expect(repository).toContain('throw new PracticalDurableContradictionError(kind, message, details);');
+    expect(repository.match(/durableContradiction\('CERTIFICATE_NOT_BOUND_TO_LEASE'/g)).toHaveLength(1);
+    expect(repository.match(/durableContradiction\('CERTIFICATE_LEASE_NOT_UNIQUE'/g)).toHaveLength(2);
+    // The bound check lives in the no-wire completion check; the two-reads disagreement there stays an ordinary conflict.
+    const start = repository.indexOf('requireLeasedOrderBoundCancelLease: (expected: PracticalLeasedCancelExpectation) => run(false, async () => {');
+    const check = repository.slice(start, repository.indexOf('\n      }),', start));
+    expect(check).toContain("if (!sameDurableCertificate(certificate, snapshotCertificate)) conflict('The two locked reads of the leased certificate disagree'");
+    expect(check).toContain("durableContradiction('CERTIFICATE_NOT_BOUND_TO_LEASE', 'The lease does not rest on its exact CONSUMED certificate'");
+    const onlyLease = repository.slice(repository.indexOf('async function requireOnlyLeaseOfCertificate('), repository.indexOf('function durableContradiction('));
+    expect(onlyLease).toContain("if (!Array.isArray(rows)) conflict('The certificate lease read returned no row set'");
+    expect(onlyLease).toContain("if (typeof row !== 'object' || row === null || Array.isArray(row)) conflict(");
+    expect(onlyLease).toContain("Object.getOwnPropertyDescriptor(row, 'leaseId')?.value");
+    expect(onlyLease).toContain("Object.getOwnPropertyDescriptor(row, 'certificateId')?.value");
+    expect(onlyLease).toContain('if (!isExactId(storedLeaseId) || storedLeaseId.length > 64) conflict(');
+    expect(onlyLease).toContain("if (typeof storedCertificateId !== 'string' || !PRACTICAL_DIGEST_PATTERN.test(storedCertificateId)) conflict(");
+    const validated = onlyLease.indexOf('projected.push({ leaseId: storedLeaseId, certificateId: storedCertificateId });');
+    const cardinality = onlyLease.indexOf("if (projected.length !== 1) durableContradiction('CERTIFICATE_LEASE_NOT_UNIQUE'");
+    const identity = onlyLease.indexOf('if (projected[0]!.leaseId !== leaseId || projected[0]!.certificateId !== certificateId)');
+    expect(validated).toBeGreaterThan(0);
+    expect(cardinality).toBeGreaterThan(validated);
+    expect(identity).toBeGreaterThan(cardinality);
+    // No other src module constructs or matches it except the one Stage 1B2 adapter (instanceof).
+    for (const file of files.filter((candidate) => candidate.startsWith('src/') && candidate !== REPOSITORY && candidate !== `${PERSISTENCE_ROOT}ports.ts`)) {
+      const code = codeOf(file);
+      if (code.includes('PracticalDurableContradictionError')) {
+        expect(file).toBe(MUTATION_ADAPTER);
+        expect(code).not.toMatch(/new PracticalDurableContradictionError\(/);
+      }
+    }
+  });
+});

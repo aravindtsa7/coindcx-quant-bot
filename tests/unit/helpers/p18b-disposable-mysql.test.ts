@@ -335,6 +335,7 @@ describe('the Stage 1B2 strict runner and the new suite apply the guard first', 
     'tests/integration/execution/live-practical-cancel-interlock.integration.test.ts',
     'tests/integration/execution/live-practical-cancel-nowire.integration.test.ts',
     'tests/integration/execution/live-practical-cancel-unknown-acquire.integration.test.ts',
+    'tests/integration/execution/live-practical-cancel-previous-runtime.integration.test.ts',
   ] as const;
 
   function runRunner(databaseUrl: string | undefined): { status: number | null; output: string } {
