@@ -88,7 +88,7 @@ import {
   issuePracticalRecoveryCertificate,
   revokePracticalRecoveryCertificate,
   type PracticalCertificationEvidenceSummary,
-  type PracticalRecoveryCertificate,
+  PracticalRecoveryCertificate,
 } from '../practical/certificate';
 import type { PracticalFenceExpectation } from '../practical/fence';
 import {
@@ -121,6 +121,7 @@ import {
   type PracticalReadObservation,
 } from './observation';
 import type {
+  PracticalOriginalWatchCheck,
   PracticalPrivateStreamSource,
   PracticalReconciliationStateReader,
   PracticalReconciliationStateView,
@@ -379,6 +380,7 @@ export class PracticalRecoveryService {
 
   #watch: WatchContext | null = null;
   #outstanding: OutstandingCertificate | null = null;
+  #originalWatchTime: { readonly certificate: PracticalRecoveryCertificate; readonly atMs: number } | null = null;
   /**
    * DURABLE-SAFETY HOLD: a revocation this service needed could not be
    * CONFIRMED durably (so an ISSUED certificate may physically remain). While
@@ -434,6 +436,50 @@ export class PracticalRecoveryService {
   /** Resolves once every tripwire revocation started so far has finished. */
   public settled(): Promise<void> {
     return this.#tripwire.settled();
+  }
+
+  /**
+   * Genuine-instance, synchronous original issuance/watch check. Calling the
+   * static method cannot dispatch through a caller-overridden instance method.
+   * Durable consumption leaves #outstanding intact; no ISSUED renewal or durable
+   * read is needed. Trips/stop/replacement remove that original association.
+   */
+  public static checkOriginalCertificateWatch(service: unknown, input: {
+    readonly certificate: unknown;
+    readonly trustedNowMs: number;
+  }): PracticalOriginalWatchCheck {
+    const refused = (reason: PracticalInvalidationReason): PracticalOriginalWatchCheck => Object.freeze({ kind: 'REFUSED', reason });
+    try {
+      if (typeof service !== 'object' || service === null || !(#outstanding in service)) return refused('EVIDENCE_STALE');
+      const proto: unknown = Object.getPrototypeOf(input);
+      const keys = Reflect.ownKeys(input);
+      if ((proto !== Object.prototype && proto !== null) || keys.length !== 2 || !keys.includes('certificate') || !keys.includes('trustedNowMs')
+        || !('value' in Object.getOwnPropertyDescriptor(input, 'certificate')!) || !('value' in Object.getOwnPropertyDescriptor(input, 'trustedNowMs')!)) return refused('EVIDENCE_STALE');
+      const record = PracticalRecoveryCertificate.read(input.certificate);
+      if (record === null || service.#outstanding?.certificate !== input.certificate) return refused('EVIDENCE_STALE');
+      if (record.accountId !== service.#accountId || record.providerAccountFingerprint !== service.#fingerprint) return refused('ACCOUNT_IDENTITY_MISMATCH');
+      if (record.runtimeEpoch !== service.#runtimeEpoch) return refused('RUNTIME_EPOCH_CHANGED');
+      const nowMs = input.trustedNowMs;
+      const prior = service.#originalWatchTime;
+      if (!Number.isSafeInteger(nowMs) || nowMs < record.issuedAtMs
+        || (prior !== null && prior.certificate === input.certificate && nowMs < prior.atMs)) return refused('CLOCK_ANOMALY');
+      const status = PracticalRecoveryCertificate.status(input.certificate as PracticalRecoveryCertificate);
+      if (status !== 'ISSUED' && status !== 'CONSUMED') return refused('EVIDENCE_STALE');
+      service.#originalWatchTime = { certificate: input.certificate as PracticalRecoveryCertificate, atMs: nowMs };
+      const enablement = PracticalLiveSafetyEnablement.read(service.#enablement);
+      if (enablement === null || enablement.stage !== 'STAGE_5A_CANCEL_ONLY' || !enablement.accountAllowlist.includes(service.#accountId)) return refused('CONFIG_CHANGED');
+      if (nowMs >= Math.min(record.expiresAtMs, record.issuedAtMs + enablement.ceilings.certificateLifetimeMs)) return refused('CERTIFICATE_EXPIRED');
+      const problem = service.#authorityProblem(record, nowMs);
+      if (problem !== null) return refused(problem);
+      const watch = service.#watch?.watch;
+      if (watch === undefined || watch.binding.confirmedAtMs > record.issuedAtMs || watch.armedAtMs > record.issuedAtMs) return refused('EVIDENCE_STALE');
+      // The health read can synchronously trip/reenter: association must still hold.
+      if (service.#hold !== null || service.#outstanding?.certificate !== input.certificate
+        || service.#watch?.watch !== watch || service.#tripwire.watch !== watch || service.#tripwire.trip !== null) return refused('EVIDENCE_STALE');
+      return Object.freeze({ kind: 'UNCHANGED' });
+    } catch {
+      return refused('EVIDENCE_STALE');
+    }
   }
 
   // ----- startup ------------------------------------------------------------
@@ -1340,5 +1386,31 @@ export class PracticalRecoveryService {
     } catch {
       // Already terminal, or an unusable time: it can never become usable either way.
     }
+  }
+}
+
+// Pin this new trusted decision during defining-module initialization, before
+// any consumer can capture or call it. Do not freeze unrelated recovery APIs.
+Object.defineProperty(PracticalRecoveryService, 'checkOriginalCertificateWatch', {
+  value: PracticalRecoveryService.checkOriginalCertificateWatch,
+  writable: false,
+  configurable: false,
+});
+
+// tsc emits CommonJS with mutable export properties. Preserve the lexical
+// class identity as well: preloading this module must not redirect the guard
+// by replacing its exported class before the gateway boundary is imported.
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  const descriptor = Object.getOwnPropertyDescriptor(module.exports, 'PracticalRecoveryService');
+  if (descriptor?.configurable === false) {
+    // tsx already emits a non-configurable lexical getter. Accept only that
+    // immutable, setter-free binding to this exact class; never skip blindly.
+    if (descriptor.get === undefined || descriptor.set !== undefined
+      || module.exports.PracticalRecoveryService !== PracticalRecoveryService) throw new Error('RECOVERY_EXPORT_BINDING_INVALID');
+  } else {
+    Object.defineProperty(module.exports, 'PracticalRecoveryService', {
+      get: () => PracticalRecoveryService,
+      configurable: false,
+    });
   }
 }

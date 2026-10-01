@@ -222,9 +222,13 @@ describe('[8][15][16] no strict authority, no continuity claim, no compensation 
 });
 
 describe('[9][10][17] not wired; no network, gateway, runtime, private-stream, or recovery-engine reach', () => {
-  it('practical-mutation has ZERO importers outside its own tree', () => {
+  it('practical-mutation has exactly the three unwired orchestration importers outside its own tree', () => {
     const importers = files.filter((file) => !file.startsWith(MUTATION_ROOT) && (graph.get(file) ?? []).some((dependency) => dependency.startsWith(MUTATION_ROOT)));
-    expect(importers).toEqual([]);
+    expect(importers.sort()).toEqual([
+      'src/execution/live/practical-cancel/gateway-boundary.ts',
+      'src/execution/live/practical-cancel/ports.ts',
+      'src/execution/live/practical-cancel/service.ts',
+    ]);
   });
 
   it('reaches no integration module, gateway, transport, signer, service, composer, runtime, dispatch, or private stream', () => {
@@ -282,7 +286,7 @@ describe('[9][10][17] not wired; no network, gateway, runtime, private-stream, o
     }
   });
 
-  it('entry, reported-result and genuine no-wire issuers have ZERO production callers and exactly two test callers', () => {
+  it('entry/result have exactly the unwired boundary caller; genuine no-wire retains ZERO production callers', () => {
     const ticketFile = `${MUTATION_ROOT}ticket.ts`;
     const walkTests = (directory: string): string[] => readdirSync(path.join(REPO_ROOT, directory), { withFileTypes: true }).flatMap((entry) => {
       const file = `${directory}/${entry.name}`;
@@ -290,7 +294,7 @@ describe('[9][10][17] not wired; no network, gateway, runtime, private-stream, o
     });
     const testFiles = [...walkTests('tests/unit'), ...walkTests('tests/integration')];
     for (const name of ['enterPracticalCancelGateway', 'issuePracticalCancelOutcome', 'issuePracticalCancelTransportNoWire']) {
-      expect(files.filter((file) => file !== ticketFile && codeOf(file).includes(name))).toEqual([]);
+      expect(files.filter((file) => file !== ticketFile && codeOf(file).includes(name))).toEqual(name === 'issuePracticalCancelTransportNoWire' ? [] : ['src/execution/live/practical-cancel/gateway-boundary.ts']);
       expect(testFiles.filter((file) => sourceOf(file).includes(name)).sort()).toEqual([
         'tests/integration/execution/live-practical-cancel-dispatch.integration.test.ts',
         'tests/unit/execution/live/practical-mutation/dispatch.test.ts',
@@ -646,7 +650,7 @@ describe('[Wave 2B2c] unknown-acquire resolution: read-only, exact, single-use, 
     expect(ticket).toContain('const UNKNOWN_ACQUIRE_RECEIPTS = new WeakMap<object, PracticalUnknownAcquire>();');
     expect(ticket).not.toMatch(/export const UNKNOWN_ACQUIRE_RECEIPTS|export \{ UNKNOWN_ACQUIRE_RECEIPTS/);
     expect(files.filter((file) => codeOf(file).includes('UNKNOWN_ACQUIRE_RECEIPTS'))).toEqual([`${MUTATION_ROOT}ticket.ts`]);
-    expect(files.filter((file) => file !== `${MUTATION_ROOT}ticket.ts` && codeOf(file).includes('readPracticalUnknownAcquireReceipt'))).toEqual([]);
+    expect(files.filter((file) => file !== `${MUTATION_ROOT}ticket.ts` && codeOf(file).includes('readPracticalUnknownAcquireReceipt'))).toEqual(['src/execution/live/practical-cancel/service.ts']);
     // The receipt exposes only a static status: no instance getter, no static read of its record.
     const receiptClass = ticket.slice(ticket.indexOf('export class PracticalUnknownAcquire {'), ticket.indexOf('Object.freeze(PracticalUnknownAcquire.prototype);'));
     expect(receiptClass).not.toMatch(/\bget \w+\(|public static read\(|toJSON|inspect/);

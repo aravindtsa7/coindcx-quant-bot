@@ -158,6 +158,9 @@ describe('no provider, network, gateway, dispatch, or arm reachability (no new r
     const importers = files.filter((file) => !file.startsWith(PERSISTENCE_ROOT) && (graph.get(file) ?? []).some((dependency) => dependency.startsWith(PERSISTENCE_ROOT)));
     // [Checkpoint B] The exact, reviewed widening: the recovery core depends on the Prisma-free PORT only.
     expect(importers.sort()).toEqual([
+      // Unwired orchestration reads only PORT error types/classes, never adapter operations.
+      'src/execution/live/practical-cancel/ports.ts',
+      'src/execution/live/practical-cancel/service.ts',
       // [Stage 1B2 Wave 2B1] the order-bound CANCEL store: the PORT (types/errors) and the ADAPTER (its caller-owned scope).
       MUTATION_ADAPTER,
       'src/execution/live/practical-recovery/ports.ts',

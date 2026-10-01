@@ -4,7 +4,7 @@ import { Prisma, PrismaClient } from '@prisma/client';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { LiveExecutionIntentRecord } from '../../../src/execution/live/intent';
 import { PrismaLiveExecutionRepository, consumeCancelDispatchWithinCallerFencedTransaction } from '../../../src/execution/live/repository';
-import { issuePracticalRecoveryCertificate, type PracticalRecoveryCertificate } from '../../../src/execution/live/practical/certificate';
+import { issuePracticalRecoveryCertificate, PracticalRecoveryCertificate } from '../../../src/execution/live/practical/certificate';
 import { issuePracticalLiveSafetyEnablement, type PracticalLiveSafetyEnablement } from '../../../src/execution/live/practical/policy';
 import type { PracticalAccountSnapshot } from '../../../src/execution/live/practical-persistence/ports';
 import { PrismaPracticalSafetyRepository, withLockedPracticalAccountWithinCallerTransaction } from '../../../src/execution/live/practical-persistence/repository';
@@ -14,6 +14,14 @@ import { providerAccountFingerprint } from '../../../src/execution/live/reconcil
 import { newLiveRuntimeIdentity, readLiveRuntimeEpoch, requireCurrentReconciliation } from '../../../src/execution/live/reconciliation/barrier';
 import { DisposableMysqlGuardError, DisposableMysqlLifecycle, generateDisposableDatabaseName } from '../../helpers/p18b-disposable-mysql';
 import { classifyPracticalCancelBinding, currentPracticalCancelBinding } from '../../../src/execution/live/practical-cancel-binding';
+import { FakeClock } from '../../../src/core/time/clock';
+import { resolveLiveExecutionGate } from '../../../src/execution/live/gate';
+import { PracticalRecoveryService } from '../../../src/execution/live/practical-recovery/service';
+import { PrismaLiveReconciliationRepository } from '../../../src/execution/live/reconciliation/repository';
+import { PracticalCancelService } from '../../../src/execution/live/practical-cancel/service';
+import { PracticalCancelGatewayBoundary } from '../../../src/execution/live/practical-cancel/gateway-boundary';
+import type { PracticalCancelStore, PracticalCancelResult, PracticalCancelDependencies } from '../../../src/execution/live/practical-cancel/ports';
+import { FakePrivateStream, FakeReconciliation, FakeScheduler, FakeVenue } from '../../unit/execution/live/practical-recovery/support';
 
 // Test-only synthetic authority. No provider, capture database or production issuer.
 const STRICT = process.env['REQUIRE_LIVE_PRACTICAL_CANCEL_DISPATCH_DB_INTEGRATION'] === '1';
@@ -579,5 +587,307 @@ describe('unwired dispatch real-MySQL acceptance', () => {
       await store().completeCancelLease({ outcome: outcomeOf(attempt, 'CANCEL_ACCEPTED'), trustedNowMs: CLOSE_AT });
       expect((await orderRow(seed.order.intentId)).revision).toBe(2_147_483_647);
     }
+  });
+});
+
+type OrchestrationMethod = keyof PracticalCancelStore;
+const ORCHESTRATION_METHODS: readonly OrchestrationMethod[] = ['acquireCancelLease', 'armCancelLease', 'createCancelDispatchPermission',
+  'consumeCancelDispatchPermission', 'completeCancelLease', 'abandonAcquiredCancel', 'completeUndispatchedCancel', 'completeUnenteredCancelDispatch', 'resolveUnknownAcquire'];
+
+/** Real recovery issuance and real stores; provider/readiness inputs are synthetic test-only fixtures. */
+async function orchestrationFixture() {
+  const accountId = freshAccount();
+  const clock = new FakeClock(T0);
+  const privateStream = new FakePrivateStream();
+  const reconciliation = new FakeReconciliation(accountId, EPOCH);
+  const venue = new FakeVenue(clock);
+  venue.identity = { kind: 'OBSERVED', fingerprint: FINGERPRINT };
+  venue.orders = []; venue.positions = [];
+  const enablement = enablementFor(accountId);
+  const recovery = new PracticalRecoveryService({ accountId, runtimeEpoch: EPOCH, expectedProviderAccountFingerprint: FINGERPRINT, enablement,
+    persistence: practical(), venue, reconciliation, privateStream, clock, scheduler: new FakeScheduler(clock) });
+  expect(await recovery.recoverAtStartup()).toMatchObject({ kind: 'READY' });
+  expect(await recovery.startWatch()).toMatchObject({ kind: 'WATCHING' });
+  const generation = reconciliation.completeHealthyRun(EPOCH);
+  const state = { status: 'HEALTHY' as const, currentGeneration: generation, currentRunId: 'orchestration-reconciliation', currentRuntimeEpoch: EPOCH,
+    healthyGeneration: generation, blockingFindingCount: 0, revision: 1 };
+  await connectionA.liveReconciliationState.upsert({ where: { accountId }, create: { accountId, ...state }, update: state } as never);
+  const certified = await recovery.certifyAccount();
+  if (certified.kind !== 'CERTIFIED') throw new Error('ORCHESTRATION_CERTIFICATION_FIXTURE_FAILED');
+  const record = PracticalRecoveryCertificate.read(certified.certificate)!;
+  clock.setTime(record.issuedAtMs + 60_000);
+  const order = intentRecord(accountId);
+  await execution().ensureIntent(order);
+  const exchangeOrderId = `orchestration-venue-${randomBytes(4).toString('hex')}`;
+  await connectionA.liveOrder.update({ where: { intentId: order.intentId }, data: { state: 'ACKNOWLEDGED', exchangeOrderId, revision: 2 } });
+  const gate = resolveLiveExecutionGate({ NODE_ENV: 'production', LIVE_EXECUTION_ENABLED: 'true', COINDCX_API_KEY: 'synthetic-integration-key', COINDCX_API_SECRET: 'synthetic-integration-secret',
+    COINDCX_LIVE_ACCOUNT_ID: accountId, COINDCX_EXPECTED_ACCOUNT_FINGERPRINT: FINGERPRINT, LIVE_EXECUTION_ACCOUNT_ALLOWLIST: accountId,
+    LIVE_EXECUTION_PAIR_ALLOWLIST: order.content.pair, LIVE_EXECUTION_MAX_ORDER_NOTIONAL_INR: '10000000' });
+  if (gate.status !== 'ENABLED') throw new Error('ORCHESTRATION_GATE_FIXTURE_FAILED');
+  const methods: OrchestrationMethod[] = [];
+  const cleanupInputs: unknown[] = [];
+  let calls = 0;
+  let gatewayResult: unknown = { kind: 'CANCEL_ACCEPTED', observation: null };
+  const overrides = new Map<OrchestrationMethod, PrismaClient>();
+  const after = new Map<OrchestrationMethod, (result: unknown, input: unknown) => void | Promise<void>>();
+  const real = store();
+  const port = Object.fromEntries(ORCHESTRATION_METHODS.map(method => [method, async (input: unknown) => {
+    methods.push(method);
+    if (['completeCancelLease', 'abandonAcquiredCancel', 'completeUndispatchedCancel', 'completeUnenteredCancelDispatch'].includes(method)) cleanupInputs.push(input);
+    const selected = overrides.has(method) ? store(overrides.get(method)!) : real;
+    const result = await (selected[method] as (input: never) => Promise<unknown>).call(selected, input as never);
+    await after.get(method)?.(result, input);
+    return result;
+  }])) as unknown as PracticalCancelStore;
+  const gateway: PracticalCancelDependencies['gateway'] = { async cancelOrder(request) { calls += 1; expect(Object.isFrozen(request)).toBe(true); expect(request).toEqual({ clientOrderId: order.clientOrderId,
+    exchangeOrderId, pair: order.content.pair, timeoutMs: 1000 }); return gatewayResult as never; } };
+  const service = new PracticalCancelService({ store: port, clock, runtimeIdentity: IDENTITY, enablement, liveEnablement: gate.enablement, recovery, requestTimeoutMs: 1000, gateway });
+  const input = { intentId: order.intentId, expected: expectationOf(certified.account), certificate: certified.certificate };
+  return { accountId, clock, privateStream, recovery, certificate: certified.certificate, order, exchangeOrderId, service, input, methods, cleanupInputs, overrides, after,
+    gateway, calls: () => calls, result: (value: unknown) => { gatewayResult = value; } };
+}
+function requireBookkeeping(result: PracticalCancelResult) {
+  if (result.kind !== 'BOOKKEEPING_PENDING') throw new Error('EXPECTED_GENUINE_BOOKKEEPING_CONTINUATION');
+  return result.continuation;
+}
+
+describe('unwired orchestrator real-MySQL acceptance (synthetic provider fixtures)', () => {
+  it.each(['assignment', 'reflect', 'define', 'delete'] as const)('boundary %s cannot send and return false NOT_ENTERED after committed consumption', async operation => {
+    if (skip()) return;
+    const h = await orchestrationFixture();
+    let redirects = 0;
+    const replacement = async (attempt: unknown) => {
+      redirects += 1;
+      const arm = PracticalCancelDispatchOwner.read(attempt)!.armed;
+      await h.gateway.cancelOrder(Object.freeze({ clientOrderId: arm.clientOrderId, exchangeOrderId: arm.exchangeOrderId, pair: arm.pair, timeoutMs: 1000 }));
+      return { kind: 'NOT_ENTERED', code: 'ORIGINAL_WATCH_REFUSED' };
+    };
+    h.after.set('consumeCancelDispatchPermission', async result => {
+      expect(PracticalCancelDispatchOwner.status((result as { attempt: unknown }).attempt)).toBe('UNENTERED');
+      expect((await orderRow(h.order.intentId)).revision).toBe(5);
+      h.privateStream.unprove();
+      const target = PracticalCancelGatewayBoundary.prototype as unknown as Record<string, unknown>;
+      if (operation === 'assignment') expect(() => { target['invoke'] = replacement; }).toThrow(TypeError);
+      if (operation === 'reflect') expect(Reflect.set(target, 'invoke', replacement)).toBe(false);
+      if (operation === 'define') expect(() => Object.defineProperty(target, 'invoke', { value: replacement })).toThrow(TypeError);
+      if (operation === 'delete') expect(Reflect.deleteProperty(target, 'invoke')).toBe(false);
+    });
+    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' });
+    expect(h.calls()).toBe(0); expect(redirects).toBe(0);
+    expect(h.methods).toEqual(['acquireCancelLease', 'armCancelLease', 'createCancelDispatchPermission', 'consumeCancelDispatchPermission', 'completeUnenteredCancelDispatch']);
+    expect(h.cleanupInputs).toHaveLength(1);
+    const owner = (h.cleanupInputs[0] as { owner: unknown }).owner;
+    expect(PracticalCancelDispatchOwner.read(owner)?.role).toBe('ATTEMPT'); expect(PracticalCancelDispatchOwner.status(owner)).toBe('SPENT');
+    const closed = await orderRow(h.order.intentId);
+    expect(closed.revision).toBe(6); expect(closed.cancelState).toBe('NONE'); expect(closed.cancelWireArmed).toBe(false);
+    expect((await practicalRows(h.accountId)).certificates[0]?.status).toBe('CONSUMED');
+  });
+  it.each(['COMMITTED', 'ROLLED_BACK'] as const)('protected final-boundary cleanup %s uncertainty retries identical ownership without dispatch', async truth => {
+    if (skip()) return;
+    const h = await orchestrationFixture();
+    h.after.set('consumeCancelDispatchPermission', () => {
+      h.privateStream.unprove();
+      expect(Reflect.set(PracticalCancelGatewayBoundary.prototype, 'invoke', () => ({ kind: 'NOT_ENTERED' }))).toBe(false);
+    });
+    h.overrides.set('completeUnenteredCancelDispatch', truth === 'COMMITTED' ? commitLostClient() : rollbackLostClient());
+    const continuation = requireBookkeeping(await h.service.cancel(h.input));
+    h.overrides.delete('completeUnenteredCancelDispatch'); await h.recovery.settled();
+    expect(Reflect.set(PracticalCancelGatewayBoundary.prototype, 'invoke', () => ({ kind: 'REPORTED' }))).toBe(false);
+    expect(await h.service.retryBookkeeping({ continuation })).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE', disposition: truth === 'COMMITTED' ? 'ALREADY_COMPLETED' : 'COMPLETED' });
+    expect((h.cleanupInputs[0] as { owner: unknown }).owner).toBe((h.cleanupInputs[1] as { owner: unknown }).owner);
+    expect(h.methods.filter(m => m === 'acquireCancelLease')).toHaveLength(1);
+    expect(h.methods.filter(m => m === 'consumeCancelDispatchPermission')).toHaveLength(1);
+    expect(h.methods.filter(m => m === 'completeUnenteredCancelDispatch')).toHaveLength(2);
+    expect(h.calls()).toBe(0); expect((await orderRow(h.order.intentId)).revision).toBe(6);
+  });
+  it.each(['assignment', 'reflect', 'define', 'delete'] as const)('%s cannot replace original-watch loss after committed consumption: zero gateway calls and only owned cleanup', async operation => {
+    if (skip()) return;
+    const h = await orchestrationFixture();
+    const checker = PracticalRecoveryService.checkOriginalCertificateWatch;
+    h.after.set('consumeCancelDispatchPermission', async result => {
+      const attempt = (result as { attempt: unknown }).attempt;
+      expect(PracticalCancelDispatchOwner.status(attempt)).toBe('UNENTERED');
+      expect((await orderRow(h.order.intentId)).revision).toBe(5);
+      expect((await practicalRows(h.accountId)).certificates[0]?.status).toBe('CONSUMED');
+      h.privateStream.unprove();
+      const target = PracticalRecoveryService as unknown as Record<string, unknown>;
+      const key = 'checkOriginalCertificateWatch';
+      const fake = () => ({ kind: 'UNCHANGED' });
+      if (operation === 'assignment') expect(() => { target[key] = fake; }).toThrow(TypeError);
+      if (operation === 'reflect') expect(Reflect.set(target, key, fake)).toBe(false);
+      if (operation === 'define') expect(() => Object.defineProperty(target, key, { value: fake })).toThrow(TypeError);
+      if (operation === 'delete') expect(Reflect.deleteProperty(target, key)).toBe(false);
+      expect(PracticalRecoveryService.checkOriginalCertificateWatch).toBe(checker);
+      expect(checker(h.recovery, { certificate: h.certificate, trustedNowMs: h.clock.nowMs() }).kind).toBe('REFUSED');
+    });
+    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' });
+    expect(h.calls()).toBe(0);
+    expect(h.methods).toEqual(['acquireCancelLease', 'armCancelLease', 'createCancelDispatchPermission', 'consumeCancelDispatchPermission', 'completeUnenteredCancelDispatch']);
+    expect(h.cleanupInputs).toHaveLength(1);
+    const owner = (h.cleanupInputs[0] as { owner: unknown }).owner;
+    expect(PracticalCancelDispatchOwner.read(owner)?.role).toBe('ATTEMPT');
+    expect(PracticalCancelDispatchOwner.status(owner)).toBe('SPENT');
+    const closed = await orderRow(h.order.intentId);
+    expect(closed.revision).toBe(6); expect(closed.cancelState).toBe('NONE'); expect(closed.cancelWireArmed).toBe(false);
+    expect((await practicalRows(h.accountId)).state?.state).toBe('QUARANTINED');
+  });
+  it.each(['COMMITTED', 'ROLLED_BACK'] as const)('watch-loss cleanup %s uncertainty remains bookkeeping-only despite attempted checker replacement', async truth => {
+    if (skip()) return;
+    const h = await orchestrationFixture();
+    h.after.set('consumeCancelDispatchPermission', () => {
+      h.privateStream.unprove();
+      expect(Reflect.set(PracticalRecoveryService, 'checkOriginalCertificateWatch', () => ({ kind: 'UNCHANGED' }))).toBe(false);
+    });
+    h.overrides.set('completeUnenteredCancelDispatch', truth === 'COMMITTED' ? commitLostClient() : rollbackLostClient());
+    const continuation = requireBookkeeping(await h.service.cancel(h.input));
+    expect(h.calls()).toBe(0);
+    h.overrides.delete('completeUnenteredCancelDispatch');
+    await h.recovery.settled();
+    expect(await h.service.retryBookkeeping({ continuation })).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE', disposition: truth === 'COMMITTED' ? 'ALREADY_COMPLETED' : 'COMPLETED' });
+    expect(h.methods.filter(method => method === 'acquireCancelLease')).toHaveLength(1);
+    expect(h.methods.filter(method => method === 'consumeCancelDispatchPermission')).toHaveLength(1);
+    expect(h.methods.filter(method => method === 'completeUnenteredCancelDispatch')).toHaveLength(2);
+    expect((h.cleanupInputs[0] as { owner: unknown }).owner).toBe((h.cleanupInputs[1] as { owner: unknown }).owner);
+    expect(h.calls()).toBe(0);
+  });
+  it('a genuine malformed latch is blocked, never completed, with no Phase17 write or gateway call', async () => {
+    if (skip()) return;
+    const h = await orchestrationFixture(); const before = await orderRow(h.order.intentId);
+    await connectionA.$executeRaw`UPDATE live_practical_account_fence SET mode = 'CERTIFYING', run_id = ' padded-run' WHERE account_id = ${h.accountId}`;
+    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'BLOCKED', code: 'MANUAL_REVIEW_REQUIRED' });
+    expect(await orderRow(h.order.intentId)).toEqual(before); expect(h.calls()).toBe(0);
+    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'BLOCKED', code: 'PRACTICAL_PERSISTENCE_LATCHED' });
+  });
+  it('retains the genuine original watch after durable consumption and preserves economic rows', async () => {
+    if (skip()) return;
+    const h = await orchestrationFixture();
+    const before = await orderRow(h.order.intentId);
+    h.after.set('acquireCancelLease', async () => {
+      expect((await practicalRows(h.accountId)).certificates[0]?.status).toBe('CONSUMED');
+      expect(PracticalRecoveryService.checkOriginalCertificateWatch(h.recovery, { certificate: h.certificate, trustedNowMs: h.clock.nowMs() })).toEqual({ kind: 'UNCHANGED' });
+      expect(await h.recovery.monitorAuthority()).toMatchObject({ kind: 'NO_OUTSTANDING_CERTIFICATE' });
+    });
+    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'COMPLETED', outcome: 'ACCEPTED' });
+    expect(h.calls()).toBe(1);
+    const after = await orderRow(h.order.intentId);
+    expect(after.cancelState).toBe('CANCEL_ACKNOWLEDGED'); expect(after.cancelWireArmed).toBe(false);
+    for (const key of ['orderedQuantity', 'cumulativeFilledQuantity', 'remainingQuantity', 'averageFillPrice', 'exchangeOrderId', 'pair'] as const) expect(after[key]).toEqual(before[key]);
+    expect(after.state).toBe('CANCEL_REQUESTED'); // request bookkeeping, never CANCELLED/finality
+    expect((await practicalRows(h.accountId)).certificates[0]?.status).toBe('CONSUMED');
+  });
+  it.each(['acquireCancelLease', 'armCancelLease', 'createCancelDispatchPermission', 'consumeCancelDispatchPermission'] as const)('watch trip during %s cleans only current owner', async method => {
+    if (skip()) return;
+    const h = await orchestrationFixture();
+    h.after.set(method, () => { h.privateStream.unprove(); });
+    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' });
+    expect(h.calls()).toBe(0);
+    expect(h.methods.at(-1)).toBe(method === 'acquireCancelLease' ? 'abandonAcquiredCancel' : method === 'armCancelLease' ? 'completeUndispatchedCancel' : 'completeUnenteredCancelDispatch');
+    expect((await orderRow(h.order.intentId)).cancelState).toBe('NONE');
+    expect((await practicalRows(h.accountId)).state?.state).toBe('QUARANTINED');
+  });
+  it.each(['acquireCancelLease', 'armCancelLease', 'createCancelDispatchPermission', 'consumeCancelDispatchPermission'] as const)('time regression during %s never enters gateway', async method => {
+    if (skip()) return;
+    const h = await orchestrationFixture(); h.after.set(method, () => { h.clock.advance(-1); });
+    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' }); expect(h.calls()).toBe(0);
+  });
+  it.each(['acquireCancelLease', 'armCancelLease', 'createCancelDispatchPermission'] as const)('remote reconciliation supersession during %s refuses and cleans without renewed health', async method => {
+    if (skip()) return;
+    const h = await orchestrationFixture();
+    h.after.set(method, async () => { await connectionB.liveReconciliationState.update({ where: { accountId: h.accountId }, data: { currentRuntimeEpoch: 'superseding-test-epoch' } }); });
+    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' }); expect(h.calls()).toBe(0);
+  });
+  it('does not claim a socket fence when remote supersession occurs after confirmed consumption', async () => {
+    if (skip()) return;
+    const h = await orchestrationFixture();
+    h.after.set('consumeCancelDispatchPermission', async () => { await connectionB.liveReconciliationState.update({ where: { accountId: h.accountId }, data: { currentRuntimeEpoch: 'superseding-test-epoch' } }); });
+    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'COMPLETED', outcome: 'ACCEPTED' }); expect(h.calls()).toBe(1);
+    // This exposes the honest DB-to-socket gap; no strict authorization is minted.
+    await expect(requireCurrentReconciliation(new PrismaLiveReconciliationRepository(connectionA), h.accountId, IDENTITY, 'CANCEL')).rejects.toThrow();
+  });
+  it.each(['COMMITTED', 'ROLLED_BACK'] as const)('genuine unknown consumption %s issues no attempt and never invokes or resends', async truth => {
+    if (skip()) return;
+    const h = await orchestrationFixture(); h.overrides.set('consumeCancelDispatchPermission', truth === 'COMMITTED' ? commitLostClient() : rollbackLostClient());
+    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' });
+    expect(h.calls()).toBe(0); expect(h.methods.filter(m => m === 'consumeCancelDispatchPermission')).toHaveLength(1);
+    expect((await orderRow(h.order.intentId)).revision).toBe(truth === 'COMMITTED' ? 6 : 5);
+    const retried = await h.service.cancel(h.input); expect(retried.kind).not.toBe('COMPLETED'); expect(h.calls()).toBe(0);
+  });
+  it('CAS loser has no cleanup continuation or writes over the winner revision', async () => {
+    if (skip()) return;
+    const h = await orchestrationFixture();
+    h.after.set('createCancelDispatchPermission', async () => { await connectionB.liveOrder.update({ where: { intentId: h.order.intentId }, data: { revision: { increment: 1 } } }); });
+    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'BLOCKED', code: 'PRACTICAL_MUTATION_DISPATCH_CONFLICT' });
+    expect(h.calls()).toBe(0); expect(h.cleanupInputs).toEqual([]);
+    expect((await practicalRows(h.accountId)).leases[0]?.status).toBe('LEASED'); expect((await orderRow(h.order.intentId)).cancelWireArmed).toBe(true);
+  });
+  it.each(['COMMITTED', 'ROLLED_BACK'] as const)('unknown completion %s retries only the identical bookkeeping receipt', async truth => {
+    if (skip()) return;
+    const h = await orchestrationFixture(); h.overrides.set('completeCancelLease', truth === 'COMMITTED' ? commitLostClient() : rollbackLostClient());
+    const continuation = requireBookkeeping(await h.service.cancel(h.input)); expect(h.calls()).toBe(1);
+    h.overrides.delete('completeCancelLease');
+    expect(await h.service.retryBookkeeping({ continuation })).toMatchObject({ kind: 'COMPLETED', outcome: 'ACCEPTED', disposition: truth === 'COMMITTED' ? 'ALREADY_COMPLETED' : 'COMPLETED' });
+    const first = h.cleanupInputs[0] as { outcome: unknown }, second = h.cleanupInputs[1] as { outcome: unknown };
+    expect(first.outcome).toBe(second.outcome); expect(h.calls()).toBe(1);
+    expect(h.methods.filter(m => m === 'consumeCancelDispatchPermission')).toHaveLength(1);
+  });
+  it.each(['COMMITTED', 'ROLLED_BACK'] as const)('unknown creation with repeated unknown cleanup %s retains its hidden original owner', async truth => {
+    if (skip()) return;
+    const h = await orchestrationFixture();
+    h.overrides.set('createCancelDispatchPermission', commitLostClient());
+    h.overrides.set('completeUnenteredCancelDispatch', truth === 'COMMITTED' ? commitLostClient() : rollbackLostClient());
+    const continuation = requireBookkeeping(await h.service.cancel(h.input));
+    const first = h.cleanupInputs[0] as { owner: unknown; report: unknown };
+    expect(PracticalArmedCancel.status(first.owner)).toBe('TRANSFERRED');
+    for (let retry = 0; retry < 2; retry += 1) expect(await h.service.retryBookkeeping({ continuation })).toMatchObject({ kind: 'BLOCKED', code: 'PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN' });
+    h.overrides.delete('completeUnenteredCancelDispatch');
+    expect(await h.service.retryBookkeeping({ continuation })).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' });
+    expect((await orderRow(h.order.intentId)).revision).toBe(5);
+    for (const value of h.cleanupInputs as Array<{ owner: unknown; report: unknown }>) { expect(value.owner).toBe(first.owner); expect(value.report).toBe(first.report); }
+    expect(h.methods.filter(m => m === 'createCancelDispatchPermission')).toHaveLength(1);
+    expect(h.methods).not.toContain('consumeCancelDispatchPermission'); expect(h.calls()).toBe(0);
+  });
+  it('startup disarm after real acquisition refuses the original watch and leaves only owned cleanup', async () => {
+    if (skip()) return;
+    const h = await orchestrationFixture();
+    h.after.set('acquireCancelLease', async () => {
+      expect(await h.recovery.recoverAtStartup()).toMatchObject({ kind: 'BLOCKED_MUTATION_LEASE_HELD' });
+      expect(PracticalRecoveryService.checkOriginalCertificateWatch(h.recovery, { certificate: h.certificate, trustedNowMs: h.clock.nowMs() }).kind).toBe('REFUSED');
+    });
+    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' }); expect(h.calls()).toBe(0);
+  });
+  it.each(['COMMITTED', 'ROLLED_BACK'] as const)('unknown acquire %s resolves then abandons; it cannot resume dispatch', async truth => {
+    if (skip()) return;
+    const h = await orchestrationFixture(); h.overrides.set('acquireCancelLease', truth === 'COMMITTED' ? commitLostClient() : rollbackLostClient());
+    const continuation = requireBookkeeping(await h.service.cancel(h.input));
+    const result = await h.service.retryBookkeeping({ continuation });
+    expect(result).toMatchObject(truth === 'COMMITTED' ? { kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' } : { kind: 'NOT_COMMITTED', certificateStatus: 'ISSUED' });
+    expect(h.calls()).toBe(0); expect(h.methods).not.toContain('armCancelLease'); expect(h.methods.filter(m => m === 'acquireCancelLease')).toHaveLength(1);
+    expect(JSON.stringify(continuation)).toBe('{}');
+  });
+  it.each(['COMMITTED', 'ROLLED_BACK'] as const)('READY cleanup unknown %s retains original bounds and refuses unrelated advancement', async truth => {
+    if (skip()) return;
+    const h = await orchestrationFixture(); h.after.set('createCancelDispatchPermission', () => { h.privateStream.unprove(); });
+    h.overrides.set('completeUnenteredCancelDispatch', truth === 'COMMITTED' ? commitLostClient() : rollbackLostClient());
+    const continuation = requireBookkeeping(await h.service.cancel(h.input));
+    h.overrides.delete('completeUnenteredCancelDispatch');
+    await h.recovery.settled(); // measure only the retry, after independent tripwire invalidation
+    const originalInput = h.cleanupInputs[0] as { owner: unknown; report: unknown };
+    expect(PracticalCancelDispatchOwner.cleanupRevisions(originalInput.owner)).toEqual([4]);
+    await connectionA.liveOrder.update({ where: { intentId: h.order.intentId }, data: { revision: { increment: 1 } } });
+    const before = await durable(h.accountId, h.order.intentId);
+    const observed = writeObserver(); h.overrides.set('completeUnenteredCancelDispatch', observed.client);
+    expect((await h.service.retryBookkeeping({ continuation })).kind).toBe('BLOCKED');
+    expect(observed.writes()).toBe(0);
+    expect(await durable(h.accountId, h.order.intentId)).toEqual(before);
+    const retryInput = h.cleanupInputs[1] as { owner: unknown; report: unknown };
+    expect(retryInput.owner).toBe(originalInput.owner); expect(retryInput.report).toBe(originalInput.report);
+    expect(PracticalCancelDispatchOwner.cleanupRevisions(originalInput.owner)).toEqual([4]); expect(h.calls()).toBe(0);
+  });
+  it.each(['PRE_DISPATCH_FAILURE', 'AMBIGUOUS', 'REJECTED'] as const)('reported %s preserves conservative durable classifications', async kind => {
+    if (skip()) return;
+    const h = await orchestrationFixture(); h.result({ kind, reasonCode: 'HTTP_400' });
+    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'COMPLETED', outcome: kind === 'REJECTED' ? 'REJECTED' : 'AMBIGUOUS' });
+    expect((await orderRow(h.order.intentId)).cancelState).toBe(kind === 'REJECTED' ? 'CANCEL_REJECTED' : 'CANCEL_AMBIGUOUS');
+    expect((await practicalRows(h.accountId)).certificates[0]?.status).toBe('CONSUMED'); expect(h.calls()).toBe(1);
   });
 });

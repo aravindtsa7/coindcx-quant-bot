@@ -118,6 +118,9 @@ describe('no caller-selectable gate and no premature wiring', () => {
     // gateway) must be an explicit, reviewed edit of this list.
     const importers = files.filter((file) => !file.startsWith(PRACTICAL_ROOT) && (graph.get(file) ?? []).some((dependency) => dependency.startsWith(PRACTICAL_ROOT)));
     expect(importers.sort()).toEqual([
+      'src/execution/live/practical-cancel/gateway-boundary.ts',
+      'src/execution/live/practical-cancel/ports.ts',
+      'src/execution/live/practical-cancel/service.ts',
       // [Stage 1B2 Wave 2B1] the order-bound CANCEL mutation store (itself wired into nothing; pinned by
       // phase18b-stage1b2-practical-mutation-boundary): it READS genuine Stage 1A values, it mints none.
       'src/execution/live/practical-mutation/ports.ts',
@@ -130,6 +133,7 @@ describe('no caller-selectable gate and no premature wiring', () => {
       'src/execution/live/practical-persistence/rows.ts',
       // [Checkpoint B] the read-only recovery core (itself wired into nothing).
       'src/execution/live/practical-recovery/observation.ts',
+      'src/execution/live/practical-recovery/ports.ts',
       'src/execution/live/practical-recovery/private-events.ts',
       'src/execution/live/practical-recovery/service.ts',
       'src/execution/live/practical-recovery/telemetry.ts',

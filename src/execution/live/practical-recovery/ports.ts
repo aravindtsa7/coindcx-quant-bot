@@ -32,6 +32,12 @@ import type { Clock } from '../../../core/time/clock';
 import type { LiveProviderAccountIdentityRead } from '../reconciliation/account-identity';
 import type { LiveEvidenceProvenance, LiveVenueOrderEvidence, LiveVenuePositionEvidence } from '../reconciliation/types';
 import type { PracticalSafetyRepository } from '../practical-persistence/ports';
+import type { PracticalInvalidationReason } from '../practical/types';
+
+/** Immediate original-watch observation. Never a transferable authorization. */
+export type PracticalOriginalWatchCheck =
+  | { readonly kind: 'UNCHANGED' }
+  | { readonly kind: 'REFUSED'; readonly reason: PracticalInvalidationReason };
 
 // ---------------------------------------------------------------------------
 // Time

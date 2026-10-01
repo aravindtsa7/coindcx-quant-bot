@@ -51,10 +51,12 @@ describe('module layout', () => {
     expect(recoveryFiles).toEqual(onDisk.map((name) => `${RECOVERY_ROOT}${name}`));
   });
 
-  it('nothing in src/ imports the recovery core except the Checkpoint C shadow core, and only its pure read-only modules (no runtime wiring)', () => {
+  it('only the exact shadow and unwired orchestration importers reach recovery (no runtime wiring)', () => {
     const importers = files.filter((file) => !file.startsWith(RECOVERY_ROOT) && (graph.get(file) ?? []).some((dependency) => dependency.startsWith(RECOVERY_ROOT)));
     // [Checkpoint C] the exact, reviewed widening.
     expect(importers.sort()).toEqual([
+      'src/execution/live/practical-cancel/gateway-boundary.ts',
+      'src/execution/live/practical-cancel/ports.ts',
       'src/execution/live/practical-shadow/classification.ts',
       'src/execution/live/practical-shadow/collector.ts',
       'src/execution/live/practical-shadow/config.ts',
@@ -64,7 +66,8 @@ describe('module layout', () => {
     const allowed = new Set(['observation.ts', 'private-events.ts', 'ports.ts', 'telemetry.ts', 'timing.ts'].map((name) => `${RECOVERY_ROOT}${name}`));
     for (const importer of importers) {
       for (const dependency of (graph.get(importer) ?? []).filter((node) => node.startsWith(RECOVERY_ROOT))) {
-        expect(allowed.has(dependency), `${importer} -> ${dependency}`).toBe(true);
+        const exactCheckerImporter = importer === 'src/execution/live/practical-cancel/gateway-boundary.ts' || importer === 'src/execution/live/practical-cancel/ports.ts';
+        expect(allowed.has(dependency) || (exactCheckerImporter && dependency === `${RECOVERY_ROOT}service.ts`), `${importer} -> ${dependency}`).toBe(true);
       }
     }
   });

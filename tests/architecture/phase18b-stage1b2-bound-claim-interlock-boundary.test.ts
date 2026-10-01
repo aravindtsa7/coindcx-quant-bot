@@ -304,10 +304,10 @@ describe('scope: [Wave 2B2b widened] only the no-wire completion and in-process 
   it('no src module introduces a completion-of-dispatch / recovery / permit surface; the adapter writes no dispatched outcome', () => {
     for (const file of files.filter((candidate) => candidate.startsWith('src/'))) {
       expect(codeOf(file), file).not.toMatch(/recoverOrphanedCancelLease|PracticalVerifiedCancelResolution/);
-      if (!file.startsWith('src/execution/live/practical-mutation/')) expect(codeOf(file), file).not.toMatch(/completeCancelLease|PracticalCancelDispatchPermit/);
+      if (!file.startsWith('src/execution/live/practical-mutation/') && file !== 'src/execution/live/practical-cancel/service.ts') expect(codeOf(file), file).not.toMatch(/completeCancelLease|PracticalCancelDispatchPermit/);
     }
     const namesNoWireOperations = files.filter((file) => /completeUndispatchedCancel|abandonAcquiredCancel/.test(codeOf(file))).sort();
-    expect(namesNoWireOperations).toEqual(['src/execution/live/practical-mutation/ports.ts', MUTATION_ADAPTER].sort());
+    expect(namesNoWireOperations).toEqual(['src/execution/live/practical-cancel/service.ts', 'src/execution/live/practical-mutation/ports.ts', MUTATION_ADAPTER].sort());
     const adapter = codeOf(MUTATION_ADAPTER);
     expect(adapter).not.toMatch(/HTTP_|statusCode|\b429\b/);
   });
