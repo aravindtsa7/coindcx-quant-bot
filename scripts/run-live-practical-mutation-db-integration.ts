@@ -5,7 +5,7 @@
  * soft-skippable (the repository's live-DB integration convention), so unit
  * development never depends on a local MySQL being up.
  *
- * This script is the Stage 1B2 ACCEPTANCE path. It runs the seven Stage 1B2
+ * This script is the Stage 1B2 ACCEPTANCE path. It runs the eight Stage 1B2
  * real-MySQL suites with their strict flags set:
  *
  *   - the frozen mutation-safety migration shape
@@ -24,7 +24,10 @@
  *     (REQUIRE_LIVE_PRACTICAL_CANCEL_UNKNOWN_ACQUIRE_DB_INTEGRATION),
  *   - the Wave 2B2d previous-runtime UNARMED leased-fence recovery, its zombie
  *     races, and the reconciliation afterwards
- *     (REQUIRE_LIVE_PRACTICAL_CANCEL_PREVIOUS_RUNTIME_DB_INTEGRATION).
+ *     (REQUIRE_LIVE_PRACTICAL_CANCEL_PREVIOUS_RUNTIME_DB_INTEGRATION),
+ *   - the unwired permission/consumption and coupled reported outcomes
+ *     (REQUIRE_LIVE_PRACTICAL_CANCEL_DISPATCH_DB_INTEGRATION).
+ * Explicit run mode and six workers apply to every suite in this runner.
  *
  * Under those flags each suite's `beforeAll` THROWS, failing the run, if it
  * cannot provision its own real, disposable MySQL database (always dropped
@@ -62,6 +65,8 @@ const result = spawnSync(
     'tests/integration/execution/live-practical-cancel-nowire.integration.test.ts',
     'tests/integration/execution/live-practical-cancel-unknown-acquire.integration.test.ts',
     'tests/integration/execution/live-practical-cancel-previous-runtime.integration.test.ts',
+    'tests/integration/execution/live-practical-cancel-dispatch.integration.test.ts',
+    '--maxWorkers=6',
   ],
   {
     stdio: 'inherit',
@@ -74,6 +79,7 @@ const result = spawnSync(
       REQUIRE_LIVE_PRACTICAL_CANCEL_NOWIRE_DB_INTEGRATION: '1',
       REQUIRE_LIVE_PRACTICAL_CANCEL_UNKNOWN_ACQUIRE_DB_INTEGRATION: '1',
       REQUIRE_LIVE_PRACTICAL_CANCEL_PREVIOUS_RUNTIME_DB_INTEGRATION: '1',
+      REQUIRE_LIVE_PRACTICAL_CANCEL_DISPATCH_DB_INTEGRATION: '1',
     },
   },
 );

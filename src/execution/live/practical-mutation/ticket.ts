@@ -39,10 +39,10 @@
  * ARMED-TICKET LIFECYCLE [Wave 2B2b]. ARMED -> COMPLETING_NO_WIRE -> SPENT
  * after a committed no-wire completion, or back to ARMED after a PROVEN
  * rollback, or -> COMMIT_UNKNOWN (only an identical NOT_DISPATCHED retry with
- * the SAME reason accepts it). There is NO take and NO dispatch state: in
- * Wave 2B2 an ARMED ticket is, by construction, a ticket that was never
- * handed to any gateway. A future, separately reviewed gateway wave must add
- * a durable dispatch-permit boundary; this module grants nothing like it.
+ * the SAME reason accepts it). The unwired dispatch core additionally
+ * transfers ARMED through PERMIT_CREATING into exclusive permit ownership.
+ * TRANSFERRED never regains existing no-wire or dispatch eligibility. The
+ * closed tables below add consumption/entry/result bookkeeping, not a gateway.
  *
  * UNKNOWN-ACQUIRE RECEIPT [Wave 2B2c]. `PracticalUnknownAcquire` is minted
  * ONLY when an acquisition's transaction work completed but its COMMIT could
@@ -146,7 +146,15 @@ export type PracticalAcquiredCancelStatus =
   | 'ABANDONING'
   | 'ABANDON_OUTCOME_UNKNOWN';
 
-export type PracticalArmedCancelStatus = 'ARMED' | 'COMPLETING_NO_WIRE' | 'COMMIT_UNKNOWN' | 'SPENT';
+export type PracticalArmedCancelStatus = 'ARMED' | 'COMPLETING_NO_WIRE' | 'COMMIT_UNKNOWN' | 'SPENT' | 'PERMIT_CREATING' | 'TRANSFERRED' | 'PERMIT_CREATION_UNKNOWN';
+export const PRACTICAL_ARMED_CANCEL_TRANSITIONS: Readonly<Record<PracticalArmedCancelStatus, readonly PracticalArmedCancelStatus[]>> = Object.freeze({
+  ARMED: Object.freeze(['COMPLETING_NO_WIRE', 'PERMIT_CREATING'] as const),
+  COMPLETING_NO_WIRE: Object.freeze(['ARMED', 'COMMIT_UNKNOWN', 'SPENT'] as const),
+  COMMIT_UNKNOWN: Object.freeze(['COMPLETING_NO_WIRE'] as const),
+  PERMIT_CREATING: Object.freeze(['ARMED', 'PERMIT_CREATION_UNKNOWN', 'TRANSFERRED'] as const),
+  PERMIT_CREATION_UNKNOWN: Object.freeze(['TRANSFERRED'] as const),
+  TRANSFERRED: Object.freeze([]), SPENT: Object.freeze([]),
+});
 
 /** [Wave 2B2c] The unknown-acquire receipt lifecycle (see the module header). */
 export type PracticalUnknownAcquireStatus = 'PENDING' | 'RESOLVING' | 'SPENT' | 'REFUSED' | 'ANOMALY_UNESCALATED' | 'ESCALATING';
@@ -352,15 +360,30 @@ Object.freeze(PracticalAcquiredCancel);
 
 export class PracticalArmedCancel {
   readonly #record: PracticalArmedCancelRecord;
+  readonly #provenance: PracticalAcquiredCancelRecord | null;
   #status: PracticalArmedCancelStatus = 'ARMED';
   /** The NOT_DISPATCHED reason of a completion whose COMMIT was unknown: only the identical retry is accepted. */
   #unknownReason: string | null = null;
 
-  public constructor(issuer: unknown, record: PracticalArmedCancelRecord) {
+  public constructor(issuer: unknown, record: PracticalArmedCancelRecord, provenance?: PracticalAcquiredCancelRecord) {
     if (issuer !== TICKET_ISSUER) {
       throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'An armed practical cancel may only be issued by the Stage 1B2 adapter after a committed arm');
     }
     this.#record = validArmedRecord(record);
+    this.#provenance = provenance === undefined ? null : validAcquiredRecord(provenance);
+    if (this.#provenance !== null) {
+      const original = this.#provenance;
+      if (original.accountId !== record.accountId || original.leaseId !== record.leaseId
+        || original.certificate.certificateId !== record.certificateId || original.intentId !== record.intentId
+        || original.clientOrderId !== record.clientOrderId || original.cancelGeneration !== record.cancelGeneration
+        || original.exchangeOrderId !== record.exchangeOrderId || original.pair !== record.pair
+        || original.runtimeEpoch !== record.runtimeEpoch || original.reconciliationGeneration !== record.reconciliationGeneration
+        || original.orderRevisionAfterClaim + 1 !== record.orderRevisionAfterArm
+        || original.certificate.streamIncarnation !== record.certificateStreamIncarnation
+        || original.certificate.expiresAtMs !== record.certificateExpiresAtMs || original.leaseCreatedAtMs > record.armedAtMs) {
+        refuse('Original acquisition provenance does not match this arm', 'provenance');
+      }
+    }
     Object.freeze(this);
   }
 
@@ -368,6 +391,12 @@ export class PracticalArmedCancel {
   public static read(value: unknown): PracticalArmedCancelRecord | null {
     if (typeof value !== 'object' || value === null || !(#record in value)) return null;
     return (value as PracticalArmedCancel).#record;
+  }
+
+  /** Immutable acquisition provenance. Missing provenance never permits dispatch. */
+  public static provenance(value: unknown): PracticalAcquiredCancelRecord | null {
+    if (typeof value !== 'object' || value === null || !(#provenance in value)) return null;
+    return (value as PracticalArmedCancel).#provenance;
   }
 
   /** The lifecycle status of a GENUINE ticket, or null. */
@@ -395,7 +424,7 @@ export class PracticalArmedCancel {
       throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'A genuine armed practical cancel is required');
     }
     const ticket = value as PracticalArmedCancel;
-    if (ticket.#status !== from) {
+    if (ticket.#status !== from || !PRACTICAL_ARMED_CANCEL_TRANSITIONS[from].includes(to)) {
       throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', `The armed practical cancel is ${ticket.#status}, not ${from}`, { status: ticket.#status });
     }
     if (from === 'COMMIT_UNKNOWN' && to === 'COMPLETING_NO_WIRE' && reason !== ticket.#unknownReason) {
@@ -413,6 +442,213 @@ export class PracticalArmedCancel {
 }
 Object.freeze(PracticalArmedCancel.prototype);
 Object.freeze(PracticalArmedCancel);
+
+// Dispatch ownership is exclusively transferred, never restored from durable rows.
+// READY -> CONSUMING -> TRANSFERRED | READY(proven rollback) | REFUSED(CAS loser)
+// | CONSUMPTION_UNKNOWN(no attempt). UNENTERED -> ENTERED -> RESULT_RECORDED.
+// Cleanup/completion reservations restore only their prior state on proven rollback.
+export type PracticalCancelDispatchStatus = 'READY' | 'CONSUMING' | 'TRANSFERRED' | 'REFUSED'
+  | 'CONSUMPTION_UNKNOWN' | 'UNENTERED' | 'ENTERED' | 'RESULT_RECORDED'
+  | 'CLEANING' | 'CLEANUP_UNKNOWN' | 'COMPLETING' | 'COMMIT_UNKNOWN' | 'SPENT';
+export type PracticalCancelDispatchRole = 'PERMIT' | 'ATTEMPT' | 'OUTCOME';
+export const PRACTICAL_CANCEL_DISPATCH_TRANSITIONS: Readonly<Record<PracticalCancelDispatchStatus, readonly PracticalCancelDispatchStatus[]>> = Object.freeze({
+  READY: Object.freeze(['CONSUMING', 'CLEANING', 'COMPLETING'] as const),
+  CONSUMING: Object.freeze(['READY', 'TRANSFERRED', 'REFUSED', 'CONSUMPTION_UNKNOWN'] as const),
+  CONSUMPTION_UNKNOWN: Object.freeze(['CLEANING'] as const),
+  UNENTERED: Object.freeze(['ENTERED', 'CLEANING'] as const),
+  ENTERED: Object.freeze(['RESULT_RECORDED'] as const),
+  CLEANING: Object.freeze(['READY', 'UNENTERED', 'CONSUMPTION_UNKNOWN', 'CLEANUP_UNKNOWN', 'SPENT'] as const),
+  CLEANUP_UNKNOWN: Object.freeze(['CLEANING'] as const),
+  COMPLETING: Object.freeze(['READY', 'COMMIT_UNKNOWN', 'SPENT'] as const),
+  COMMIT_UNKNOWN: Object.freeze(['COMPLETING'] as const),
+  TRANSFERRED: Object.freeze([]), REFUSED: Object.freeze([]), RESULT_RECORDED: Object.freeze([]), SPENT: Object.freeze([]),
+});
+
+export const PRACTICAL_CANCEL_RESULT_REASONS = Object.freeze([
+  'LOCAL_REQUEST_REFUSED', 'PROVIDER_REJECTED', 'POSSIBLE_WIRE_FAILURE', 'UNEXPECTED_RESULT',
+] as const);
+export type PracticalCancelResultReason = (typeof PRACTICAL_CANCEL_RESULT_REASONS)[number];
+export type PracticalCancelReportedResult =
+  | { readonly kind: 'CANCEL_ACCEPTED'; readonly reason: null }
+  | { readonly kind: 'REJECTED' | 'AMBIGUOUS' | 'PRE_DISPATCH_FAILURE'; readonly reason: PracticalCancelResultReason };
+export interface PracticalCancelDispatchRecord {
+  readonly armed: PracticalArmedCancelRecord;
+  readonly original: PracticalAcquiredCancelRecord;
+  readonly role: PracticalCancelDispatchRole;
+  readonly result: PracticalCancelReportedResult | null;
+  readonly creationUnknown: boolean;
+}
+
+/** Opaque, non-serializable ownership. Role and lifecycle are always checked together. */
+export class PracticalCancelDispatchOwner {
+  readonly #record: PracticalCancelDispatchRecord;
+  #status: PracticalCancelDispatchStatus;
+  #cleanupReason: string | null = null;
+  #cleanupOrigin: 'READY' | 'UNENTERED' | 'CONSUMPTION_UNKNOWN' | null = null;
+  #cleanupReservedFrom: 'READY' | 'UNENTERED' | 'CONSUMPTION_UNKNOWN' | 'CLEANUP_UNKNOWN' | null = null;
+  public constructor(issuer: unknown, record: PracticalCancelDispatchRecord, status: PracticalCancelDispatchStatus) {
+    if (issuer !== TICKET_ISSUER) refuse('Dispatch ownership has an internal issuer', 'owner');
+    this.#record = Object.freeze(record);
+    this.#status = status;
+    Object.freeze(this);
+  }
+  public static read(value: unknown): PracticalCancelDispatchRecord | null {
+    return typeof value === 'object' && value !== null && #record in value ? (value as PracticalCancelDispatchOwner).#record : null;
+  }
+  public static status(value: unknown): PracticalCancelDispatchStatus | null {
+    return typeof value === 'object' && value !== null && #status in value ? (value as PracticalCancelDispatchOwner).#status : null;
+  }
+  /** Original unentered ownership, retained across every unknown cleanup retry. Never durable-row inference. */
+  public static cleanupRevisions(value: unknown): readonly number[] | null {
+    if (typeof value !== 'object' || value === null || !(#record in value)) return null;
+    const owner = value as PracticalCancelDispatchOwner;
+    if (owner.#cleanupOrigin === null) return null;
+    const revision = owner.#record.armed.orderRevisionAfterArm;
+    return Object.freeze(owner.#record.creationUnknown ? [revision]
+      : owner.#cleanupOrigin === 'UNENTERED' ? [revision + 1]
+        : owner.#cleanupOrigin === 'CONSUMPTION_UNKNOWN' ? [revision, revision + 1] : [revision]);
+  }
+  public static transition(issuer: unknown, value: unknown, from: PracticalCancelDispatchStatus, to: PracticalCancelDispatchStatus, reason: string | null = null): void {
+    if (issuer !== TICKET_ISSUER || typeof value !== 'object' || value === null || !(#status in value)) refuse('Genuine exclusive dispatch ownership required', 'owner');
+    const owner = value as PracticalCancelDispatchOwner;
+    if (owner.#status !== from || !PRACTICAL_CANCEL_DISPATCH_TRANSITIONS[from].includes(to)) refuse('Illegal dispatch lifecycle transition', 'owner.status');
+    const role = owner.#record.role;
+    const roleAllows = role === 'OUTCOME' ? ['READY', 'COMPLETING', 'COMMIT_UNKNOWN', 'SPENT'].includes(from) && ['COMPLETING', 'READY', 'COMMIT_UNKNOWN', 'SPENT'].includes(to)
+      : role === 'ATTEMPT' ? ['UNENTERED', 'ENTERED', 'RESULT_RECORDED', 'CLEANING', 'CLEANUP_UNKNOWN', 'SPENT'].includes(from)
+        && ['UNENTERED', 'ENTERED', 'RESULT_RECORDED', 'CLEANING', 'CLEANUP_UNKNOWN', 'SPENT'].includes(to)
+        : !['UNENTERED', 'ENTERED', 'RESULT_RECORDED', 'COMPLETING', 'COMMIT_UNKNOWN'].includes(from)
+          && !['UNENTERED', 'ENTERED', 'RESULT_RECORDED', 'COMPLETING', 'COMMIT_UNKNOWN'].includes(to);
+    if (!roleAllows) refuse('Dispatch lifecycle transition belongs to a different ownership role', 'owner.role');
+    if (to === 'CLEANING') {
+      if (reason === null || (owner.#cleanupReason !== null && reason !== owner.#cleanupReason)) refuse('Cleanup retry must use its identical reason', 'report');
+      if (from !== 'READY' && from !== 'UNENTERED' && from !== 'CONSUMPTION_UNKNOWN' && from !== 'CLEANUP_UNKNOWN') refuse('Cleanup requires an unentered origin', 'owner.status');
+      if (from === 'CLEANUP_UNKNOWN') {
+        if (owner.#cleanupOrigin === null) refuse('Unknown cleanup has no original ownership', 'owner.status');
+      } else owner.#cleanupOrigin = from;
+      owner.#cleanupReservedFrom = from;
+      owner.#cleanupReason = reason;
+    }
+    if (from === 'CLEANING') {
+      if (to === 'READY' || to === 'UNENTERED' || to === 'CONSUMPTION_UNKNOWN') {
+        if (to !== owner.#cleanupReservedFrom) refuse('Cleanup rollback cannot change ownership origin', 'owner.status');
+        owner.#cleanupReason = null;
+        owner.#cleanupOrigin = null;
+      }
+      owner.#cleanupReservedFrom = null;
+    }
+    owner.#status = to;
+  }
+}
+Object.freeze(PracticalCancelDispatchOwner.prototype);
+Object.freeze(PracticalCancelDispatchOwner);
+export type PracticalCancelDispatchPermit = PracticalCancelDispatchOwner;
+export type PracticalCancelDispatchAttempt = PracticalCancelDispatchOwner;
+export type PracticalCancelOutcomeReceipt = PracticalCancelDispatchOwner;
+
+/** Internal store-only armed reservation; refuses missing original provenance. */
+export function reservePracticalCancelPermitCreation(value: unknown): PracticalCancelDispatchRecord {
+  const armed = PracticalArmedCancel.read(value);
+  const original = PracticalArmedCancel.provenance(value);
+  if (armed === null || original === null) refuse('Original acquisition provenance is required', 'armed');
+  PracticalArmedCancel.transition(TICKET_ISSUER, value, 'ARMED', 'PERMIT_CREATING', null);
+  return Object.freeze({ armed, original, role: 'PERMIT', result: null, creationUnknown: false });
+}
+export function restorePracticalCancelPermitCreation(value: unknown): void {
+  PracticalArmedCancel.transition(TICKET_ISSUER, value, 'PERMIT_CREATING', 'ARMED', null);
+}
+/** Creation commit uncertainty gives no permit; the original ticket retains unentered cleanup only. */
+export function markPracticalCancelPermitCreationUnknown(value: unknown): void {
+  PracticalArmedCancel.transition(TICKET_ISSUER, value, 'PERMIT_CREATING', 'PERMIT_CREATION_UNKNOWN', null);
+}
+export function issuePracticalCancelDispatchPermit(value: unknown): PracticalCancelDispatchPermit {
+  const armed = PracticalArmedCancel.read(value);
+  const original = PracticalArmedCancel.provenance(value);
+  if (armed === null || original === null) refuse('Original acquisition provenance is required', 'armed');
+  const owner = new PracticalCancelDispatchOwner(TICKET_ISSUER, Object.freeze({ armed, original, role: 'PERMIT', result: null, creationUnknown: false }), 'READY');
+  PracticalArmedCancel.transition(TICKET_ISSUER, value, 'PERMIT_CREATING', 'TRANSFERRED', null);
+  return owner;
+}
+/** Unknown creation issued no permit; transfer the original ticket into cleanup-only ownership. */
+const CREATION_CLEANUP = new WeakMap<object, PracticalCancelDispatchOwner>();
+export function issuePracticalCancelCreationCleanup(value: unknown): PracticalCancelDispatchOwner {
+  if (typeof value === 'object' && value !== null) {
+    const prior = CREATION_CLEANUP.get(value);
+    if (prior !== undefined) return prior;
+  }
+  const armed = PracticalArmedCancel.read(value);
+  const original = PracticalArmedCancel.provenance(value);
+  if (armed === null || original === null) refuse('Original acquisition provenance is required', 'armed');
+  const owner = new PracticalCancelDispatchOwner(TICKET_ISSUER, Object.freeze({ armed, original, role: 'PERMIT', result: null, creationUnknown: true }), 'CONSUMPTION_UNKNOWN');
+  PracticalArmedCancel.transition(TICKET_ISSUER, value, 'PERMIT_CREATION_UNKNOWN', 'TRANSFERRED', null);
+  CREATION_CLEANUP.set(value as object, owner);
+  return owner;
+}
+export function transitionPracticalCancelDispatchOwner(value: unknown, from: PracticalCancelDispatchStatus, to: PracticalCancelDispatchStatus, reason: string | null = null): void {
+  PracticalCancelDispatchOwner.transition(TICKET_ISSUER, value, from, to, reason);
+}
+export function issuePracticalCancelDispatchAttempt(value: unknown): PracticalCancelDispatchAttempt {
+  const record = PracticalCancelDispatchOwner.read(value);
+  if (record === null || record.role !== 'PERMIT') refuse('A genuine consuming permit is required', 'permission');
+  const attempt = new PracticalCancelDispatchOwner(TICKET_ISSUER, Object.freeze({ ...record, role: 'ATTEMPT' }), 'UNENTERED');
+  transitionPracticalCancelDispatchOwner(value, 'CONSUMING', 'TRANSFERRED');
+  return attempt;
+}
+
+/** Zero production callers: the future trusted gateway owner must guard immediately before entry. */
+export function enterPracticalCancelGateway(value: unknown): PracticalArmedCancelRecord {
+  const record = PracticalCancelDispatchOwner.read(value);
+  if (record === null || record.role !== 'ATTEMPT') refuse('A genuine unentered attempt is required', 'attempt');
+  transitionPracticalCancelDispatchOwner(value, 'UNENTERED', 'ENTERED');
+  return record.armed;
+}
+
+const NO_WIRE_RESULTS = new WeakMap<object, PracticalCancelDispatchOwner>();
+/** Zero production callers. Future issuer must be the trusted transport's proven no-write boundary. */
+export function issuePracticalCancelTransportNoWire(value: unknown): object {
+  const record = PracticalCancelDispatchOwner.read(value);
+  if (record?.role !== 'ATTEMPT' || PracticalCancelDispatchOwner.status(value) !== 'ENTERED') refuse('An entered genuine attempt is required', 'attempt');
+  const proof = Object.freeze({});
+  NO_WIRE_RESULTS.set(proof, value as PracticalCancelDispatchOwner);
+  return proof;
+}
+
+/** Normalize only closed, own data fields. Unexpected/hostile/thrown results are possible-wire ambiguity. */
+function normalizedCancelResult(value: unknown, attempt: unknown): PracticalCancelReportedResult {
+  const unexpected = Object.freeze({ kind: 'AMBIGUOUS' as const, reason: 'UNEXPECTED_RESULT' as const });
+  try {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return unexpected;
+    const proto: unknown = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return unexpected;
+    const keys = Reflect.ownKeys(value);
+    const data: Record<string, unknown> = {};
+    for (const key of keys) {
+      if (typeof key !== 'string') return unexpected;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !('value' in descriptor)) return unexpected;
+      data[key] = descriptor.value;
+    }
+    if (data['kind'] === 'CANCEL_ACCEPTED' && keys.length === 1) return Object.freeze({ kind: 'CANCEL_ACCEPTED', reason: null });
+    if (data['kind'] === 'PRE_DISPATCH_FAILURE' && keys.length === 2 && keys.includes('noWire')) {
+      const proof = data['noWire'];
+      if (typeof proof !== 'object' || proof === null || NO_WIRE_RESULTS.get(proof) !== attempt) return unexpected;
+      NO_WIRE_RESULTS.delete(proof);
+      return Object.freeze({ kind: 'PRE_DISPATCH_FAILURE', reason: 'LOCAL_REQUEST_REFUSED' });
+    }
+    if (keys.length === 1 && data['kind'] === 'REJECTED') return Object.freeze({ kind: 'REJECTED', reason: 'PROVIDER_REJECTED' });
+    if (keys.length === 1 && data['kind'] === 'AMBIGUOUS') return Object.freeze({ kind: 'AMBIGUOUS', reason: 'POSSIBLE_WIRE_FAILURE' });
+    return unexpected;
+  } catch { return unexpected; }
+}
+
+/** Zero production callers; immutable result binding, one receipt, no authority or provider proof. */
+export function issuePracticalCancelOutcome(value: unknown, reported: unknown): PracticalCancelOutcomeReceipt {
+  const record = PracticalCancelDispatchOwner.read(value);
+  if (record?.role !== 'ATTEMPT' || PracticalCancelDispatchOwner.status(value) !== 'ENTERED') refuse('An entered genuine attempt is required', 'attempt');
+  const result = normalizedCancelResult(reported, value);
+  const receipt = new PracticalCancelDispatchOwner(TICKET_ISSUER, Object.freeze({ ...record, role: 'OUTCOME', result }), 'READY');
+  transitionPracticalCancelDispatchOwner(value, 'ENTERED', 'RESULT_RECORDED');
+  return receipt;
+}
 
 /** [Wave 2B2c] The legal receipt transitions (from -> to). Anything else is refused. */
 const UNKNOWN_ACQUIRE_TRANSITIONS: Readonly<Record<PracticalUnknownAcquireStatus, readonly PracticalUnknownAcquireStatus[]>> = Object.freeze({
@@ -492,8 +728,8 @@ export function issuePracticalAcquiredCancel(record: PracticalAcquiredCancelReco
 }
 
 /** Mints the armed ticket. Called only after the arm transaction COMMITTED. */
-export function issuePracticalArmedCancel(record: PracticalArmedCancelRecord): PracticalArmedCancel {
-  return new PracticalArmedCancel(TICKET_ISSUER, record);
+export function issuePracticalArmedCancel(record: PracticalArmedCancelRecord, provenance?: PracticalAcquiredCancelRecord): PracticalArmedCancel {
+  return new PracticalArmedCancel(TICKET_ISSUER, record, provenance);
 }
 
 /** AVAILABLE -> IN_USE at arm entry. Throws (nothing changes) for a forged, in-use, or spent handle. */

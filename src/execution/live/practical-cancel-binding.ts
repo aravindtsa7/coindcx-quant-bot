@@ -47,15 +47,15 @@ export interface LivePracticalCancelBindingExpectation {
  * What an ordinary (non-Stage-1B2) Phase17/18 cancel-column write may do.
  *
  *   UNBOUND     no lease names the current generation: ordinary behavior.
- *   HISTORICAL  COMPLETED PRE_DISPATCH_FAILURE and the claim is NONE: the
- *               joint no-wire release already happened; ordinary behavior
+ *   HISTORICAL  COMPLETED PRE_DISPATCH_FAILURE/NONE, or the exact armed
+ *               ACCEPTED/CANCEL_ACKNOWLEDGED and REJECTED/CANCEL_REJECTED pairs;
+ *               the coupled completion already happened; ordinary behavior
  *               (including a new claim at generation + 1).
  *   LEASED      the lease still owns the claim: refuse.
  *   PRACTICAL_AMBIGUITY_UNRESOLVED
  *               COMPLETED AMBIGUOUS with CANCEL_AMBIGUOUS: sticky; only a
  *               future reviewed evidence boundary may resolve it: refuse.
- *   SPLIT       any other COMPLETED combination (including ACCEPTED/REJECTED,
- *               which no reviewed path produces yet): integrity violation.
+ *   SPLIT       any other COMPLETED combination: integrity violation.
  */
 export type LivePracticalCancelBindingVerdict =
   | 'UNBOUND'
@@ -151,6 +151,8 @@ export function classifyPracticalCancelBinding(
   if (binding === null) return 'UNBOUND';
   if (binding.status === 'LEASED') return 'LEASED';
   if (binding.outcome === 'PRE_DISPATCH_FAILURE' && cancelState === 'NONE') return 'HISTORICAL';
+  if (binding.armedAtMs !== null && ((binding.outcome === 'ACCEPTED' && cancelState === 'CANCEL_ACKNOWLEDGED')
+    || (binding.outcome === 'REJECTED' && cancelState === 'CANCEL_REJECTED'))) return 'HISTORICAL';
   if (binding.outcome === 'AMBIGUOUS' && binding.armedAtMs !== null && cancelState === 'CANCEL_AMBIGUOUS') {
     return 'PRACTICAL_AMBIGUITY_UNRESOLVED';
   }

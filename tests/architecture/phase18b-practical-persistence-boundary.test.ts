@@ -133,8 +133,8 @@ describe('no provider, network, gateway, dispatch, or arm reachability (no new r
     // non-null binding, CANCEL only), the scope's arm compare-and-set WHERE, and [Wave 2B2b] the scope-only no-wire
     // completion compare-and-set WHERE inside #apply (a WHERE only: it never writes a binding column).
     const bindingColumns = /intentId: binding\.intentId, clientOrderId: binding\.clientOrderId, cancelGeneration: binding\.cancelGeneration/g;
-    expect(adapter.match(bindingColumns)).toHaveLength(3);
-    expect(privateMethodSource('#apply').match(bindingColumns)).toHaveLength(2);
+    expect(adapter.match(bindingColumns)).toHaveLength(4);
+    expect(privateMethodSource('#apply').match(bindingColumns)).toHaveLength(3);
     expect(privateMethodSource('#apply')).toContain("if (binding !== null && extras.insertLease.action !== 'CANCEL') conflict(");
     expect(privateMethodSource('#openScope').match(bindingColumns)).toHaveLength(1);
     // [Wave 2B2b] The ONLY bound-lease completion: PRE_DISPATCH_FAILURE, under the full binding + exact arm state.
@@ -142,11 +142,12 @@ describe('no provider, network, gateway, dispatch, or arm reachability (no new r
     expect(apply).toContain("if (binding === null || lease.action !== 'CANCEL') conflict('Only an order-bound CANCEL lease can be completed as a no-wire cancel'");
     expect(apply).toContain("status: 'LEASED', armedAtMs: lease.armedAtMs === null ? null : BigInt(lease.armedAtMs), completedAtMs: null, outcome: null,");
     expect(apply).toContain("data: { status: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE', completedAtMs: now },");
-    expect(apply.match(/outcome: '(ACCEPTED|REJECTED|AMBIGUOUS|DUPLICATE_CLIENT_ORDER_ID)'/g)).toBeNull();
+    expect(apply).toContain("data: { status: 'COMPLETED', outcome, completedAtMs: now }");
+    expect(apply).not.toContain("outcome: 'DUPLICATE_CLIENT_ORDER_ID'");
     // The Stage 1B1 completion still can never match an order-bound lease.
     expect(apply).toContain('intentId: null,');
     // armed_at_ms is written in exactly ONE place: the scope's arm CAS, conditioned on armedAtMs IS NULL.
-    expect(adapter.match(/armedAtMs: BigInt\(/g)).toHaveLength(1);
+    expect(adapter.match(/armedAtMs: BigInt\(/g)).toHaveLength(2);
     expect(privateMethodSource('#openScope')).toContain('data: { armedAtMs: BigInt(nowMs) },');
     expect(privateMethodSource('#openScope')).toContain("status: 'LEASED', armedAtMs: null, completedAtMs: null,");
     expect(adapter).toContain('intent_id AS intentId, client_order_id AS clientOrderId, cancel_generation AS cancelGeneration,');
@@ -532,7 +533,7 @@ describe('the Stage 1B1 migration', () => {
 });
 
 describe('[Wave 2B2c] the lease-writer set and the read-only unknown-acquire inspection', () => {
-  it('EXACTLY four statements in src/ write live_practical_mutation_lease, all in the Stage 1B1 adapter, and none deletes (no reviewed writer can close an unresolved attempt)', () => {
+  it('EXACTLY five reviewed statements in src/ write live_practical_mutation_lease, all in the Stage 1B1 adapter, and none deletes (no reviewed writer can close an unresolved attempt)', () => {
     // The proof that a PENDING unknown-acquire receipt's lease can only be LEASED and unarmed rests on this set:
     // insert (acquire), the arm CAS (needs a genuine handle), the Stage 1B1 completion (refuses any order-bound lease;
     // WHERE intentId: null), and the no-wire completion (needs a genuine ticket or handle). A new writer breaks this pin.
@@ -544,7 +545,7 @@ describe('[Wave 2B2c] the lease-writer set and the read-only unknown-acquire ins
       }
       expect(code, file).not.toMatch(/(UPDATE|DELETE FROM|INSERT INTO|REPLACE INTO)\s+live_practical_mutation_lease/i);
     }
-    expect(writers.sort()).toEqual([`${REPOSITORY}:create`, `${REPOSITORY}:updateMany`, `${REPOSITORY}:updateMany`, `${REPOSITORY}:updateMany`]);
+    expect(writers.sort()).toEqual([`${REPOSITORY}:create`, `${REPOSITORY}:updateMany`, `${REPOSITORY}:updateMany`, `${REPOSITORY}:updateMany`, `${REPOSITORY}:updateMany`]);
     const repository = codeOf(REPOSITORY);
     // The Stage 1B1 completion can never match an order-bound lease (WHERE intentId: null), and releaseLease refuses one first.
     expect(repository).toMatch(/runtimeEpoch: lease\.runtimeEpoch, reconciliationGeneration: lease\.reconciliationGeneration, status: 'LEASED',\s+intentId: null,\s+\},\s+data: \{ status: 'COMPLETED', outcome: extras\.completeLease\.outcome, completedAtMs: now \},/);

@@ -33,7 +33,7 @@
 import { assertCredentialFree } from '../errors';
 import type { PracticalFenceExpectation } from '../practical/fence';
 import type { PracticalInvalidationReason } from '../practical/types';
-import type { PracticalAcquiredCancel, PracticalArmedCancel } from './ticket';
+import type { PracticalAcquiredCancel, PracticalArmedCancel, PracticalCancelDispatchPermit, PracticalCancelDispatchAttempt } from './ticket';
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -48,6 +48,8 @@ export type PracticalMutationErrorCode =
   | 'PRACTICAL_MUTATION_DWELL_NOT_ELAPSED'
   /** A pre-write arm check failed. The whole arm transaction rolled back: zero change. */
   | 'PRACTICAL_MUTATION_ARM_REFUSED'
+  /** Original dispatch revision lost: permanently retire this owner, no cleanup capability. */
+  | 'PRACTICAL_MUTATION_DISPATCH_CONFLICT'
   /** A post-write re-read, or a locked durable row, did not prove the exact expected result. Rolled back. */
   | 'PRACTICAL_MUTATION_SELF_CHECK_FAILED'
   /** A database failure (deadlock retries exhausted, or a non-retryable database error). Nothing was committed. */
@@ -379,6 +381,38 @@ export type PracticalPreviousRuntimeRecovery =
 export interface PracticalCancelMutationStore {
   acquireCancelLease(input: PracticalCancelAcquireInput): Promise<PracticalCancelAcquisition>;
   armCancelLease(input: PracticalCancelArmInput): Promise<PracticalCancelArm>;
+}
+
+/** Unwired original-arm ownership; no caller selectors, authority fallbacks or provider proof. */
+export interface PracticalCancelPermissionInput {
+  readonly armed: unknown;
+  readonly enablement: unknown;
+  readonly runtimeIdentity: unknown;
+  readonly trustedNowMs: number;
+}
+export interface PracticalCancelConsumptionInput {
+  readonly permission: unknown;
+  readonly enablement: unknown;
+  readonly runtimeIdentity: unknown;
+  readonly trustedNowMs: number;
+}
+export interface PracticalUnenteredCancelInput {
+  readonly owner: unknown;
+  readonly report: PracticalNotDispatchedReport;
+  readonly trustedNowMs: number;
+}
+export interface PracticalCancelOutcomeInput {
+  readonly outcome: unknown;
+  readonly trustedNowMs: number;
+}
+export type PracticalCancelCompletion =
+  | { readonly kind: 'COMPLETED' | 'ALREADY_COMPLETED'; readonly outcome: 'ACCEPTED' | 'REJECTED' | 'AMBIGUOUS' | 'PRE_DISPATCH_FAILURE'; readonly leaseId: string; readonly intentId: string; readonly cancelGeneration: number }
+  | { readonly kind: 'MALFORMED_LATCHED'; readonly reviewEpisodeId: string };
+export interface PracticalCancelDispatchStore {
+  createCancelDispatchPermission(input: PracticalCancelPermissionInput): Promise<{ readonly kind: 'PERMITTED'; readonly permission: PracticalCancelDispatchPermit }>;
+  consumeCancelDispatchPermission(input: PracticalCancelConsumptionInput): Promise<{ readonly kind: 'CONSUMED'; readonly attempt: PracticalCancelDispatchAttempt }>;
+  completeUnenteredCancelDispatch(input: PracticalUnenteredCancelInput): Promise<PracticalNoWireCompletion>;
+  completeCancelLease(input: PracticalCancelOutcomeInput): Promise<PracticalCancelCompletion>;
 }
 
 /** [Wave 2B2b] Truthful no-wire closing of an owned attempt. PRE_DISPATCH_FAILURE only. */

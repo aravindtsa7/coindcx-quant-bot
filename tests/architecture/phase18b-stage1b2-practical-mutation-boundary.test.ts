@@ -102,7 +102,7 @@ describe('[4][5][6][7] the Phase 17 primitives: claim + arm only, strict wrapper
     const naming = (name: string) => files.filter((file) => file !== LIVE_REPOSITORY && codeOf(file).includes(name));
     expect(naming('claimCancelWithinCallerFencedTransaction')).toEqual([ADAPTER]);
     expect(naming('armCancelWireWithinCallerFencedTransaction')).toEqual([ADAPTER]);
-    expect(naming('completeCancelAttemptWithinCallerFencedTransaction')).toEqual([]);
+    expect(naming('completeCancelAttemptWithinCallerFencedTransaction')).toEqual([ADAPTER]);
   });
 
   it('the adapter imports exactly the claim/arm primitives, [Wave 2B2b] the two named no-wire releases, and the claim outcome type from live/repository.ts', () => {
@@ -110,6 +110,9 @@ describe('[4][5][6][7] the Phase 17 primitives: claim + arm only, strict wrapper
       'import {',
       '  armCancelWireWithinCallerFencedTransaction,',
       '  claimCancelWithinCallerFencedTransaction,',
+      '  consumeCancelDispatchWithinCallerFencedTransaction,',
+      '  reproveCancelOrderWithinCallerFencedTransaction,',
+      '  completeCancelAttemptWithinCallerFencedTransaction,',
       '  releaseArmedUndispatchedCancelClaimWithinCallerFencedTransaction,',
       '  releaseUnarmedCancelClaimWithinCallerFencedTransaction,',
       '  type ClaimCancelOutcome,',
@@ -118,7 +121,7 @@ describe('[4][5][6][7] the Phase 17 primitives: claim + arm only, strict wrapper
     const specifiers = extractImportSpecifiers(sourceOf(ADAPTER), ADAPTER);
     expect(specifiers.filter((specifier) => specifier === '../repository')).toHaveLength(1);
     const adapter = codeOf(ADAPTER);
-    for (const name of ['PrismaLiveExecutionRepository', 'claimCancel(', 'armCancelWire(', 'completeCancelAttempt']) {
+    for (const name of ['PrismaLiveExecutionRepository', 'claimCancel(', 'armCancelWire(', '.completeCancelAttempt(']) {
       expect(adapter.includes(name), name).toBe(false);
     }
   });
@@ -240,6 +243,7 @@ describe('[9][10][17] not wired; no network, gateway, runtime, private-stream, o
     // reconciliation/barrier.ts (readLiveRuntimeEpoch). It imports no reconciliation repository or service itself.
     expect([...(graph.get(ADAPTER) ?? [])].sort()).toEqual([
       'src/execution/live/identity.ts',
+      'src/execution/live/errors.ts',
       `${MUTATION_ROOT}ports.ts`,
       `${MUTATION_ROOT}preflight.ts`,
       `${MUTATION_ROOT}ticket.ts`,
@@ -276,6 +280,36 @@ describe('[9][10][17] not wired; no network, gateway, runtime, private-stream, o
       expect(codeOf(file).includes('subscriptionConfirmation'), file).toBe(false);
       expect(codeOf(file).includes('PROVEN_READY'), file).toBe(false);
     }
+  });
+
+  it('entry, reported-result and genuine no-wire issuers have ZERO production callers and exactly two test callers', () => {
+    const ticketFile = `${MUTATION_ROOT}ticket.ts`;
+    const walkTests = (directory: string): string[] => readdirSync(path.join(REPO_ROOT, directory), { withFileTypes: true }).flatMap((entry) => {
+      const file = `${directory}/${entry.name}`;
+      return entry.isDirectory() ? walkTests(file) : file.endsWith('.ts') ? [file] : [];
+    });
+    const testFiles = [...walkTests('tests/unit'), ...walkTests('tests/integration')];
+    for (const name of ['enterPracticalCancelGateway', 'issuePracticalCancelOutcome', 'issuePracticalCancelTransportNoWire']) {
+      expect(files.filter((file) => file !== ticketFile && codeOf(file).includes(name))).toEqual([]);
+      expect(testFiles.filter((file) => sourceOf(file).includes(name)).sort()).toEqual([
+        'tests/integration/execution/live-practical-cancel-dispatch.integration.test.ts',
+        'tests/unit/execution/live/practical-mutation/dispatch.test.ts',
+      ]);
+    }
+  });
+
+  it('permission/attempt issuers and lifecycle changes belong only to the unwired adapter', () => {
+    for (const name of ['issuePracticalCancelDispatchPermit', 'issuePracticalCancelDispatchAttempt', 'reservePracticalCancelPermitCreation',
+      'restorePracticalCancelPermitCreation', 'markPracticalCancelPermitCreationUnknown', 'issuePracticalCancelCreationCleanup', 'transitionPracticalCancelDispatchOwner']) {
+      expect(files.filter((file) => file !== `${MUTATION_ROOT}ticket.ts` && codeOf(file).includes(name))).toEqual([ADAPTER]);
+    }
+    for (const name of ['consumeCancelDispatchWithinCallerFencedTransaction', 'reproveCancelOrderWithinCallerFencedTransaction']) {
+      expect(files.filter((file) => file !== LIVE_REPOSITORY && codeOf(file).includes(name))).toEqual([ADAPTER]);
+      for (const barrel of files.filter((file) => file.endsWith('/index.ts'))) expect(codeOf(barrel)).not.toContain(name);
+    }
+    expect(codeOf(ADAPTER)).toContain('issuePracticalArmedCancel(armedRecord, context.handle)');
+    expect(codeOf(ADAPTER)).toContain('arm.orderRevisionAfterArm > 2_147_483_645');
+    expect(codeOf(LIVE_REPOSITORY)).toContain('expectedRevision > 2_147_483_645');
   });
 });
 
@@ -342,13 +376,13 @@ describe('[11] the caller-owned Stage 1B1 hook uses ONLY the supplied transactio
     expect(adapter.match(/this\.#prisma\.\$transaction\(/g)).toHaveLength(1);
     // Acquire, arm, [Wave 2B2b] the one shared no-wire body, [Wave 2B2c] the read-only resolution, and [Wave 2B2d] the
     // previous-runtime recovery.
-    expect(adapter.match(/withLockedPracticalAccountWithinCallerTransaction\(this\.#practical, tx, /g)).toHaveLength(5);
+    expect(adapter.match(/withLockedPracticalAccountWithinCallerTransaction\(this\.#practical, tx, /g)).toHaveLength(7);
     // Exactly these operation bodies run inside #transaction: acquire, arm, the no-wire body (completion + abandon),
     // [Wave 2B2c] the resolution, and [Wave 2B2d] the recovery.
-    expect(adapter.match(/this\.#transaction\(\(tx\) => this\.#(acquireWithin|armWithin|noWireWithin)\(tx, context\)\)/g)).toHaveLength(4);
+    expect(adapter.match(/this\.#transaction\(\(tx\) => this\.#(acquireWithin|armWithin|noWireWithin)\(tx, context\)\)/g)).toHaveLength(5);
     expect(adapter.match(/this\.#transaction\(\(tx\) => this\.#resolveWithin\(tx, record\)\)/g)).toHaveLength(1);
     expect(adapter.match(/this\.#transaction\(\(tx\) => this\.#recoverWithin\(tx, accountId, epoch, nowMs\)\)/g)).toHaveLength(1);
-    expect(adapter.match(/this\.#transaction\(/g)).toHaveLength(6);
+    expect(adapter.match(/this\.#transaction\(/g)).toHaveLength(10);
   });
 });
 
@@ -396,7 +430,7 @@ describe('[12][13][14] the classified Phase 17 pre-write claim failures', () => 
     // [2B2c] resolution's outcome handling, the claim, the malformed escalation, and [2B2c] the anomaly escalation
     // (which never throws). No try surrounds a no-wire release primitive.
     // [Wave 2B2d] + the recovery's outcome handling: ten.
-    expect(adapter.match(/\btry \{/g)).toHaveLength(10);
+    expect(adapter.match(/\btry \{/g)).toHaveLength(14);
     expect(adapter).not.toMatch(/try \{\s+(const \w+ = )?await release(Unarmed|ArmedUndispatched)CancelClaimWithinCallerFencedTransaction/);
     // The ONLY try around a Phase 17 primitive is the claim (the arm is never caught: any failure rolls back).
     expect(adapter).not.toMatch(/try \{\s+(const \w+ = )?await armCancelWireWithinCallerFencedTransaction/);
@@ -425,7 +459,7 @@ describe('[12][13][14] the classified Phase 17 pre-write claim failures', () => 
     const returns = [...preflight.matchAll(/return '(\w+)';/g)].map((match) => match[1]);
     expect(returns).toEqual(['PREFLIGHT_MISMATCH', 'RUNTIME_EPOCH_CHANGED', 'GENERATION_CHANGED', 'PREFLIGHT_MISMATCH']);
     const adapter = codeOf(ADAPTER);
-    expect(adapter.match(/classifyPracticalReconciliationMismatch\(/g)).toHaveLength(2);
+    expect(adapter.match(/classifyPracticalReconciliationMismatch\(/g)).toHaveLength(3);
     expect(adapter.includes("'RUNTIME_EPOCH_CHANGED'"), 'the adapter never maps a reconciliation reason inline').toBe(false);
     expect(adapter.includes("'GENERATION_CHANGED'")).toBe(false);
     expect(adapter.indexOf("return invalidated('CONFIG_CHANGED', 'EFFECTIVE_LIFETIME_EXCEEDED', null);"))
@@ -459,7 +493,7 @@ describe('the acquired / armed values are minted ONLY by the adapter, ONLY after
     // No take / dispatch surface exists anywhere: an ARMED ticket is, by construction, never dispatched.
     const ticket = codeOf(`${MUTATION_ROOT}ticket.ts`);
     expect(ticket).not.toMatch(/export function take|static take\(|isTaken|#taken/);
-    expect(ticket).not.toMatch(/'DISPATCHED'|'PERMITTED'|'PERMIT_PENDING'|DispatchPermit/);
+    expect(ticket).not.toMatch(/'DISPATCHED'|'PERMITTED'|'PERMIT_PENDING'/);
     expect(files.filter((file) => /takePracticalArmedCancel/.test(codeOf(file)))).toEqual([]);
     expect(ticket).not.toMatch(/export const TICKET_ISSUER|export \{ TICKET_ISSUER/);
   });

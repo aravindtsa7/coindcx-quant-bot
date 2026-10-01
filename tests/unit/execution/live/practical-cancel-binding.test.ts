@@ -130,10 +130,10 @@ describe('classifyPracticalCancelBinding: the single planner/guard table', () =>
     }
   });
 
-  it('COMPLETED ACCEPTED / REJECTED (no reviewed path produces them yet) is always SPLIT', () => {
+  it('only exact armed accepted/acknowledged and rejected/rejected completions are historical', () => {
     for (const outcome of ['ACCEPTED', 'REJECTED'] as const) {
       for (const state of ['NONE', 'CANCEL_RESERVED', 'CANCEL_AMBIGUOUS', 'CANCEL_ACKNOWLEDGED', 'CANCEL_REJECTED']) {
-        expect(classifyPracticalCancelBinding(view({ status: 'COMPLETED', outcome, armedAtMs: 9 }), state)).toBe('SPLIT');
+        expect(classifyPracticalCancelBinding(view({ status: 'COMPLETED', outcome, armedAtMs: 9 }), state)).toBe((outcome === 'ACCEPTED' && state === 'CANCEL_ACKNOWLEDGED') || (outcome === 'REJECTED' && state === 'CANCEL_REJECTED') ? 'HISTORICAL' : 'SPLIT');
       }
     }
   });

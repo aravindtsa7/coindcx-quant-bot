@@ -1324,6 +1324,31 @@ export class PrismaPracticalSafetyRepository implements PracticalSafetyRepositor
         return Object.freeze({ lease: completed, certificate: certificateAfter, account: after });
       }),
 
+      // Reported outcomes only: the caller couples the Phase17 transition in this same transaction.
+      completeOrderBoundCancelLeaseOutcome: (trustedNowMs: number, outcome: 'ACCEPTED' | 'REJECTED' | 'AMBIGUOUS') => run(true, async () => {
+        const completable = lifecycle.completable;
+        if (completable === null || completable.lease.armedAtMs === null) conflict('An exact armed lease check must precede reported completion', { accountId });
+        if (outcome !== 'ACCEPTED' && outcome !== 'REJECTED' && outcome !== 'AMBIGUOUS') conflict('Unknown reported cancel outcome', { accountId });
+        const { lease, certificate } = completable;
+        const nowMs = Math.max(requireTime(trustedNowMs, 'trustedNowMs'), lease.armedAtMs ?? lease.createdAtMs);
+        const fence = current.fence;
+        const released = releasePracticalMutationLease(fence, { accountId, runtimeEpoch: fence.runtimeEpoch, reconciliationGeneration: fence.reconciliationGeneration, revision: fence.revision }, lease.leaseId);
+        const after = await this.#apply(tx, current, {
+          nextState: transitionOrFailClosed(current.state, { kind: 'MUTATION_OUTCOME_RECORDED', outcome }),
+          nextFence: released, openCause: 'MUTATION_OUTCOME_RECORDED', reason: null,
+        }, nowMs, { completeBoundLeaseOutcome: { lease, outcome } });
+        const completed = parsePracticalLeaseRow(await readLeaseRow(tx, lease.leaseId, true));
+        const certAfter = parsePracticalCertificateRow(await readCertificateRow(tx, certificate.certificateId, true));
+        if (completed.leaseId !== lease.leaseId || completed.accountId !== lease.accountId || completed.certificateId !== lease.certificateId
+          || completed.action !== 'CANCEL' || completed.runtimeEpoch !== lease.runtimeEpoch || completed.reconciliationGeneration !== lease.reconciliationGeneration
+          || completed.createdAtMs !== lease.createdAtMs || completed.status !== 'COMPLETED' || completed.outcome !== outcome || completed.completedAtMs !== nowMs
+          || completed.armedAtMs !== lease.armedAtMs || !sameOrderBinding(completed.orderBinding, lease.orderBinding)
+          || !sameFence(after.fence, released) || after.currentLease !== null
+          || after.state !== transitionOrFailClosed(current.state, { kind: 'MUTATION_OUTCOME_RECORDED', outcome })
+          || !sameDurableCertificate(certAfter, certificate)) conflict('Reported cancel completion failed its exact self-check', { accountId });
+        return Object.freeze({ lease: completed, certificate: certAfter, account: after });
+      }),
+
       // [Wave 2B2d] PREVIOUS-RUNTIME recovery: the SAME no-wire completion and, in the SAME write, the Stage 1A
       // adoption of the (now IDLE) fence by this runtime. No intermediate IDLE-at-the-old-epoch state exists, so every
       // later operation of an old-epoch process fails its epoch / fence check.
@@ -1487,6 +1512,7 @@ export class PrismaPracticalSafetyRepository implements PracticalSafetyRepositor
        * ONLY from the caller-owned scope's no-wire completion.
        */
       readonly completeBoundLeaseNoWire?: { readonly lease: PracticalMutationLeaseRecord };
+      readonly completeBoundLeaseOutcome?: { readonly lease: PracticalMutationLeaseRecord; readonly outcome: 'ACCEPTED' | 'REJECTED' | 'AMBIGUOUS' };
     } = {},
   ): Promise<PracticalAccountSnapshot> {
     // The plan is computed (and every generated id validated) before the first write.
@@ -1556,7 +1582,23 @@ export class PrismaPracticalSafetyRepository implements PracticalSafetyRepositor
       });
       exactlyOne(updated.count, 'The order-bound lease was completed or changed concurrently');
     }
+    if (extras.completeBoundLeaseOutcome !== undefined) {
+      const { lease, outcome } = extras.completeBoundLeaseOutcome;
+      const binding = lease.orderBinding;
+      if (binding === null || lease.action !== 'CANCEL' || lease.armedAtMs === null) conflict('Reported completion requires an armed bound CANCEL', { leaseId: lease.leaseId });
+      const updated = await tx.livePracticalMutationLease.updateMany({
+        where: {
+          leaseId: lease.leaseId, accountId: current.accountId, certificateId: lease.certificateId, action: 'CANCEL',
+          runtimeEpoch: lease.runtimeEpoch, reconciliationGeneration: lease.reconciliationGeneration,
+          intentId: binding.intentId, clientOrderId: binding.clientOrderId, cancelGeneration: binding.cancelGeneration,
+          status: 'LEASED', armedAtMs: BigInt(lease.armedAtMs), completedAtMs: null, outcome: null,
+        },
+        data: { status: 'COMPLETED', outcome, completedAtMs: now },
+      });
+      exactlyOne(updated.count, 'Reported cancel lease was completed concurrently');
+    }
     if (plan.enterReviewEpisode !== null) {
+      // No authority is granted by a reported outcome; the consumed certificate is unchanged.
       await tx.livePracticalReviewEpisode.create({ data: {
         reviewEpisodeId: plan.enterReviewEpisode.reviewEpisodeId,
         accountId: current.accountId,
@@ -1746,6 +1788,12 @@ export interface PracticalLockedAccountScope {
    * (never restores CERTIFIED_IDLE); the fence released; strict re-read.
    */
   completeOrderBoundCancelLeaseNoWire(trustedNowMs: number): Promise<{
+    readonly lease: PracticalMutationLeaseRecord;
+    readonly certificate: PracticalDurableCertificateRecord;
+    readonly account: PracticalAccountSnapshot;
+  }>;
+  /** Reported-result bookkeeping only; exact armed lease, same transaction as Phase17 completion. */
+  completeOrderBoundCancelLeaseOutcome(trustedNowMs: number, outcome: 'ACCEPTED' | 'REJECTED' | 'AMBIGUOUS'): Promise<{
     readonly lease: PracticalMutationLeaseRecord;
     readonly certificate: PracticalDurableCertificateRecord;
     readonly account: PracticalAccountSnapshot;

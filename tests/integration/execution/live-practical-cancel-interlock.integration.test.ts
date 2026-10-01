@@ -517,11 +517,11 @@ describe('P18B-W2B2a-DB a historical PRE_DISPATCH_FAILURE binding never blocks; 
     expect(await durableSnapshot(seeded.order.intentId)).toEqual(before);
   });
 
-  it('T6: COMPLETED ACCEPTED with CANCEL_ACKNOWLEDGED (no reviewed producer exists) is split and refused', async () => {
+  it('T6: COMPLETED ACCEPTED with CANCEL_REJECTED remains split and refused', async () => {
     if (skip()) return;
     const seeded = await leasedArmed();
     await connectionA.$transaction(async (tx) => {
-      await completeCancelAttemptWithinCallerFencedTransaction(tx, seeded.order.intentId, 1, 'ACKNOWLEDGED', null, seeded.accountId);
+      await completeCancelAttemptWithinCallerFencedTransaction(tx, seeded.order.intentId, 1, 'REJECTED', null, seeded.accountId);
       await tx.$executeRaw`UPDATE live_practical_mutation_lease SET status = 'COMPLETED', outcome = 'ACCEPTED', completed_at_ms = armed_at_ms
         WHERE intent_id = ${seeded.order.intentId} AND cancel_generation = 1`;
     });

@@ -715,6 +715,63 @@ export async function armCancelWireWithinCallerFencedTransaction(
  *
  * `fencedAccountId` behaves exactly as in `armCancelWireWithinCallerFencedTransaction`.
  */
+/**
+ * Caller-fenced Stage 1B2 consumption. Original arm revision is immutable;
+ * advancing it is a one-shot CAS, NOT a sent marker or recoverable permission.
+ * Leaves economic state, reservation and arm intact. Needs room for completion.
+ */
+export async function consumeCancelDispatchWithinCallerFencedTransaction(
+  tx: Prisma.TransactionClient,
+  intentId: string,
+  expectedRevision: number,
+  generation: number,
+  fencedAccountId: string,
+): Promise<LiveOrderStateRecord> {
+  if (!Number.isInteger(expectedRevision) || expectedRevision < 1 || expectedRevision > 2_147_483_645
+    || typeof fencedAccountId !== 'string' || fencedAccountId.length === 0) {
+    throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Dispatch consumption requires an exact account and revision with completion capacity');
+  }
+  await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;
+  await tx.$executeRaw`SELECT intent_id FROM live_execution_intent WHERE intent_id = ${intentId} FOR UPDATE`;
+  const verified = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
+  if (verified === null) throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Cancel order is missing during consumption');
+  const current = verified.order;
+  if (current.accountId !== fencedAccountId) throw new LiveExecutionError('LIVE_AUTHORITY_INVALID', 'Consumption account does not own the order');
+  if (current.revision !== expectedRevision || current.cancelGeneration !== generation
+    || current.cancelState !== 'CANCEL_RESERVED' || !current.cancelWireArmed) {
+    throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Original armed cancel claim no longer permits consumption');
+  }
+  const updated = await tx.liveOrder.updateMany({
+    where: {
+      intentId, accountId: current.accountId, clientOrderId: current.clientOrderId, pair: current.pair,
+      orderedQuantity: canonicalLiveDecimalString(current.orderedQuantity, 'orderedQuantity'),
+      state: current.state, revision: expectedRevision, cancelGeneration: generation,
+      cancelState: 'CANCEL_RESERVED', cancelWireArmed: true,
+      exchangeOrderId: current.exchangeOrderId, cancelExchangeOrderId: current.cancelExchangeOrderId,
+    },
+    data: { revision: { increment: 1 } },
+  });
+  if (updated.count !== 1) throw new LiveExecutionError('LIVE_ORDER_STATE_CONFLICT', 'Cancel dispatch consumption lost its exact revision CAS');
+  const after = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
+  if (after === null || after.order.revision !== expectedRevision + 1 || after.order.state !== current.state
+    || after.order.cancelGeneration !== generation || after.order.cancelState !== 'CANCEL_RESERVED' || !after.order.cancelWireArmed) {
+    throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Consumed cancel claim did not re-read exactly');
+  }
+  return after.order;
+}
+
+/** Internal caller-transaction integrity reproof, never authority or an observation API. */
+export async function reproveCancelOrderWithinCallerFencedTransaction(tx: Prisma.TransactionClient, intentId: string, fencedAccountId: string): Promise<LiveOrderStateRecord> {
+  await tx.$executeRaw`SELECT intent_id FROM live_order WHERE intent_id = ${intentId} FOR UPDATE`;
+  await tx.$executeRaw`SELECT intent_id FROM live_execution_intent WHERE intent_id = ${intentId} FOR UPDATE`;
+  const verified = await readVerifiedOrder(tx as unknown as IntentReadClient, intentId);
+  if (verified === null) throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Cancel order is missing during integrity reproof');
+  if (typeof fencedAccountId !== 'string' || fencedAccountId.length === 0 || verified.order.accountId !== fencedAccountId) {
+    throw new LiveExecutionError('LIVE_AUTHORITY_INVALID', 'Integrity reproof requires the exact caller-fenced account');
+  }
+  return verified.order;
+}
+
 export async function completeCancelAttemptWithinCallerFencedTransaction(
   tx: Prisma.TransactionClient,
   intentId: string,

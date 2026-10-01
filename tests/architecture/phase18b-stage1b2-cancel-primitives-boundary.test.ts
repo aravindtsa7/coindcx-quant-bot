@@ -103,12 +103,15 @@ describe('the primitives are NOT a public authority surface', () => {
     const naming = files.filter((file) => file !== REPOSITORY && PRIMITIVES.some((name) => codeOf(file).includes(name)));
     expect(naming).toEqual([MUTATION_ADAPTER]);
     const adapter = codeOf(MUTATION_ADAPTER);
-    expect(adapter.includes('completeCancelAttemptWithinCallerFencedTransaction'), 'the adapter never names completion').toBe(false);
+    expect(adapter.includes('completeCancelAttemptWithinCallerFencedTransaction'), 'only the unwired adapter composes completion').toBe(true);
     // One import (claim, arm, and [Wave 2B2b] the two named no-wire releases; never completion), one call each.
     expect(adapter).toContain([
       'import {',
       '  armCancelWireWithinCallerFencedTransaction,',
       '  claimCancelWithinCallerFencedTransaction,',
+      '  consumeCancelDispatchWithinCallerFencedTransaction,',
+      '  reproveCancelOrderWithinCallerFencedTransaction,',
+      '  completeCancelAttemptWithinCallerFencedTransaction,',
       '  releaseArmedUndispatchedCancelClaimWithinCallerFencedTransaction,',
       '  releaseUnarmedCancelClaimWithinCallerFencedTransaction,',
       '  type ClaimCancelOutcome,',

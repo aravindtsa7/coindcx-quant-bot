@@ -41,9 +41,13 @@
  */
 import { Prisma, type PrismaClient } from '@prisma/client';
 import { LIVE_CLIENT_ORDER_ID_PATTERN } from '../identity';
+import { LiveExecutionError } from '../errors';
 import {
   armCancelWireWithinCallerFencedTransaction,
   claimCancelWithinCallerFencedTransaction,
+  consumeCancelDispatchWithinCallerFencedTransaction,
+  reproveCancelOrderWithinCallerFencedTransaction,
+  completeCancelAttemptWithinCallerFencedTransaction,
   releaseArmedUndispatchedCancelClaimWithinCallerFencedTransaction,
   releaseUnarmedCancelClaimWithinCallerFencedTransaction,
   type ClaimCancelOutcome,
@@ -86,6 +90,12 @@ import {
   type PracticalCancelArm,
   type PracticalCancelArmInput,
   type PracticalCancelMutationStore,
+  type PracticalCancelPermissionInput,
+  type PracticalCancelConsumptionInput,
+  type PracticalUnenteredCancelInput,
+  type PracticalCancelOutcomeInput,
+  type PracticalCancelCompletion,
+  type PracticalCancelDispatchStore,
   type PracticalCancelNoWireStore,
   type PracticalNoDispatchReason,
   type PracticalNoWireCompletion,
@@ -107,6 +117,15 @@ import {
   type PracticalClassifiedPreWriteClaimFailureCode,
 } from './preflight';
 import {
+  PracticalCancelDispatchOwner,
+  reservePracticalCancelPermitCreation,
+  restorePracticalCancelPermitCreation,
+  markPracticalCancelPermitCreationUnknown,
+  issuePracticalCancelDispatchPermit,
+  issuePracticalCancelDispatchAttempt,
+  issuePracticalCancelCreationCleanup,
+  transitionPracticalCancelDispatchOwner,
+  type PracticalCancelDispatchRecord,
   beginPracticalAcquiredCancelAbandon,
   beginPracticalArmedCancelNoWireCompletion,
   beginPracticalUnknownAcquireResolution,
@@ -445,6 +464,8 @@ interface NoWireContext {
   readonly expectedLeaseCreatedAtMs: number | null;
   readonly certificateMatches: (certificate: PracticalDurableCertificateRecord) => boolean;
   readonly nowMs: number;
+  /** New dispatch owners constrain revisions from their original lifecycle; never derive ownership from them. */
+  readonly dispatchRevisions?: readonly number[];
 }
 
 type NoWireOutcome = { readonly kind: 'COMPLETED' | 'ALREADY_COMPLETED' };
@@ -595,7 +616,7 @@ function refusalReasonOf(error: unknown): PracticalRecoveryRefusalReason {
   return 'ACCOUNT_UNREADABLE';
 }
 
-export class PrismaPracticalCancelMutationStore implements PracticalCancelMutationStore, PracticalCancelNoWireStore, PracticalUnknownAcquireRecoveryStore, PracticalPreviousRuntimeRecoveryStore {
+export class PrismaPracticalCancelMutationStore implements PracticalCancelMutationStore, PracticalCancelNoWireStore, PracticalUnknownAcquireRecoveryStore, PracticalPreviousRuntimeRecoveryStore, PracticalCancelDispatchStore {
   readonly #prisma: PrismaClient;
   readonly #practical: PrismaPracticalSafetyRepository;
 
@@ -642,6 +663,204 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
   }
 
   // ----- acquire ---------------------------------------------------------------
+
+  /** Read-only authority reproof; exclusive local transfer, no reconstructed provenance. */
+  public async createCancelDispatchPermission(input: PracticalCancelPermissionInput) {
+    const raw = requireClosedWorld(input, ['armed', 'enablement', 'runtimeIdentity', 'trustedNowMs']);
+    const armed = raw['armed'];
+    const record = PracticalArmedCancel.read(armed);
+    if (record === null || PracticalArmedCancel.provenance(armed) === null) authorityInvalid('Original arm provenance is required', 'armed');
+    const nowMs = requireNowMs(raw['trustedNowMs']);
+    const policy = requireCancelEnablement(raw['enablement'], record.accountId);
+    const epoch = requireRuntimeEpoch(raw['runtimeIdentity']);
+    if (epoch !== record.runtimeEpoch) authorityInvalid('Arm belongs to another runtime', 'runtimeIdentity');
+    const owner = reservePracticalCancelPermitCreation(armed);
+    try {
+      await this.#transaction((tx) => this.#dispatchAuthorityWithin(tx, owner, nowMs, policy, false));
+    } catch (error) {
+      if (error instanceof TransactionOutcomeUnknown) {
+        markPracticalCancelPermitCreationUnknown(armed);
+        throw new PracticalMutationError('PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN', 'Permission creation was unconfirmed; no permit issued, cleanup only', undefined, error.cause);
+      }
+      restorePracticalCancelPermitCreation(armed);
+      throw error;
+    }
+    return Object.freeze({ kind: 'PERMITTED' as const, permission: issuePracticalCancelDispatchPermit(armed) });
+  }
+
+  /** Exact original revision CAS; commit acknowledgement is required to issue an attempt. */
+  public async consumeCancelDispatchPermission(input: PracticalCancelConsumptionInput) {
+    const raw = requireClosedWorld(input, ['permission', 'enablement', 'runtimeIdentity', 'trustedNowMs']);
+    const permission = raw['permission'];
+    const owner = PracticalCancelDispatchOwner.read(permission);
+    if (owner === null || owner.role !== 'PERMIT') authorityInvalid('Genuine permission required', 'permission');
+    const nowMs = requireNowMs(raw['trustedNowMs']);
+    const policy = requireCancelEnablement(raw['enablement'], owner.armed.accountId);
+    const epoch = requireRuntimeEpoch(raw['runtimeIdentity']);
+    if (epoch !== owner.armed.runtimeEpoch) authorityInvalid('Permission belongs to another runtime', 'runtimeIdentity');
+    transitionPracticalCancelDispatchOwner(permission, 'READY', 'CONSUMING');
+    try {
+      await this.#transaction((tx) => this.#dispatchAuthorityWithin(tx, owner, nowMs, policy, true));
+    } catch (error) {
+      if (error instanceof TransactionOutcomeUnknown) {
+        transitionPracticalCancelDispatchOwner(permission, 'CONSUMING', 'CONSUMPTION_UNKNOWN');
+        throw new PracticalMutationError('PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN', 'Consumption was unconfirmed; no attempt issued, dispatch retry prohibited', undefined, error.cause);
+      }
+      const loser = (error instanceof PracticalMutationError && error.code === 'PRACTICAL_MUTATION_DISPATCH_CONFLICT')
+        || (error instanceof LiveExecutionError && error.code === 'LIVE_ORDER_STATE_CONFLICT');
+      transitionPracticalCancelDispatchOwner(permission, 'CONSUMING', loser ? 'REFUSED' : 'READY');
+      throw error;
+    }
+    return Object.freeze({ kind: 'CONSUMED' as const, attempt: issuePracticalCancelDispatchAttempt(permission) });
+  }
+
+  async #dispatchAuthorityWithin(tx: Tx, owner: PracticalCancelDispatchRecord, nowMs: number, policy: CancelPolicy, consume: boolean): Promise<void> {
+    const { armed: arm, original } = owner;
+    if (arm.orderRevisionAfterArm > 2_147_483_645) armRefused('Insufficient signed INT revision capacity for consumption and completion', {});
+    await withLockedPracticalAccountWithinCallerTransaction(this.#practical, tx, arm.accountId, async (scope) => {
+      if (scope.account.state !== 'MUTATING') armRefused('Account is no longer MUTATING', {});
+      const { lease, certificate } = await scope.requireLeasedOrderBoundCancelLease({
+        leaseId: arm.leaseId, certificateId: arm.certificateId, runtimeEpoch: arm.runtimeEpoch,
+        reconciliationGeneration: arm.reconciliationGeneration,
+        binding: { intentId: arm.intentId, clientOrderId: arm.clientOrderId, cancelGeneration: arm.cancelGeneration },
+      });
+      if (!sameCertificateSnapshot(certificate, original.certificate) || lease.createdAtMs !== original.leaseCreatedAtMs
+        || lease.armedAtMs !== arm.armedAtMs) armRefused('Original certificate or arm binding changed', {});
+      if (nowMs < certificate.issuedAtMs + policy.dwellMs || nowMs < arm.armedAtMs
+        || nowMs >= Math.min(certificate.expiresAtMs, certificate.issuedAtMs + policy.lifetimeMs)) armRefused('Dispatch is outside the original certificate window', {});
+      const mismatch = classifyPracticalReconciliationMismatch(await lockReconciliationState(tx, arm.accountId), {
+        accountId: arm.accountId, runtimeEpoch: arm.runtimeEpoch, reconciliationGeneration: arm.reconciliationGeneration,
+      });
+      if (mismatch !== null) armRefused('Reconciliation no longer matches the original arm', { reason: mismatch });
+      const order = await lockPhase17Order(tx, arm.intentId);
+      this.#requireDispatchOrder(order, arm);
+      const verified = await reproveCancelOrderWithinCallerFencedTransaction(tx, arm.intentId, requireExactAccountId(lease.accountId, arm.accountId));
+      if (verified.revision !== order.revision) selfCheckFailed('Locked and verified order reads disagree', {});
+      if (order.state !== 'CANCEL_REQUESTED' || order.revision !== arm.orderRevisionAfterArm || order.cancelState !== 'CANCEL_RESERVED' || !order.cancelWireArmed
+        || order.cancelFaultCode !== null) throw new PracticalMutationError('PRACTICAL_MUTATION_DISPATCH_CONFLICT', 'Original armed claim lost its dispatch revision');
+      if (consume) {
+        const consumed = await consumeCancelDispatchWithinCallerFencedTransaction(tx, arm.intentId, arm.orderRevisionAfterArm, arm.cancelGeneration, requireExactAccountId(lease.accountId, arm.accountId));
+        const after = await lockPhase17Order(tx, arm.intentId);
+        this.#requireDispatchOrder(after, arm);
+        if (consumed.revision !== arm.orderRevisionAfterArm + 1 || after.revision !== consumed.revision
+          || after.state !== order.state || !after.cancelWireArmed || after.cancelState !== 'CANCEL_RESERVED') selfCheckFailed('Consumption did not preserve the exact armed pair', {});
+      }
+    });
+  }
+
+  #requireDispatchOrder(order: LockedPhase17Order | null, arm: PracticalArmedCancelRecord): asserts order is LockedPhase17Order {
+    if (order === null || order.intentId !== arm.intentId || order.accountId !== arm.accountId
+      || order.clientOrderId !== arm.clientOrderId || order.pair !== arm.pair
+      || order.exchangeOrderId !== arm.exchangeOrderId || order.cancelExchangeOrderId !== arm.exchangeOrderId
+      || order.cancelGeneration !== arm.cancelGeneration) completionRefused('Exact original order/claim identity is not provable', {});
+  }
+
+  /** Genuine unentered ownership only; a consumption conflict owner cannot enter this path. */
+  public async completeUnenteredCancelDispatch(input: PracticalUnenteredCancelInput): Promise<PracticalNoWireCompletion> {
+    const raw = requireClosedWorld(input, ['owner', 'report', 'trustedNowMs']);
+    const reason = requireNotDispatchedReport(raw['report']);
+    const nowMs = requireNowMs(raw['trustedNowMs']);
+    let value = raw['owner'];
+    if (PracticalArmedCancel.status(value) === 'PERMIT_CREATION_UNKNOWN' || PracticalArmedCancel.status(value) === 'TRANSFERRED') value = issuePracticalCancelCreationCleanup(value);
+    const owner = PracticalCancelDispatchOwner.read(value);
+    const from = PracticalCancelDispatchOwner.status(value);
+    if (owner === null || from === null || !((owner.role === 'PERMIT' && (from === 'READY' || from === 'CONSUMPTION_UNKNOWN' || from === 'CLEANUP_UNKNOWN'))
+      || (owner.role === 'ATTEMPT' && (from === 'UNENTERED' || from === 'CLEANUP_UNKNOWN')))) authorityInvalid('Exclusive genuine unentered ownership required', 'owner');
+    transitionPracticalCancelDispatchOwner(value, from, 'CLEANING', reason);
+    const revisions = PracticalCancelDispatchOwner.cleanupRevisions(value);
+    if (revisions === null) authorityInvalid('Original cleanup ownership is required', 'owner');
+    const context = this.#dispatchNoWireContext(owner, nowMs, from === 'CLEANUP_UNKNOWN', revisions);
+    let result: NoWireOutcome;
+    try { result = await this.#transaction((tx) => this.#noWireWithin(tx, context)); }
+    catch (error) {
+      if (error instanceof TransactionOutcomeUnknown) {
+        transitionPracticalCancelDispatchOwner(value, 'CLEANING', 'CLEANUP_UNKNOWN');
+        throw new PracticalMutationError('PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN', 'Unentered cleanup unconfirmed; identical cleanup only', undefined, error.cause);
+      }
+      transitionPracticalCancelDispatchOwner(value, 'CLEANING', from);
+      return this.#afterNoWireRollback(error, owner.armed.accountId, owner.armed.runtimeEpoch, nowMs);
+    }
+    transitionPracticalCancelDispatchOwner(value, 'CLEANING', 'SPENT');
+    return Object.freeze({ kind: result.kind, outcome: 'PRE_DISPATCH_FAILURE', leaseId: owner.armed.leaseId, intentId: owner.armed.intentId, cancelGeneration: owner.armed.cancelGeneration });
+  }
+
+  #dispatchNoWireContext(owner: PracticalCancelDispatchRecord, nowMs: number, retry: boolean, revisions: readonly number[]): NoWireContext {
+    const arm = owner.armed;
+    return Object.freeze({
+      mode: 'ARMED_TICKET', retry, accountId: arm.accountId, leaseId: arm.leaseId, certificateId: arm.certificateId,
+      runtimeEpoch: arm.runtimeEpoch, reconciliationGeneration: arm.reconciliationGeneration, intentId: arm.intentId,
+      clientOrderId: arm.clientOrderId, cancelGeneration: arm.cancelGeneration, pair: arm.pair, exchangeOrderId: arm.exchangeOrderId,
+      expectedArmedAtMs: arm.armedAtMs, expectedLeaseCreatedAtMs: owner.original.leaseCreatedAtMs,
+      certificateMatches: (certificate: PracticalDurableCertificateRecord) => sameCertificateSnapshot(certificate, owner.original.certificate), nowMs,
+      dispatchRevisions: revisions,
+    });
+  }
+
+  /** Immutable internal reported-result receipt only; no authority renewal, observations or resend. */
+  public async completeCancelLease(input: PracticalCancelOutcomeInput): Promise<PracticalCancelCompletion> {
+    const raw = requireClosedWorld(input, ['outcome', 'trustedNowMs']);
+    const value = raw['outcome'];
+    const owner = PracticalCancelDispatchOwner.read(value);
+    const from = PracticalCancelDispatchOwner.status(value);
+    if (owner === null || owner.role !== 'OUTCOME' || owner.result === null || (from !== 'READY' && from !== 'COMMIT_UNKNOWN')) authorityInvalid('Genuine immutable outcome receipt required', 'outcome');
+    const nowMs = requireNowMs(raw['trustedNowMs']);
+    transitionPracticalCancelDispatchOwner(value, from, 'COMPLETING');
+    let result: PracticalCancelCompletion;
+    try { result = await this.#transaction((tx) => this.#completeDispatchWithin(tx, owner, nowMs, from === 'COMMIT_UNKNOWN')); }
+    catch (error) {
+      if (error instanceof TransactionOutcomeUnknown) {
+        transitionPracticalCancelDispatchOwner(value, 'COMPLETING', 'COMMIT_UNKNOWN');
+        throw new PracticalMutationError('PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN', 'Outcome completion unconfirmed; only this identical receipt may retry', undefined, error.cause);
+      }
+      transitionPracticalCancelDispatchOwner(value, 'COMPLETING', from);
+      return this.#afterNoWireRollback(error, owner.armed.accountId, owner.armed.runtimeEpoch, nowMs);
+    }
+    transitionPracticalCancelDispatchOwner(value, 'COMPLETING', 'SPENT');
+    return result;
+  }
+
+  async #completeDispatchWithin(tx: Tx, owner: PracticalCancelDispatchRecord, nowMs: number, retry: boolean): Promise<PracticalCancelCompletion> {
+    const { armed: arm, original, result } = owner;
+    if (result === null) authorityInvalid('Reported outcome is missing', 'outcome');
+    const outcome = result.kind === 'CANCEL_ACCEPTED' ? 'ACCEPTED' : result.kind;
+    const cancelState = outcome === 'ACCEPTED' ? 'CANCEL_ACKNOWLEDGED' : outcome === 'REJECTED' ? 'CANCEL_REJECTED' : outcome === 'AMBIGUOUS' ? 'CANCEL_AMBIGUOUS' : 'NONE';
+    const fault = outcome === 'ACCEPTED' || outcome === 'PRE_DISPATCH_FAILURE' ? null : outcome === 'AMBIGUOUS' ? 'LIVE_CANCEL_AMBIGUOUS' : result.reason;
+    return withLockedPracticalAccountWithinCallerTransaction(this.#practical, tx, arm.accountId, async (scope) => {
+      if (scope.account.fence.runtimeEpoch !== arm.runtimeEpoch) completionRefused('Original runtime is superseded', {});
+      const expected = { leaseId: arm.leaseId, certificateId: arm.certificateId, runtimeEpoch: arm.runtimeEpoch,
+        reconciliationGeneration: arm.reconciliationGeneration, binding: { intentId: arm.intentId, clientOrderId: arm.clientOrderId, cancelGeneration: arm.cancelGeneration } };
+      const held = scope.account.fence.mode.kind === 'MUTATION_LEASED' && scope.account.fence.mode.leaseId === arm.leaseId;
+      const { lease, certificate } = held ? await scope.requireLeasedOrderBoundCancelLease(expected) : await scope.readOrderBoundCancelLease(expected);
+      if (!sameCertificateSnapshot(certificate, original.certificate) || lease.armedAtMs !== arm.armedAtMs
+        || lease.createdAtMs !== original.leaseCreatedAtMs) completionRefused('Original certificate/lease/arm provenance changed', {});
+      const before = await lockPhase17Order(tx, arm.intentId);
+      this.#requireDispatchOrder(before, arm);
+      const verified = await reproveCancelOrderWithinCallerFencedTransaction(tx, arm.intentId, requireExactAccountId(lease.accountId, arm.accountId));
+      if (verified.revision !== before.revision) selfCheckFailed('Locked and verified outcome reads disagree', {});
+      if (!held) {
+        if (!retry || lease.status !== 'COMPLETED' || lease.outcome !== outcome || lease.completedAtMs === null
+          || lease.completedAtMs < arm.armedAtMs || before.cancelState !== cancelState || before.cancelWireArmed
+          || before.cancelFaultCode !== fault || before.revision !== arm.orderRevisionAfterArm + 2) completionRefused('Identical coupled completion is not provable', {});
+        if (outcome === 'AMBIGUOUS') {
+          if (verified.faultCode !== 'LIVE_CANCEL_AMBIGUOUS') completionRefused('Ambiguous order fault mapping changed', {});
+        }
+        return Object.freeze({ kind: 'ALREADY_COMPLETED', outcome, leaseId: arm.leaseId, intentId: arm.intentId, cancelGeneration: arm.cancelGeneration });
+      }
+      if (before.revision !== arm.orderRevisionAfterArm + 1 || before.cancelState !== 'CANCEL_RESERVED' || !before.cancelWireArmed || before.cancelFaultCode !== null) completionRefused('Original consumed armed claim is not provable', {});
+      const completedOrder = outcome === 'PRE_DISPATCH_FAILURE'
+        ? await releaseArmedUndispatchedCancelClaimWithinCallerFencedTransaction(tx, arm.intentId, arm.cancelGeneration, requireExactAccountId(lease.accountId, arm.accountId))
+        : await completeCancelAttemptWithinCallerFencedTransaction(tx, arm.intentId, arm.cancelGeneration, outcome === 'ACCEPTED' ? 'ACKNOWLEDGED' : outcome, fault, requireExactAccountId(lease.accountId, arm.accountId));
+      const practical = outcome === 'PRE_DISPATCH_FAILURE' ? await scope.completeOrderBoundCancelLeaseNoWire(nowMs)
+        : await scope.completeOrderBoundCancelLeaseOutcome(nowMs, outcome);
+      const after = await lockPhase17Order(tx, arm.intentId);
+      this.#requireDispatchOrder(after, arm);
+      if (after.revision !== arm.orderRevisionAfterArm + 2 || after.state !== before.state || after.cancelState !== cancelState
+        || after.cancelWireArmed || after.cancelFaultCode !== fault || completedOrder.revision !== after.revision
+        || (outcome === 'AMBIGUOUS' && completedOrder.faultCode !== 'LIVE_CANCEL_AMBIGUOUS')
+        || practical.lease.outcome !== outcome || practical.certificate.status !== 'CONSUMED') selfCheckFailed('Coupled reported outcome did not re-read exactly', {});
+      return Object.freeze({ kind: 'COMPLETED', outcome, leaseId: arm.leaseId, intentId: arm.intentId, cancelGeneration: arm.cancelGeneration });
+    });
+  }
 
   public async acquireCancelLease(input: PracticalCancelAcquireInput): Promise<PracticalCancelAcquisition> {
     // A. Before any durable access: closed-world input and genuine authority only.
@@ -864,7 +1083,7 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
     }
     // C. ONLY AFTER COMMIT: spend the acquired handle, then mint the ticket.
     spendPracticalAcquiredCancel(acquired);
-    return Object.freeze({ kind: 'ARMED' as const, ticket: issuePracticalArmedCancel(armedRecord) });
+    return Object.freeze({ kind: 'ARMED' as const, ticket: issuePracticalArmedCancel(armedRecord, context.handle) });
   }
 
   /** B. The ONE arm transaction. Every statement uses `tx`. */
@@ -1130,6 +1349,7 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
       if (before.cancelGeneration !== ctx.cancelGeneration || before.cancelState !== 'CANCEL_RESERVED') {
         splitState('The practical lease is LEASED but the Phase 17 claim of its generation is not CANCEL_RESERVED', details);
       }
+      if (ctx.dispatchRevisions !== undefined && !ctx.dispatchRevisions.includes(before.revision)) completionRefused('Unentered original ownership revision is not provable', details);
 
       // 3. The locked, COUPLED durable pair is the ONLY source of the release variant.
       const leaseArmed = lease.armedAtMs !== null;
@@ -1227,6 +1447,14 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
       || order.pair !== ctx.pair
       || order.exchangeOrderId !== ctx.exchangeOrderId) {
       completionRefused('The Phase 17 order is not exactly the order this lease is bound to', details);
+    }
+
+    if (ctx.dispatchRevisions !== undefined) {
+      // Only the new dispatch cleanup path: practical scope -> order -> sealed intent,
+      // using this same transaction, without renewed health or reconciliation locks.
+      await reproveCancelOrderWithinCallerFencedTransaction(tx, ctx.intentId, requireExactAccountId(lease.accountId, ctx.accountId));
+      if (order.cancelGeneration !== ctx.cancelGeneration
+        || !ctx.dispatchRevisions.some((revision) => revision + 1 === order.revision)) completionRefused('Original unentered completion cannot be re-proven', details);
     }
 
     // 4. This generation released exactly as the no-wire release leaves it, or a LATER generation has started.

@@ -239,10 +239,10 @@ describe('the two named no-wire release primitives', () => {
 describe('scope: [Wave 2B2b widened] only the no-wire completion and in-process abandon exist; no recovery, dispatch, permit, ACCEPTED, or REJECTED', () => {
   it('the Stage 1B2 adapter never names Phase 17 completion; each no-wire primitive is called exactly ONCE in the no-wire body ([Wave 2B2d] + the UNARMED one once in the previous-runtime recovery), fenced with the exact lease account', () => {
     const adapter = codeOf(MUTATION_ADAPTER);
-    expect(adapter).not.toContain('completeCancelAttemptWithinCallerFencedTransaction');
-    expect(adapter).not.toMatch(/completeCancelLease|recoverOrphanedCancelLease|DispatchPermit/);
+    expect(adapter.match(/await completeCancelAttemptWithinCallerFencedTransaction\(/g)).toHaveLength(1);
+    expect(adapter).not.toMatch(/recoverOrphanedCancelLease/);
     // One derived call each, in the shared no-wire body, selected ONLY by the locked coupled durable pair.
-    expect(adapter.match(/await releaseArmedUndispatchedCancelClaimWithinCallerFencedTransaction\(/g)).toHaveLength(1);
+    expect(adapter.match(/await releaseArmedUndispatchedCancelClaimWithinCallerFencedTransaction\(/g)).toHaveLength(2);
     // [Wave 2B2d] + exactly ONE unarmed call in the previous-runtime recovery (never the armed-undispatched release there).
     expect(adapter.match(/await releaseUnarmedCancelClaimWithinCallerFencedTransaction\(/g)).toHaveLength(2);
     const recover = adapter.slice(adapter.indexOf('async #recoverWithin('), adapter.indexOf('async #afterRecoveryRollback('));
@@ -303,12 +303,13 @@ describe('scope: [Wave 2B2b widened] only the no-wire completion and in-process 
 
   it('no src module introduces a completion-of-dispatch / recovery / permit surface; the adapter writes no dispatched outcome', () => {
     for (const file of files.filter((candidate) => candidate.startsWith('src/'))) {
-      expect(codeOf(file), file).not.toMatch(/completeCancelLease|recoverOrphanedCancelLease|PracticalCancelDispatchPermit|PracticalVerifiedCancelResolution/);
+      expect(codeOf(file), file).not.toMatch(/recoverOrphanedCancelLease|PracticalVerifiedCancelResolution/);
+      if (!file.startsWith('src/execution/live/practical-mutation/')) expect(codeOf(file), file).not.toMatch(/completeCancelLease|PracticalCancelDispatchPermit/);
     }
     const namesNoWireOperations = files.filter((file) => /completeUndispatchedCancel|abandonAcquiredCancel/.test(codeOf(file))).sort();
     expect(namesNoWireOperations).toEqual(['src/execution/live/practical-mutation/ports.ts', MUTATION_ADAPTER].sort());
     const adapter = codeOf(MUTATION_ADAPTER);
-    expect(adapter).not.toMatch(/'AMBIGUOUS'|'REJECTED'|'ACCEPTED'|HTTP_|statusCode|\b429\b/);
+    expect(adapter).not.toMatch(/HTTP_|statusCode|\b429\b/);
   });
 
   it('live/repository.ts still reaches no practical module, integration module, gateway, transport, or signer', () => {

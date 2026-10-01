@@ -130,8 +130,8 @@ describe('B / C-prime. split practical bindings: blocking MANUAL_REVIEW finding,
     ['COMPLETED PRE_DISPATCH_FAILURE while CANCEL_AMBIGUOUS', COMPLETED_PRE_DISPATCH, 'CANCEL_AMBIGUOUS'],
     ['COMPLETED AMBIGUOUS while NONE', COMPLETED_AMBIGUOUS, 'NONE'],
     ['COMPLETED AMBIGUOUS while CANCEL_ACKNOWLEDGED', COMPLETED_AMBIGUOUS, 'CANCEL_ACKNOWLEDGED'],
-    ['COMPLETED REJECTED (no reviewed producer)', binding({ status: 'COMPLETED', outcome: 'REJECTED', armedAtMs: 1_000 }), 'CANCEL_REJECTED'],
-    ['COMPLETED ACCEPTED (no reviewed producer)', binding({ status: 'COMPLETED', outcome: 'ACCEPTED', armedAtMs: 1_000 }), 'CANCEL_ACKNOWLEDGED'],
+    ['COMPLETED REJECTED with wrong claim', binding({ status: 'COMPLETED', outcome: 'REJECTED', armedAtMs: 1_000 }), 'CANCEL_ACKNOWLEDGED'],
+    ['COMPLETED ACCEPTED with wrong claim', binding({ status: 'COMPLETED', outcome: 'ACCEPTED', armedAtMs: 1_000 }), 'CANCEL_REJECTED'],
   ] as const)('%s', (_label, practical, cancelState) => {
     const order = cancelRequested({ cancelState, practicalCancelBinding: practical });
     const plan = planClaimRecovery([order]);
