@@ -1,5 +1,63 @@
 # Unwired cancel dispatch permission and coupled outcomes
 
+## Permanent local admission closure and bounded drain (contract before implementation)
+
+This extension is unwired. It neither composes a runtime nor stops a watch,
+stream or transport. `requestStop()` synchronously returns ADMISSION_CLOSED
+after closing a permanent private latch; repeated calls are idempotent. There
+is no reopen/reset. A service internally creates one opaque native-private
+lifecycle association bound to that genuine service and the exact constructor
+dependency snapshot. Its boundary receives that same association. Missing,
+cloned, forged, foreign-owner or foreign-dependency associations refuse.
+Factory/brand installation belongs only to the service; observation belongs
+only to the service/boundary; closure belongs only to the service. Classes,
+prototypes, instances and CommonJS/tsx exports are protected at initialization.
+
+| Operation / observation | Reservation and continuation |
+| --- | --- |
+| New cancel after stop | REFUSED / ADMISSION_CLOSED before acquisition |
+| Stop during acquire/arm/creation/consumption | Save returned genuine owner first; existing eligible cleanup only, unchanged revision/reason rules |
+| Stop reentrantly during final watch inspection | Final synchronous closure check immediately before entry refuses |
+| Entry before stop | One existing invocation and outcome completion; never unentered cleanup or resend |
+| drain before stop | REFUSED / ADMISSION_NOT_CLOSED, no work |
+| concurrent drain | REFUSED / DRAIN_IN_PROGRESS; no queue |
+| manual retry while drain owns coordination | REFUSED / OPERATION_IN_PROGRESS |
+| drain observing active manual bookkeeping | Wait only; do not retry that bookkeeping again in this call |
+| drain observing active cancel | Wait; optionally retry its exact existing eligible continuation once |
+| drain starting with pending bookkeeping | At most one exact continuation retry |
+| deadline with operation still pending | IN_FLIGHT; retain operation reservation and ownership |
+| no active/pending work, but unresolved blocked result | BLOCKED; never LOCAL_DRAINED |
+| genuine completion or unknown-acquire NOT_COMMITTED | Clear only this service's resolved work; LOCAL_DRAINED may follow |
+
+`drain()` has one total 30,000 ms scheduling timer per call, covering both wait
+and retry, never restarted at phase changes. Scheduling supplies no authority;
+cleanup still uses existing trusted time. Timeout does not cancel a transaction,
+clear ownership, release its reservation, or make a retry available. Late work
+remains attached with rejection handled; subsequent calls inspect actual state.
+There is no retry loop. Public manual retry remains available after stop, except
+while another drain/retry owns coordination. Drain never acquires, arms,
+creates/consumes permission, certifies, invokes the gateway or substitutes an
+owner. It uses only the existing private bookkeeping implementation.
+
+Closed drain results are LOCAL_DRAINED; IN_FLIGHT with current phase;
+BOOKKEEPING_PENDING with ACQUIRE/CLEANUP/COMPLETION; BLOCKED with the fixed typed
+code; or REFUSED with ADMISSION_NOT_CLOSED/DRAIN_IN_PROGRESS. BLOCKED results
+that cannot prove closure retain private unresolved status even without an
+eligible continuation. Invalid requests, repeated stop and deadlines cannot
+erase it; no new cancel can replace unresolved work. Genuine identical-owner
+bookkeeping success may clear it. No repair/restart ownership is invented.
+In particular a malformed latch retains its original MANUAL_REVIEW_REQUIRED
+result on later cancel calls instead of reacquiring to probe the database again.
+
+LOCAL_DRAINED is only in-process service/bookkeeping quiescence, not durable
+shutdown authorization, provider finality, continuity, or stopped sockets.
+`stopWatch()` remains outside this wave. The original watch, unknown-consumption
+prohibition, no-write proof boundary, strict Tier-A, remote supersession gap and
+UNARMED-only previous-runtime recovery are unchanged. In particular remote
+supersession after consumption may still precede one native invocation; no
+local timer/latch is an atomic database-to-socket fence. Armed orphans remain
+blocked. Tests use synthetic provider evidence only, never a production fallback.
+
 This contract is defined before implementation. It is a provider-independent
 extension of the reviewed Stage 1B2 store, not production execution wiring.
 

@@ -11,8 +11,8 @@ const { graph, files } = buildImportGraph(path.join(ROOT, 'src'), ROOT);
 const code = (file: string) => readFileSync(path.join(ROOT, file), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`])\/\/.*$/gm, '$1');
 
 describe('unwired practical cancel orchestration', () => {
-  it('has exactly three modules, no barrel and zero outside source importers', () => {
-    expect(readdirSync(path.join(ROOT, TREE)).sort()).toEqual(['gateway-boundary.ts', 'ports.ts', 'service.ts']);
+  it('has exactly four modules, no barrel and zero outside source importers', () => {
+    expect(readdirSync(path.join(ROOT, TREE)).sort()).toEqual(['gateway-boundary.ts', 'lifecycle.ts', 'ports.ts', 'service.ts']);
     expect(files.filter(file => !file.startsWith(TREE) && (graph.get(file) ?? []).some(dependency => dependency.startsWith(TREE)))).toEqual([]);
   });
   it('has no concrete network, operational composition or Phase17 service dependency', () => {
@@ -65,7 +65,7 @@ describe('unwired practical cancel orchestration', () => {
     }
     expect(boundary).toContain('Object.entries({ PracticalCancelGatewayBoundary, checkPracticalCancelGuard })');
     expect(service).toContain('Object.entries({ PracticalCancelService, PracticalCancelBookkeeping })');
-    expect(service).toContain('this.#boundary = new PracticalCancelGatewayBoundary(this.#dependencies)');
+    expect(service).toContain('this.#boundary = new PracticalCancelGatewayBoundary(this.#dependencies, this.#lifecycle, this)');
     expect(service).toContain('await this.#boundary.invoke(consumed.attempt, certificate, time)');
     expect(boundary).toContain('this.#invoke = hasCancelTransportSource(dependencies.gateway) ? null : dependencies.gateway.cancelOrder.bind(dependencies.gateway)');
     expect(boundary).toContain('const guard = checkPracticalCancelGuard(this.#dependencies, certificate, time)');
@@ -75,5 +75,27 @@ describe('unwired practical cancel orchestration', () => {
     for (const file of [SERVICE, BOUNDARY, `${TREE}ports.ts`]) {
       expect(code(file)).not.toMatch(/\$transaction|\$queryRaw|\$executeRaw|WithinCallerFencedTransaction|transitionPracticalCancelDispatchOwner|issuePracticalCancelDispatchPermit|issuePracticalCancelDispatchAttempt/);
     }
+  });
+  it('pins native lifecycle issuance/closure, exact associations and the final revocation-only observation', () => {
+    const lifecycle = `${TREE}lifecycle.ts`, source = code(lifecycle);
+    expect(files.filter(file => (graph.get(file) ?? []).includes(lifecycle)).sort()).toEqual([BOUNDARY, SERVICE].sort());
+    const callers = (symbol: string) => files.filter(file => file !== lifecycle && new RegExp(`\\b${symbol}\\s*\\(`).test(code(file))).sort();
+    for (const symbol of ['createPracticalCancelLifecycle', 'installPracticalCancelLifecycleBrand']) expect(callers(symbol)).toEqual([SERVICE]);
+    expect(callers('PracticalCancelLifecycle.close')).toEqual([SERVICE]);
+    expect(callers('PracticalCancelLifecycle.open')).toEqual([BOUNDARY, SERVICE].sort());
+    expect(callers('PracticalCancelLifecycle.matches')).toEqual([BOUNDARY]);
+    expect(source).toContain('value.#owner === owner && value.#dependencies === dependencies');
+    expect(source).toContain('associations.get(value.#owner) === value');
+    expect(source).toContain('Object.freeze(PracticalCancelLifecycle.prototype)'); expect(source).toContain('Object.freeze(PracticalCancelLifecycle)');
+    expect(source).toContain('Object.freeze(this)'); expect(source).toContain('get: () => value, configurable: false');
+    expect(source).not.toMatch(/reopen|reset|process\.env|gateway|Prisma|certif/i);
+    const boundary = code(BOUNDARY), entry = boundary.indexOf('enterPracticalCancelGateway(attempt);');
+    const last = boundary.lastIndexOf('PracticalCancelLifecycle.open', entry);
+    expect(last).toBeGreaterThan(boundary.indexOf('const guard = checkPracticalCancelGuard', boundary.indexOf('public async invoke')));
+    expect(boundary.slice(last, entry)).not.toMatch(/\bawait\b|checkPracticalCancelGuard|telemetry|setTimeout/);
+    const service = code(SERVICE), drain = service.slice(service.indexOf('public async drain'), service.indexOf('#admissionOpen():'));
+    expect(drain.match(/setTimeout\(/g)).toHaveLength(1); expect(drain).toContain('30_000');
+    expect(drain.match(/this\.#retryBookkeeping\(/g)).toHaveLength(1);
+    expect(drain).not.toMatch(/acquireCancelLease|armCancelLease|consumeCancelDispatchPermission|\.invoke\(|stopWatch|while\s*\(/);
   });
 });

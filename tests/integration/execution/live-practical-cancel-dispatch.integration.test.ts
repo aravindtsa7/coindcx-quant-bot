@@ -284,6 +284,27 @@ function rollbackLostClient(): PrismaClient {
   });
 }
 
+/** Controlled local lifecycle observation after work, while the real transaction is still open. */
+function lifecycleTransactionClient(observe: () => void, truth: 'CONFIRMED' | 'COMMITTED' | 'ROLLED_BACK' = 'CONFIRMED'): PrismaClient {
+  return new Proxy(connectionA, {
+    get(target, property, receiver) {
+      if (property === '$transaction') return async (work: (tx: unknown) => Promise<unknown>, options: unknown) => {
+        let result: unknown;
+        try {
+          result = await (target.$transaction as (w: (tx: unknown) => Promise<unknown>, o: unknown) => Promise<unknown>)(async tx => {
+            const value = await work(tx); observe();
+            if (truth === 'ROLLED_BACK') throw new ForcedRollback('synthetic lifecycle rollback');
+            return value;
+          }, options);
+        } catch (error) { if (!(error instanceof ForcedRollback)) throw error; }
+        if (truth !== 'CONFIRMED') throw new Prisma.PrismaClientKnownRequestError('synthetic lifecycle acknowledgement lost', { code: 'P1017', clientVersion: 'test' });
+        return result;
+      };
+      return Reflect.get(target, property, receiver);
+    },
+  });
+}
+
 async function permitted() {
   const seed = await armed();
   const result = await store().createCancelDispatchPermission({ armed: seed.ticket, enablement: enablementFor(seed.accountId), runtimeIdentity: IDENTITY, trustedNowMs: ARM_AT + 1 });
@@ -660,6 +681,74 @@ function requireBookkeeping(result: PracticalCancelResult) {
 }
 
 describe('unwired orchestrator real-MySQL acceptance (synthetic provider fixtures)', () => {
+  it('stop before admission makes no durable calls and local drain is not durable shutdown proof', async () => {
+    if (skip()) return;
+    const h = await orchestrationFixture(), before = await durable(h.accountId, h.order.intentId);
+    expect(await h.service.drain()).toEqual({ kind: 'REFUSED', code: 'ADMISSION_NOT_CLOSED' });
+    h.service.requestStop(); h.service.requestStop();
+    expect(await h.service.cancel(h.input)).toMatchObject({ code: 'ADMISSION_CLOSED' });
+    expect(await h.service.drain()).toEqual({ kind: 'LOCAL_DRAINED' });
+    expect(h.methods).toEqual([]); expect(h.calls()).toBe(0); expect(await durable(h.accountId, h.order.intentId)).toEqual(before);
+    expect((await practicalRows(h.accountId)).certificates[0]?.status).toBe('ISSUED'); // local drainage did not revoke or stop observation
+  });
+  it.each(['acquireCancelLease', 'armCancelLease', 'createCancelDispatchPermission', 'consumeCancelDispatchPermission'].flatMap(method => ['before-commit', 'after-commit'].map(order => [method, order] as const)))('%s stop %s closes the genuine paired owner without dispatch', async (method, order) => {
+    if (skip()) return;
+    const h = await orchestrationFixture(), before = await orderRow(h.order.intentId);
+    if (order === 'before-commit') h.overrides.set(method as OrchestrationMethod, lifecycleTransactionClient(() => { h.service.requestStop(); }));
+    else h.after.set(method as OrchestrationMethod, () => { h.service.requestStop(); });
+    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' });
+    expect(await h.service.drain()).toEqual({ kind: 'LOCAL_DRAINED' }); expect(h.calls()).toBe(0);
+    const after = await orderRow(h.order.intentId), rows = await practicalRows(h.accountId);
+    expect(after.cancelState).toBe('NONE'); expect(after.cancelWireArmed).toBe(false);
+    expect(after.revision).toBe(method === 'acquireCancelLease' ? 4 : method === 'consumeCancelDispatchPermission' ? 6 : 5);
+    expect(rows.leases[0]).toMatchObject({ status: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' });
+    expect(rows.certificates[0]?.status).toBe('CONSUMED'); expect(rows.state?.state).toBe('QUARANTINED'); expect(rows.fence?.mode).toBe('IDLE');
+    for (const key of ['orderedQuantity', 'cumulativeFilledQuantity', 'remainingQuantity', 'averageFillPrice', 'exchangeOrderId', 'pair'] as const) expect(after[key]).toEqual(before[key]);
+  });
+  it.each(['acquireCancelLease', 'armCancelLease', 'createCancelDispatchPermission', 'consumeCancelDispatchPermission', 'completeCancelLease'].flatMap(method => ['COMMITTED', 'ROLLED_BACK'].map(truth => [method, truth] as const)))('%s genuine unknown %s after local stop preserves ownership and drain never resends', async (method, truth) => {
+    if (skip()) return;
+    const h = await orchestrationFixture();
+    h.overrides.set(method as OrchestrationMethod, lifecycleTransactionClient(() => { h.service.requestStop(); }, truth as 'COMMITTED' | 'ROLLED_BACK'));
+    const result = await h.service.cancel(h.input); expect(['COMPLETED', 'BOOKKEEPING_PENDING']).toContain(result.kind);
+    h.overrides.delete(method as OrchestrationMethod);
+    expect(await h.service.drain()).toEqual({ kind: 'LOCAL_DRAINED' });
+    expect(h.calls()).toBe(method === 'completeCancelLease' ? 1 : 0);
+    expect(h.methods.filter(m => m === 'acquireCancelLease')).toHaveLength(1);
+    expect(h.methods.filter(m => m === 'armCancelLease')).toHaveLength(method === 'acquireCancelLease' ? 0 : 1);
+    const rows = await practicalRows(h.accountId), after = await orderRow(h.order.intentId);
+    if (method === 'acquireCancelLease' && truth === 'ROLLED_BACK') {
+      expect(rows.leases).toHaveLength(0); expect(rows.certificates[0]?.status).toBe('ISSUED'); expect(after.cancelState).toBe('NONE');
+    } else {
+      expect(rows.leases[0]?.status).toBe('COMPLETED'); expect(rows.certificates[0]?.status).toBe('CONSUMED');
+      expect(rows.fence?.mode).toBe('IDLE'); expect(rows.state?.state).toBe('QUARANTINED'); expect(after.cancelWireArmed).toBe(false);
+      expect(after.cancelState).toBe(method === 'completeCancelLease' ? 'CANCEL_ACKNOWLEDGED' : 'NONE');
+    }
+    if (method === 'completeCancelLease') {
+      expect((h.cleanupInputs[0] as { outcome: unknown }).outcome).toBe((h.cleanupInputs[1] as { outcome: unknown }).outcome);
+      expect(h.methods.filter(m => m === 'consumeCancelDispatchPermission')).toHaveLength(1);
+    }
+  });
+  it.each(['COMMITTED', 'ROLLED_BACK'] as const)('stopped READY cleanup unknown %s drains the identical owner with its original revision bounds', async truth => {
+    if (skip()) return;
+    const h = await orchestrationFixture(); h.after.set('createCancelDispatchPermission', () => { h.service.requestStop(); });
+    h.overrides.set('completeUnenteredCancelDispatch', truth === 'COMMITTED' ? commitLostClient() : rollbackLostClient());
+    requireBookkeeping(await h.service.cancel(h.input)); const original = h.cleanupInputs[0] as { owner: unknown; report: unknown };
+    expect(PracticalCancelDispatchOwner.cleanupRevisions(original.owner)).toEqual([4]); h.overrides.delete('completeUnenteredCancelDispatch');
+    expect(await h.service.drain()).toEqual({ kind: 'LOCAL_DRAINED' });
+    expect(h.cleanupInputs[1]).toMatchObject({ owner: original.owner, report: original.report });
+    expect((await orderRow(h.order.intentId)).revision).toBe(5); expect(h.calls()).toBe(0); expect(h.methods).not.toContain('consumeCancelDispatchPermission');
+  });
+  it.each(['COMMITTED', 'ROLLED_BACK'] as const)('stopped unknown cleanup %s cannot drain after unrelated revision advancement and writes nothing', async truth => {
+    if (skip()) return;
+    const h = await orchestrationFixture(); h.after.set('createCancelDispatchPermission', () => { h.service.requestStop(); });
+    h.overrides.set('completeUnenteredCancelDispatch', truth === 'COMMITTED' ? commitLostClient() : rollbackLostClient());
+    requireBookkeeping(await h.service.cancel(h.input)); const original = h.cleanupInputs[0] as { owner: unknown; report: unknown };
+    await connectionA.liveOrder.update({ where: { intentId: h.order.intentId }, data: { revision: { increment: 1 } } });
+    const before = await durable(h.accountId, h.order.intentId), observed = writeObserver(); h.overrides.set('completeUnenteredCancelDispatch', observed.client);
+    expect((await h.service.drain()).kind).toBe('BOOKKEEPING_PENDING');
+    expect(observed.writes()).toBe(0); expect(await durable(h.accountId, h.order.intentId)).toEqual(before);
+    expect((h.cleanupInputs[1] as { owner: unknown }).owner).toBe(original.owner); expect(PracticalCancelDispatchOwner.cleanupRevisions(original.owner)).toEqual([4]); expect(h.calls()).toBe(0);
+  });
   it.each(['clock', 'base-url'].flatMap(source => ['CONFIRMED', 'COMMITTED', 'ROLLED_BACK'].map(truth => [source, truth] as const)))('malformed %s input %s atomically records ambiguity and retries only the identical receipt', async (source, truth) => {
     if (skip()) return;
     const h = await orchestrationFixture(source as 'clock' | 'base-url'), before = await orderRow(h.order.intentId);
@@ -828,7 +917,12 @@ describe('unwired orchestrator real-MySQL acceptance (synthetic provider fixture
     await connectionA.$executeRaw`UPDATE live_practical_account_fence SET mode = 'CERTIFYING', run_id = ' padded-run' WHERE account_id = ${h.accountId}`;
     expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'BLOCKED', code: 'MANUAL_REVIEW_REQUIRED' });
     expect(await orderRow(h.order.intentId)).toEqual(before); expect(h.calls()).toBe(0);
-    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'BLOCKED', code: 'PRACTICAL_PERSISTENCE_LATCHED' });
+    // Retain the original unresolved result instead of reacquiring just to probe the durable latch.
+    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'BLOCKED', code: 'MANUAL_REVIEW_REQUIRED' });
+    expect(h.methods.filter(method => method === 'acquireCancelLease')).toHaveLength(1);
+    h.service.requestStop();
+    expect(await h.service.drain()).toEqual({ kind: 'BLOCKED', code: 'MANUAL_REVIEW_REQUIRED' });
+    expect(await orderRow(h.order.intentId)).toEqual(before); expect(h.calls()).toBe(0);
   });
   it('retains the genuine original watch after durable consumption and preserves economic rows', async () => {
     if (skip()) return;
@@ -891,6 +985,9 @@ describe('unwired orchestrator real-MySQL acceptance (synthetic provider fixture
     expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'BLOCKED', code: 'PRACTICAL_MUTATION_DISPATCH_CONFLICT' });
     expect(h.calls()).toBe(0); expect(h.cleanupInputs).toEqual([]);
     expect((await practicalRows(h.accountId)).leases[0]?.status).toBe('LEASED'); expect((await orderRow(h.order.intentId)).cancelWireArmed).toBe(true);
+    h.service.requestStop();
+    expect(await h.service.drain()).toEqual({ kind: 'BLOCKED', code: 'PRACTICAL_MUTATION_DISPATCH_CONFLICT' });
+    expect(h.calls()).toBe(0); expect(h.cleanupInputs).toEqual([]);
   });
   it.each(['COMMITTED', 'ROLLED_BACK'] as const)('unknown completion %s retries only the identical bookkeeping receipt', async truth => {
     if (skip()) return;

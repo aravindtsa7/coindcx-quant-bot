@@ -15,6 +15,7 @@ import { PracticalRecoveryCertificate, consumePracticalRecoveryCertificate } fro
 import { PracticalRecoveryService } from '../../../../../src/execution/live/practical-recovery/service';
 import { PracticalCancelService } from '../../../../../src/execution/live/practical-cancel/service';
 import { PracticalCancelGatewayBoundary } from '../../../../../src/execution/live/practical-cancel/gateway-boundary';
+import { PracticalCancelLifecycle, createPracticalCancelLifecycle } from '../../../../../src/execution/live/practical-cancel/lifecycle';
 import type { PracticalCancelDependencies, PracticalCancelStore } from '../../../../../src/execution/live/practical-cancel/ports';
 import { PracticalMutationError } from '../../../../../src/execution/live/practical-mutation/ports';
 import {
@@ -404,6 +405,193 @@ async function harness(timeoutMs = 1000) {
     setStop: (kind: typeof acquisitionStop) => { acquisitionStop = kind; }, setMalformed: () => { malformedCleanup = true; }, setUnknown: () => { completionUnknown = true; } };
 }
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+describe('permanent local admission closure and bounded bookkeeping drain', () => {
+  it('before stop drain refuses without work; repeated stop permanently refuses admission', async () => {
+    const h = await harness();
+    expect(await h.service.drain()).toEqual({ kind: 'REFUSED', code: 'ADMISSION_NOT_CLOSED' });
+    expect(h.service.requestStop()).toEqual({ kind: 'ADMISSION_CLOSED' });
+    expect(h.service.requestStop()).toEqual({ kind: 'ADMISSION_CLOSED' });
+    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'REFUSED', code: 'ADMISSION_CLOSED' });
+    expect(await h.service.drain()).toEqual({ kind: 'LOCAL_DRAINED' });
+    expect(h.calls).toEqual([]); expect(h.cleanups).toEqual([]); expect(h.gateway.cancelOrder).not.toHaveBeenCalled();
+  });
+
+  it.each(['ACQUIRE', 'ARM', 'PERMISSION', 'CONSUMPTION'] as const)('stop while %s awaits retains the returned original owner and uses only eligible cleanup', async step => {
+    const h = await harness(), reached = deferred(), release = deferred();
+    h.hooks[step] = async () => { reached.resolve(); await release.promise; };
+    const operation = h.service.cancel(h.input); await reached.promise;
+    h.service.requestStop(); const drain = h.service.drain();
+    expect(await h.service.drain()).toEqual({ kind: 'REFUSED', code: 'DRAIN_IN_PROGRESS' });
+    release.resolve();
+    expect(await operation).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' });
+    expect(await drain).toEqual({ kind: 'LOCAL_DRAINED' });
+    expect(h.calls).toEqual(['ACQUIRE', 'ARM', 'PERMISSION', 'CONSUMPTION'].slice(0, ['ACQUIRE', 'ARM', 'PERMISSION', 'CONSUMPTION'].indexOf(step) + 1));
+    expect(h.cleanups.map(c => c.kind)).toEqual([step === 'ACQUIRE' ? 'ABANDON' : step === 'ARM' ? 'ARMED' : 'UNENTERED']);
+    expect(h.gateway.cancelOrder).not.toHaveBeenCalled();
+  });
+
+  it('reentrant stop inside final watch inspection precedes irreversible entry', async () => {
+    const h = await harness();
+    const health = h.stream.getHealthSnapshot.bind(h.stream); let armed = false;
+    h.hooks.CONSUMPTION = () => { armed = true; };
+    h.stream.getHealthSnapshot = () => { if (armed) { h.service.requestStop(); h.service.requestStop(); } return health(); };
+    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' });
+    expect(h.gateway.cancelOrder).not.toHaveBeenCalled(); expect(h.cleanups.map(c => c.kind)).toEqual(['UNENTERED']);
+    expect(await h.service.drain()).toEqual({ kind: 'LOCAL_DRAINED' });
+  });
+
+  it.each(['ACQUIRE', 'ARM', 'PERMISSION', 'CONSUMPTION'].flatMap(step => ['unprove', 'latch', 'replacement'].map(loss => [step, loss] as const)))('%s original-watch %s still cleans only its genuine owner and can drain locally', async (step, loss) => {
+    const h = await harness();
+    h.hooks[step as 'ACQUIRE' | 'ARM' | 'PERMISSION' | 'CONSUMPTION'] = async () => {
+      if (loss === 'unprove') h.stream.unprove();
+      if (loss === 'latch') h.stream.health = { ...h.stream.health, reconciliationRequired: true };
+      if (loss === 'replacement') {
+        h.stream.health = { ...h.stream.health, generationId: 2, subscriptionConfirmation: { source: 'PROVIDER', incarnation: 2, confirmedAtMs: h.clock.nowMs() } };
+        await h.recovery.startWatch(); // synthetic test evidence only; never replacement authority for this certificate
+      }
+    };
+    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' });
+    expect(h.gateway.cancelOrder).not.toHaveBeenCalled();
+    expect(h.cleanups.map(c => c.kind)).toEqual([step === 'ACQUIRE' ? 'ABANDON' : step === 'ARM' ? 'ARMED' : 'UNENTERED']);
+    h.service.requestStop(); expect(await h.service.drain()).toEqual({ kind: 'LOCAL_DRAINED' });
+    expect(h.calls.filter(c => c === 'ACQUIRE')).toHaveLength(1);
+  });
+
+  it('entry preceding stop finishes one invocation and outcome completion only', async () => {
+    const h = await harness(), entered = deferred(), response = deferred<unknown>();
+    h.gateway.cancelOrder.mockImplementation(async () => { entered.resolve(); return response.promise; });
+    const operation = h.service.cancel(h.input); await entered.promise;
+    h.service.requestStop(); const drain = h.service.drain(); response.resolve({ kind: 'CANCEL_ACCEPTED', observation: null });
+    expect(await operation).toMatchObject({ outcome: 'ACCEPTED' }); expect(await drain).toEqual({ kind: 'LOCAL_DRAINED' });
+    expect(h.gateway.cancelOrder).toHaveBeenCalledTimes(1); expect(h.cleanups.map(c => c.kind)).toEqual(['OUTCOME']);
+  });
+
+  it.each(['fulfill', 'reject'] as const)('timeout while original acquisition awaits preserves exclusivity until late %s', async late => {
+    const h = await harness(), reached = deferred(), release = deferred();
+    h.hooks.ACQUIRE = async () => { reached.resolve(); await release.promise; };
+    const operation = h.service.cancel(h.input); await reached.promise; h.service.requestStop();
+    vi.useFakeTimers();
+    try {
+      const drain = h.service.drain(); await vi.advanceTimersByTimeAsync(30_000);
+      expect(await drain).toEqual({ kind: 'IN_FLIGHT', phase: 'ACQUIRE' });
+      expect(await h.service.retryBookkeeping({ continuation: {} as never })).toMatchObject({ code: 'OPERATION_IN_PROGRESS' });
+      if (late === 'fulfill') release.resolve(); else release.reject(new Error('SYNTHETIC_ROLLBACK'));
+      const result = await operation;
+      expect(result.kind).toBe(late === 'fulfill' ? 'COMPLETED' : 'BLOCKED');
+      expect((await h.service.drain()).kind).toBe(late === 'fulfill' ? 'LOCAL_DRAINED' : 'BLOCKED');
+      expect(h.calls).toEqual(['ACQUIRE']); expect(h.gateway.cancelOrder).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('a drain-started retry remains exclusive after timeout and late completion resolves the exact receipt', async () => {
+    const h = await harness(); h.setUnknown(); const pending = await h.service.cancel(h.input);
+    if (pending.kind !== 'BOOKKEEPING_PENDING') throw new Error('EXPECTED_PENDING');
+    const reached = deferred(), release = deferred(); h.hooks.COMPLETION = async () => { reached.resolve(); await release.promise; };
+    h.service.requestStop(); vi.useFakeTimers();
+    try {
+      const drain = h.service.drain(); await reached.promise; await vi.advanceTimersByTimeAsync(30_000);
+      expect(await drain).toEqual({ kind: 'IN_FLIGHT', phase: 'COMPLETION' });
+      expect(await h.service.retryBookkeeping({ continuation: pending.continuation })).toMatchObject({ code: 'OPERATION_IN_PROGRESS' });
+      const observer = h.service.drain(); release.resolve(); expect(await observer).toEqual({ kind: 'LOCAL_DRAINED' });
+      expect(h.cleanups).toHaveLength(2); expect(h.cleanups[0]!.owner).toBe(h.cleanups[1]!.owner);
+      expect(h.gateway.cancelOrder).toHaveBeenCalledTimes(1); expect(h.calls.filter(c => c === 'CONSUMPTION')).toHaveLength(1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('one total budget includes waiting for cancel and the single subsequent bookkeeping retry', async () => {
+    const h = await harness(); h.setUnknown(); const firstReached = deferred(), firstRelease = deferred(), retryReached = deferred(), retryRelease = deferred();
+    let runs = 0; h.hooks.COMPLETION = async () => { if (++runs === 1) { firstReached.resolve(); await firstRelease.promise; } else { retryReached.resolve(); await retryRelease.promise; } };
+    const operation = h.service.cancel(h.input); await firstReached.promise; h.service.requestStop(); vi.useFakeTimers();
+    try {
+      const drain = h.service.drain(); let settled = false; void drain.then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(20_000); firstRelease.resolve(); expect((await operation).kind).toBe('BOOKKEEPING_PENDING'); await retryReached.promise;
+      await vi.advanceTimersByTimeAsync(9_999); expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1); expect(await drain).toEqual({ kind: 'IN_FLIGHT', phase: 'COMPLETION' });
+      retryRelease.resolve(); await Promise.resolve(); await Promise.resolve();
+      expect(await h.service.drain()).toEqual({ kind: 'LOCAL_DRAINED' }); expect(h.cleanups).toHaveLength(2);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('late retry rejection after the drain deadline keeps the exact genuine receipt and handles settlement', async () => {
+    const h = await harness(); h.setUnknown(); const pending = await h.service.cancel(h.input);
+    if (pending.kind !== 'BOOKKEEPING_PENDING') throw new Error('EXPECTED_PENDING');
+    const reached = deferred(), release = deferred();
+    h.hooks.COMPLETION = async () => {
+      reached.resolve();
+      try { await release.promise; }
+      catch (error) {
+        // Synthetic proven rollback of bookkeeping, not restored dispatch authority.
+        transitionPracticalCancelDispatchOwner(h.cleanups.at(-1)!.owner, 'COMPLETING', 'COMMIT_UNKNOWN');
+        throw error;
+      }
+    };
+    h.service.requestStop(); vi.useFakeTimers();
+    try {
+      const drain = h.service.drain(); await reached.promise; await vi.advanceTimersByTimeAsync(30_000);
+      expect(await drain).toEqual({ kind: 'IN_FLIGHT', phase: 'COMPLETION' });
+      expect(await h.service.retryBookkeeping({ continuation: pending.continuation })).toMatchObject({ code: 'OPERATION_IN_PROGRESS' });
+      const observer = h.service.drain(); release.reject(new Error('SYNTHETIC_BOOKKEEPING_ROLLBACK'));
+      expect(await observer).toEqual({ kind: 'BOOKKEEPING_PENDING', phase: 'COMPLETION' });
+      expect(h.cleanups).toHaveLength(2); delete h.hooks.COMPLETION;
+      expect(await h.service.retryBookkeeping({ continuation: pending.continuation })).toMatchObject({ kind: 'COMPLETED', outcome: 'ACCEPTED' });
+      expect(await h.service.drain()).toEqual({ kind: 'LOCAL_DRAINED' });
+      expect(new Set(h.cleanups.map(c => c.owner)).size).toBe(1);
+      expect(h.calls.filter(c => c === 'ACQUIRE')).toHaveLength(1); expect(h.calls.filter(c => c === 'CONSUMPTION')).toHaveLength(1);
+      expect(h.gateway.cancelOrder).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(['manual-first', 'drain-first'] as const)('%s bookkeeping/drain ordering never overlaps retries', async order => {
+    const h = await harness(); h.setUnknown(); const pending = await h.service.cancel(h.input);
+    if (pending.kind !== 'BOOKKEEPING_PENDING') throw new Error('EXPECTED_PENDING');
+    const reached = deferred(), release = deferred(); h.hooks.COMPLETION = async () => { reached.resolve(); await release.promise; };
+    h.service.requestStop();
+    const first = order === 'manual-first' ? h.service.retryBookkeeping({ continuation: pending.continuation }) : h.service.drain(); await reached.promise;
+    const drain = order === 'manual-first' ? h.service.drain() : null;
+    expect(await h.service.retryBookkeeping({ continuation: pending.continuation })).toMatchObject({ code: 'OPERATION_IN_PROGRESS' });
+    expect(await h.service.drain()).toEqual({ kind: 'REFUSED', code: 'DRAIN_IN_PROGRESS' });
+    release.resolve(); await first; if (drain !== null) expect(await drain).toEqual({ kind: 'LOCAL_DRAINED' });
+    expect(await h.service.drain()).toEqual({ kind: 'LOCAL_DRAINED' }); expect(h.cleanups).toHaveLength(2); expect(h.gateway.cancelOrder).toHaveBeenCalledTimes(1);
+  });
+
+  it('a drain retries at most once and a later identical success clears retained uncertainty', async () => {
+    const h = await harness(); h.setUnknown(); const pending = await h.service.cancel(h.input); expect(pending.kind).toBe('BOOKKEEPING_PENDING');
+    h.service.requestStop(); h.setUnknown();
+    expect(await h.service.drain()).toEqual({ kind: 'BOOKKEEPING_PENDING', phase: 'COMPLETION' });
+    expect(h.cleanups).toHaveLength(2); expect(await h.service.drain()).toEqual({ kind: 'LOCAL_DRAINED' });
+    expect(h.cleanups).toHaveLength(3); expect(new Set(h.cleanups.map(c => c.owner)).size).toBe(1); expect(h.gateway.cancelOrder).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['acquire-malformed', 'cleanup-malformed', 'ownerless-operational'] as const)('%s cannot become false local drainage or be erased by invalid requests', async fault => {
+    const h = await harness();
+    if (fault === 'acquire-malformed') h.setStop('MALFORMED_LATCHED');
+    if (fault === 'cleanup-malformed') h.setMalformed();
+    if (fault === 'ownerless-operational') h.dependencies.store.acquireCancelLease = async () => { throw new Error('SYNTHETIC_UNRESOLVED'); };
+    expect((await h.service.cancel(h.input)).kind).toBe('BLOCKED');
+    expect((await h.service.cancel({} as never)).kind).toBe('BLOCKED'); h.service.requestStop();
+    expect((await h.service.retryBookkeeping({ continuation: {} as never })).kind).toBe('REFUSED');
+    h.service.requestStop(); expect((await h.service.drain()).kind).toBe('BLOCKED');
+  });
+
+  it('missing/forged/cloned/foreign associations cannot construct a boundary or be minted for a fake service', async () => {
+    const h = await harness(), other = await harness();
+    for (const value of [undefined, {}, Object.create(PracticalCancelLifecycle.prototype), { ...h.service }, other.service]) {
+      expect(() => new PracticalCancelGatewayBoundary(h.dependencies, value, h.service)).toThrow('CANCEL_LIFECYCLE_ASSOCIATION_REFUSED');
+    }
+    expect(() => createPracticalCancelLifecycle({}, h.dependencies)).toThrow();
+    expect(() => createPracticalCancelLifecycle(Object.create(PracticalCancelService.prototype), h.dependencies)).toThrow();
+    expect(() => createPracticalCancelLifecycle(h.service, h.dependencies)).toThrow();
+    expect(await h.service.cancel(h.input)).toMatchObject({ outcome: 'ACCEPTED' }); expect(h.gateway.cancelOrder).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('genuine original-watch continuation', () => {
   it.each(['assignment', 'reflect', 'define', 'delete'] as const)('%s cannot replace watch refusal after confirmed consumption or enter a gateway', async operation => {
     const h = await harness();
@@ -736,7 +924,10 @@ describe('trusted cancel lookup replacement through actual CommonJS loaders', ()
         if(operation==='assignment')assert.throws(()=>{object[key]=value},TypeError);
         if(operation==='reflect')assert.equal(Reflect.set(object,key,value),false);
         if(operation==='define')assert.throws(()=>Object.defineProperty(object,key,{value}),TypeError);
-        if(operation==='delete')assert.throws(()=>{delete object[key]},TypeError);
+        if(operation==='delete'){
+          if(Object.hasOwn(object,key))assert.throws(()=>{delete object[key]},TypeError);
+          else assert.equal(delete object[key],true); // inherited lookup is unchanged
+        }
         assert.equal(object[key],original);
       };
       const attack=h=>{
@@ -760,10 +951,7 @@ describe('trusted cancel lookup replacement through actual CommonJS loaders', ()
           mutate(serviceNamespace.PracticalCancelService.prototype,'retryBookkeeping',redirect);
         }
         if(h){
-          const boundary=new Boundary(h.dependencies);
-          assert.equal(Reflect.set(boundary,'invoke',redirect),false);
-          assert.throws(()=>Object.defineProperty(boundary,'invoke',{value:redirect}),TypeError);
-          assert.equal(boundary.invoke,invoke);
+          assert.throws(()=>new Boundary(h.dependencies,{},h.service));
           assert.equal(Reflect.set(h.service,'cancel',redirect),false);
           assert.equal(Reflect.set(h.service,'retryBookkeeping',redirect),false);
         }
@@ -814,4 +1002,70 @@ describe('trusted cancel lookup replacement through actual CommonJS loaders', ()
     `, format === 'tsc' ? compiledRoot : path.resolve('src'), format === 'tsc' ? fixtureFile : tsxFixtureFile, timing, operation, format === 'tsc' ? 'js' : 'ts'], { cwd: process.cwd(), encoding: 'utf8', timeout: 60_000, windowsHide: true });
     expect(output.trim()).toBe('COMMONJS_FINAL_DISPATCH_CHAIN_PINNED');
   }, 70_000);
+
+  it.each(['tsc', 'tsx'].flatMap(format => ['before', 'after'].flatMap(timing => ['assignment', 'reflect', 'define', 'delete'].map(operation => [format, timing, operation] as const))))('%s %s import: %s cannot reopen lifecycle or bypass stopped final entry', (format, timing, operation) => {
+    const output = execFileSync(process.execPath, [...(format === 'tsx' ? ['--require', 'tsx/cjs'] : []), '-e', String.raw`
+      'use strict'; const assert=require('assert/strict'),path=require('path');
+      const [root,fixturePath,timing,operation,extension]=process.argv.slice(1);
+      const file=p=>path.join(root,'execution/live/practical-cancel',p+'.'+extension);
+      const lifecycle=require(file('lifecycle')),Class=lifecycle.PracticalCancelLifecycle;
+      const {makeFixture}=require(fixturePath); let serviceNamespace=null;
+      const mutate=(object,key,value)=>{
+        const original=object[key];
+        if(operation==='assignment')assert.throws(()=>{object[key]=value},TypeError);
+        if(operation==='reflect')assert.equal(Reflect.set(object,key,value),false);
+        if(operation==='define')assert.throws(()=>Object.defineProperty(object,key,{value}),TypeError);
+        if(operation==='delete'){
+          if(Object.hasOwn(object,key))assert.throws(()=>{delete object[key]},TypeError);
+          else assert.equal(delete object[key],true); // inherited lookup is unchanged
+        }
+        assert.equal(object[key],original);
+      };
+      const attack=h=>{
+        for(const key of Object.keys(lifecycle))mutate(lifecycle,key,()=>({kind:'UNCHANGED'}));
+        for(const key of ['matches','open','close'])mutate(Class,key,()=>true);
+        mutate(Class.prototype,'toJSON',()=>({}));
+        if(serviceNamespace){for(const key of ['requestStop','drain'])mutate(serviceNamespace.PracticalCancelService.prototype,key,()=>({kind:'LOCAL_DRAINED'}));}
+        if(h){for(const key of ['requestStop','drain'])mutate(h.service,key,()=>({kind:'LOCAL_DRAINED'}));}
+      };
+      if(timing==='after')serviceNamespace=require(file('service')); attack(null);
+      (async()=>{
+        const h=await makeFixture(); serviceNamespace=require(file('service')); attack(h);
+        assert.equal(h.service.requestStop().kind,'ADMISSION_CLOSED');attack(h);
+        assert.equal((await h.service.cancel(h.input)).code,'ADMISSION_CLOSED'); assert.equal(h.calls.length,0);assert.equal(h.gateway.cancelOrder.mock.calls.length,0);
+        assert.equal((await h.service.drain()).kind,'LOCAL_DRAINED');
+        const loss=await makeFixture();loss.hooks.CONSUMPTION=()=>{loss.service.requestStop();attack(loss)};
+        assert.equal((await loss.service.cancel(loss.input)).outcome,'PRE_DISPATCH_FAILURE');assert.equal(loss.gateway.cancelOrder.mock.calls.length,0);
+        assert.equal(loss.cleanups.length,1);assert.equal(loss.cleanups[0].kind,'UNENTERED');assert.equal((await loss.service.drain()).kind,'LOCAL_DRAINED');
+        const pending=await makeFixture();pending.setUnknown();const result=await pending.service.cancel(pending.input);assert.equal(result.kind,'BOOKKEEPING_PENDING');
+        pending.service.requestStop();attack(pending);assert.equal((await pending.service.drain()).kind,'LOCAL_DRAINED');
+        assert.equal(pending.cleanups[0].owner,pending.cleanups[1].owner);assert.equal(pending.gateway.cancelOrder.mock.calls.length,1);
+        assert.equal(pending.calls.filter(c=>c==='ACQUIRE').length,1);assert.equal(pending.calls.filter(c=>c==='CONSUMPTION').length,1);
+        const valid=await makeFixture();attack(valid);assert.equal((await valid.service.cancel(valid.input)).outcome,'ACCEPTED');assert.equal(valid.gateway.cancelOrder.mock.calls.length,1);
+        console.log('LOCAL_LIFECYCLE_BEHAVIOR_PINNED');
+      })().catch(()=>{console.error('LOCAL_LIFECYCLE_BEHAVIOR_FAILED');process.exitCode=1});
+    `, format === 'tsc' ? compiledRoot : path.resolve('src'), format === 'tsc' ? fixtureFile : tsxFixtureFile, timing, operation, format === 'tsc' ? 'js' : 'ts'], { cwd: process.cwd(), encoding: 'utf8', timeout: 60_000, windowsHide: true });
+    expect(output.trim()).toBe('LOCAL_LIFECYCLE_BEHAVIOR_PINNED');
+  }, 70_000);
+
+  it.each(['tsc', 'tsx'] as const)('%s native lifecycle associations reject genuine foreign owners/dependencies and cloned values', format => {
+    // Privileged internal brand fixture, isolated from production service import.
+    // It exercises association identity; gateway effects above use real services/recovery.
+    const output = execFileSync(process.execPath, [...(format === 'tsx' ? ['--require', 'tsx/cjs'] : []), '-e', String.raw`
+      'use strict';const assert=require('assert/strict'),path=require('path');const [root,extension]=process.argv.slice(1);
+      const m=require(path.join(root,'execution/live/practical-cancel/lifecycle.'+extension));
+      class NativeOwner{#brand=true;static genuine(v){return typeof v==='object'&&v!==null&&#brand in v}}
+      m.installPracticalCancelLifecycleBrand(v=>NativeOwner.genuine(v));
+      const a=new NativeOwner,b=new NativeOwner,da=Object.freeze({}),db=Object.freeze({});
+      const one=m.createPracticalCancelLifecycle(a,da),two=m.createPracticalCancelLifecycle(b,db),C=m.PracticalCancelLifecycle;
+      assert.equal(C.open(one,a,da),true);assert.equal(C.open(two,b,db),true);
+      for(const [v,owner,deps] of [[one,b,da],[one,a,db],[two,a,da],[{...one},a,da],[Object.create(C.prototype),a,da],[null,a,da]]){
+        assert.equal(C.open(v,owner,deps),false);assert.throws(()=>C.close(v,owner,deps));
+      }
+      assert.equal(C.open(one,a,da),true);C.close(one,a,da);C.close(one,a,da);assert.equal(C.open(one,a,da),false);assert.equal(C.open(two,b,db),true);
+      assert.throws(()=>JSON.stringify(one));assert.throws(()=>m.createPracticalCancelLifecycle(a,da));assert.throws(()=>m.createPracticalCancelLifecycle({},da));
+      console.log('NATIVE_LIFECYCLE_BINDINGS_PINNED');
+    `, format === 'tsc' ? compiledRoot : path.resolve('src'), format === 'tsc' ? 'js' : 'ts'], { cwd: process.cwd(), encoding: 'utf8', timeout: 30_000, windowsHide: true });
+    expect(output.trim()).toBe('NATIVE_LIFECYCLE_BINDINGS_PINNED');
+  });
 });

@@ -9,7 +9,8 @@ import {
   readPracticalUnknownAcquireReceipt,
 } from '../practical-mutation/ticket';
 import { checkPracticalCancelGuard, PracticalCancelGatewayBoundary } from './gateway-boundary';
-import type { PracticalCancelCode, PracticalCancelDependencies, PracticalCancelInput, PracticalCancelPhase, PracticalCancelResult, PracticalCancelTime } from './ports';
+import type { PracticalCancelCode, PracticalCancelDependencies, PracticalCancelDrainResult, PracticalCancelInput, PracticalCancelPhase, PracticalCancelResult, PracticalCancelTime } from './ports';
+import { createPracticalCancelLifecycle, installPracticalCancelLifecycleBrand, PracticalCancelLifecycle } from './lifecycle';
 
 type Job =
   | { readonly kind: 'ACQUIRE'; readonly owner: unknown }
@@ -80,16 +81,28 @@ export class PracticalCancelService {
   readonly #boundary: PracticalCancelGatewayBoundary;
   #running = false;
   #pending: PracticalCancelBookkeeping | null = null;
+  readonly #lifecycle: PracticalCancelLifecycle;
+  #draining = false;
+  #phase: PracticalCancelPhase = 'PREFLIGHT';
+  #operationKind: 'CANCEL' | 'BOOKKEEPING' | null = null;
+  #done: Promise<void> = Promise.resolve();
+  #signalDone: (() => void) | null = null;
+  #unresolved: { readonly phase: PracticalCancelPhase; readonly code: PracticalCancelCode } | null = null;
+
+  static { installPracticalCancelLifecycleBrand(value => typeof value === 'object' && value !== null && #running in value); }
 
   public constructor(dependencies: PracticalCancelDependencies) {
     this.#dependencies = Object.freeze({ ...dependencies });
-    this.#boundary = new PracticalCancelGatewayBoundary(this.#dependencies);
+    this.#lifecycle = createPracticalCancelLifecycle(this, this.#dependencies);
+    this.#boundary = new PracticalCancelGatewayBoundary(this.#dependencies, this.#lifecycle, this);
     Object.freeze(this);
   }
 
   public async cancel(input: PracticalCancelInput): Promise<PracticalCancelResult> {
+    if (!this.#admissionOpen()) return Object.freeze({ kind: 'REFUSED', phase: 'PREFLIGHT', code: 'ADMISSION_CLOSED' });
     if (this.#running || this.#pending !== null) return Object.freeze({ kind: 'REFUSED', phase: 'PREFLIGHT', code: 'OPERATION_IN_PROGRESS' });
-    this.#running = true; // reservation precedes every await and caller getter
+    if (this.#unresolved !== null) return blocked(this.#unresolved.phase, this.#unresolved.code);
+    this.#beginOperation('CANCEL'); // reservation precedes every await and caller getter
     let phase: PracticalCancelPhase = 'PREFLIGHT';
     let job: Job | null = null;
     const time: PracticalCancelTime = { lastNowMs: 0 };
@@ -97,45 +110,45 @@ export class PracticalCancelService {
       const data = fields(input, ['intentId', 'expected', 'certificate']);
       if (data === null || typeof data['intentId'] !== 'string' || !/^[0-9a-f]{64}$/.test(data['intentId'])) return Object.freeze({ kind: 'REFUSED', phase, code: 'INVALID_INPUT' });
       const certificate = data['certificate'];
-      const first = checkPracticalCancelGuard(this.#dependencies, certificate, time);
+      const first = this.#guard(certificate, time);
       if (first.kind === 'REFUSED') return Object.freeze({ kind: 'REFUSED', phase, code: first.code });
       const record = PracticalRecoveryCertificate.read(certificate)!;
-      let guard = checkPracticalCancelGuard(this.#dependencies, certificate, time);
+      let guard = this.#guard(certificate, time);
       if (guard.kind === 'REFUSED') return Object.freeze({ kind: 'REFUSED', phase, code: guard.code });
-      phase = 'ACQUIRE';
+      this.#phase = phase = 'ACQUIRE';
       const acquisition = await this.#dependencies.store.acquireCancelLease({ accountId: record.accountId, expected: data['expected'] as PracticalCancelInput['expected'],
         certificate, enablement: this.#dependencies.enablement, runtimeIdentity: this.#dependencies.runtimeIdentity,
         intentId: data['intentId'], trustedNowMs: guard.nowMs });
       switch (acquisition.kind) {
         case 'CERTIFICATE_TERMINATED': return Object.freeze({ kind: 'ACQUISITION_STOPPED', reason: 'CERTIFICATE_TERMINATED' });
         case 'AUTHORITY_INVALIDATED': return Object.freeze({ kind: 'ACQUISITION_STOPPED', reason: 'AUTHORITY_INVALIDATED' });
-        case 'MALFORMED_LATCHED': return blocked(phase, 'MANUAL_REVIEW_REQUIRED');
+        case 'MALFORMED_LATCHED': return this.#blocked(phase, 'MANUAL_REVIEW_REQUIRED');
         case 'ACQUIRED': job = { kind: 'ABANDON', owner: acquisition.acquired }; break;
-        default: return blocked(phase, 'OPERATIONAL_FAILURE');
+        default: return this.#blocked(phase, 'OPERATIONAL_FAILURE');
       }
-      guard = checkPracticalCancelGuard(this.#dependencies, certificate, time);
+      guard = this.#guard(certificate, time);
       if (guard.kind === 'REFUSED') return await this.#cleanup(job);
-      phase = 'ARM';
+      this.#phase = phase = 'ARM';
       const armed = await this.#dependencies.store.armCancelLease({ acquired: acquisition.acquired, enablement: this.#dependencies.enablement,
         runtimeIdentity: this.#dependencies.runtimeIdentity, trustedNowMs: guard.nowMs });
       job = { kind: 'ARMED', owner: armed.ticket, report: reportFor('OPERATIONAL_FAILURE') };
-      guard = checkPracticalCancelGuard(this.#dependencies, certificate, time);
+      guard = this.#guard(certificate, time);
       if (guard.kind === 'REFUSED') return await this.#cleanup({ ...job, report: reportFor(guard.code) });
-      phase = 'PERMISSION';
+      this.#phase = phase = 'PERMISSION';
       const permitted = await this.#dependencies.store.createCancelDispatchPermission({ armed: armed.ticket, enablement: this.#dependencies.enablement,
         runtimeIdentity: this.#dependencies.runtimeIdentity, trustedNowMs: guard.nowMs });
       job = { kind: 'UNENTERED', owner: permitted.permission, report: reportFor('OPERATIONAL_FAILURE') };
-      guard = checkPracticalCancelGuard(this.#dependencies, certificate, time);
+      guard = this.#guard(certificate, time);
       if (guard.kind === 'REFUSED') return await this.#cleanup({ ...job, report: reportFor(guard.code) });
-      phase = 'CONSUMPTION';
+      this.#phase = phase = 'CONSUMPTION';
       const consumed = await this.#dependencies.store.consumeCancelDispatchPermission({ permission: permitted.permission, enablement: this.#dependencies.enablement,
         runtimeIdentity: this.#dependencies.runtimeIdentity, trustedNowMs: guard.nowMs });
       job = { kind: 'UNENTERED', owner: consumed.attempt, report: reportFor('OPERATIONAL_FAILURE') };
-      phase = 'FINAL_GUARD';
+      this.#phase = phase = 'FINAL_GUARD';
       const result = await this.#boundary.invoke(consumed.attempt, certificate, time);
       if (result.kind === 'NOT_ENTERED') return await this.#cleanup({ ...job, report: reportFor(result.code) });
       job = { kind: 'OUTCOME', owner: result.outcome };
-      phase = 'COMPLETION';
+      this.#phase = phase = 'COMPLETION';
       return await this.#cleanup(job);
     } catch (error) {
       // Read genuine unknown-acquire provenance BEFORE any wrapping/sanitization.
@@ -145,13 +158,18 @@ export class PracticalCancelService {
         if (job.kind === 'ARMED' && PracticalArmedCancel.status(job.owner) === 'PERMIT_CREATION_UNKNOWN') job = { kind: 'UNENTERED', owner: job.owner, report: job.report, creationUnknown: true };
         return await this.#cleanup(job);
       }
-      return blocked(phase, codeOf(error));
-    } finally { this.#running = false; }
+      return this.#blocked(phase, codeOf(error));
+    } finally { this.#endOperation(); }
   }
 
   public async retryBookkeeping(input: { readonly continuation: PracticalCancelBookkeeping }): Promise<PracticalCancelResult> {
+    if (this.#draining) return Object.freeze({ kind: 'REFUSED', phase: 'CLEANUP', code: 'OPERATION_IN_PROGRESS' });
+    return this.#retryBookkeeping(input);
+  }
+
+  async #retryBookkeeping(input: { readonly continuation: PracticalCancelBookkeeping }): Promise<PracticalCancelResult> {
     if (this.#running) return Object.freeze({ kind: 'REFUSED', phase: 'CLEANUP', code: 'OPERATION_IN_PROGRESS' });
-    this.#running = true;
+    this.#beginOperation('BOOKKEEPING');
     let continuation: PracticalCancelBookkeeping | null = null;
     let job: Job | null = null;
     try {
@@ -161,14 +179,16 @@ export class PracticalCancelService {
       if (job === null) return Object.freeze({ kind: 'REFUSED', phase: 'CLEANUP', code: 'INVALID_INPUT' });
       continuation = data['continuation'] as PracticalCancelBookkeeping;
       if (job.kind === 'ACQUIRE') {
+        this.#phase = 'ACQUIRE';
         const resolution = await this.#dependencies.store.resolveUnknownAcquire({ unknown: job.owner, runtimeIdentity: this.#dependencies.runtimeIdentity, trustedNowMs: this.#cleanupNow() });
         if (resolution.kind === 'NOT_COMMITTED') {
           PracticalCancelBookkeeping.finish(BOOKKEEPING_ISSUER, continuation, null);
           continuation = null;
           this.#pending = null;
+          this.#unresolved = null;
           return Object.freeze({ kind: 'NOT_COMMITTED', certificateStatus: resolution.certificateStatus });
         }
-        if (resolution.kind !== 'RESTORED') return blocked('ACQUIRE', 'OPERATIONAL_FAILURE');
+        if (resolution.kind !== 'RESTORED') return this.#blocked('ACQUIRE', 'OPERATIONAL_FAILURE');
         job = { kind: 'ABANDON', owner: resolution.acquired };
       }
       const result = await this.#execute(job);
@@ -177,11 +197,67 @@ export class PracticalCancelService {
       if (result.kind === 'COMPLETED') this.#pending = null;
       return result;
     } catch (error) {
-      return blocked(job?.kind === 'OUTCOME' ? 'COMPLETION' : job?.kind === 'ACQUIRE' ? 'ACQUIRE' : 'CLEANUP', codeOf(error));
+      return this.#blocked(job?.kind === 'OUTCOME' ? 'COMPLETION' : job?.kind === 'ACQUIRE' ? 'ACQUIRE' : 'CLEANUP', codeOf(error));
     } finally {
-      if (continuation !== null && job !== null) PracticalCancelBookkeeping.finish(BOOKKEEPING_ISSUER, continuation, job);
-      this.#running = false;
+      try { if (continuation !== null && job !== null) PracticalCancelBookkeeping.finish(BOOKKEEPING_ISSUER, continuation, job); }
+      finally { this.#endOperation(); }
     }
+  }
+
+  public requestStop(): { readonly kind: 'ADMISSION_CLOSED' } {
+    PracticalCancelLifecycle.close(this.#lifecycle, this, this.#dependencies);
+    return Object.freeze({ kind: 'ADMISSION_CLOSED' });
+  }
+
+  public async drain(): Promise<PracticalCancelDrainResult> {
+    if (this.#admissionOpen()) return Object.freeze({ kind: 'REFUSED', code: 'ADMISSION_NOT_CLOSED' });
+    if (this.#draining) return Object.freeze({ kind: 'REFUSED', code: 'DRAIN_IN_PROGRESS' });
+    this.#draining = true;
+    let expired = false;
+    let timer!: ReturnType<typeof setTimeout>;
+    const deadline = new Promise<void>(resolve => { timer = setTimeout(() => { expired = true; resolve(); }, 30_000); });
+    try {
+      const observingBookkeeping = this.#operationKind === 'BOOKKEEPING';
+      if (this.#running) await Promise.race([this.#done, deadline]);
+      if (expired || this.#running || observingBookkeeping) return this.#drainState();
+      const pending = this.#pending;
+      if (pending !== null) {
+        // One exact retry only. Its reservation survives this drain's scheduling timeout.
+        const work = this.#retryBookkeeping({ continuation: pending });
+        await Promise.race([work.then(() => undefined, () => { this.#blocked(this.#phase, 'OPERATIONAL_FAILURE'); }), deadline]);
+      }
+      return this.#drainState();
+    } finally { clearTimeout(timer); this.#draining = false; }
+  }
+
+  #admissionOpen(): boolean { return PracticalCancelLifecycle.open(this.#lifecycle, this, this.#dependencies); }
+  #guard(certificate: unknown, time: PracticalCancelTime) {
+    if (!this.#admissionOpen()) return Object.freeze({ kind: 'REFUSED' as const, code: 'ADMISSION_CLOSED' as const });
+    const result = checkPracticalCancelGuard(this.#dependencies, certificate, time);
+    return this.#admissionOpen() ? result : Object.freeze({ kind: 'REFUSED' as const, code: 'ADMISSION_CLOSED' as const });
+  }
+  #beginOperation(kind: 'CANCEL' | 'BOOKKEEPING'): void {
+    this.#running = true;
+    this.#phase = kind === 'CANCEL' ? 'PREFLIGHT' : 'CLEANUP';
+    this.#operationKind = kind;
+    this.#done = new Promise(resolve => { this.#signalDone = resolve; });
+  }
+  #endOperation(): void {
+    this.#running = false;
+    this.#operationKind = null;
+    const resolve = this.#signalDone;
+    this.#signalDone = null;
+    resolve?.();
+  }
+  #blocked(phase: PracticalCancelPhase, code: PracticalCancelCode): PracticalCancelResult {
+    this.#unresolved = Object.freeze({ phase, code });
+    return blocked(phase, code);
+  }
+  #drainState(): PracticalCancelDrainResult {
+    if (this.#running) return Object.freeze({ kind: 'IN_FLIGHT', phase: this.#phase });
+    if (this.#pending !== null) return Object.freeze({ kind: 'BOOKKEEPING_PENDING', phase: this.#phase === 'ACQUIRE' ? 'ACQUIRE' : this.#phase === 'COMPLETION' ? 'COMPLETION' : 'CLEANUP' });
+    if (this.#unresolved !== null) return Object.freeze({ kind: 'BLOCKED', code: this.#unresolved.code });
+    return Object.freeze({ kind: 'LOCAL_DRAINED' });
   }
 
   #cleanupNow(): number {
@@ -198,6 +274,7 @@ export class PracticalCancelService {
     return job.kind === 'OUTCOME' && ['READY', 'COMMIT_UNKNOWN'].includes(PracticalCancelDispatchOwner.status(job.owner) ?? '');
   }
   async #execute(job: Job): Promise<PracticalCancelResult> {
+    this.#phase = job.kind === 'OUTCOME' ? 'COMPLETION' : job.kind === 'ACQUIRE' ? 'ACQUIRE' : 'CLEANUP';
     const nowMs = this.#cleanupNow();
     const store = this.#dependencies.store;
     const result = job.kind === 'OUTCOME' ? await store.completeCancelLease({ outcome: job.owner, trustedNowMs: nowMs })
@@ -205,8 +282,11 @@ export class PracticalCancelService {
       : job.kind === 'ARMED' ? await store.completeUndispatchedCancel({ armed: job.owner, report: job.report, trustedNowMs: nowMs })
       : job.kind === 'UNENTERED' ? await store.completeUnenteredCancelDispatch({ owner: job.owner, report: job.report, trustedNowMs: nowMs })
       : null;
-    if (result?.kind === 'COMPLETED' || result?.kind === 'ALREADY_COMPLETED') return Object.freeze({ kind: 'COMPLETED', outcome: result.outcome, disposition: result.kind });
-    return blocked(job.kind === 'OUTCOME' ? 'COMPLETION' : 'CLEANUP', result?.kind === 'MALFORMED_LATCHED' ? 'MANUAL_REVIEW_REQUIRED' : 'OPERATIONAL_FAILURE');
+    if (result?.kind === 'COMPLETED' || result?.kind === 'ALREADY_COMPLETED') {
+      this.#unresolved = null;
+      return Object.freeze({ kind: 'COMPLETED', outcome: result.outcome, disposition: result.kind });
+    }
+    return this.#blocked(job.kind === 'OUTCOME' ? 'COMPLETION' : 'CLEANUP', result?.kind === 'MALFORMED_LATCHED' ? 'MANUAL_REVIEW_REQUIRED' : 'OPERATIONAL_FAILURE');
   }
   #pendingResult(job: Job, code: PracticalCancelCode): PracticalCancelResult {
     const continuation = new PracticalCancelBookkeeping(BOOKKEEPING_ISSUER, this, job);
@@ -219,7 +299,7 @@ export class PracticalCancelService {
       return result;
     } catch (error) {
       if (this.#cleanupEligible(job)) return this.#pendingResult(job, codeOf(error));
-      return blocked(job.kind === 'OUTCOME' ? 'COMPLETION' : 'CLEANUP', codeOf(error));
+      return this.#blocked(job.kind === 'OUTCOME' ? 'COMPLETION' : 'CLEANUP', codeOf(error));
     }
   }
 }

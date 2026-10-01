@@ -87,5 +87,8 @@ describe('unwired practical cancel transport provenance', () => {
     expect(finish.indexOf('settled = true')).toBeLessThan(finish.indexOf('projectResult'));
     expect(finish).toContain("const noWire = issuePracticalCancelTransportNoWire(attempt);\n          resolve(issuePracticalCancelOutcome(attempt, { kind: 'PRE_DISPATCH_FAILURE', noWire }))");
     expect(boundary).not.toMatch(/completeUnenteredCancelDispatch|issueCancelTransportNoWrite/);
+    const entry = boundary.indexOf('enterPracticalCancelGateway(attempt);');
+    expect(boundary.lastIndexOf('PracticalCancelLifecycle.open', entry)).toBeGreaterThan(boundary.indexOf('const guard = checkPracticalCancelGuard', boundary.indexOf('public async invoke')));
+    expect(boundary.slice(entry, boundary.indexOf('invokeCancelTransport(context)', entry))).not.toMatch(/\bawait\b|drain\(|requestStop\(|setTimeout/);
   });
 });

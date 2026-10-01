@@ -11,6 +11,7 @@ import {
 import { PracticalRecoveryService } from '../practical-recovery/service';
 import { readLiveRuntimeEpoch } from '../reconciliation/barrier';
 import type { PracticalCancelDependencies, PracticalCancelLocalRefusal, PracticalCancelTime } from './ports';
+import { PracticalCancelLifecycle } from './lifecycle';
 import { hasCancelTransportSource, reserveCancelTransportInvocation, invokeCancelTransport, settleCancelTransportInvocation, closeCancelTransportInvocation,
   type CancelTransportInvocation } from '../practical-cancel-transport-evidence';
 
@@ -105,8 +106,15 @@ export type PracticalCancelGatewayResult =
 export class PracticalCancelGatewayBoundary {
   readonly #dependencies: PracticalCancelDependencies;
   readonly #invoke: ((request: LiveCancelOrderRequest) => Promise<unknown>) | null;
+  readonly #lifecycle: PracticalCancelLifecycle;
+  readonly #owner: object;
+  readonly #associationDependencies: PracticalCancelDependencies;
 
-  public constructor(dependencies: PracticalCancelDependencies) {
+  public constructor(dependencies: PracticalCancelDependencies, lifecycle: unknown, owner: object) {
+    if (!PracticalCancelLifecycle.matches(lifecycle, owner, dependencies)) throw new Error('CANCEL_LIFECYCLE_ASSOCIATION_REFUSED');
+    this.#lifecycle = lifecycle;
+    this.#owner = owner;
+    this.#associationDependencies = dependencies;
     if (!Number.isSafeInteger(dependencies.requestTimeoutMs) || dependencies.requestTimeoutMs < 1 || dependencies.requestTimeoutMs > 120_000) throw new Error('INVALID_CANCEL_TIMEOUT');
     this.#dependencies = Object.freeze({ ...dependencies });
     this.#invoke = hasCancelTransportSource(dependencies.gateway) ? null : dependencies.gateway.cancelOrder.bind(dependencies.gateway);
@@ -137,6 +145,11 @@ export class PracticalCancelGatewayBoundary {
     if (guard.kind === 'REFUSED') { if (context !== null) closeCancelTransportInvocation(context); return Object.freeze({ kind: 'NOT_ENTERED', code: guard.code }); }
     if (guard.nowMs < owner.armed.armedAtMs) { if (context !== null) closeCancelTransportInvocation(context); return Object.freeze({ kind: 'NOT_ENTERED', code: 'CLOCK_ANOMALY' }); }
     let invocation: Promise<unknown>;
+    // Last synchronous observation AFTER watch inspection; no callback or await before entry.
+    if (!PracticalCancelLifecycle.open(this.#lifecycle, this.#owner, this.#associationDependencies)) {
+      if (context !== null) closeCancelTransportInvocation(context);
+      return Object.freeze({ kind: 'NOT_ENTERED', code: 'ADMISSION_CLOSED' });
+    }
     try {
       enterPracticalCancelGateway(attempt);
     } catch {

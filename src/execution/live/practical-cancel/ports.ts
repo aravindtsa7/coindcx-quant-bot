@@ -41,7 +41,7 @@ export type PracticalCancelPhase = 'PREFLIGHT' | 'ACQUIRE' | 'ARM' | 'PERMISSION
 export type PracticalCancelLocalRefusal = 'INVALID_INPUT' | 'OPERATION_IN_PROGRESS'
   | 'ENABLEMENT_REFUSED' | 'ACCOUNT_BINDING_REFUSED' | 'RUNTIME_BINDING_REFUSED'
   | 'ORIGINAL_WATCH_REFUSED' | 'DISPATCH_WINDOW_CLOSED' | 'CLOCK_ANOMALY'
-  | 'ENTRY_REFUSED' | 'OPERATIONAL_FAILURE' | 'MANUAL_REVIEW_REQUIRED';
+  | 'ENTRY_REFUSED' | 'OPERATIONAL_FAILURE' | 'MANUAL_REVIEW_REQUIRED' | 'ADMISSION_CLOSED';
 export type PracticalCancelCode = PracticalCancelLocalRefusal | PracticalMutationErrorCode | LiveExecutionFailureCode
   | PracticalPersistenceErrorCode | PracticalLiveSafetyErrorCode;
 export type PracticalCancelReportedOutcome = 'ACCEPTED' | 'REJECTED' | 'AMBIGUOUS' | 'PRE_DISPATCH_FAILURE';
@@ -54,3 +54,11 @@ export type PracticalCancelResult =
 
 /** Internal mutable time high-water mark, owned by one operation, never caller input. */
 export interface PracticalCancelTime { lastNowMs: number }
+
+/** Local bookkeeping only; LOCAL_DRAINED never authorizes durable/provider shutdown. */
+export type PracticalCancelDrainResult =
+  | { readonly kind: 'LOCAL_DRAINED' }
+  | { readonly kind: 'IN_FLIGHT'; readonly phase: PracticalCancelPhase }
+  | { readonly kind: 'BOOKKEEPING_PENDING'; readonly phase: 'ACQUIRE' | 'CLEANUP' | 'COMPLETION' }
+  | { readonly kind: 'BLOCKED'; readonly code: PracticalCancelCode }
+  | { readonly kind: 'REFUSED'; readonly code: 'ADMISSION_NOT_CLOSED' | 'DRAIN_IN_PROGRESS' };
