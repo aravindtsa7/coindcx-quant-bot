@@ -13,7 +13,8 @@ import { liveDecimal } from '../../../execution/live/decimal';
 import { isSendableLiveClientOrderId } from '../../../execution/live/identity';
 import type { LiveOrderObservation, LiveOrderObservationKind, LiveOrderSide, LiveTimeInForce } from '../../../execution/live/types';
 import { Clock, SystemClock } from '../clock';
-import { CoinDcxOrderMutationTransport } from './mutation-transport';
+import { CoinDcxOrderMutationTransport, type OrderMutationWireResult } from './mutation-transport';
+import { installCancelGatewayBrand, registerCancelGatewaySource, readCancelTransportRequest, propagateCancelTransportResult, type CancelTransportInvocation } from '../../../execution/live/practical-cancel-transport-evidence';
 import {
   LiveCancelResponseSchema,
   LiveCreateOrderResponseSchema,
@@ -191,6 +192,8 @@ export class CoinDcxLiveFuturesOrderGateway implements CoinDcxFuturesOrderGatewa
   readonly #transport: CoinDcxOrderMutationTransport;
   readonly #clock: Clock;
 
+  static { installCancelGatewayBrand((gateway, transport) => typeof gateway === 'object' && gateway !== null && #transport in gateway && gateway.#transport === transport); }
+
   public constructor(options: CoinDcxLiveOrderGatewayOptions) {
     this.#transport = new CoinDcxOrderMutationTransport({
       apiKey: options.apiKey,
@@ -198,6 +201,16 @@ export class CoinDcxLiveFuturesOrderGateway implements CoinDcxFuturesOrderGatewa
       baseUrl: options.baseUrl,
     });
     this.#clock = options.clock ?? new SystemClock();
+    registerCancelGatewaySource(this, this.#transport, invocation => this.#cancelWithProvenance(invocation));
+  }
+
+  async #cancelWithProvenance(invocation: CancelTransportInvocation): Promise<object> {
+    // Clock callbacks are outside the trusted transport preparation region.
+    readCancelTransportRequest(invocation);
+    const timestamp: unknown = this.#clock.nowMs();
+    const observation = await CoinDcxOrderMutationTransport.executePracticalCancel(this.#transport, invocation, timestamp);
+    const result = this.#cancelResult(observation.wire);
+    return propagateCancelTransportResult(invocation, this, result, observation.evidence);
   }
 
   public async placeOrder(request: LivePlaceOrderRequest): Promise<LivePlaceOrderResult> {
@@ -264,6 +277,10 @@ export class CoinDcxLiveFuturesOrderGateway implements CoinDcxFuturesOrderGatewa
       id: request.exchangeOrderId,
     }, request.timeoutMs);
 
+    return this.#cancelResult(wire);
+  }
+
+  #cancelResult(wire: OrderMutationWireResult): LiveCancelOrderResult {
     if (wire.kind === 'PRE_DISPATCH') return { kind: 'PRE_DISPATCH_FAILURE', reasonCode: wire.reasonCode };
     if (wire.kind === 'UNESTABLISHED') return { kind: 'AMBIGUOUS', reasonCode: wire.reasonCode };
     if (wire.statusCode >= 400) {
@@ -409,4 +426,12 @@ export class CoinDcxLiveFuturesOrderGateway implements CoinDcxFuturesOrderGatewa
       providerEventTimeMs,
     });
   }
+}
+
+// Only the new genuine producer identity is pinned; legacy gateway methods stay unchanged.
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  const descriptor = Object.getOwnPropertyDescriptor(module.exports, 'CoinDcxLiveFuturesOrderGateway');
+  if (descriptor?.configurable === false) {
+    if (descriptor.get === undefined || descriptor.set !== undefined || module.exports.CoinDcxLiveFuturesOrderGateway !== CoinDcxLiveFuturesOrderGateway) throw new Error('CANCEL_GATEWAY_EXPORT_BINDING_INVALID');
+  } else Object.defineProperty(module.exports, 'CoinDcxLiveFuturesOrderGateway', { get: () => CoinDcxLiveFuturesOrderGateway, configurable: false });
 }

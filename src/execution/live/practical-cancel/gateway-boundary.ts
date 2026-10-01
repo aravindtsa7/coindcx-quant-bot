@@ -1,16 +1,18 @@
-/** Sole unwired production-source entry/result owner. No transport-no-wire issuer. */
+/** Sole unwired production-source entry/result and verified transport-token owner. */
 import { LiveExecutionEnablement } from '../gate';
 import type { LiveCancelOrderRequest } from '../gateway';
 import { PracticalRecoveryCertificate } from '../practical/certificate';
 import { PracticalLiveSafetyEnablement } from '../practical/policy';
 import { practicalCancelDwellMs } from '../practical-mutation/preflight';
 import {
-  PracticalCancelDispatchOwner, enterPracticalCancelGateway, issuePracticalCancelOutcome,
+  PracticalCancelDispatchOwner, enterPracticalCancelGateway, issuePracticalCancelOutcome, issuePracticalCancelTransportNoWire,
   type PracticalCancelOutcomeReceipt,
 } from '../practical-mutation/ticket';
 import { PracticalRecoveryService } from '../practical-recovery/service';
 import { readLiveRuntimeEpoch } from '../reconciliation/barrier';
 import type { PracticalCancelDependencies, PracticalCancelLocalRefusal, PracticalCancelTime } from './ports';
+import { hasCancelTransportSource, reserveCancelTransportInvocation, invokeCancelTransport, settleCancelTransportInvocation, closeCancelTransportInvocation,
+  type CancelTransportInvocation } from '../practical-cancel-transport-evidence';
 
 export type PracticalCancelGuard = { readonly kind: 'UNCHANGED'; readonly nowMs: number }
   | { readonly kind: 'REFUSED'; readonly code: PracticalCancelLocalRefusal };
@@ -73,17 +75,26 @@ function projectResult(value: unknown): Report {
 }
 
 /** A timeout settles only our report. It neither cancels nor retries the invocation. */
-function boundedReport(invocation: Promise<unknown>, timeoutMs: number): Promise<Report> {
-  return new Promise((resolve) => {
+function boundedReport(invocation: Promise<unknown>, timeoutMs: number, context: CancelTransportInvocation | null, attempt: unknown): Promise<PracticalCancelOutcomeReceipt> {
+  return new Promise((resolve, reject) => {
     let settled = false;
-    const finish = (report: Report): void => {
+    const finish = (value: unknown, fulfilled: boolean): void => {
       if (settled) return;
-      settled = true;
+      settled = true; // reserve terminal settlement BEFORE reflection or consuming proof
       clearTimeout(timer);
-      resolve(report);
+      try {
+        const observation = fulfilled && context !== null ? settleCancelTransportInvocation(context, value) : null;
+        if (context !== null && observation === null) closeCancelTransportInvocation(context);
+        if (observation?.noWrite === true) {
+          const noWire = issuePracticalCancelTransportNoWire(attempt);
+          resolve(issuePracticalCancelOutcome(attempt, { kind: 'PRE_DISPATCH_FAILURE', noWire }));
+        } else resolve(issuePracticalCancelOutcome(attempt, fulfilled
+          ? projectResult(context === null ? value : observation?.result) : AMBIGUOUS));
+      } catch { reject(new Error('CANCEL_REPORT_UNAVAILABLE')); }
     };
-    const timer = setTimeout(() => finish(AMBIGUOUS), timeoutMs);
-    invocation.then(value => finish(projectResult(value)), () => finish(AMBIGUOUS));
+    const timer = setTimeout(() => finish(undefined, false), timeoutMs);
+    // Late fulfilment is ignored before even reflective inspection; rejection is handled.
+    invocation.then(value => finish(value, true), () => finish(undefined, false));
   });
 }
 
@@ -93,12 +104,12 @@ export type PracticalCancelGatewayResult =
 
 export class PracticalCancelGatewayBoundary {
   readonly #dependencies: PracticalCancelDependencies;
-  readonly #invoke: (request: LiveCancelOrderRequest) => Promise<unknown>;
+  readonly #invoke: ((request: LiveCancelOrderRequest) => Promise<unknown>) | null;
 
   public constructor(dependencies: PracticalCancelDependencies) {
     if (!Number.isSafeInteger(dependencies.requestTimeoutMs) || dependencies.requestTimeoutMs < 1 || dependencies.requestTimeoutMs > 120_000) throw new Error('INVALID_CANCEL_TIMEOUT');
     this.#dependencies = Object.freeze({ ...dependencies });
-    this.#invoke = dependencies.gateway.cancelOrder.bind(dependencies.gateway);
+    this.#invoke = hasCancelTransportSource(dependencies.gateway) ? null : dependencies.gateway.cancelOrder.bind(dependencies.gateway);
     Object.freeze(this);
   }
 
@@ -121,23 +132,25 @@ export class PracticalCancelGatewayBoundary {
     if (live === null || !live.pairAllowlist.includes(owner.armed.pair)) return Object.freeze({ kind: 'NOT_ENTERED', code: 'ENABLEMENT_REFUSED' });
     const request = Object.freeze({ clientOrderId: owner.armed.clientOrderId, exchangeOrderId: owner.armed.exchangeOrderId,
       pair: owner.armed.pair, timeoutMs: this.#dependencies.requestTimeoutMs });
+    const context = reserveCancelTransportInvocation(this.#dependencies.gateway, attempt, request);
     const guard = checkPracticalCancelGuard(this.#dependencies, certificate, time);
-    if (guard.kind === 'REFUSED') return Object.freeze({ kind: 'NOT_ENTERED', code: guard.code });
-    if (guard.nowMs < owner.armed.armedAtMs) return Object.freeze({ kind: 'NOT_ENTERED', code: 'CLOCK_ANOMALY' });
+    if (guard.kind === 'REFUSED') { if (context !== null) closeCancelTransportInvocation(context); return Object.freeze({ kind: 'NOT_ENTERED', code: guard.code }); }
+    if (guard.nowMs < owner.armed.armedAtMs) { if (context !== null) closeCancelTransportInvocation(context); return Object.freeze({ kind: 'NOT_ENTERED', code: 'CLOCK_ANOMALY' }); }
     let invocation: Promise<unknown>;
     try {
       enterPracticalCancelGateway(attempt);
     } catch {
+      if (context !== null) closeCancelTransportInvocation(context);
       return Object.freeze({ kind: 'NOT_ENTERED', code: 'ENTRY_REFUSED' });
     }
     // No await, queue, telemetry or unrelated callback between entry and invocation.
     try {
-      invocation = Promise.resolve(this.#invoke(request));
+      invocation = Promise.resolve(context === null ? this.#invoke!(request) : invokeCancelTransport(context));
     } catch {
       invocation = Promise.reject(new Error('CANCEL_INVOCATION_UNCERTAIN'));
     }
-    const report = await boundedReport(invocation, this.#dependencies.requestTimeoutMs);
-    return Object.freeze({ kind: 'REPORTED', outcome: issuePracticalCancelOutcome(attempt, report) });
+    const outcome = await boundedReport(invocation, this.#dependencies.requestTimeoutMs, context, attempt);
+    return Object.freeze({ kind: 'REPORTED', outcome });
   }
 }
 

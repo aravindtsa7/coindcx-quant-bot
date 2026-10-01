@@ -20,17 +20,17 @@ describe('unwired practical cancel orchestration', () => {
       const reach = [...computeReachable(graph, file)];
       expect(reach.filter(node => node.startsWith('src/integration/') || node.startsWith('src/dispatch/') || node.startsWith('src/coin-runtime/'))).toEqual([]);
       expect(reach).not.toContain('src/execution/live/service.ts');
-      expect(code(file)).not.toMatch(/cancelDurable|issuePracticalRecoveryCertificate|issuePracticalLiveSafetyEnablement|issuePracticalCancelTransportNoWire|requireCurrentReconciliation|ACCOUNT_CONTINUITY_PROVEN|process\.env|fetch\(/);
+      expect(code(file)).not.toMatch(/cancelDurable|issuePracticalRecoveryCertificate|issuePracticalLiveSafetyEnablement|requireCurrentReconciliation|ACCOUNT_CONTINUITY_PROVEN|process\.env|fetch\(/);
     }
   });
   it('uses the genuine static checker and synchronous entry before the sole invocation', () => {
     const boundary = code(BOUNDARY);
     expect(boundary).toContain('PracticalRecoveryService.checkOriginalCertificateWatch(dependencies.recovery');
     const entry = boundary.indexOf('enterPracticalCancelGateway(attempt);');
-    const invocation = boundary.indexOf('this.#invoke(request)', entry);
+    const invocation = boundary.indexOf('this.#invoke!(request)', entry);
     expect(entry).toBeGreaterThan(0); expect(invocation).toBeGreaterThan(entry);
     expect(boundary.slice(entry, invocation)).not.toMatch(/\bawait\b|telemetry|setTimeout|queueMicrotask/);
-    expect(boundary.match(/this\.#invoke\(request\)/g)).toHaveLength(1);
+    expect(boundary.match(/this\.#invoke!\(request\)/g)).toHaveLength(1);
     expect(boundary).not.toMatch(/fetchOrder|\.observation\b|\.reasonCode\b/);
   });
   it('pins both trusted lookup identities in the defining CommonJS module without freezing unrelated recovery APIs', () => {
@@ -67,7 +67,7 @@ describe('unwired practical cancel orchestration', () => {
     expect(service).toContain('Object.entries({ PracticalCancelService, PracticalCancelBookkeeping })');
     expect(service).toContain('this.#boundary = new PracticalCancelGatewayBoundary(this.#dependencies)');
     expect(service).toContain('await this.#boundary.invoke(consumed.attempt, certificate, time)');
-    expect(boundary).toContain('this.#invoke = dependencies.gateway.cancelOrder.bind(dependencies.gateway)');
+    expect(boundary).toContain('this.#invoke = hasCancelTransportSource(dependencies.gateway) ? null : dependencies.gateway.cancelOrder.bind(dependencies.gateway)');
     expect(boundary).toContain('const guard = checkPracticalCancelGuard(this.#dependencies, certificate, time)');
     expect(boundary).not.toMatch(/dependencies\.(?:invoke|checkPracticalCancelGuard)|this\.invoke\s*=/);
   });

@@ -165,7 +165,7 @@ async function healthy(accountId: string, overrides: Record<string, unknown> = {
 
 function intentRecord(accountId: string): LiveExecutionIntentRecord {
   sequence += 1;
-  const tag = `${randomBytes(4).toString('hex')}${sequence.toString(16).padStart(4, '0')}`;
+  const tag = `a${randomBytes(4).toString('hex').slice(0, 7)}${sequence.toString(16).padStart(4, '0')}`;
   return {
     intentId: `${'0'.repeat(52)}${tag}`,
     clientOrderId: `p17-${'0'.repeat(20)}${tag}`,
@@ -835,7 +835,12 @@ describe('P18B-W2B1-DB arm: binding and CONSUMED-certificate tamper refuses with
   ] as const)('%s (a collation-tolerated or foreign-key-bypassing tamper, disposable fixture)', async (_name, refusal, sql, key) => {
     if (skip()) return;
     await tampered(async (context) => {
+      if (_name === 'case-only lease intent id') expect(context.intentId).not.toBe(context.intentId.toUpperCase());
       await tamperWithoutForeignKeys((tx) => tx.$executeRawUnsafe(sql, context[key]));
+      if (_name === 'case-only lease intent id') {
+        const lease = await connectionA.livePracticalMutationLease.findFirstOrThrow({ where: { accountId: context.accountId } });
+        expect(lease.intentId).toBe(context.intentId.toUpperCase());
+      }
     }, refusal);
   });
 

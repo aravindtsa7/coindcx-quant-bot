@@ -225,6 +225,7 @@ describe('[9][10][17] not wired; no network, gateway, runtime, private-stream, o
   it('practical-mutation has exactly the three unwired orchestration importers outside its own tree', () => {
     const importers = files.filter((file) => !file.startsWith(MUTATION_ROOT) && (graph.get(file) ?? []).some((dependency) => dependency.startsWith(MUTATION_ROOT)));
     expect(importers.sort()).toEqual([
+      'src/execution/live/practical-cancel-transport-evidence.ts',
       'src/execution/live/practical-cancel/gateway-boundary.ts',
       'src/execution/live/practical-cancel/ports.ts',
       'src/execution/live/practical-cancel/service.ts',
@@ -294,7 +295,7 @@ describe('[9][10][17] not wired; no network, gateway, runtime, private-stream, o
     });
     const testFiles = [...walkTests('tests/unit'), ...walkTests('tests/integration')];
     for (const name of ['enterPracticalCancelGateway', 'issuePracticalCancelOutcome', 'issuePracticalCancelTransportNoWire']) {
-      expect(files.filter((file) => file !== ticketFile && codeOf(file).includes(name))).toEqual(name === 'issuePracticalCancelTransportNoWire' ? [] : ['src/execution/live/practical-cancel/gateway-boundary.ts']);
+      expect(files.filter((file) => file !== ticketFile && codeOf(file).includes(name))).toEqual(['src/execution/live/practical-cancel/gateway-boundary.ts']);
       expect(testFiles.filter((file) => sourceOf(file).includes(name)).sort()).toEqual([
         'tests/integration/execution/live-practical-cancel-dispatch.integration.test.ts',
         'tests/unit/execution/live/practical-mutation/dispatch.test.ts',

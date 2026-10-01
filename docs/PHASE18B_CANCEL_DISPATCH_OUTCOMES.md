@@ -72,12 +72,14 @@ No record or status supplied by a caller grants ownership.
 
 The internal synchronous `enterPracticalCancelGateway` and
 `issuePracticalCancelOutcome` now have only the unwired gateway-boundary caller.
-`issuePracticalCancelTransportNoWire` retains zero production callers. Their
+`issuePracticalCancelTransportNoWire` now has that same sole boundary caller,
+only after consuming genuine matching local-preparation evidence. Their
 direct test access remains exactly the original unit/integration fixtures.
-The no-wire token is attempt-bound. There is no implemented production transport
-issuer, and these test fixtures are not a production proof fallback. A future
-trusted owner must project the real gateway result into this closed reported
-result contract and prove transport no-write before issuing its no-wire token.
+The no-wire token is attempt-bound. The separately documented unwired transport
+bridge proves only local preparation failure before native request-factory
+entry; test fixtures are not a production proof fallback. Its closed contract
+is in `PHASE18B_CANCEL_TRANSPORT_PROVENANCE.md`. Ordinary structural gateway
+results still cannot produce no-wire proof.
 Raw reasons, errors, payloads and observations are not retained. Unexpected,
 hostile, timed-out or thrown results normalize to fixed ambiguity categories.
 
@@ -216,7 +218,10 @@ service/bookkeeping class exports, are non-configurable lexical getters with
 no setters. Supported tsx getters must already bind the exact lexical value.
 Preloading either module before consumer import cannot redirect these exports.
 No mutable injected callback establishes readiness or selects final dispatch.
-The gateway callback is bound once into a private field by the genuine boundary.
+An ordinary gateway callback is bound once into a private field by the genuine
+boundary. A genuine provenance-capable gateway instead has a private registered
+invocation path protected in its defining modules; public gateway/transport
+method replacement cannot redirect that path.
 
 These protections prevent replacing final dispatch after consumption, including
 a replacement that sends and falsely returns NOT_ENTERED. Original-watch loss
@@ -241,18 +246,19 @@ It checks genuine runtime/practical enablement, credential account/fingerprint,
 original watch, dwell, effective expiry and time, then spends entry and invokes
 cancelOrder exactly once with no await/hook/queue between them. A bounded local
 wait uses the policy timeout; settlement is once-only and late results are ignored.
-Only this boundary calls entry/outcome issuers. It never calls the no-wire issuer.
+Only this boundary calls entry/outcome and verified no-wire token issuers.
 
 | Gateway observation after entry | Immutable report |
 | --- | --- |
 | exact own-data CANCEL_ACCEPTED with observation field | CANCEL_ACCEPTED; observation ignored |
 | exact own-data REJECTED with nonempty reasonCode | REJECTED; fixed core reason |
 | AMBIGUOUS, structural PRE_DISPATCH_FAILURE, throw, timeout, malformed/hostile result | AMBIGUOUS |
+| exact private invocation envelope with consumed genuine pre-factory no-write evidence | PRE_DISPATCH_FAILURE; entered outcome completion only |
 
 No raw result or economic observation is retained. No fetch/ingest occurs.
 Structural PRE_DISPATCH_FAILURE is not genuine transport proof. No-write
-issuance remains zero production callers until a separate proof-preserving
-transport bridge is reviewed. Before entry, owned cleanup remains available.
+issuance is restricted to the separate local-preparation provenance contract;
+after native factory entry it is permanently unavailable. Before entry, owned cleanup remains available.
 Completion uncertainty retries bookkeeping only with the identical receipt.
 
 Local synchronous ordering does not atomically fence remote runtime supersession,

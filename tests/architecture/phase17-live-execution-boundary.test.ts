@@ -308,6 +308,16 @@ describe('P17-I19 tests cannot accidentally reach a real venue', () => {
     for (const file of testFiles) {
       const source = readFileSync(file, 'utf8');
       if (!source.includes('new CoinDcxLiveFuturesOrderGateway')) continue;
+      const relative = path.relative(REPO_ROOT, file).split(path.sep).join('/');
+      if (relative === 'tests/unit/execution/live/practical-cancel/service.test.ts') {
+        expect(source).toContain("baseUrl !== 'invalid-local-url' && !baseUrl.startsWith('http://127.0.0.1:')");
+        expect(source).toContain("function genuineGateway(baseUrl = 'http://127.0.0.1:1'");
+        expect(source).not.toContain('api.coindcx.com'); continue;
+      }
+      if (relative === 'tests/integration/execution/live-practical-cancel-dispatch.integration.test.ts') {
+        expect(source).toContain("baseUrl: 'invalid-local-url'");
+        expect(source).not.toContain('api.coindcx.com'); continue;
+      }
       expect(source).toMatch(/baseUrl:\s*(venue\.baseUrl|'http:\/\/127\.0\.0\.1)/);
       expect(source).not.toContain('api.coindcx.com');
     }

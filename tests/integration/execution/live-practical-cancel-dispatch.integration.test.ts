@@ -1,7 +1,9 @@
 import { execFileSync } from 'node:child_process';
+import http from 'node:http';
 import { randomBytes } from 'node:crypto';
 import { Prisma, PrismaClient } from '@prisma/client';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { CoinDcxLiveFuturesOrderGateway } from '../../../src/integration/coindcx/live/order-gateway';
 import type { LiveExecutionIntentRecord } from '../../../src/execution/live/intent';
 import { PrismaLiveExecutionRepository, consumeCancelDispatchWithinCallerFencedTransaction } from '../../../src/execution/live/repository';
 import { issuePracticalRecoveryCertificate, PracticalRecoveryCertificate } from '../../../src/execution/live/practical/certificate';
@@ -595,7 +597,7 @@ const ORCHESTRATION_METHODS: readonly OrchestrationMethod[] = ['acquireCancelLea
   'consumeCancelDispatchPermission', 'completeCancelLease', 'abandonAcquiredCancel', 'completeUndispatchedCancel', 'completeUnenteredCancelDispatch', 'resolveUnknownAcquire'];
 
 /** Real recovery issuance and real stores; provider/readiness inputs are synthetic test-only fixtures. */
-async function orchestrationFixture() {
+async function orchestrationFixture(provenance: boolean | 'clock' | 'base-url' = false) {
   const accountId = freshAccount();
   const clock = new FakeClock(T0);
   const privateStream = new FakePrivateStream();
@@ -641,10 +643,16 @@ async function orchestrationFixture() {
   }])) as unknown as PracticalCancelStore;
   const gateway: PracticalCancelDependencies['gateway'] = { async cancelOrder(request) { calls += 1; expect(Object.isFrozen(request)).toBe(true); expect(request).toEqual({ clientOrderId: order.clientOrderId,
     exchangeOrderId, pair: order.content.pair, timeoutMs: 1000 }); return gatewayResult as never; } };
-  const service = new PracticalCancelService({ store: port, clock, runtimeIdentity: IDENTITY, enablement, liveEnablement: gate.enablement, recovery, requestTimeoutMs: 1000, gateway });
+  let inputHookCalls = 0;
+  const malformed = new Proxy({}, { get() { inputHookCalls++; throw new Error('UNEXPECTED_PREPARATION_INPUT_HOOK'); } });
+  const practicalGatewayOptions = { apiKey: 'synthetic-integration-key', apiSecret: 'synthetic-integration-secret', baseUrl: 'invalid-local-url',
+    clock: provenance === 'clock' ? { nowMs: () => malformed as never } : clock };
+  if (provenance === 'base-url') practicalGatewayOptions.baseUrl = malformed as never;
+  const service = new PracticalCancelService({ store: port, clock, runtimeIdentity: IDENTITY, enablement, liveEnablement: gate.enablement, recovery, requestTimeoutMs: 1000,
+    gateway: provenance ? new CoinDcxLiveFuturesOrderGateway(practicalGatewayOptions) : gateway });
   const input = { intentId: order.intentId, expected: expectationOf(certified.account), certificate: certified.certificate };
   return { accountId, clock, privateStream, recovery, certificate: certified.certificate, order, exchangeOrderId, service, input, methods, cleanupInputs, overrides, after,
-    gateway, calls: () => calls, result: (value: unknown) => { gatewayResult = value; } };
+    gateway, calls: () => calls, inputHookCalls: () => inputHookCalls, result: (value: unknown) => { gatewayResult = value; } };
 }
 function requireBookkeeping(result: PracticalCancelResult) {
   if (result.kind !== 'BOOKKEEPING_PENDING') throw new Error('EXPECTED_GENUINE_BOOKKEEPING_CONTINUATION');
@@ -652,6 +660,70 @@ function requireBookkeeping(result: PracticalCancelResult) {
 }
 
 describe('unwired orchestrator real-MySQL acceptance (synthetic provider fixtures)', () => {
+  it.each(['clock', 'base-url'].flatMap(source => ['CONFIRMED', 'COMMITTED', 'ROLLED_BACK'].map(truth => [source, truth] as const)))('malformed %s input %s atomically records ambiguity and retries only the identical receipt', async (source, truth) => {
+    if (skip()) return;
+    const h = await orchestrationFixture(source as 'clock' | 'base-url'), before = await orderRow(h.order.intentId);
+    const consumedOrders: Awaited<ReturnType<typeof orderRow>>[] = [];
+    h.after.set('consumeCancelDispatchPermission', async () => { consumedOrders.push(await orderRow(h.order.intentId)); });
+    const native = vi.spyOn(http, 'request').mockImplementation(() => { throw new Error('UNEXPECTED_NATIVE_FACTORY'); });
+    try {
+      if (truth !== 'CONFIRMED') h.overrides.set('completeCancelLease', truth === 'COMMITTED' ? commitLostClient() : rollbackLostClient());
+      const result = await h.service.cancel(h.input);
+      if (truth === 'CONFIRMED') expect(result).toMatchObject({ kind: 'COMPLETED', outcome: 'AMBIGUOUS' });
+      else {
+        const continuation = requireBookkeeping(result); h.overrides.delete('completeCancelLease');
+        expect(await h.service.retryBookkeeping({ continuation })).toMatchObject({ kind: 'COMPLETED', outcome: 'AMBIGUOUS', disposition: truth === 'COMMITTED' ? 'ALREADY_COMPLETED' : 'COMPLETED' });
+        expect((h.cleanupInputs[0] as { outcome: unknown }).outcome).toBe((h.cleanupInputs[1] as { outcome: unknown }).outcome);
+      }
+      const after = await orderRow(h.order.intentId), practicalAfter = await practicalRows(h.accountId);
+      expect(native).not.toHaveBeenCalled(); expect(h.inputHookCalls()).toBe(0); expect(h.calls()).toBe(0);
+      expect(h.methods.filter(m => m === 'consumeCancelDispatchPermission')).toHaveLength(1); expect(h.methods).not.toContain('completeUnenteredCancelDispatch');
+      expect(after.cancelState).toBe('CANCEL_AMBIGUOUS'); expect(after.cancelWireArmed).toBe(false); expect(after.revision).toBe(6);
+      expect(after.cancelFaultCode).toBe('LIVE_CANCEL_AMBIGUOUS'); expect(after.faultCode).toBe('LIVE_CANCEL_AMBIGUOUS');
+      expect(consumedOrders).toHaveLength(1); expect(after.state).toBe(consumedOrders[0]!.state);
+      for (const key of ['orderedQuantity', 'cumulativeFilledQuantity', 'remainingQuantity', 'averageFillPrice', 'exchangeOrderId', 'pair'] as const) expect(after[key]).toEqual(before[key]);
+      expect(practicalAfter.certificates[0]?.status).toBe('CONSUMED'); expect(practicalAfter.state?.state).toBe('QUARANTINED'); expect(practicalAfter.fence?.mode).toBe('IDLE');
+      expect(practicalAfter.leases[0]).toMatchObject({ status: 'COMPLETED', outcome: 'AMBIGUOUS' });
+    } finally { native.mockRestore(); }
+  });
+  it.each(['CONFIRMED', 'COMMITTED', 'ROLLED_BACK'] as const)('genuine pre-factory no-write %s preserves coupled state and retries bookkeeping only', async truth => {
+    if (skip()) return;
+    const h = await orchestrationFixture(true), before = await orderRow(h.order.intentId);
+    const consumedOrders: Awaited<ReturnType<typeof orderRow>>[] = [];
+    h.after.set('consumeCancelDispatchPermission', async () => { consumedOrders.push(await orderRow(h.order.intentId)); });
+    const native = vi.spyOn(http, 'request');
+    try {
+      if (truth !== 'CONFIRMED') h.overrides.set('completeCancelLease', truth === 'COMMITTED' ? commitLostClient() : rollbackLostClient());
+      const result = await h.service.cancel(h.input);
+      if (truth === 'CONFIRMED') expect(result).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' });
+      else {
+        const continuation = requireBookkeeping(result); h.overrides.delete('completeCancelLease');
+        expect(await h.service.retryBookkeeping({ continuation })).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE', disposition: truth === 'COMMITTED' ? 'ALREADY_COMPLETED' : 'COMPLETED' });
+        expect((h.cleanupInputs[0] as { outcome: unknown }).outcome).toBe((h.cleanupInputs[1] as { outcome: unknown }).outcome);
+      }
+      const after = await orderRow(h.order.intentId), practicalAfter = await practicalRows(h.accountId);
+      expect(native).not.toHaveBeenCalled(); expect(h.calls()).toBe(0);
+      expect(h.methods.filter(m => m === 'consumeCancelDispatchPermission')).toHaveLength(1);
+      expect(h.methods).not.toContain('completeUnenteredCancelDispatch');
+      expect(after.cancelState).toBe('NONE'); expect(after.cancelWireArmed).toBe(false);
+      expect(after.cancelFaultCode).toBeNull(); expect(after.revision).toBe(6);
+      expect(consumedOrders).toHaveLength(1); expect(consumedOrders[0]!.state).toBe('CANCEL_REQUESTED');
+      expect(after.state).toBe(consumedOrders[0]!.state);
+      for (const key of ['orderedQuantity', 'cumulativeFilledQuantity', 'remainingQuantity', 'averageFillPrice', 'exchangeOrderId', 'pair'] as const) expect(after[key]).toEqual(before[key]);
+      expect(practicalAfter.certificates[0]?.status).toBe('CONSUMED'); expect(practicalAfter.state?.state).toBe('QUARANTINED');
+      expect(practicalAfter.leases[0]).toMatchObject({ status: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' });
+    } finally { native.mockRestore(); }
+  });
+  it.each(['COMMITTED', 'ROLLED_BACK'] as const)('unknown consumption %s with genuine source makes zero native calls', async truth => {
+    if (skip()) return;
+    const h = await orchestrationFixture(true); h.overrides.set('consumeCancelDispatchPermission', truth === 'COMMITTED' ? commitLostClient() : rollbackLostClient());
+    const native = vi.spyOn(http, 'request');
+    try {
+      expect(await h.service.cancel(h.input)).toMatchObject({ outcome: 'PRE_DISPATCH_FAILURE' });
+      expect(native).not.toHaveBeenCalled(); expect(h.methods).not.toContain('completeCancelLease');
+      expect(h.methods.filter(m => m === 'consumeCancelDispatchPermission')).toHaveLength(1);
+    } finally { native.mockRestore(); }
+  });
   it.each(['assignment', 'reflect', 'define', 'delete'] as const)('boundary %s cannot send and return false NOT_ENTERED after committed consumption', async operation => {
     if (skip()) return;
     const h = await orchestrationFixture();

@@ -2,6 +2,12 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import ts from 'typescript';
+import http from 'node:http';
+import https from 'node:https';
+import { EventEmitter } from 'node:events';
+import { CoinDcxLiveFuturesOrderGateway } from '../../../../../src/integration/coindcx/live/order-gateway';
+import { CoinDcxOrderMutationTransport } from '../../../../../src/integration/coindcx/live/mutation-transport';
+import * as provenance from '../../../../../src/execution/live/practical-cancel-transport-evidence';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { FakeClock } from '../../../../../src/core/time/clock';
 import { resolveLiveExecutionGate } from '../../../../../src/execution/live/gate';
@@ -22,6 +28,280 @@ import { FINGERPRINT, FakePrivateStream, FakeReconciliation, FakeScheduler, Fake
 
 const ACCOUNT = 'orchestration-test-account';
 const INTENT = 'a'.repeat(64);
+
+function genuineGateway(baseUrl = 'http://127.0.0.1:1', clock = { nowMs: () => T0 }) {
+  if (baseUrl !== 'invalid-local-url' && !baseUrl.startsWith('http://127.0.0.1:')) throw new Error('NONLOCAL_TEST_GATEWAY_REFUSED');
+  return new CoinDcxLiveFuturesOrderGateway({ apiKey: 'synthetic-unit-key', apiSecret: 'synthetic-unit-secret', baseUrl, clock });
+}
+
+describe('genuine practical cancel transport provenance', () => {
+  it.each(['clock', 'base-url'] as const)('%s callback re-entry is refused before preparation without false no-write', async source => {
+    const h = await harness(); let factoryCalls = 0, writes = 0, hooks = 0, clockCalls = 0;
+    const nested: Promise<unknown>[] = []; let gateway!: CoinDcxLiveFuturesOrderGateway;
+    const originalRequest = Object.freeze({ clientOrderId: `p17-${'b'.repeat(32)}`, exchangeOrderId: 'exact-venue-order', pair: 'B-BTC_USDT', timeoutMs: 20 });
+    const reenter = () => { nested.push(gateway.cancelOrder(originalRequest).catch(() => null)); throw new Error('SYNTHETIC_COERCION_FAILED'); };
+    const timestamp = { toJSON() { hooks++; return reenter(); } };
+    const baseUrl = { [Symbol.toPrimitive]() { hooks++; if (hooks === 1) return reenter(); return 'http://127.0.0.1:1'; } };
+    const native = vi.spyOn(http, 'request').mockImplementation((() => {
+      factoryCalls++; const request = new EventEmitter() as EventEmitter & { write: () => void; end: () => void; destroy: () => void };
+      request.write = () => { writes++; }; request.destroy = () => undefined;
+      request.end = () => queueMicrotask(() => request.emit('error', new Error('SYNTHETIC_LOCAL_FAILURE')));
+      return request;
+    }) as never);
+    const tls = vi.spyOn(https, 'request').mockImplementation(() => { throw new Error('UNEXPECTED_TLS_FACTORY'); });
+    try {
+      const options = { apiKey: 'synthetic-coercion-key', apiSecret: 'synthetic-coercion-secret',
+        baseUrl: source === 'base-url' ? baseUrl as never : 'http://127.0.0.1:1', clock: { nowMs: () => source === 'clock' && clockCalls++ === 0 ? timestamp as never : T0 } };
+      gateway = new CoinDcxLiveFuturesOrderGateway(options);
+      const result = await new PracticalCancelService({ ...h.dependencies, gateway }).cancel(h.input);
+      await Promise.all(nested);
+      expect(result).toMatchObject({ kind: 'COMPLETED', outcome: 'AMBIGUOUS' });
+      expect(factoryCalls).toBe(0); expect(writes).toBe(0); expect(hooks).toBe(0); expect(tls).not.toHaveBeenCalled(); expect(nested).toHaveLength(0);
+      expect(h.cleanups.map(c => c.kind)).toEqual(['OUTCOME']);
+      expect(PracticalCancelDispatchOwner.read(h.cleanups[0]!.owner)?.result?.kind).toBe('AMBIGUOUS');
+    } finally { await Promise.all(nested); native.mockRestore(); tls.mockRestore(); }
+  });
+  it('reads every transport option once and retains the validated credential snapshots for ordinary dispatch', async () => {
+    const reads = { key: 0, secret: 0, base: 0, limit: 0 }; let hooks = 0, writes = 0;
+    const hostile = new Proxy({}, { get() { hooks++; throw new Error('CALLBACK_SECRET'); } });
+    const options = { get apiKey(): string { return ++reads.key === 1 ? 'synthetic-getter-key' : hostile as never; },
+      get apiSecret(): string { return ++reads.secret === 1 ? 'synthetic-getter-secret' : hostile as never; },
+      get baseUrl() { reads.base++; return 'http://127.0.0.1:1'; }, get maxResponseBytes() { reads.limit++; return 1000; } };
+    const native = vi.spyOn(http, 'request').mockImplementation((() => {
+      const request = new EventEmitter() as EventEmitter & { write: () => void; end: () => void; destroy: () => void };
+      request.write = () => { writes++; }; request.destroy = () => undefined;
+      request.end = () => queueMicrotask(() => request.emit('error', new Error('SYNTHETIC_LOCAL_FAILURE'))); return request;
+    }) as never);
+    try {
+      const transport = new CoinDcxOrderMutationTransport(options);
+      expect(await transport.execute('CANCEL_ORDER', { timestamp: T0, id: 'exact-venue-order' }, 20)).toMatchObject({ kind: 'PRE_DISPATCH' });
+      expect(reads).toEqual({ key: 1, secret: 1, base: 1, limit: 1 }); expect(hooks).toBe(0); expect(writes).toBe(1); expect(native).toHaveBeenCalledTimes(1);
+    } finally { native.mockRestore(); }
+  });
+  it.each(['boxed', 'object', 'proxy', 'revoked', 'date', 'string', 'bigint', 'symbol', 'boolean', 'null', 'undefined', 'nan', 'positive-infinity', 'negative-infinity', 'fraction', 'negative', 'unsafe'] as const)('malformed timestamp %s is ambiguous without coercion, factory calls or no-write receipt', async kind => {
+    const h = await harness(); let hooks = 0;
+    const refuse = () => { hooks++; throw new Error('UNEXPECTED_INPUT_INSPECTION'); };
+    const revoked = Proxy.revocable({}, {}); revoked.revoke();
+    const values: Record<typeof kind, unknown> = { boxed: new Number(T0), object: { toJSON: refuse, toString: refuse, valueOf: refuse, [Symbol.toPrimitive]: refuse },
+      proxy: new Proxy({}, { get: refuse, getPrototypeOf: refuse, ownKeys: refuse }), revoked: revoked.proxy, date: new Date(T0), string: '123', bigint: 1n,
+      symbol: Symbol('synthetic-time'), boolean: false, null: null, undefined, nan: NaN, 'positive-infinity': Infinity, 'negative-infinity': -Infinity,
+      fraction: 1.5, negative: -1, unsafe: Number.MAX_SAFE_INTEGER + 1 };
+    const native = vi.spyOn(http, 'request').mockImplementation(() => { throw new Error('UNEXPECTED_NATIVE_FACTORY'); });
+    try {
+      const gateway = genuineGateway('invalid-local-url', { nowMs: () => values[kind] as never });
+      expect(await new PracticalCancelService({ ...h.dependencies, gateway }).cancel(h.input)).toMatchObject({ kind: 'COMPLETED', outcome: 'AMBIGUOUS' });
+      expect(hooks).toBe(0); expect(native).not.toHaveBeenCalled(); expect(h.cleanups.map(c => c.kind)).toEqual(['OUTCOME']);
+      expect(PracticalCancelDispatchOwner.read(h.cleanups[0]!.owner)?.result?.kind).toBe('AMBIGUOUS');
+    } finally { native.mockRestore(); }
+  });
+  it.each(['boxed', 'object', 'proxy', 'revoked', 'number', 'bigint', 'symbol', 'boolean', 'null'] as const)('malformed retained base URL %s is ambiguous without coercion', async kind => {
+    const h = await harness(); let hooks = 0;
+    const refuse = () => { hooks++; throw new Error('UNEXPECTED_URL_INSPECTION'); };
+    const revoked = Proxy.revocable({}, {}); revoked.revoke();
+    const values: Record<typeof kind, unknown> = { boxed: new String('http://127.0.0.1:1'), object: { toString: refuse, toJSON: refuse, valueOf: refuse, [Symbol.toPrimitive]: refuse },
+      proxy: new Proxy({}, { get: refuse, getPrototypeOf: refuse, ownKeys: refuse }), revoked: revoked.proxy, number: 1, bigint: 1n, symbol: Symbol('synthetic-url'), boolean: false, null: null };
+    const native = vi.spyOn(http, 'request').mockImplementation(() => { throw new Error('UNEXPECTED_NATIVE_FACTORY'); });
+    try {
+      const gateway = new CoinDcxLiveFuturesOrderGateway({ apiKey: 'synthetic-url-key', apiSecret: 'synthetic-url-secret', baseUrl: values[kind] as never, clock: { nowMs: () => T0 } });
+      expect(await new PracticalCancelService({ ...h.dependencies, gateway }).cancel(h.input)).toMatchObject({ kind: 'COMPLETED', outcome: 'AMBIGUOUS' });
+      expect(hooks).toBe(0); expect(native).not.toHaveBeenCalled(); expect(h.cleanups.map(c => c.kind)).toEqual(['OUTCOME']);
+      expect(PracticalCancelDispatchOwner.read(h.cleanups[0]!.owner)?.result?.kind).toBe('AMBIGUOUS');
+    } finally { native.mockRestore(); }
+  });
+  it.each([0, T0, Number.MAX_SAFE_INTEGER])('valid primitive timestamp %s retains genuine invalid-primitive-URL preparation proof', async timestamp => {
+    const h = await harness(); const native = vi.spyOn(http, 'request'), tls = vi.spyOn(https, 'request');
+    try {
+      expect(await new PracticalCancelService({ ...h.dependencies, gateway: genuineGateway('invalid-local-url', { nowMs: () => timestamp }) }).cancel(h.input)).toMatchObject({ outcome: 'PRE_DISPATCH_FAILURE' });
+      expect(native).not.toHaveBeenCalled(); expect(tls).not.toHaveBeenCalled(); expect(h.cleanups.map(c => c.kind)).toEqual(['OUTCOME']);
+    } finally { native.mockRestore(); tls.mockRestore(); }
+  });
+  it('a clock throwing outside preparation remains ambiguity and bookkeeping retry never resends', async () => {
+    const h = await harness(); h.setUnknown(); const native = vi.spyOn(http, 'request'); let clockCalls = 0;
+    try {
+      const service = new PracticalCancelService({ ...h.dependencies, gateway: genuineGateway('invalid-local-url', { nowMs: () => { clockCalls++; throw new Error('SYNTHETIC_CLOCK_FAILURE'); } }) });
+      const result = await service.cancel(h.input); if (result.kind !== 'BOOKKEEPING_PENDING') throw new Error('EXPECTED_PENDING');
+      expect(PracticalCancelDispatchOwner.read(h.cleanups[0]!.owner)?.result?.kind).toBe('AMBIGUOUS');
+      expect(await service.retryBookkeeping({ continuation: result.continuation })).toMatchObject({ outcome: 'AMBIGUOUS' });
+      expect(h.cleanups[0]!.owner).toBe(h.cleanups[1]!.owner); expect(clockCalls).toBe(1); expect(native).not.toHaveBeenCalled();
+      expect(h.calls.filter(c => c === 'CONSUMPTION')).toHaveLength(1); expect(h.cleanups.every(c => c.kind === 'OUTCOME')).toBe(true);
+    } finally { native.mockRestore(); }
+  });
+  it.each(['apiKey', 'apiSecret'] as const)('callback-bearing %s snapshot refuses construction without coercion', field => {
+    let reads = 0, hooks = 0;
+    const hostile = new Proxy({}, { get() { hooks++; throw new Error('UNEXPECTED_CREDENTIAL_INSPECTION'); } });
+    const options = { apiKey: 'synthetic-snapshot-key', apiSecret: 'synthetic-snapshot-secret' };
+    Object.defineProperty(options, field, { get() { reads++; return hostile; } });
+    expect(() => new CoinDcxOrderMutationTransport(options)).toThrow(); expect(reads).toBe(1); expect(hooks).toBe(0);
+  });
+  it('genuine bound gateway retains first validated credential options and never reads their hostile later values', async () => {
+    const h = await harness(); let keyReads = 0, secretReads = 0, hooks = 0;
+    const hostile = new Proxy({}, { get() { hooks++; throw new Error('UNEXPECTED_LATER_SECRET'); } });
+    const options = { get apiKey(): string { return ++keyReads === 1 ? 'synthetic-once-key' : hostile as never; },
+      get apiSecret(): string { return ++secretReads === 1 ? 'synthetic-once-secret' : hostile as never; }, baseUrl: 'invalid-local-url', clock: { nowMs: () => T0 } };
+    const native = vi.spyOn(http, 'request');
+    try {
+      expect(await new PracticalCancelService({ ...h.dependencies, gateway: new CoinDcxLiveFuturesOrderGateway(options) }).cancel(h.input)).toMatchObject({ outcome: 'PRE_DISPATCH_FAILURE' });
+      expect(keyReads).toBe(1); expect(secretReads).toBe(1); expect(hooks).toBe(0); expect(native).not.toHaveBeenCalled();
+      expect(h.cleanups.map(c => c.kind)).toEqual(['OUTCOME']);
+    } finally { native.mockRestore(); }
+  });
+  async function preparedAttempt() {
+    const h = await harness(), d = h.dependencies;
+    const acquisition = await d.store.acquireCancelLease({ accountId: ACCOUNT, expected: h.input.expected, certificate: h.certificate, enablement: d.enablement, runtimeIdentity: d.runtimeIdentity, intentId: INTENT, trustedNowMs: h.clock.nowMs() });
+    if (acquisition.kind !== 'ACQUIRED') throw new Error('ATTEMPT_FIXTURE_FAILED');
+    const armed = await d.store.armCancelLease({ acquired: acquisition.acquired, enablement: d.enablement, runtimeIdentity: d.runtimeIdentity, trustedNowMs: h.clock.nowMs() });
+    const permit = await d.store.createCancelDispatchPermission({ armed: armed.ticket, enablement: d.enablement, runtimeIdentity: d.runtimeIdentity, trustedNowMs: h.clock.nowMs() });
+    const consumed = await d.store.consumeCancelDispatchPermission({ permission: permit.permission, enablement: d.enablement, runtimeIdentity: d.runtimeIdentity, trustedNowMs: h.clock.nowMs() });
+    const request = Object.freeze({ clientOrderId: `p17-${'b'.repeat(32)}`, exchangeOrderId: 'exact-venue-order', pair: 'B-BTC_USDT', timeoutMs: 1000 });
+    return { attempt: consumed.attempt, request, gateway: genuineGateway('invalid-local-url') };
+  }
+  it('exact binding, duplicate reservation, context cloning and foreign source refuse without native calls', async () => {
+    const a = await preparedAttempt(), b = await preparedAttempt(); const native = vi.spyOn(http, 'request');
+    try {
+      expect(() => provenance.reserveCancelTransportInvocation(a.gateway, a.attempt, Object.freeze({ ...a.request, pair: 'B-OTHER_USDT' }))).toThrow();
+      expect(() => provenance.reserveCancelTransportInvocation(a.gateway, a.attempt, { ...a.request })).toThrow();
+      const context = provenance.reserveCancelTransportInvocation(a.gateway, a.attempt, a.request)!;
+      expect(() => provenance.reserveCancelTransportInvocation(a.gateway, a.attempt, a.request)).toThrow();
+      expect(() => provenance.invokeCancelTransport({ ...context })).toThrow(); expect(() => JSON.stringify(context)).toThrow();
+      expect(() => provenance.issueCancelTransportNoWrite(context, new CoinDcxOrderMutationTransport({ apiKey: 'synthetic-key', apiSecret: 'synthetic-secret' }))).toThrow();
+      const other = provenance.reserveCancelTransportInvocation(b.gateway, b.attempt, b.request)!;
+      transitionPracticalCancelDispatchOwner(a.attempt, 'UNENTERED', 'ENTERED'); transitionPracticalCancelDispatchOwner(b.attempt, 'UNENTERED', 'ENTERED');
+      const [one, two] = await Promise.all([provenance.invokeCancelTransport(context), provenance.invokeCancelTransport(other)]);
+      expect(() => provenance.invokeCancelTransport(context)).toThrow();
+      expect(provenance.settleCancelTransportInvocation(context, two)).toBeNull();
+      expect(provenance.settleCancelTransportInvocation(other, one)).toBeNull(); expect(native).not.toHaveBeenCalled();
+    } finally { native.mockRestore(); }
+  });
+  it('genuine evidence is consumed once; a cloned envelope is not proof', async () => {
+    const a = await preparedAttempt(), b = await preparedAttempt();
+    const one = provenance.reserveCancelTransportInvocation(a.gateway, a.attempt, a.request)!, two = provenance.reserveCancelTransportInvocation(b.gateway, b.attempt, b.request)!;
+    transitionPracticalCancelDispatchOwner(a.attempt, 'UNENTERED', 'ENTERED'); transitionPracticalCancelDispatchOwner(b.attempt, 'UNENTERED', 'ENTERED');
+    const first = await provenance.invokeCancelTransport(one), second = await provenance.invokeCancelTransport(two);
+    expect(provenance.settleCancelTransportInvocation(one, first)).toMatchObject({ noWrite: true });
+    expect(provenance.settleCancelTransportInvocation(one, first)).toBeNull();
+    expect(provenance.settleCancelTransportInvocation(two, { ...second as object })).toBeNull();
+  });
+  it('closing a genuine invocation before late propagation invalidates its proof', async () => {
+    const a = await preparedAttempt(); const context = provenance.reserveCancelTransportInvocation(a.gateway, a.attempt, a.request)!;
+    transitionPracticalCancelDispatchOwner(a.attempt, 'UNENTERED', 'ENTERED');
+    const pending = provenance.invokeCancelTransport(context); provenance.closeCancelTransportInvocation(context);
+    expect(provenance.settleCancelTransportInvocation(context, await pending)).toBeNull();
+    expect(() => provenance.invokeCancelTransport(context)).toThrow();
+  });
+  it('actual preparation failure has zero native calls and completes an entered no-write outcome', async () => {
+    const h = await harness();
+    const native = vi.spyOn(http, 'request'), tls = vi.spyOn(https, 'request');
+    const gateway = genuineGateway('invalid-local-url');
+    const publicCall = vi.spyOn(gateway, 'cancelOrder').mockRejectedValue(new Error('PUBLIC_METHOD_MUST_NOT_BE_CALLED'));
+    const publicTransport = vi.spyOn(CoinDcxOrderMutationTransport.prototype, 'execute').mockRejectedValue(new Error('PUBLIC_TRANSPORT_MUST_NOT_BE_CALLED'));
+    try {
+      expect(await new PracticalCancelService({ ...h.dependencies, gateway }).cancel(h.input)).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' });
+      expect(native).not.toHaveBeenCalled(); expect(tls).not.toHaveBeenCalled(); expect(publicCall).not.toHaveBeenCalled(); expect(publicTransport).not.toHaveBeenCalled();
+      expect(h.cleanups.map(c => c.kind)).toEqual(['OUTCOME']);
+      expect(PracticalCancelDispatchOwner.read(h.cleanups[0]!.owner)?.result).toEqual({ kind: 'PRE_DISPATCH_FAILURE', reason: 'LOCAL_REQUEST_REFUSED' });
+    } finally { native.mockRestore(); tls.mockRestore(); publicCall.mockRestore(); publicTransport.mockRestore(); }
+  });
+  it.each(['factory-throw', 'connecting-error', 'connected-error', 'reused-error', 'queued-write', 'partial-response', 'malformed-response', 'timeout'] as const)('%s after factory entry cannot prove no-write', async mode => {
+    const h = await harness(20);
+    const native = vi.spyOn(http, 'request').mockImplementation(((_url: unknown, _options: unknown, response: (value: unknown) => void) => {
+      if (mode === 'factory-throw') throw new Error('SYNTHETIC_FACTORY_THROW');
+      const req = new EventEmitter() as EventEmitter & { write: () => void; end: () => void; destroy: () => void };
+      req.write = () => { if (mode === 'queued-write') throw new Error('QUEUED_WRITE_FAILED'); };
+      req.end = () => undefined; req.destroy = () => undefined;
+      queueMicrotask(() => {
+        const socket = new EventEmitter() as EventEmitter & { connecting: boolean };
+        socket.connecting = mode !== 'reused-error'; req.emit('socket', socket);
+        if (mode === 'connected-error') socket.emit('connect');
+        if (mode === 'partial-response' || mode === 'malformed-response') {
+          const res = new EventEmitter() as EventEmitter & { statusCode: number; destroy: () => void }; res.statusCode = 200; res.destroy = () => undefined;
+          response(res); res.emit('data', Buffer.from('{')); res.emit(mode === 'partial-response' ? 'aborted' : 'end');
+        } else if (mode !== 'timeout' && mode !== 'queued-write') req.emit('error', new Error('SYNTHETIC_TRANSPORT_ERROR'));
+      });
+      return req;
+    }) as never);
+    try {
+      expect(await new PracticalCancelService({ ...h.dependencies, gateway: genuineGateway() }).cancel(h.input)).toMatchObject({ outcome: 'AMBIGUOUS' });
+      expect(native).toHaveBeenCalledTimes(1); expect(h.cleanups.map(c => c.kind)).toEqual(['OUTCOME']);
+    } finally { native.mockRestore(); }
+  });
+  it('genuine valid flow invokes once with original body despite public replacement', async () => {
+    const h = await harness(); let payload = '';
+    const native = vi.spyOn(http, 'request').mockImplementation(((_url: unknown, _options: unknown, response: (value: unknown) => void) => {
+      const req = new EventEmitter() as EventEmitter & { write: (body: string) => void; end: () => void; destroy: () => void };
+      req.write = body => { payload = body; }; req.destroy = () => undefined;
+      req.end = () => queueMicrotask(() => { const res = new EventEmitter() as EventEmitter & { statusCode: number }; res.statusCode = 200;
+        response(res); res.emit('data', Buffer.from('{"message":"success","status":200,"code":200}')); res.emit('end'); });
+      return req;
+    }) as never);
+    const gateway = genuineGateway(), replaced = vi.spyOn(gateway, 'cancelOrder').mockRejectedValue(new Error('REPLACED_PUBLIC_METHOD'));
+    try {
+      const service = new PracticalCancelService({ ...h.dependencies, gateway });
+      const [result, duplicate] = await Promise.all([service.cancel(h.input), service.cancel(h.input)]);
+      expect(result).toMatchObject({ outcome: 'ACCEPTED' }); expect(duplicate.kind).toBe('REFUSED');
+      expect(native).toHaveBeenCalledTimes(1); expect(replaced).not.toHaveBeenCalled();
+      expect(JSON.parse(payload)).toEqual({ timestamp: T0, id: 'exact-venue-order' });
+    } finally { native.mockRestore(); replaced.mockRestore(); }
+  });
+  it.each([200, 400, 429] as const)('actual loopback native factory HTTP %s preserves the existing response mapping', async status => {
+    const h = await harness(); let requests = 0, payload = '';
+    const server = http.createServer((request, response) => {
+      requests++; request.on('data', bytes => { payload += String(bytes); });
+      request.on('end', () => {
+        response.writeHead(status, { 'Content-Type': 'application/json' });
+        response.end(JSON.stringify(status === 200 ? { message: 'success', status: 200, code: 200 } : { message: 'synthetic local refusal', status: String(status), code: String(status) }));
+      });
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = server.address(); if (address === null || typeof address === 'string') throw new Error('LOCAL_LISTENER_FAILED');
+      const service = new PracticalCancelService({ ...h.dependencies, gateway: genuineGateway(`http://127.0.0.1:${address.port}`) });
+      const [result, duplicate] = await Promise.all([service.cancel(h.input), service.cancel(h.input)]);
+      expect(result).toMatchObject({ outcome: status === 200 ? 'ACCEPTED' : status === 400 ? 'REJECTED' : 'AMBIGUOUS' }); expect(duplicate.kind).toBe('REFUSED');
+      expect(requests).toBe(1); expect(JSON.parse(payload)).toEqual({ timestamp: T0, id: 'exact-venue-order' });
+      expect(h.cleanups.map(c => c.kind)).toEqual(['OUTCOME']);
+      expect(requests).toBe(1);
+    } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); }
+  });
+  it('watch loss after consumption causes zero native requests and only unentered cleanup', async () => {
+    const h = await harness(); h.hooks.CONSUMPTION = () => { h.stream.unprove(); };
+    const native = vi.spyOn(http, 'request');
+    try {
+      expect(await new PracticalCancelService({ ...h.dependencies, gateway: genuineGateway() }).cancel(h.input)).toMatchObject({ outcome: 'PRE_DISPATCH_FAILURE' });
+      expect(native).not.toHaveBeenCalled(); expect(h.cleanups.map(c => c.kind)).toEqual(['UNENTERED']);
+    } finally { native.mockRestore(); }
+  });
+  it('structural provenance port cannot qualify; structural no-write stays ambiguous', async () => {
+    const h = await harness(); const forged = { cancelOrder: vi.fn(async () => ({ kind: 'PRE_DISPATCH_FAILURE' as const, reasonCode: 'LOCAL_CANCEL_PREPARATION_FAILED' })), cancelOrderWithProvenance: vi.fn() };
+    expect(provenance.hasCancelTransportSource(forged)).toBe(false);
+    expect(await new PracticalCancelService({ ...h.dependencies, gateway: forged }).cancel(h.input)).toMatchObject({ outcome: 'AMBIGUOUS' });
+    expect(forged.cancelOrder).toHaveBeenCalledTimes(1); expect(forged.cancelOrderWithProvenance).not.toHaveBeenCalled();
+  });
+  it.each(['fulfil', 'reject'] as const)('timeout ignores late %s before reflection and cannot resend', async mode => {
+    const h = await harness(5); let fulfil!: (value: unknown) => void, reject!: (error: unknown) => void;
+    h.gateway.cancelOrder.mockImplementation(() => new Promise((yes, no) => { fulfil = yes; reject = no; }));
+    expect(await h.service.cancel(h.input)).toMatchObject({ outcome: 'AMBIGUOUS' });
+    let inspected = 0;
+    if (mode === 'fulfil') fulfil(new Proxy({}, { getPrototypeOf() { inspected++; throw new Error('LATE_INSPECTION'); }, ownKeys() { inspected++; throw new Error('LATE_INSPECTION'); } }));
+    else reject(new Error('LATE_REJECTION'));
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(inspected).toBe(0); expect(h.gateway.cancelOrder).toHaveBeenCalledTimes(1); expect(h.cleanups).toHaveLength(1);
+    expect(PracticalCancelDispatchOwner.read(h.cleanups[0]!.owner)?.result?.kind).toBe('AMBIGUOUS');
+  });
+  it('forged contexts, source selection, constructors and ownership clones refuse', async () => {
+    const h = await harness(); const gateway = genuineGateway('invalid-local-url');
+    const request = Object.freeze({ clientOrderId: `p17-${'b'.repeat(32)}`, exchangeOrderId: 'exact-venue-order', pair: 'B-BTC_USDT', timeoutMs: 1000 });
+    for (const forged of [{}, Object.create(PracticalCancelDispatchOwner.prototype), { ...h.certificate }]) {
+      expect(() => provenance.reserveCancelTransportInvocation(gateway, forged, request)).toThrow('PROVENANCE_REFUSED');
+    }
+    expect(() => provenance.registerCancelGatewaySource({}, {}, async () => ({}))).toThrow();
+    expect(() => provenance.registerCancelTransportSource({})).toThrow();
+    expect(() => provenance.installCancelTransportBrand(() => true)).toThrow();
+    expect(() => provenance.installCancelGatewayBrand(() => true)).toThrow();
+    expect(provenance.settleCancelTransportInvocation({}, {})).toBeNull(); expect(() => provenance.invokeCancelTransport({})).toThrow();
+    expect(() => new provenance.CancelTransportInvocation({}, {} as never, request, {} as never, async () => ({}))).toThrow();
+    expect(() => new provenance.CancelTransportNoWriteEvidence({}, {} as never)).toThrow();
+  });
+});
 type Step = 'ACQUIRE' | 'ARM' | 'PERMISSION' | 'CONSUMPTION' | 'COMPLETION';
 function liveGate(fingerprint = FINGERPRINT, pair = 'B-BTC_USDT') {
   const gate = resolveLiveExecutionGate({ NODE_ENV: 'production', LIVE_EXECUTION_ENABLED: 'true', COINDCX_API_KEY: 'synthetic-unit-key', COINDCX_API_SECRET: 'synthetic-unit-secret',
@@ -207,9 +487,10 @@ describe('unwired orchestration and gateway boundary', () => {
     expect(Object.isFrozen(request)).toBe(true);
     expect(h.calls).toEqual(['ACQUIRE', 'ARM', 'PERMISSION', 'CONSUMPTION', 'COMPLETION']);
   });
-  it.each(['UNPROVEN', 'LATCH', 'DISCONNECTED', 'JOIN_LOST', 'INCARNATION', 'CONFIRMATION', 'INVALID_EVENT', 'STATE', 'EXPIRED', 'DWELL', 'CLOCK', 'RUNTIME', 'ENABLEMENT', 'LIVE_GATE', 'ACCOUNT', 'FAKE_CHECKER'] as const)('%s refuses with zero gateway calls', async reason => {
+  it.each(['ordinary', 'provenance'].flatMap(source => ['UNPROVEN', 'LATCH', 'DISCONNECTED', 'JOIN_LOST', 'INCARNATION', 'CONFIRMATION', 'INVALID_EVENT', 'STATE', 'EXPIRED', 'DWELL', 'CLOCK', 'RUNTIME', 'ENABLEMENT', 'LIVE_GATE', 'ACCOUNT', 'FAKE_CHECKER'].map(reason => [source, reason] as const)))('%s %s refuses with zero gateway/native calls', async (source, reason) => {
     const h = await harness();
     const dependencies = { ...h.dependencies };
+    if (source === 'provenance') dependencies.gateway = genuineGateway();
     switch (reason) {
       case 'UNPROVEN': h.stream.unprove(); break;
       case 'LATCH': h.stream.health = { ...h.stream.health, reconciliationRequired: true }; break;
@@ -228,8 +509,11 @@ describe('unwired orchestration and gateway boundary', () => {
       case 'ACCOUNT': dependencies.liveEnablement = liveGate('d'.repeat(64)); break;
       case 'FAKE_CHECKER': dependencies.recovery = { checkOriginalCertificateWatch: () => ({ kind: 'UNCHANGED' }) } as never; break;
     }
-    const result = await new PracticalCancelService(dependencies).cancel(h.input);
-    expect(result.kind).toBe('REFUSED'); expect(h.gateway.cancelOrder).not.toHaveBeenCalled(); expect(h.calls).toEqual([]);
+    const native = vi.spyOn(http, 'request').mockImplementation(() => { throw new Error('UNEXPECTED_NATIVE_REQUEST'); });
+    try {
+      const result = await new PracticalCancelService(dependencies).cancel(h.input);
+      expect(result.kind).toBe('REFUSED'); expect(h.gateway.cancelOrder).not.toHaveBeenCalled(); expect(native).not.toHaveBeenCalled(); expect(h.calls).toEqual([]);
+    } finally { native.mockRestore(); }
   });
   it.each(['ACQUIRE', 'ARM', 'PERMISSION', 'CONSUMPTION'] as const)('trip during %s cleans only current ownership and never calls gateway', async step => {
     const h = await harness(); h.hooks[step] = () => h.stream.emit('df-order-update');
@@ -430,6 +714,10 @@ describe('trusted cancel lookup replacement through actual CommonJS loaders', ()
       const Boundary=namespace.PracticalCancelGatewayBoundary,invoke=Boundary.prototype.invoke,guard=namespace.checkPracticalCancelGuard;
       const Recovery=require(file('practical-recovery/service')).PracticalRecoveryService;
       const Owner=require(file('practical-mutation/ticket')).PracticalCancelDispatchOwner;
+      const proof=require(file('practical-cancel-transport-evidence'));
+      const transportNamespace=require(path.join(root,'integration/coindcx/live/mutation-transport.'+extension));
+      const gatewayNamespace=require(path.join(root,'integration/coindcx/live/order-gateway.'+extension));
+      const Transport=transportNamespace.CoinDcxOrderMutationTransport,Gateway=gatewayNamespace.CoinDcxLiveFuturesOrderGateway;
       const consumer=file('practical-cancel/service'),{makeFixture}=require(fixturePath);
       assert.equal(require.cache[require.resolve(consumer)],undefined);
       let serviceNamespace=null,current=null,redirectedCalls=0,forgedConstructions=0;
@@ -456,6 +744,13 @@ describe('trusted cancel lookup replacement through actual CommonJS loaders', ()
         mutate(Boundary.prototype,'invoke',redirect);
         mutate(namespace,'PracticalCancelGatewayBoundary',forgedConstructor);
         mutate(namespace,'checkPracticalCancelGuard',()=>({kind:'UNCHANGED',nowMs:0}));
+        for(const key of Object.keys(proof))mutate(proof,key,forgedConstructor);
+        mutate(proof.CancelTransportInvocation,'invoke',redirect);
+        mutate(proof.CancelTransportInvocation,'settle',()=>({noWrite:true,result:{kind:'CANCEL_ACCEPTED',observation:null}}));
+        mutate(proof.CancelTransportNoWriteEvidence,'consume',()=>true);
+        mutate(Transport,'executePracticalCancel',redirect);
+        mutate(transportNamespace,'CoinDcxOrderMutationTransport',forgedConstructor);
+        mutate(gatewayNamespace,'CoinDcxLiveFuturesOrderGateway',forgedConstructor);
         assert.equal(namespace.PracticalCancelGatewayBoundary,Boundary);
         assert.equal(Boundary.prototype.invoke,invoke);assert.equal(namespace.checkPracticalCancelGuard,guard);
         if(serviceNamespace){
@@ -494,6 +789,25 @@ describe('trusted cancel lookup replacement through actual CommonJS loaders', ()
         assert.equal((await pending.service.retryBookkeeping({continuation:uncertain.continuation})).outcome,'ACCEPTED');
         assert.deepEqual(pending.calls.filter(c=>c!=='COMPLETION'),before);assert.equal(pending.gateway.cancelOrder.mock.calls.length,1);
         assert.equal((await pending.service.retryBookkeeping({continuation:uncertain.continuation})).kind,'REFUSED');
+        let nativeCalls=0;const http=require('node:http'),oldRequest=http.request;
+        http.request=()=>{nativeCalls++;throw new Error('UNEXPECTED_NATIVE_REQUEST')};
+        try{
+          const genuine=await makeFixture();
+          const gateway=new Gateway({apiKey:'synthetic-process-key',apiSecret:'synthetic-process-secret',baseUrl:'invalid-local-url',clock:genuine.clock});
+          gateway.cancelOrder=()=>{redirectedCalls++;throw new Error('PUBLIC_GATEWAY_REPLACED')};
+          const genuineService=new serviceNamespace.PracticalCancelService({...genuine.dependencies,gateway});
+          attack(genuine);
+          const [noWrite,second]=await Promise.all([genuineService.cancel(genuine.input),genuineService.cancel(genuine.input)]);
+          assert.equal(noWrite.outcome,'PRE_DISPATCH_FAILURE');assert.equal(second.kind,'REFUSED');
+          assert.equal(genuine.cleanups.length,1);assert.equal(genuine.cleanups[0].kind,'OUTCOME');
+          assert.equal(Owner.read(genuine.cleanups[0].owner).result.kind,'PRE_DISPATCH_FAILURE');
+          const lostGenuine=await makeFixture();
+          const guarded=new serviceNamespace.PracticalCancelService({...lostGenuine.dependencies,gateway:new Gateway({apiKey:'synthetic-process-key',apiSecret:'synthetic-process-secret',baseUrl:'invalid-local-url',clock:lostGenuine.clock})});
+          lostGenuine.hooks.CONSUMPTION=()=>{lostGenuine.stream.unprove();attack(lostGenuine)};
+          assert.equal((await guarded.cancel(lostGenuine.input)).outcome,'PRE_DISPATCH_FAILURE');
+          assert.equal(lostGenuine.cleanups.length,1);assert.equal(lostGenuine.cleanups[0].kind,'UNENTERED');
+          assert.equal(nativeCalls,0);
+        }finally{http.request=oldRequest}
         assert.equal(redirectedCalls,0);assert.equal(forgedConstructions,0);
         console.log('COMMONJS_FINAL_DISPATCH_CHAIN_PINNED');
       })().catch(()=>{console.error('COMMONJS_FINAL_DISPATCH_CHAIN_REGRESSION_FAILED');process.exitCode=1});

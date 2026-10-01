@@ -23,6 +23,9 @@
  */
 import http from 'node:http';
 import https from 'node:https';
+import { createHmac } from 'node:crypto';
+import { installCancelTransportBrand, registerCancelTransportSource, beginCancelTransportPreparation, markCancelTransmissionPossible, issueCancelTransportNoWrite,
+  readCancelTransportRequest, type CancelTransportInvocation, type CancelTransportNoWriteEvidence } from '../../../execution/live/practical-cancel-transport-evidence';
 import { parse as parseLosslessJson } from 'lossless-json';
 import { CoinDcxConfigError } from '../../../core/errors/app-error';
 import { createChildLogger } from '../../../monitoring/logger';
@@ -54,18 +57,62 @@ export class CoinDcxOrderMutationTransport {
   readonly #signer: RequestSigner;
   readonly #baseUrl: string;
   readonly #maxResponseBytes: number;
+  readonly #practicalSecret: string;
+  readonly #practicalBaseUrl: unknown;
+
+  static { installCancelTransportBrand(value => typeof value === 'object' && value !== null && #practicalSecret in value); }
 
   public constructor(options: OrderMutationTransportOptions) {
-    if (typeof options.apiKey !== 'string' || options.apiKey.trim() === '') {
+    const apiKey = options.apiKey;
+    if (typeof apiKey !== 'string' || apiKey.trim() === '') {
       throw new CoinDcxConfigError('A CoinDCX API key is required for order mutation');
     }
-    if (typeof options.apiSecret !== 'string' || options.apiSecret.trim() === '') {
+    const apiSecret = options.apiSecret;
+    if (typeof apiSecret !== 'string' || apiSecret.trim() === '') {
       throw new CoinDcxConfigError('A CoinDCX API secret is required for order mutation');
     }
-    this.#apiKey = options.apiKey;
-    this.#signer = new HmacSha256Signer(options.apiSecret);
-    this.#baseUrl = options.baseUrl ?? COINDCX_LIVE_BASE_URL;
-    this.#maxResponseBytes = options.maxResponseBytes ?? COINDCX_LIVE_MAX_RESPONSE_BYTES;
+    this.#apiKey = apiKey;
+    this.#signer = new HmacSha256Signer(apiSecret);
+    const baseUrl = options.baseUrl, maxResponseBytes = options.maxResponseBytes;
+    this.#baseUrl = baseUrl ?? COINDCX_LIVE_BASE_URL;
+    this.#practicalBaseUrl = baseUrl === undefined ? COINDCX_LIVE_BASE_URL : baseUrl;
+    this.#maxResponseBytes = maxResponseBytes ?? COINDCX_LIVE_MAX_RESPONSE_BYTES;
+    this.#practicalSecret = apiSecret;
+    registerCancelTransportSource(this);
+  }
+
+  /** Defining-module protected entry to private transport; no public execute lookup. */
+  public static executePracticalCancel(transport: unknown, invocation: CancelTransportInvocation, timestamp: unknown): Promise<{ readonly wire: OrderMutationWireResult; readonly evidence: CancelTransportNoWriteEvidence | null }> {
+    if (typeof transport !== 'object' || transport === null || !(#practicalSecret in transport)) throw new Error('CANCEL_TRANSPORT_SOURCE_REFUSED');
+    return transport.#executePracticalCancel(invocation, timestamp);
+  }
+
+  async #executePracticalCancel(invocation: CancelTransportInvocation, timestamp: unknown): Promise<{ readonly wire: OrderMutationWireResult; readonly evidence: CancelTransportNoWriteEvidence | null }> {
+    const request = readCancelTransportRequest(invocation);
+    // Snapshot and validate actual retained inputs before the proof-producing region.
+    // typeof and Number.isSafeInteger never coerce or inspect malformed values.
+    const id = request.exchangeOrderId, baseUrl = this.#practicalBaseUrl, apiKey = this.#apiKey, secret = this.#practicalSecret;
+    const cancelPath = COINDCX_ORDER_MUTATION_ENDPOINTS.CANCEL_ORDER.path;
+    if (typeof timestamp !== 'number' || !Number.isSafeInteger(timestamp) || timestamp < 0
+      || typeof baseUrl !== 'string' || typeof apiKey !== 'string' || typeof secret !== 'string'
+      || typeof id !== 'string' || typeof cancelPath !== 'string') throw new Error('CANCEL_LOCAL_INPUT_INVALID');
+    beginCancelTransportPreparation(invocation, this);
+    let payload: string, url: URL, headers: Record<string, string>;
+    try {
+      // Plain locally built body, private secret and native HMAC: no preparation callbacks.
+      payload = JSON.stringify({ timestamp, id });
+      url = new URL(cancelPath, baseUrl);
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('INVALID_LOCAL_PROTOCOL');
+      headers = { Accept: 'application/json', 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(payload, 'utf8')),
+        'X-AUTH-APIKEY': apiKey, 'X-AUTH-SIGNATURE': createHmac('sha256', secret).update(payload, 'utf8').digest('hex') };
+    } catch {
+      return { wire: { kind: 'PRE_DISPATCH', reasonCode: 'LOCAL_CANCEL_PREPARATION_FAILED' }, evidence: issueCancelTransportNoWrite(invocation, this) };
+    }
+    // From before factory invocation onward no failure can issue practical proof.
+    try {
+      const wire = await this.#executePrepared('CANCEL_ORDER', payload, url, headers, request.timeoutMs, invocation);
+      return { wire, evidence: null };
+    } catch { return { wire: { kind: 'UNESTABLISHED', reasonCode: 'CANCEL_INVOCATION_UNCERTAIN' }, evidence: null }; }
   }
 
   /**
@@ -91,7 +138,6 @@ export class CoinDcxOrderMutationTransport {
     }
 
     const url = new URL(definition.path, this.#baseUrl);
-    const requestModule = url.protocol === 'https:' ? https : http;
     const headers: Record<string, string> = {
       Accept: 'application/json',
       'Content-Type': 'application/json',
@@ -100,6 +146,12 @@ export class CoinDcxOrderMutationTransport {
       'X-AUTH-SIGNATURE': this.#signer.sign(payload),
     };
 
+    return this.#executePrepared(endpoint, payload, url, headers, timeoutMs);
+  }
+
+  #executePrepared(endpoint: CoinDcxOrderMutationEndpoint, payload: string, url: URL, headers: Record<string, string>, timeoutMs: number, invocation?: CancelTransportInvocation): Promise<OrderMutationWireResult> {
+    const definition = COINDCX_ORDER_MUTATION_ENDPOINTS[endpoint];
+    const requestModule = url.protocol === 'https:' ? https : http;
     return new Promise<OrderMutationWireResult>((resolve) => {
       let settled = false;
       let connected = false;
@@ -121,6 +173,7 @@ export class CoinDcxOrderMutationTransport {
       const unresolvedOutcome = (reasonCode: string): OrderMutationWireResult =>
         (connected ? { kind: 'UNESTABLISHED', reasonCode } : { kind: 'PRE_DISPATCH', reasonCode });
 
+      if (invocation !== undefined) markCancelTransmissionPossible(invocation, this);
       const request = requestModule.request(url, { method: definition.method, headers }, (response) => {
         const statusCode = response.statusCode ?? 0;
         const chunks: Buffer[] = [];
@@ -174,4 +227,12 @@ export class CoinDcxOrderMutationTransport {
       request.end();
     });
   }
+}
+
+Object.defineProperty(CoinDcxOrderMutationTransport, 'executePracticalCancel', { value: CoinDcxOrderMutationTransport.executePracticalCancel, writable: false, configurable: false });
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  const descriptor = Object.getOwnPropertyDescriptor(module.exports, 'CoinDcxOrderMutationTransport');
+  if (descriptor?.configurable === false) {
+    if (descriptor.get === undefined || descriptor.set !== undefined || module.exports.CoinDcxOrderMutationTransport !== CoinDcxOrderMutationTransport) throw new Error('CANCEL_TRANSPORT_EXPORT_BINDING_INVALID');
+  } else Object.defineProperty(module.exports, 'CoinDcxOrderMutationTransport', { get: () => CoinDcxOrderMutationTransport, configurable: false });
 }

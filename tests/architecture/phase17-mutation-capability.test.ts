@@ -23,6 +23,7 @@ const APPROVED_NETWORK_OWNERS = Object.freeze([
 ]);
 
 const APPROVED_COINDCX_CRYPTO_OWNERS = Object.freeze([
+  'src/integration/coindcx/live/mutation-transport.ts',
   'src/integration/coindcx/instrument-authority.ts',
   'src/integration/coindcx/paper-evidence.ts',
   'src/integration/coindcx/signer.ts',
