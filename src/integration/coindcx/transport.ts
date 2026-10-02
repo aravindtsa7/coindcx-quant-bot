@@ -452,3 +452,27 @@ export class CoinDcxTransport {
     });
   }
 }
+
+// Capture in the defining module, before any consumer or option getter can patch prototypes.
+const OWNED_DESCRIPTORS = Object.getOwnPropertyDescriptors(CoinDcxTransport.prototype);
+for (const descriptor of Object.values(OWNED_DESCRIPTORS)) {
+  for (const value of [descriptor.value, descriptor.get, descriptor.set]) if (typeof value === 'function') Object.freeze(value);
+}
+function protectOwnedInstance<T extends object>(instance: T): T {
+  for (const [key, descriptor] of Object.entries(OWNED_DESCRIPTORS)) {
+    if (key === 'constructor') continue;
+    if (typeof descriptor.value === 'function') Object.defineProperty(instance, key, { value: Object.freeze(descriptor.value.bind(instance)), writable: false, configurable: false });
+    else if (descriptor.get !== undefined) Object.defineProperty(instance, key, { get: Object.freeze(descriptor.get.bind(instance)), configurable: false });
+  }
+  return Object.freeze(instance);
+}
+
+/** Internal owned construction; callers are pinned, never an injectable authority port. */
+export function createOwnedCoinDcxReadTransport(options: TransportOptions) : CoinDcxTransport { return protectOwnedInstance(new CoinDcxTransport(options)); }
+Object.freeze(createOwnedCoinDcxReadTransport);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  const descriptor = Object.getOwnPropertyDescriptor(module.exports, 'createOwnedCoinDcxReadTransport');
+  if (descriptor?.configurable === false) {
+    if (descriptor.get === undefined || descriptor.set !== undefined || module.exports.createOwnedCoinDcxReadTransport !== createOwnedCoinDcxReadTransport) throw new Error('CREDENTIAL_CONSTRUCTION_EXPORT_INVALID');
+  } else Object.defineProperty(module.exports, 'createOwnedCoinDcxReadTransport', { get: () => createOwnedCoinDcxReadTransport, configurable: false });
+}

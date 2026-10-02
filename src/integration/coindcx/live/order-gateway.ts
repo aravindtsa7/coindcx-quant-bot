@@ -13,7 +13,7 @@ import { liveDecimal } from '../../../execution/live/decimal';
 import { isSendableLiveClientOrderId } from '../../../execution/live/identity';
 import type { LiveOrderObservation, LiveOrderObservationKind, LiveOrderSide, LiveTimeInForce } from '../../../execution/live/types';
 import { Clock, SystemClock } from '../clock';
-import { CoinDcxOrderMutationTransport, type OrderMutationWireResult } from './mutation-transport';
+import { createOwnedCoinDcxMutationTransport, CoinDcxOrderMutationTransport, type OrderMutationWireResult } from './mutation-transport';
 import { installCancelGatewayBrand, registerCancelGatewaySource, readCancelTransportRequest, propagateCancelTransportResult, type CancelTransportInvocation } from '../../../execution/live/practical-cancel-transport-evidence';
 import {
   LiveCancelResponseSchema,
@@ -194,12 +194,11 @@ export class CoinDcxLiveFuturesOrderGateway implements CoinDcxFuturesOrderGatewa
 
   static { installCancelGatewayBrand((gateway, transport) => typeof gateway === 'object' && gateway !== null && #transport in gateway && gateway.#transport === transport); }
 
-  public constructor(options: CoinDcxLiveOrderGatewayOptions) {
-    this.#transport = new CoinDcxOrderMutationTransport({
-      apiKey: options.apiKey,
-      apiSecret: options.apiSecret,
-      baseUrl: options.baseUrl,
-    });
+  public constructor(options: CoinDcxLiveOrderGatewayOptions, owned?: unknown) {
+    const transportOptions = { apiKey: options.apiKey, apiSecret: options.apiSecret, baseUrl: options.baseUrl };
+    this.#transport = owned === OWNED_CONSTRUCTION
+      ? createOwnedCoinDcxMutationTransport({ ...transportOptions, baseUrl: options.baseUrl! })
+      : new CoinDcxOrderMutationTransport(transportOptions);
     this.#clock = options.clock ?? new SystemClock();
     registerCancelGatewaySource(this, this.#transport, invocation => this.#cancelWithProvenance(invocation));
   }
@@ -434,4 +433,29 @@ if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
   if (descriptor?.configurable === false) {
     if (descriptor.get === undefined || descriptor.set !== undefined || module.exports.CoinDcxLiveFuturesOrderGateway !== CoinDcxLiveFuturesOrderGateway) throw new Error('CANCEL_GATEWAY_EXPORT_BINDING_INVALID');
   } else Object.defineProperty(module.exports, 'CoinDcxLiveFuturesOrderGateway', { get: () => CoinDcxLiveFuturesOrderGateway, configurable: false });
+}
+
+// Capture in the defining module, before any consumer or option getter can patch prototypes.
+const OWNED_DESCRIPTORS = Object.getOwnPropertyDescriptors(CoinDcxLiveFuturesOrderGateway.prototype);
+for (const descriptor of Object.values(OWNED_DESCRIPTORS)) {
+  for (const value of [descriptor.value, descriptor.get, descriptor.set]) if (typeof value === 'function') Object.freeze(value);
+}
+function protectOwnedInstance<T extends object>(instance: T): T {
+  for (const [key, descriptor] of Object.entries(OWNED_DESCRIPTORS)) {
+    if (key === 'constructor') continue;
+    if (typeof descriptor.value === 'function') Object.defineProperty(instance, key, { value: Object.freeze(descriptor.value.bind(instance)), writable: false, configurable: false });
+    else if (descriptor.get !== undefined) Object.defineProperty(instance, key, { get: Object.freeze(descriptor.get.bind(instance)), configurable: false });
+  }
+  return Object.freeze(instance);
+}
+const OWNED_CONSTRUCTION = Object.freeze({});
+const OWNED_CLOCK = Object.freeze({ nowMs: Object.freeze(() => Date.now()) });
+/** Internal owned construction; callers are pinned, never an injectable authority port. */
+export function createOwnedCoinDcxMutationGateway(options: Readonly<{ apiKey: string; apiSecret: string; baseUrl: string }>) : CoinDcxLiveFuturesOrderGateway { return protectOwnedInstance(new CoinDcxLiveFuturesOrderGateway({ ...options, clock: OWNED_CLOCK }, OWNED_CONSTRUCTION)); }
+Object.freeze(createOwnedCoinDcxMutationGateway);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  const descriptor = Object.getOwnPropertyDescriptor(module.exports, 'createOwnedCoinDcxMutationGateway');
+  if (descriptor?.configurable === false) {
+    if (descriptor.get === undefined || descriptor.set !== undefined || module.exports.createOwnedCoinDcxMutationGateway !== createOwnedCoinDcxMutationGateway) throw new Error('CREDENTIAL_CONSTRUCTION_EXPORT_INVALID');
+  } else Object.defineProperty(module.exports, 'createOwnedCoinDcxMutationGateway', { get: () => createOwnedCoinDcxMutationGateway, configurable: false });
 }

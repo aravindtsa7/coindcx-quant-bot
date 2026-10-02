@@ -30,7 +30,7 @@ import { parse as parseLosslessJson } from 'lossless-json';
 import { CoinDcxConfigError } from '../../../core/errors/app-error';
 import { createChildLogger } from '../../../monitoring/logger';
 import type { RequestSigner } from '../signer';
-import { HmacSha256Signer } from '../signer';
+import { HmacSha256Signer, createOwnedCoinDcxSigner } from '../signer';
 import {
   COINDCX_LIVE_BASE_URL,
   COINDCX_LIVE_MAX_RESPONSE_BYTES,
@@ -62,7 +62,7 @@ export class CoinDcxOrderMutationTransport {
 
   static { installCancelTransportBrand(value => typeof value === 'object' && value !== null && #practicalSecret in value); }
 
-  public constructor(options: OrderMutationTransportOptions) {
+  public constructor(options: OrderMutationTransportOptions, owned?: unknown) {
     const apiKey = options.apiKey;
     if (typeof apiKey !== 'string' || apiKey.trim() === '') {
       throw new CoinDcxConfigError('A CoinDCX API key is required for order mutation');
@@ -72,7 +72,7 @@ export class CoinDcxOrderMutationTransport {
       throw new CoinDcxConfigError('A CoinDCX API secret is required for order mutation');
     }
     this.#apiKey = apiKey;
-    this.#signer = new HmacSha256Signer(apiSecret);
+    this.#signer = owned === OWNED_CONSTRUCTION ? createOwnedCoinDcxSigner(apiSecret) : new HmacSha256Signer(apiSecret);
     const baseUrl = options.baseUrl, maxResponseBytes = options.maxResponseBytes;
     this.#baseUrl = baseUrl ?? COINDCX_LIVE_BASE_URL;
     this.#practicalBaseUrl = baseUrl === undefined ? COINDCX_LIVE_BASE_URL : baseUrl;
@@ -235,4 +235,28 @@ if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
   if (descriptor?.configurable === false) {
     if (descriptor.get === undefined || descriptor.set !== undefined || module.exports.CoinDcxOrderMutationTransport !== CoinDcxOrderMutationTransport) throw new Error('CANCEL_TRANSPORT_EXPORT_BINDING_INVALID');
   } else Object.defineProperty(module.exports, 'CoinDcxOrderMutationTransport', { get: () => CoinDcxOrderMutationTransport, configurable: false });
+}
+
+// Capture in the defining module, before any consumer or option getter can patch prototypes.
+const OWNED_DESCRIPTORS = Object.getOwnPropertyDescriptors(CoinDcxOrderMutationTransport.prototype);
+for (const descriptor of Object.values(OWNED_DESCRIPTORS)) {
+  for (const value of [descriptor.value, descriptor.get, descriptor.set]) if (typeof value === 'function') Object.freeze(value);
+}
+function protectOwnedInstance<T extends object>(instance: T): T {
+  for (const [key, descriptor] of Object.entries(OWNED_DESCRIPTORS)) {
+    if (key === 'constructor') continue;
+    if (typeof descriptor.value === 'function') Object.defineProperty(instance, key, { value: Object.freeze(descriptor.value.bind(instance)), writable: false, configurable: false });
+    else if (descriptor.get !== undefined) Object.defineProperty(instance, key, { get: Object.freeze(descriptor.get.bind(instance)), configurable: false });
+  }
+  return Object.freeze(instance);
+}
+const OWNED_CONSTRUCTION = Object.freeze({});
+/** Internal owned construction; callers are pinned, never an injectable authority port. */
+export function createOwnedCoinDcxMutationTransport(options: Readonly<{ apiKey: string; apiSecret: string; baseUrl: string }>) : CoinDcxOrderMutationTransport { return protectOwnedInstance(new CoinDcxOrderMutationTransport(options, OWNED_CONSTRUCTION)); }
+Object.freeze(createOwnedCoinDcxMutationTransport);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  const descriptor = Object.getOwnPropertyDescriptor(module.exports, 'createOwnedCoinDcxMutationTransport');
+  if (descriptor?.configurable === false) {
+    if (descriptor.get === undefined || descriptor.set !== undefined || module.exports.createOwnedCoinDcxMutationTransport !== createOwnedCoinDcxMutationTransport) throw new Error('CREDENTIAL_CONSTRUCTION_EXPORT_INVALID');
+  } else Object.defineProperty(module.exports, 'createOwnedCoinDcxMutationTransport', { get: () => createOwnedCoinDcxMutationTransport, configurable: false });
 }

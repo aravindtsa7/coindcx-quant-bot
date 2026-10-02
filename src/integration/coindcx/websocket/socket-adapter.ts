@@ -178,3 +178,28 @@ export class FakeCoinDcxSocketFactory implements CoinDcxSocketFactory {
     return this.createdSockets[this.createdSockets.length - 1];
   }
 }
+
+const OWNED_SOCKET_DESCRIPTORS = Object.getOwnPropertyDescriptors(ProductionCoinDcxSocket.prototype);
+for (const descriptor of Object.values(OWNED_SOCKET_DESCRIPTORS)) for (const value of [descriptor.value, descriptor.get]) if (typeof value === 'function') Object.freeze(value);
+function ownedSocket(endpoint: string, options?: CoinDcxSocketOptions): CoinDcxSocket {
+  const socket = new ProductionCoinDcxSocket(endpoint, options);
+  for (const [key, descriptor] of Object.entries(OWNED_SOCKET_DESCRIPTORS)) {
+    if (key === 'constructor') continue;
+    if (typeof descriptor.value === 'function') Object.defineProperty(socket, key, { value: Object.freeze(descriptor.value.bind(socket)), writable: false, configurable: false });
+    else if (descriptor.get !== undefined) Object.defineProperty(socket, key, { get: Object.freeze(descriptor.get.bind(socket)), configurable: false });
+  }
+  return Object.freeze(socket);
+}
+/** No socket is created until the existing stream explicitly starts. */
+export function createOwnedCoinDcxSocketFactory(): CoinDcxSocketFactory {
+  const factory = new ProductionCoinDcxSocketFactory();
+  Object.defineProperty(factory, 'createSocket', { value: Object.freeze(ownedSocket), writable: false, configurable: false });
+  return Object.freeze(factory);
+}
+Object.freeze(createOwnedCoinDcxSocketFactory);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  const descriptor = Object.getOwnPropertyDescriptor(module.exports, 'createOwnedCoinDcxSocketFactory');
+  if (descriptor?.configurable === false) {
+    if (descriptor.get === undefined || descriptor.set !== undefined || module.exports.createOwnedCoinDcxSocketFactory !== createOwnedCoinDcxSocketFactory) throw new Error('CREDENTIAL_CONSTRUCTION_EXPORT_INVALID');
+  } else Object.defineProperty(module.exports, 'createOwnedCoinDcxSocketFactory', { get: () => createOwnedCoinDcxSocketFactory, configurable: false });
+}

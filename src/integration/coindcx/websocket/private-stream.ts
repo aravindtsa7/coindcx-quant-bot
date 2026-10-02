@@ -2,7 +2,7 @@ import { PrivateStreamDiagnosticRecorder, type PrivateStreamDiagnosticConfig } f
 import type { ExportHistory, PrivateStreamDiagnosticsV1, SocketAttempt } from './private-stream-diagnostics-schema';
 import pino from 'pino';
 import { Clock, SystemClock } from '../clock';
-import { HmacSha256Signer, RequestSigner } from '../signer';
+import { HmacSha256Signer, RequestSigner, createOwnedCoinDcxSigner } from '../signer';
 import { CoinDcxConfigError, CoinDcxSocketError } from '../../../core/errors/app-error';
 import { logger as rootLogger } from '../../../monitoring/logger';
 import { BackoffPolicyConfig, calculateBackoffWithJitter, DEFAULT_BACKOFF_CONFIG } from './backoff';
@@ -14,7 +14,7 @@ import {
 } from './schemas';
 import {
   COINDCX_DEFAULT_SOCKET_ENDPOINT,
-  ProductionCoinDcxSocketFactory,
+  ProductionCoinDcxSocketFactory, createOwnedCoinDcxSocketFactory,
 } from './socket-adapter';
 import {
   categorizeDisconnectReason,
@@ -119,7 +119,7 @@ export class CoinDcxPrivateAccountStream {
   // Downstream subscribers
   readonly #subscribers = new Set<StreamEventListener>();
 
-  constructor(config: PrivateStreamConfig) {
+  constructor(config: PrivateStreamConfig, owned?: unknown) {
     if (!config.apiKey || config.apiKey.trim() === '') {
       throw new CoinDcxConfigError('COINDCX_API_KEY is required for private stream initialization');
     }
@@ -131,7 +131,7 @@ export class CoinDcxPrivateAccountStream {
       if (!config.apiSecret || config.apiSecret.trim() === '') {
         throw new CoinDcxConfigError('COINDCX_API_SECRET is required for private stream request signing');
       }
-      this.#signer = new HmacSha256Signer(config.apiSecret.trim());
+      this.#signer = owned === OWNED_CONSTRUCTION ? createOwnedCoinDcxSigner(config.apiSecret.trim()) : new HmacSha256Signer(config.apiSecret.trim());
     }
 
     this.#endpoint = config.endpoint ?? COINDCX_DEFAULT_SOCKET_ENDPOINT;
@@ -779,4 +779,38 @@ export class CoinDcxPrivateAccountStream {
       reconciliationRequiredTotal: this.#reconciliationRequired ? 1 : 0,
     });
   }
+}
+
+// Capture in the defining module, before any consumer or option getter can patch prototypes.
+const OWNED_DESCRIPTORS = Object.getOwnPropertyDescriptors(CoinDcxPrivateAccountStream.prototype);
+for (const descriptor of Object.values(OWNED_DESCRIPTORS)) {
+  for (const value of [descriptor.value, descriptor.get, descriptor.set]) if (typeof value === 'function') Object.freeze(value);
+}
+function protectOwnedInstance<T extends object>(instance: T): T {
+  for (const [key, descriptor] of Object.entries(OWNED_DESCRIPTORS)) {
+    if (key === 'constructor') continue;
+    if (typeof descriptor.value === 'function') Object.defineProperty(instance, key, { value: Object.freeze(descriptor.value.bind(instance)), writable: false, configurable: false });
+    else if (descriptor.get !== undefined) Object.defineProperty(instance, key, { get: Object.freeze(descriptor.get.bind(instance)), configurable: false });
+  }
+  return Object.freeze(instance);
+}
+const OWNED_CONSTRUCTION = Object.freeze({});
+const OWNED_CLOCK = Object.freeze({ nowMs: Object.freeze(() => Date.now()) });
+const OWNED_RNG = Math.random;
+const OWNED_SCHEDULER: StreamScheduler = Object.freeze({
+  setTimeout: Object.freeze((callback: () => void, ms: number) => setTimeout(callback, ms)),
+  clearTimeout: Object.freeze((id: number | NodeJS.Timeout) => clearTimeout(id)),
+  setInterval: Object.freeze((callback: () => void, ms: number) => setInterval(callback, ms)),
+  clearInterval: Object.freeze((id: number | NodeJS.Timeout) => clearInterval(id)),
+});
+/** Internal owned construction; callers are pinned, never an injectable authority port. */
+export function createOwnedCoinDcxPrivateStream(options: Readonly<{ apiKey: string; apiSecret: string; endpoint: string }>) : CoinDcxPrivateAccountStream {
+  return protectOwnedInstance(new CoinDcxPrivateAccountStream({ ...options, clock: OWNED_CLOCK, scheduler: OWNED_SCHEDULER, rng: OWNED_RNG, socketFactory: createOwnedCoinDcxSocketFactory() }, OWNED_CONSTRUCTION));
+}
+Object.freeze(createOwnedCoinDcxPrivateStream);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  const descriptor = Object.getOwnPropertyDescriptor(module.exports, 'createOwnedCoinDcxPrivateStream');
+  if (descriptor?.configurable === false) {
+    if (descriptor.get === undefined || descriptor.set !== undefined || module.exports.createOwnedCoinDcxPrivateStream !== createOwnedCoinDcxPrivateStream) throw new Error('CREDENTIAL_CONSTRUCTION_EXPORT_INVALID');
+  } else Object.defineProperty(module.exports, 'createOwnedCoinDcxPrivateStream', { get: () => createOwnedCoinDcxPrivateStream, configurable: false });
 }

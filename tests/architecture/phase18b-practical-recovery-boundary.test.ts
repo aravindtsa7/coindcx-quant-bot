@@ -62,6 +62,7 @@ describe('module layout', () => {
       'src/execution/live/practical-shadow/config.ts',
       'src/execution/live/practical-shadow/evidence.ts',
       'src/execution/live/practical-shadow/types.ts',
+      'src/integration/coindcx/live/practical-credential-sources.ts',
     ]);
     const allowed = new Set(['observation.ts', 'private-events.ts', 'ports.ts', 'telemetry.ts', 'timing.ts'].map((name) => `${RECOVERY_ROOT}${name}`));
     for (const importer of importers) {

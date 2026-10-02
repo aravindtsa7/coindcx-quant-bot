@@ -45,8 +45,8 @@ import {
   ListWalletTransactionsRequestSchema,
   UserInfoResponseSchema,
 } from './schemas';
-import { HmacSha256Signer, RequestSigner } from './signer';
-import { CoinDcxTransport, TransportOptions } from './transport';
+import { HmacSha256Signer, RequestSigner, createOwnedCoinDcxSigner } from './signer';
+import { createOwnedCoinDcxReadTransport, CoinDcxTransport, TransportOptions } from './transport';
 import { readInrFuturesInstrument } from './instrument-reader';
 
 const logger = createChildLogger('coindcx:client');
@@ -77,12 +77,12 @@ export class CoinDcxClient {
   readonly #clock: Clock;
   readonly #hasCredentials: boolean;
 
-  constructor(options: CoinDcxClientOptions = {}) {
+  constructor(options: CoinDcxClientOptions = {}, owned?: unknown) {
     this.#clock = options.clock ?? new SystemClock();
 
     let signer: RequestSigner | undefined;
     if (options.apiSecret && options.apiSecret.trim() !== '') {
-      signer = new HmacSha256Signer(options.apiSecret);
+      signer = owned === OWNED_CONSTRUCTION ? createOwnedCoinDcxSigner(options.apiSecret) : new HmacSha256Signer(options.apiSecret);
     }
 
     const apiKey = options.apiKey;
@@ -100,7 +100,7 @@ export class CoinDcxClient {
         apiKey,
         signer,
       };
-      this.#transport = new CoinDcxTransport(transportOpts);
+      this.#transport = owned === OWNED_CONSTRUCTION ? createOwnedCoinDcxReadTransport(transportOpts) : new CoinDcxTransport(transportOpts);
     }
   }
 
@@ -519,4 +519,29 @@ export class CoinDcxClient {
     }
     return parsed.data.map(normalizeTrade);
   }
+}
+
+// Capture in the defining module, before any consumer or option getter can patch prototypes.
+const OWNED_DESCRIPTORS = Object.getOwnPropertyDescriptors(CoinDcxClient.prototype);
+for (const descriptor of Object.values(OWNED_DESCRIPTORS)) {
+  for (const value of [descriptor.value, descriptor.get, descriptor.set]) if (typeof value === 'function') Object.freeze(value);
+}
+function protectOwnedInstance<T extends object>(instance: T): T {
+  for (const [key, descriptor] of Object.entries(OWNED_DESCRIPTORS)) {
+    if (key === 'constructor') continue;
+    if (typeof descriptor.value === 'function') Object.defineProperty(instance, key, { value: Object.freeze(descriptor.value.bind(instance)), writable: false, configurable: false });
+    else if (descriptor.get !== undefined) Object.defineProperty(instance, key, { get: Object.freeze(descriptor.get.bind(instance)), configurable: false });
+  }
+  return Object.freeze(instance);
+}
+const OWNED_CONSTRUCTION = Object.freeze({});
+const OWNED_CLOCK = Object.freeze({ nowMs: Object.freeze(() => Date.now()) });
+/** Internal owned construction; callers are pinned, never an injectable authority port. */
+export function createOwnedCoinDcxReadClient(options: Readonly<{ apiKey: string; apiSecret: string; baseUrl: string }>) : CoinDcxClient { return protectOwnedInstance(new CoinDcxClient({ ...options, clock: OWNED_CLOCK }, OWNED_CONSTRUCTION)); }
+Object.freeze(createOwnedCoinDcxReadClient);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  const descriptor = Object.getOwnPropertyDescriptor(module.exports, 'createOwnedCoinDcxReadClient');
+  if (descriptor?.configurable === false) {
+    if (descriptor.get === undefined || descriptor.set !== undefined || module.exports.createOwnedCoinDcxReadClient !== createOwnedCoinDcxReadClient) throw new Error('CREDENTIAL_CONSTRUCTION_EXPORT_INVALID');
+  } else Object.defineProperty(module.exports, 'createOwnedCoinDcxReadClient', { get: () => createOwnedCoinDcxReadClient, configurable: false });
 }

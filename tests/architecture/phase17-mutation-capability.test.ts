@@ -72,15 +72,18 @@ describe('F17-14 production capability ownership', () => {
     expect(hmacConstructorOwners.sort()).toEqual([
       'src/integration/coindcx/client.ts',
       MUTATION_TRANSPORT,
+      // The defining module's protected helper constructs its own lexical signer.
+      // External helper callers remain pinned separately; no new signing owner.
+      'src/integration/coindcx/signer.ts',
       'src/integration/coindcx/websocket/private-stream.ts',
     ].sort());
   });
 
   it('pins every module capable of reaching authenticated order mutation', () => {
     const reachers = result.files.filter((file) => file !== MUTATION_TRANSPORT && computeReachable(result.graph, file).has(MUTATION_TRANSPORT));
-    expect(reachers.sort()).toEqual([MUTATION_GATEWAY, PRODUCTION_ROOT].sort());
+    expect(reachers.sort()).toEqual([MUTATION_GATEWAY, PRODUCTION_ROOT, 'src/integration/coindcx/live/practical-credential-sources.ts'].sort());
     expect(inverseDirectImporters(result.graph, MUTATION_TRANSPORT)).toEqual([MUTATION_GATEWAY]);
-    expect(inverseDirectImporters(result.graph, MUTATION_GATEWAY)).toEqual([PRODUCTION_ROOT]);
+    expect(inverseDirectImporters(result.graph, MUTATION_GATEWAY)).toEqual([PRODUCTION_ROOT, 'src/integration/coindcx/live/practical-credential-sources.ts'].sort());
   });
 
   it('fails closed on unresolved dynamic loading in protected production source', () => {

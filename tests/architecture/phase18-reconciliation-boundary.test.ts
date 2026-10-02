@@ -373,9 +373,11 @@ describe('P18-§9/§20 Phase18 adds no second mutation owner', () => {
     expect(reachable.has(MUTATION_TRANSPORT)).toBe(false);
   });
 
-  it('keeps the Phase17 rule that only the approved root reaches the mutable adapter', () => {
+  it('allows only the approved root and the disconnected credential construction factory to reach the mutable adapter', () => {
     const reachers = files.filter((file) => file !== MUTATION_ADAPTER && computeReachable(graph, file).has(MUTATION_ADAPTER));
-    expect(reachers).toEqual([APPROVED_ROOT]);
+    const factory = 'src/integration/coindcx/live/practical-credential-sources.ts';
+    expect(reachers.sort()).toEqual([APPROVED_ROOT, factory].sort());
+    expect(files.filter((file) => file !== factory && computeReachable(graph, file).has(factory))).toEqual([]);
   });
 
   it('keeps the approved production root an explicit opt-in entry point nothing imports', () => {
