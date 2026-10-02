@@ -1,3 +1,4 @@
+import { redactSafetyData, snapshotSafetyData } from '../../../monitoring/logger';
 /**
  * Phase 18B practical live safety — domain vocabulary (Stage 1A).
  *
@@ -168,8 +169,13 @@ export class PracticalLiveSafetyError extends Error {
     assertCredentialFree(details);
     this.name = 'PracticalLiveSafetyError';
     this.code = code;
-    this.details = details === undefined ? undefined : Object.freeze({ ...details });
+    this.details = details === undefined ? undefined : Object.freeze(redactSafetyData(details));
     Object.setPrototypeOf(this, new.target.prototype);
+    const kind = new.target === PracticalLiveSafetyError ? 'PracticalLiveSafetyError' : null;
+    if (kind !== null && typeof code === 'string' && nativeErrorCodes.includes(code)) {
+      nativeErrorRecords.set(this, Object.freeze({ kind, code, details: details === undefined ? undefined
+        : snapshotSafetyData(redactSafetyData(details)) as Readonly<Record<string, unknown>> }));
+    }
   }
 }
 
@@ -191,4 +197,40 @@ export function isNonNegativeSafeInteger(value: unknown): value is number {
 
 export function isPositiveSafeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1;
+}
+
+export interface PracticalLiveSafetyErrorSafetyRecord { readonly kind: 'PracticalLiveSafetyError'; readonly code: PracticalLiveSafetyErrorCode; readonly details: Readonly<Record<string, unknown>> | undefined }
+const nativeErrorCodes: readonly string[] = Object.freeze(["PRACTICAL_POLICY_INVALID","PRACTICAL_AUTHORITY_INVALID","PRACTICAL_ILLEGAL_TRANSITION","PRACTICAL_CERTIFICATE_INVALID","PRACTICAL_CERTIFICATE_BINDING_MISMATCH","PRACTICAL_CERTIFICATE_EXPIRED","PRACTICAL_CERTIFICATE_BEFORE_ISSUANCE","PRACTICAL_CERTIFICATE_NOT_ISSUED","PRACTICAL_FENCE_INVALID","PRACTICAL_FENCE_CONFLICT","PRACTICAL_FENCE_BINDING_MISMATCH","PRACTICAL_ACTION_NOT_PERMITTED"]);
+const nativeErrorRecords = new WeakMap<object, PracticalLiveSafetyErrorSafetyRecord>();
+export function readPracticalLiveSafetyError(value: unknown): PracticalLiveSafetyErrorSafetyRecord | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const record = nativeErrorRecords.get(value);
+  if (record === undefined) return null;
+  return record;
+}
+Object.freeze(readPracticalLiveSafetyError);
+
+/** Private exact matcher; public RegExp mutation cannot affect trusted decisions. */
+const practicalDigestExec = RegExp.prototype.exec;
+export function isPracticalDigest(value: unknown): value is string {
+  return typeof value === 'string' && practicalDigestExec.call(/^[0-9a-f]{64}$/, value) !== null;
+}
+Object.freeze(isPracticalDigest);
+// Reviewed defining-owner binding protection.
+Object.freeze(PracticalLiveSafetyError.prototype);
+Object.freeze(PracticalLiveSafetyError);
+Object.freeze(isExactId);
+Object.freeze(isNonNegativeSafeInteger);
+Object.freeze(isPositiveSafeInteger);
+Object.freeze(isPracticalInvalidationReason);
+Object.freeze(isPracticalMutationAction);
+Object.freeze(isPracticalAccountStateName);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["PRACTICAL_AUTHORIZATION_BASIS","PRACTICAL_DIGEST_PATTERN","PracticalLiveSafetyError","isExactId","isNonNegativeSafeInteger","isPositiveSafeInteger","isPracticalInvalidationReason","isPracticalMutationAction","PRACTICAL_MUTATION_OUTCOMES","PRACTICAL_INVALIDATION_REASONS","isPracticalAccountStateName","PRACTICAL_ACCOUNT_STATES","PRACTICAL_MUTATION_ACTIONS","readPracticalLiveSafetyError","isPracticalDigest"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

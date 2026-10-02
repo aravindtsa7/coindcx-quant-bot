@@ -37,3 +37,15 @@ export function calculateBackoffWithJitter(
 
   return config.minDelayMs + jitterOffset;
 }
+
+// Reviewed defining-owner binding protection.
+Object.freeze(calculateBackoffWithJitter);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["DEFAULT_BACKOFF_CONFIG","calculateBackoffWithJitter"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}

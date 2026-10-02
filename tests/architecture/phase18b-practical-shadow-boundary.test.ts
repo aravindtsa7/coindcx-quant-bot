@@ -341,14 +341,14 @@ describe('no automatic threshold tuning; observational configuration only', () =
     expect(analysis).not.toMatch(/SAFE_THRESHOLD|PROVIDER_GUARANTEE/);
   });
 
-  it('the only external packages in the shadow core reach are hashing, logging, decimals, and (repository only) Prisma', () => {
+  it('the shadow core reach permits hashing, logging, decimals and native Proxy inspection; Prisma remains repository-only', () => {
     const external = new Set<string>();
     for (const file of shadowFiles.filter((name) => name !== `${SHADOW_ROOT}repository.ts`)) {
       for (const node of reachOf(file)) {
         for (const specifier of extractImportSpecifiers(sourceOf(node), node)) if (!specifier.startsWith('.')) external.add(specifier);
       }
     }
-    expect([...external].sort()).toEqual(['decimal.js', 'node:crypto', 'pino']);
+    expect([...external].sort()).toEqual(['decimal.js', 'node:crypto', 'node:util', 'pino']);
   });
 });
 

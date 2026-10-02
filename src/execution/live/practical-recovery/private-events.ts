@@ -268,3 +268,26 @@ export function practicalStreamHealthTrip(health: unknown, binding: PracticalStr
   if (health.state !== binding.state) return health.state === 'DEGRADED' ? 'UNKNOWN_PRIVATE_EVENT' : 'WS_DISCONNECTED';
   return null;
 }
+
+// Preserve lexical trusted bindings; do not freeze unrelated exports.
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const [name, value] of Object.entries({ practicalPrivateStreamReadiness, bindPracticalPrivateStream, practicalStreamHealthTrip, classifyPracticalPrivateEvent })) {
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.get === undefined || descriptor.set !== undefined || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}
+
+// Reviewed defining-owner binding protection.
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["PRACTICAL_PRIVATE_STREAM_ID","PRACTICAL_PRIVATE_NOISE_EVENT_TYPES","PRACTICAL_PRIVATE_STATE_EVENT_TYPES","PRACTICAL_PRIVATE_BINDABLE_STATES"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}

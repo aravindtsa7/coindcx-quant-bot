@@ -1,3 +1,5 @@
+import { readNormalizedOrderFinancialValues } from '../normalizers';
+import { trustedLiveSubtract, trustedLiveCompare } from '../../../execution/live/decimal';
 /**
  * [P18] The authoritative venue-evidence adapter (§5, §14, §20).
  *
@@ -118,29 +120,32 @@ function requiredExact(value: Decimal): string {
  * provider. See the wire-schema doc comment for the exact sequence required
  * before this could ever change.
  */
-function toOrderEvidence(order: InrFuturesOrder): LiveVenueOrderEvidence | null {
+function toOrderEvidence(order: InrFuturesOrder, owned: boolean): LiveVenueOrderEvidence | null {
   if (order.marginCurrency !== 'INR') return null;
-  const total = requiredExact(order.totalQuantity);
-  const remaining = requiredExact(order.remainingQuantity);
-  const cancelled = order.cancelledQuantity === null ? '0' : requiredExact(order.cancelledQuantity);
-  const filled = new Decimal(total).minus(new Decimal(remaining)).minus(new Decimal(cancelled));
-  const average = exact(order.avgPriceUsdt);
+  const financial = owned ? readNormalizedOrderFinancialValues(order) : null;
+  if (owned && financial === null) throw new LiveExecutionError('LIVE_RECONCILIATION_EVIDENCE_INVALID', 'Owned order evidence lacks original numeric provenance');
+  const total = financial === null ? requiredExact(order.totalQuantity) : financial.total;
+  const remaining = financial === null ? requiredExact(order.remainingQuantity) : financial.remaining;
+  const cancelled = financial === null ? order.cancelledQuantity === null ? '0' : requiredExact(order.cancelledQuantity) : financial.cancelled;
+  const filled = owned ? trustedLiveSubtract(trustedLiveSubtract(total, remaining), cancelled)
+    : new Decimal(total).minus(new Decimal(remaining)).minus(new Decimal(cancelled));
+  const average = financial === null ? exact(order.avgPriceUsdt) : financial.average;
   return Object.freeze({
     exchangeOrderId: order.id,
     pair: order.pair,
     side: order.side === 'buy' ? 'BUY' as const : 'SELL' as const,
     venueStatus: order.status,
     orderedQuantity: total,
-    filledQuantity: filled.toFixed(),
+    filledQuantity: typeof filled === 'string' ? filled : filled.toFixed(),
     remainingQuantity: remaining,
     cancelledQuantity: cancelled,
     // A zero fill must carry NO average price, and a positive fill must carry
     // one. Normalizing here keeps the conservation rule in `evidence.ts` the
     // single place that decides whether the pair is coherent.
-    averageFillPrice: filled.isZero() ? null : average,
-    price: exact(order.priceUsdt),
+    averageFillPrice: (typeof filled === 'string' ? trustedLiveCompare(filled, '0') === 0 : filled.isZero()) ? null : average,
+    price: financial === null ? exact(order.priceUsdt) : financial.price,
     wireOrderType: order.orderType,
-    leverage: exact(order.leverage),
+    leverage: financial === null ? exact(order.leverage) : financial.leverage,
     providerCreatedAtMs: order.createdAtMs,
     providerEventTimeMs: order.updatedAtMs,
     // Exact provider value (already reduced to string-or-null by the Phase 2
@@ -176,12 +181,14 @@ export interface CoinDcxReconciliationEvidenceAdapterOptions {
 }
 
 export class CoinDcxReconciliationEvidenceAdapter implements LiveVenueEvidenceProvider {
+  readonly #ownedArithmetic: boolean;
   readonly #client: CoinDcxClient;
   readonly #credentialAccountId: string;
   readonly #clock: Clock;
   readonly #maxPages: number;
 
-  public constructor(options: CoinDcxReconciliationEvidenceAdapterOptions) {
+  public constructor(options: CoinDcxReconciliationEvidenceAdapterOptions, owned?: unknown) {
+    this.#ownedArithmetic = owned === OWNED_READER_CONSTRUCTION;
     this.#client = options.client;
     if (options.credentialAccountId.length === 0) throw new LiveExecutionError('LIVE_AUTHORITY_INVALID', 'Credential account id is required');
     this.#credentialAccountId = options.credentialAccountId;
@@ -316,7 +323,7 @@ export class CoinDcxReconciliationEvidenceAdapter implements LiveVenueEvidencePr
         if (batch.length === 0) break;
 
         for (const order of batch) {
-          const evidence = toOrderEvidence(order);
+          const evidence = toOrderEvidence(order, this.#ownedArithmetic);
           if (evidence === null) {
             incompleteReason = 'ORDER_OUTSIDE_INR_SCOPE';
             break;
@@ -420,10 +427,11 @@ function protectOwnedInstance<T extends object>(instance: T): T {
   }
   return Object.freeze(instance);
 }
+const OWNED_READER_CONSTRUCTION = Object.freeze({});
 const OWNED_CLOCK = Object.freeze({ nowMs: Object.freeze(() => Date.now()) });
 /** Internal owned construction; callers are pinned, never an injectable authority port. */
 export function createOwnedCoinDcxReader(client: CoinDcxClient, configuredAccountId: string) : CoinDcxReconciliationEvidenceAdapter {
-  return protectOwnedInstance(new CoinDcxReconciliationEvidenceAdapter({ client, credentialAccountId: configuredAccountId, clock: OWNED_CLOCK }));
+  return protectOwnedInstance(new CoinDcxReconciliationEvidenceAdapter({ client, credentialAccountId: configuredAccountId, clock: OWNED_CLOCK }, OWNED_READER_CONSTRUCTION));
 }
 Object.freeze(createOwnedCoinDcxReader);
 if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
@@ -431,4 +439,17 @@ if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
   if (descriptor?.configurable === false) {
     if (descriptor.get === undefined || descriptor.set !== undefined || module.exports.createOwnedCoinDcxReader !== createOwnedCoinDcxReader) throw new Error('CREDENTIAL_CONSTRUCTION_EXPORT_INVALID');
   } else Object.defineProperty(module.exports, 'createOwnedCoinDcxReader', { get: () => createOwnedCoinDcxReader, configurable: false });
+}
+
+// Reviewed defining-owner binding protection.
+Object.freeze(CoinDcxReconciliationEvidenceAdapter.prototype);
+Object.freeze(CoinDcxReconciliationEvidenceAdapter);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["COINDCX_RECONCILIATION_MAX_PAGES","COINDCX_RECONCILIATION_MAX_PAGES_CEILING","CoinDcxReconciliationEvidenceAdapter"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

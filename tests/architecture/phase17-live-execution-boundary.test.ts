@@ -151,11 +151,11 @@ describe('P17-I17 the Phase17 execution tree holds no integration dependency at 
 
 describe('P17-I18 exactly one approved root reaches order mutation', () => {
   it('the only module reaching the mutable transport is its own adapter and the approved production root', () => {
-    expect([...reachersOf(MUTATION_TRANSPORT)].sort()).toEqual([APPROVED_ROOT, MUTATION_ADAPTER, 'src/integration/coindcx/live/practical-credential-sources.ts'].sort());
+    expect([...reachersOf(MUTATION_TRANSPORT)].sort()).toEqual([APPROVED_ROOT, MUTATION_ADAPTER, 'src/integration/coindcx/live/practical-credential-sources.ts', 'src/integration/coindcx/live/practical-account-coordinator.ts'].sort());
   });
 
   it('the only module reaching the mutable order adapter is the approved production root', () => {
-    expect([...reachersOf(MUTATION_ADAPTER)].sort()).toEqual([APPROVED_ROOT, 'src/integration/coindcx/live/practical-credential-sources.ts'].sort());
+    expect([...reachersOf(MUTATION_ADAPTER)].sort()).toEqual([APPROVED_ROOT, 'src/integration/coindcx/live/practical-credential-sources.ts', 'src/integration/coindcx/live/practical-account-coordinator.ts'].sort());
   });
 
   it('nothing in the repository imports the approved production root, so it is an explicit opt-in entry point', () => {

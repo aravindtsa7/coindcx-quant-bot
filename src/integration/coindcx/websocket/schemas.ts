@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 import { z } from 'zod';
 import { Decimal } from '../../../core/decimal/decimal';
 import { CoinDcxSocketValidationError } from '../../../core/errors/app-error';
@@ -284,7 +285,7 @@ export const RawPositionUpdateSchema = z.array(RawPositionItemSchema);
 export function validateAndFilterPositionNotification(
   raw: unknown
 ): PrivatePositionNotificationPayload {
-  const parsed = RawPositionUpdateSchema.safeParse(raw);
+  const parsed = parseOwnedPositionNotification(raw);
   if (!parsed.success) {
     throw new CoinDcxSocketValidationError('Malformed df-position-update payload', {
       issues: parsed.error.issues.map((i) => ({ path: i.path.join('.'), message: i.message })),
@@ -371,7 +372,7 @@ export const RawOrderUpdateSchema = z.array(RawOrderItemSchema);
 export function validateAndFilterOrderNotification(
   raw: unknown
 ): PrivateOrderNotificationPayload {
-  const parsed = RawOrderUpdateSchema.safeParse(raw);
+  const parsed = parseOwnedOrderNotification(raw);
   if (!parsed.success) {
     throw new CoinDcxSocketValidationError('Malformed df-order-update payload', {
       issues: parsed.error.issues.map((i) => ({ path: i.path.join('.'), message: i.message })),
@@ -447,7 +448,7 @@ export const RawBalanceUpdateSchema = z.array(RawBalanceItemSchema);
 export function validateBalanceNotification(
   raw: unknown
 ): PrivateBalanceNotificationPayload {
-  const parsed = RawBalanceUpdateSchema.safeParse(raw);
+  const parsed = parseOwnedBalanceNotification(raw);
   if (!parsed.success) {
     throw new CoinDcxSocketValidationError('Malformed balance-update payload', {
       issues: parsed.error.issues.map((i) => ({ path: i.path.join('.'), message: i.message })),
@@ -466,4 +467,103 @@ export function validateBalanceNotification(
   return Object.freeze({
     balances: Object.freeze(balances),
   });
+}
+
+/** Independent literal recipes: no public application-owned graph node is reused. */
+function makeOwnedNotificationGraphs() {
+const RawPositionItemSchema = z.object({
+  id: z.string().min(1),
+  pair: z.string().min(1),
+  active_pos: z.union([z.string(), z.number()]),
+  avg_price: z.union([z.string(), z.number()]),
+  liquidation_price: z.union([z.string(), z.number()]).optional().nullable(),
+  locked_margin: z.union([z.string(), z.number()]).optional().nullable(),
+  leverage: z.number(),
+  mark_price: z.union([z.string(), z.number()]).optional().nullable(),
+  maintenance_margin: z.union([z.string(), z.number()]).optional().nullable(),
+  updated_at: z.number(),
+  margin_type: z.string().optional().nullable(),
+  margin_currency_short_name: z.string(),
+  settlement_currency_avg_price: z.union([z.string(), z.number()]).optional().nullable(),
+});
+const RawPositionUpdateSchema = z.array(RawPositionItemSchema);
+const RawOrderItemSchema = z.object({
+  id: z.string().min(1),
+  pair: z.string().min(1),
+  side: z.enum(['buy', 'sell']),
+  status: z.string(),
+  order_type: z.string(),
+  leverage: z.number().optional().default(1),
+  price: z.union([z.string(), z.number()]).optional().nullable(),
+  avg_price: z.union([z.string(), z.number()]).optional().nullable(),
+  total_quantity: z.union([z.string(), z.number()]),
+  remaining_quantity: z.union([z.string(), z.number()]).optional().nullable(),
+  cancelled_quantity: z.union([z.string(), z.number()]).optional().nullable(),
+  fee_amount: z.union([z.string(), z.number()]).optional().nullable(),
+  created_at: z.number(),
+  updated_at: z.number(),
+  margin_currency_short_name: z.string(),
+});
+const RawOrderUpdateSchema = z.array(RawOrderItemSchema);
+const RawBalanceItemSchema = z.object({
+  id: z.union([z.string(), z.number()]),
+  balance: z.union([z.string(), z.number()]),
+  locked_balance: z.union([z.string(), z.number()]),
+  currency_short_name: z.string(),
+});
+const RawBalanceUpdateSchema = z.array(RawBalanceItemSchema);
+return { RawOrderUpdateSchema, RawPositionUpdateSchema, RawBalanceUpdateSchema };
+}
+const ownedNotificationGraphs = makeOwnedNotificationGraphs();
+const ownedZodError = z.ZodError;
+function copyOwnedParserIssue(value: unknown): unknown {
+  if (value === null || typeof value !== 'object') return typeof value === 'function' || typeof value === 'symbol' ? '[UNSAFE_PARSE_ISSUE]' : value;
+  if (types.isProxy(value)) throw new Error('UNSAFE_PARSE_ISSUE');
+  if (value instanceof ownedZodError) return new ownedZodError(value.issues.map(issue => copyOwnedParserIssue(issue) as z.ZodIssue));
+  const result: Record<string, unknown> | unknown[] = Array.isArray(value) ? [] : {};
+  for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
+    if (!descriptor.enumerable) continue;
+    if (!Object.hasOwn(descriptor, 'value')) throw new Error('UNSAFE_PARSE_ISSUE');
+    Object.defineProperty(result, key, { value: copyOwnedParserIssue(descriptor.value), enumerable: true, writable: true, configurable: true });
+  }
+  return result;
+}
+function detachOwnedParserResult<T extends z.SafeParseReturnType<unknown, unknown>>(result: T): T {
+  if (result.success) return result;
+  try { return { success: false, error: new ownedZodError(result.error.issues.map(issue => copyOwnedParserIssue(issue) as z.ZodIssue)) } as T; }
+  catch { return { success: false, error: new ownedZodError([{ code: 'custom', path: [], message: 'Unsafe parser issue data' }]) } as T; }
+}
+export function parseOwnedOrderNotification(value: unknown): ReturnType<typeof RawOrderUpdateSchema.safeParse> {
+  return detachOwnedParserResult(ownedNotificationGraphs.RawOrderUpdateSchema.safeParse(value));
+}
+Object.freeze(parseOwnedOrderNotification);
+export function parseOwnedPositionNotification(value: unknown): ReturnType<typeof RawPositionUpdateSchema.safeParse> {
+  return detachOwnedParserResult(ownedNotificationGraphs.RawPositionUpdateSchema.safeParse(value));
+}
+Object.freeze(parseOwnedPositionNotification);
+export function parseOwnedBalanceNotification(value: unknown): ReturnType<typeof RawBalanceUpdateSchema.safeParse> {
+  return detachOwnedParserResult(ownedNotificationGraphs.RawBalanceUpdateSchema.safeParse(value));
+}
+Object.freeze(parseOwnedBalanceNotification);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const [name, value] of Object.entries({ parseOwnedOrderNotification, parseOwnedPositionNotification, parseOwnedBalanceNotification })) {
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.get === undefined || descriptor.set !== undefined || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}
+
+// Reviewed defining-owner binding protection.
+Object.freeze(validateAndFilterOrderNotification);
+Object.freeze(validateAndFilterPositionNotification);
+Object.freeze(validateBalanceNotification);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["validateAndFilterOrderNotification","validateAndFilterPositionNotification","validateBalanceNotification"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

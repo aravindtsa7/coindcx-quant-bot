@@ -95,3 +95,16 @@ export function strictestPracticalSeverity(reasons: readonly unknown[]): Practic
   if (reasons.length === 0) return 'MANUAL_REVIEW';
   return reasons.some((reason) => classifyPracticalInvalidation(reason) === 'MANUAL_REVIEW') ? 'MANUAL_REVIEW' : 'QUARANTINE';
 }
+
+// Reviewed defining-owner binding protection.
+Object.freeze(classifyPracticalInvalidation);
+Object.freeze(practicalStateForSeverity);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["classifyPracticalInvalidation","practicalStateForSeverity","PRACTICAL_INVALIDATION_SEVERITY"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}

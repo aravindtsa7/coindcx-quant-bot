@@ -13,7 +13,7 @@ const code = (file: string) => readFileSync(path.join(ROOT, file), 'utf8').repla
 describe('unwired practical cancel orchestration', () => {
   it('has exactly four modules, no barrel and zero outside source importers', () => {
     expect(readdirSync(path.join(ROOT, TREE)).sort()).toEqual(['gateway-boundary.ts', 'lifecycle.ts', 'ports.ts', 'service.ts']);
-    expect(files.filter(file => !file.startsWith(TREE) && (graph.get(file) ?? []).some(dependency => dependency.startsWith(TREE)))).toEqual([]);
+    expect(files.filter(file => !file.startsWith(TREE) && (graph.get(file) ?? []).some(dependency => dependency.startsWith(TREE)))).toEqual(['src/integration/coindcx/live/practical-account-coordinator.ts']);
   });
   it('has no concrete network, operational composition or Phase17 service dependency', () => {
     for (const file of files.filter(file => file.startsWith(TREE))) {

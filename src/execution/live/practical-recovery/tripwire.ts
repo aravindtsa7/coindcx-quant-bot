@@ -1,3 +1,4 @@
+import { readPracticalPersistenceError } from '../practical-persistence/ports';
 /**
  * Phase 18B Checkpoint B: the private-stream SAFETY TRIPWIRE.
  *
@@ -49,7 +50,7 @@
  *
  * No private payload is logged or persisted.
  */
-import { PracticalPersistenceError, type PracticalAccountLoad } from '../practical-persistence/ports';
+import { type PracticalAccountLoad } from '../practical-persistence/ports';
 import type { PracticalInvalidationReason } from '../practical/types';
 import type { PracticalPrivateStreamEnvelope, PracticalPrivateStreamSource, PracticalRecoveryClock, PracticalRevocationPort } from './ports';
 import {
@@ -303,12 +304,12 @@ export class PracticalPrivateStreamTripwire {
         result = Object.freeze({ kind: 'REVOKED' as const });
         break;
       } catch (error) {
-        if (error instanceof PracticalPersistenceError
-          && (error.code === 'PRACTICAL_PERSISTENCE_NOT_FOUND' || error.code === 'PRACTICAL_PERSISTENCE_MALFORMED' || error.code === 'PRACTICAL_PERSISTENCE_LATCHED')) {
-          result = Object.freeze({ kind: 'NOTHING_TO_REVOKE' as const, code: error.code });
+        if ((readPracticalPersistenceError(error) !== null)
+          && ((readPracticalPersistenceError(error))!.code === 'PRACTICAL_PERSISTENCE_NOT_FOUND' || (readPracticalPersistenceError(error))!.code === 'PRACTICAL_PERSISTENCE_MALFORMED' || (readPracticalPersistenceError(error))!.code === 'PRACTICAL_PERSISTENCE_LATCHED')) {
+          result = Object.freeze({ kind: 'NOTHING_TO_REVOKE' as const, code: (readPracticalPersistenceError(error))!.code });
           break;
         }
-        result = Object.freeze({ kind: 'FAILED' as const, failure: error instanceof PracticalPersistenceError ? error.code : 'UNEXPECTED_ERROR' });
+        result = Object.freeze({ kind: 'FAILED' as const, failure: (readPracticalPersistenceError(error) !== null) ? (readPracticalPersistenceError(error))!.code : 'UNEXPECTED_ERROR' });
       }
     }
     try {
@@ -316,5 +317,40 @@ export class PracticalPrivateStreamTripwire {
     } catch {
       // Hooks are observational.
     }
+  }
+}
+
+// Defining-module snapshot: owned instances cannot inherit later replacements.
+const createOwnedPracticalPrivateStreamTripwireDescriptors = Object.freeze(Object.getOwnPropertyDescriptors(PracticalPrivateStreamTripwire.prototype));
+export function createOwnedPracticalPrivateStreamTripwire(input: ConstructorParameters<typeof PracticalPrivateStreamTripwire>[0]): PracticalPrivateStreamTripwire {
+  const instance = new PracticalPrivateStreamTripwire(input);
+  for (const [key, descriptor] of Object.entries(createOwnedPracticalPrivateStreamTripwireDescriptors)) {
+    if (key === 'constructor') continue;
+    if (typeof descriptor.value === 'function') Object.defineProperty(instance, key, { value: Object.freeze(descriptor.value.bind(instance)), writable: false, configurable: false });
+    else if (descriptor.get !== undefined) Object.defineProperty(instance, key, { get: Object.freeze(descriptor.get.bind(instance)), configurable: false });
+  }
+  Object.freeze(instance);
+  return instance;
+}
+Object.freeze(createOwnedPracticalPrivateStreamTripwire);
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const [name, value] of Object.entries({ createOwnedPracticalPrivateStreamTripwire, PracticalPrivateStreamTripwire })) {
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.get === undefined || descriptor.set !== undefined || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}
+
+// Reviewed defining-owner binding protection.
+Object.freeze(practicalDurableSafetyProblem);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["practicalDurableSafetyProblem","PRACTICAL_REVOCATION_MAX_ATTEMPTS"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
   }
 }

@@ -1,3 +1,4 @@
+import { trustedLiveAbsolute, trustedLiveAdd, trustedLiveCompare, trustedLiveDecimalString, trustedLiveNegate } from '../decimal';
 /**
  * Authoritative live-position establishment and attribution (§10, §11).
  *
@@ -43,6 +44,11 @@ import type { LiveReconciliationFinding, LiveVenueEvidenceSet, LiveVenuePosition
 export function signedFillContribution(order: LiveDurableOrderView): LiveCalc {
   const filled = liveDecimal(canonicalLiveDecimalString(order.cumulativeFilledQuantity, 'cumulativeFilledQuantity'));
   return order.side === 'BUY' ? filled : filled.negated();
+}
+
+function signedFillContributionPrimitive(order: LiveDurableOrderView): string {
+  const filled = trustedLiveDecimalString(canonicalLiveDecimalString(order.cumulativeFilledQuantity, 'cumulativeFilledQuantity'));
+  return order.side === 'BUY' ? filled : trustedLiveNegate(filled);
 }
 
 /** One strategy instance's provable signed share of a pair's exposure. */
@@ -99,12 +105,12 @@ export function deriveOwnershipShares(
     strategyVersion: string;
     parameterHash: string;
     instrumentSpecSnapshotId: string;
-    total: LiveCalc;
+    total: string;
     intentIds: string[];
   }>();
 
   for (const order of orders) {
-    const contribution = signedFillContribution(order);
+    const contribution = signedFillContributionPrimitive(order);
     const existing = grouped.get(order.strategyInstanceId);
     if (existing === undefined) {
       grouped.set(order.strategyInstanceId, {
@@ -125,13 +131,13 @@ export function deriveOwnershipShares(
     if (existing.instrumentSpecSnapshotId !== order.instrumentSpecSnapshotId) {
       return { incoherentInstanceId: order.strategyInstanceId, reason: 'Durable orders for one strategy instance were validated against different instrument snapshots' };
     }
-    existing.total = existing.total.plus(contribution);
+    existing.total = trustedLiveAdd(existing.total, contribution);
     existing.intentIds.push(order.intentId);
   }
 
   const shares: ProvenOwnershipShare[] = [];
   for (const [ownerStrategyInstanceId, entry] of [...grouped.entries()].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))) {
-    const signedQuantity = entry.total.toFixed();
+    const signedQuantity = entry.total;
     shares.push(Object.freeze({
       ownerStrategyInstanceId,
       ownerStrategyId: entry.strategyId,
@@ -221,8 +227,8 @@ export function reconcilePosition(input: PositionReconciliationInput): LivePosit
   }
 
   const venueSigned = venuePosition === null
-    ? liveDecimal('0')
-    : liveDecimal(canonicalLiveDecimalString(venuePosition.signedQuantity, 'signedQuantity'));
+    ? trustedLiveDecimalString('0')
+    : trustedLiveDecimalString(canonicalLiveDecimalString(venuePosition.signedQuantity, 'signedQuantity'));
 
   const derived = deriveOwnershipShares(accountId, pair, input.orders);
   if ('incoherentInstanceId' in derived) {
@@ -234,15 +240,15 @@ export function reconcilePosition(input: PositionReconciliationInput): LivePosit
     })]);
   }
 
-  const nonZeroShares = derived.shares.filter((share) => !liveDecimal(share.signedQuantity).isZero());
+  const nonZeroShares = derived.shares.filter((share) => !(trustedLiveCompare(trustedLiveDecimalString(share.signedQuantity), '0') === 0));
   const localSigned = derived.shares.reduce(
-    (total, share) => total.plus(liveDecimal(share.signedQuantity)),
-    liveDecimal('0'),
+    (total, share) => trustedLiveAdd(total, trustedLiveDecimalString(share.signedQuantity)),
+    trustedLiveDecimalString('0'),
   );
 
   // ---- venue flat -------------------------------------------------------
-  if (venueSigned.isZero()) {
-    if (localSigned.isZero()) {
+  if ((trustedLiveCompare(venueSigned, '0') === 0)) {
+    if ((trustedLiveCompare(localSigned, '0') === 0)) {
       const findings = [buildFinding({
         category: 'VERIFIED_MATCH',
         code: 'RECON_POSITION_VERIFIED_MATCH',
@@ -262,7 +268,7 @@ export function reconcilePosition(input: PositionReconciliationInput): LivePosit
       subject,
       evidence: {
         reason: 'Local fill lineage proves exposure the venue does not hold',
-        localSignedQuantity: localSigned.toFixed(),
+        localSignedQuantity: localSigned,
         venueSignedQuantity: '0',
       },
     })]);
@@ -276,25 +282,25 @@ export function reconcilePosition(input: PositionReconciliationInput): LivePosit
       subject,
       evidence: {
         reason: 'This pair has an unresolved order, so local fill lineage cannot prove ownership of the venue aggregate',
-        venueSignedQuantity: venueSigned.toFixed(),
+        venueSignedQuantity: venueSigned,
       },
     })]);
   }
 
-  if (localSigned.isZero()) {
+  if ((trustedLiveCompare(localSigned, '0') === 0)) {
     return positionOutcome([buildFinding({
       category: 'CONFLICT',
       code: 'RECON_POSITION_UNATTRIBUTED_EXPOSURE',
       subject,
       evidence: {
         reason: 'The venue holds exposure that no local fill lineage claims; it is never assigned to a strategy',
-        venueSignedQuantity: venueSigned.toFixed(),
+        venueSignedQuantity: venueSigned,
       },
     })]);
   }
 
-  if (!localSigned.equals(venueSigned)) {
-    const sameDirection = localSigned.isNegative() === venueSigned.isNegative();
+  if (!(trustedLiveCompare(localSigned, venueSigned) === 0)) {
+    const sameDirection = (trustedLiveCompare(localSigned, '0') < 0) === (trustedLiveCompare(venueSigned, '0') < 0);
     const code = !sameDirection
       ? 'RECON_POSITION_DIRECTION_MISMATCH' as const
       : nonZeroShares.length > 1
@@ -306,19 +312,19 @@ export function reconcilePosition(input: PositionReconciliationInput): LivePosit
       subject,
       evidence: {
         reason: 'Proven local ownership does not reconcile exactly to the venue aggregate',
-        localSignedQuantity: localSigned.toFixed(),
-        venueSignedQuantity: venueSigned.toFixed(),
+        localSignedQuantity: localSigned,
+        venueSignedQuantity: venueSigned,
         shareCount: nonZeroShares.length,
       },
     })]);
   }
 
   // ---- exact reconciliation ---------------------------------------------
-  const side = venueSigned.isNegative() ? 'SHORT' as const : 'LONG' as const;
+  const side = (trustedLiveCompare(venueSigned, '0') < 0) ? 'SHORT' as const : 'LONG' as const;
   // Every share must point the same way as the aggregate. Offsetting shares
   // that happen to net correctly are NOT an attribution: one strategy would be
   // recorded as holding exposure opposite to the position it shares.
-  const opposing = nonZeroShares.filter((share) => liveDecimal(share.signedQuantity).isNegative() !== venueSigned.isNegative());
+  const opposing = nonZeroShares.filter((share) => (trustedLiveCompare(trustedLiveDecimalString(share.signedQuantity), '0') < 0) !== (trustedLiveCompare(venueSigned, '0') < 0));
   if (opposing.length > 0) {
     return positionOutcome([buildFinding({
       category: 'CONFLICT',
@@ -327,7 +333,7 @@ export function reconcilePosition(input: PositionReconciliationInput): LivePosit
       evidence: {
         reason: 'Shares net to the venue aggregate only by offsetting opposite-direction exposure; that is not an attribution',
         opposingInstanceIds: opposing.map((share) => share.ownerStrategyInstanceId).sort(),
-        venueSignedQuantity: venueSigned.toFixed(),
+        venueSignedQuantity: venueSigned,
       },
     })]);
   }
@@ -349,7 +355,7 @@ export function reconcilePosition(input: PositionReconciliationInput): LivePosit
   const shareInputs: readonly LivePositionOwnershipShareInput[] = Object.freeze(nonZeroShares.map((share) => Object.freeze({
     ownerStrategyInstanceId: share.ownerStrategyInstanceId,
     side,
-    quantity: liveDecimal(share.signedQuantity).abs().toFixed(),
+    quantity: trustedLiveAbsolute(trustedLiveDecimalString(share.signedQuantity)),
     ownerStrategyId: share.ownerStrategyId,
     ownerStrategyVersion: share.ownerStrategyVersion,
     ownerParameterHash: share.ownerParameterHash,
@@ -386,7 +392,7 @@ export function reconcilePosition(input: PositionReconciliationInput): LivePosit
         },
       })]);
     }
-    if (!liveDecimal(canonicalLiveDecimalString(durablePosition.ownedQuantity, 'ownedQuantity')).equals(liveDecimal(proven.quantity))) {
+    if (!(trustedLiveCompare(trustedLiveDecimalString(canonicalLiveDecimalString(durablePosition.ownedQuantity, 'ownedQuantity')), trustedLiveDecimalString(proven.quantity)) === 0)) {
       return positionOutcome([buildFinding({
         category: 'CONFLICT',
         code: 'RECON_POSITION_QUANTITY_MISMATCH',
@@ -432,10 +438,22 @@ export function reconcilePosition(input: PositionReconciliationInput): LivePosit
       evidence: {
         reason: 'Several strategy instances hold provable shares summing exactly to the venue aggregate; Phase17 CLOSE ownership stays unavailable for this pair',
         side,
-        venueSignedQuantity: venueSigned.toFixed(),
+        venueSignedQuantity: venueSigned,
         owners: shareInputs.map((share) => ({ ownerStrategyInstanceId: share.ownerStrategyInstanceId, quantity: share.quantity })),
       },
     })],
     [{ kind: 'APPLY_OWNERSHIP', pair, shares: shareInputs, instrumentSpecSnapshotId, materializeSingleOwner: false }],
   );
+}
+
+// Reviewed defining-owner binding protection.
+Object.freeze(reconcilePosition);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["reconcilePosition"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

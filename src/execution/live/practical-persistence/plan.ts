@@ -30,7 +30,7 @@ import {
   type PracticalQuarantineCause,
 } from '../practical/types';
 import { PracticalPersistenceError, type PracticalAccountSnapshot } from './ports';
-import { PRACTICAL_RECOVERING_STATES } from './rows';
+import { isPracticalRecoveringState } from './rows';
 
 export interface PracticalResolutionAudit {
   readonly resolutionId: string;
@@ -162,8 +162,8 @@ export function planPracticalAccountChange(
   const certificate = planCertificate(current, request);
   const review = planReview(current, request, newId);
 
-  const wasRecovering = PRACTICAL_RECOVERING_STATES.has(current.state);
-  const willRecover = PRACTICAL_RECOVERING_STATES.has(request.nextState);
+  const wasRecovering = isPracticalRecoveringState(current.state);
+  const willRecover = isPracticalRecoveringState(request.nextState);
   let closeRecoveryEpisode: PracticalAccountChangePlan['closeRecoveryEpisode'] = null;
   let openRecoveryEpisode: PracticalAccountChangePlan['openRecoveryEpisode'] = null;
   let recoveryPointer: string | null = null;
@@ -203,4 +203,16 @@ export function planPracticalAccountChange(
       currentCertificateId: certificate.pointer,
     }),
   });
+}
+
+// Reviewed defining-owner binding protection.
+Object.freeze(planPracticalAccountChange);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["planPracticalAccountChange"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

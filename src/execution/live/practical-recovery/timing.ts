@@ -50,3 +50,15 @@ export const PRACTICAL_RECOVERY_HARD_CEILINGS: PracticalRecoveryHardCeilings = O
 export function practicalCandidateExceeded(measuredMs: number, candidate: PracticalTimingCandidate): boolean {
   return measuredMs > candidate.valueMs;
 }
+
+// Reviewed defining-owner binding protection.
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["PRACTICAL_RECOVERY_HARD_CEILINGS"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}

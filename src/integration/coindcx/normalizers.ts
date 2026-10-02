@@ -345,7 +345,7 @@ export function normalizeOrder(wire: FuturesOrderWire): InrFuturesOrder {
     );
   }
 
-  return {
+  const normalized: InrFuturesOrder = {
     id: wire.id,
     pair: wire.pair,
     side: wire.side,
@@ -372,6 +372,15 @@ export function normalizeOrder(wire: FuturesOrderWire): InrFuturesOrder {
     updatedAtMs: toSafeIntegerTimestamp(wire.updated_at, 'updated_at'),
     clientOrderId: normalizeClientOrderId(wire.client_order_id),
   };
+  nativeOrderFinancialValues.set(normalized, Object.freeze({
+    total: nativeFinancialDecimalFixed.call(normalized.totalQuantity),
+    remaining: nativeFinancialDecimalFixed.call(normalized.remainingQuantity),
+    cancelled: normalized.cancelledQuantity === null ? '0' : nativeFinancialDecimalFixed.call(normalized.cancelledQuantity),
+    average: normalized.avgPriceUsdt === null ? null : nativeFinancialDecimalFixed.call(normalized.avgPriceUsdt),
+    price: normalized.priceUsdt === null ? null : nativeFinancialDecimalFixed.call(normalized.priceUsdt),
+    leverage: normalized.leverage === null ? null : nativeFinancialDecimalFixed.call(normalized.leverage),
+  }));
+  return normalized;
 }
 
 /**
@@ -457,4 +466,26 @@ export function normalizeUserInfo(
     authenticated: true,
     coindcxId: wire.coindcx_id,
   };
+}
+
+interface NativeOrderFinancialValues { readonly total: string; readonly remaining: string; readonly cancelled: string; readonly average: string | null; readonly price: string | null; readonly leverage: string | null }
+const nativeFinancialDecimalFixed = Decimal.prototype.toFixed as (this: Decimal) => string;
+const nativeOrderFinancialValues = new WeakMap<object, NativeOrderFinancialValues>();
+/** Data provenance only; this reader grants no construction, provider or mutation authority. */
+export function readNormalizedOrderFinancialValues(value: unknown): NativeOrderFinancialValues | null {
+  return typeof value === 'object' && value !== null ? nativeOrderFinancialValues.get(value) ?? null : null;
+}
+Object.freeze(readNormalizedOrderFinancialValues);
+// Reviewed defining-owner binding protection.
+Object.freeze(normalizeUserInfo);
+Object.freeze(normalizeOrder);
+Object.freeze(normalizePosition);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["normalizeUserInfo","normalizeOrder","normalizePosition","readNormalizedOrderFinancialValues"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

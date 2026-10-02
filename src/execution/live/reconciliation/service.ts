@@ -1,3 +1,5 @@
+import { trustedLiveCompare, trustedLiveDecimalString, trustedLiveSubtract } from '../decimal';
+import { readLiveExecutionError } from '../errors';
 /**
  * The Phase18 reconciliation service (§3, §4, §12, §13, §16, §17).
  *
@@ -33,7 +35,7 @@
  * port. It imports no CoinDCX module, no HTTP client, and no signer.
  */
 import { createChildLogger } from '../../../monitoring/logger';
-import { canonicalLiveDecimalString, liveDecimal } from '../decimal';
+import { canonicalLiveDecimalString } from '../decimal';
 import { LiveExecutionError } from '../errors';
 import type { LiveExecutionRepository } from '../repository';
 import type { LiveRuntimeIdentity } from './barrier';
@@ -434,12 +436,12 @@ export class LiveReconciliationService {
       });
       return this.#completeWithFindings(lease, [...findings, buildFinding({
         category: 'AMBIGUOUS',
-        code: error instanceof LiveExecutionError && error.code === 'LIVE_RECONCILIATION_EVIDENCE_INVALID'
+        code: (readLiveExecutionError(error) !== null) && (readLiveExecutionError(error))!.code === 'LIVE_RECONCILIATION_EVIDENCE_INVALID'
           ? 'RECON_EVIDENCE_CAUSALITY_VIOLATION'
           : 'RECON_EVIDENCE_INCOMPLETE',
         evidence: {
           reason: 'Authoritative venue evidence could not be established as usable',
-          failure: error instanceof LiveExecutionError ? error.code : 'UNKNOWN',
+          failure: (readLiveExecutionError(error) !== null) ? (readLiveExecutionError(error))!.code : 'UNKNOWN',
         },
       })], evidenceSnapshotSha256(rawEvidence));
     }
@@ -753,8 +755,7 @@ export class LiveReconciliationService {
         const matches = candidate.pair === order.pair
           && candidate.side === order.side
           && candidate.wireOrderType === order.wireOrderType
-          && liveDecimal(canonicalLiveDecimalString(candidate.orderedQuantity, 'orderedQuantity'))
-            .equals(liveDecimal(canonicalLiveDecimalString(order.orderedQuantity, 'orderedQuantity')));
+          && (trustedLiveCompare(trustedLiveDecimalString(canonicalLiveDecimalString(candidate.orderedQuantity, 'orderedQuantity')), trustedLiveDecimalString(canonicalLiveDecimalString(order.orderedQuantity, 'orderedQuantity'))) === 0);
         if (matches) counts.set(candidate.exchangeOrderId, (counts.get(candidate.exchangeOrderId) ?? 0) + 1);
       }
     }
@@ -1150,20 +1151,20 @@ export function buildResolvedOrderState(
   observation: LiveOrderObservation,
   targetState: LiveOrderStateName,
 ): LiveOrderStateRecord {
-  const ordered = liveDecimal(canonicalLiveDecimalString(current.orderedQuantity, 'orderedQuantity'));
-  const filled = liveDecimal(canonicalLiveDecimalString(observation.cumulativeFilledQuantity, 'cumulativeFilledQuantity'));
-  const recorded = liveDecimal(canonicalLiveDecimalString(current.cumulativeFilledQuantity, 'cumulativeFilledQuantity'));
-  if (filled.lessThan(recorded)) {
+  const ordered = trustedLiveDecimalString(canonicalLiveDecimalString(current.orderedQuantity, 'orderedQuantity'));
+  const filled = trustedLiveDecimalString(canonicalLiveDecimalString(observation.cumulativeFilledQuantity, 'cumulativeFilledQuantity'));
+  const recorded = trustedLiveDecimalString(canonicalLiveDecimalString(current.cumulativeFilledQuantity, 'cumulativeFilledQuantity'));
+  if ((trustedLiveCompare(filled, recorded) < 0)) {
     throw new LiveExecutionError('LIVE_FILL_INVALID', 'Reconciliation may not decrease a durable cumulative fill', {
       details: { intentId: current.intentId },
     });
   }
-  if (filled.greaterThan(ordered)) {
+  if ((trustedLiveCompare(filled, ordered) > 0)) {
     throw new LiveExecutionError('LIVE_FILL_INVALID', 'Reconciliation observed a fill above the ordered quantity', {
       details: { intentId: current.intentId },
     });
   }
-  if (!liveDecimal(canonicalLiveDecimalString(observation.orderedQuantity, 'orderedQuantity')).equals(ordered)) {
+  if (!(trustedLiveCompare(trustedLiveDecimalString(canonicalLiveDecimalString(observation.orderedQuantity, 'orderedQuantity')), ordered) === 0)) {
     throw new LiveExecutionError('LIVE_ORDER_IDENTITY_MISMATCH', 'Reconciliation observation reports a different ordered quantity', {
       details: { intentId: current.intentId },
     });
@@ -1172,8 +1173,8 @@ export function buildResolvedOrderState(
     ...current,
     state: targetState,
     exchangeOrderId: observation.exchangeOrderId,
-    cumulativeFilledQuantity: filled.toFixed(),
-    remainingQuantity: ordered.minus(filled).toFixed(),
+    cumulativeFilledQuantity: filled,
+    remainingQuantity: trustedLiveSubtract(ordered, filled),
     averageFillPrice: observation.averageFillPrice,
     lastExchangeStatus: observation.exchangeStatus,
     lastProviderEventTimeMs: current.lastProviderEventTimeMs === null
@@ -1194,6 +1195,29 @@ Object.freeze(LiveReconciliationCompletionProof);
 
 // Completion proof validation must keep using this module's lexical class and
 // private-field reader even when loaded through CommonJS.
+// Defining-module snapshot: owned instances cannot inherit later replacements.
+const createOwnedLiveReconciliationServiceDescriptors = Object.freeze(Object.getOwnPropertyDescriptors(LiveReconciliationService.prototype));
+export function createOwnedLiveReconciliationService(dependencies: LiveReconciliationServiceDependencies): LiveReconciliationService {
+  const instance = new LiveReconciliationService(dependencies);
+  for (const [key, descriptor] of Object.entries(createOwnedLiveReconciliationServiceDescriptors)) {
+    if (key === 'constructor') continue;
+    if (typeof descriptor.value === 'function') Object.defineProperty(instance, key, { value: Object.freeze(descriptor.value.bind(instance)), writable: false, configurable: false });
+    else if (descriptor.get !== undefined) Object.defineProperty(instance, key, { get: Object.freeze(descriptor.get.bind(instance)), configurable: false });
+  }
+  Object.freeze(instance);
+  return instance;
+}
+Object.freeze(createOwnedLiveReconciliationService);
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const [name, value] of Object.entries({ createOwnedLiveReconciliationService, LiveReconciliationService })) {
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.get === undefined || descriptor.set !== undefined || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}
+
 if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
   for (const [name, value] of Object.entries({
     SystemReconciliationClock,

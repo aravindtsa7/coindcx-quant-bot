@@ -315,3 +315,19 @@ export function transitionPracticalAccountState(from: PracticalAccountStateName,
   if (!PRACTICAL_ALLOWED_TRANSITIONS[from].includes(to)) illegal(from, event);
   return to;
 }
+
+// Reviewed defining-owner binding protection.
+Object.freeze(PracticalManualReviewResolution.prototype);
+Object.freeze(PracticalManualReviewResolution);
+Object.freeze(practicalAccountStateOnStartup);
+Object.freeze(practicalStateAfterTransitionFailure);
+Object.freeze(transitionPracticalAccountState);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["PracticalManualReviewResolution","practicalAccountStateOnStartup","practicalStateAfterTransitionFailure","transitionPracticalAccountState","PRACTICAL_ALLOWED_TRANSITIONS"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}

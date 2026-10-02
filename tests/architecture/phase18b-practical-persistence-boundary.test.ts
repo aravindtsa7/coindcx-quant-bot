@@ -75,7 +75,7 @@ describe('module layout and the Prisma boundary', () => {
   it('the whole persistence reach uses only Prisma, hashing/uuid, decimals, and logging', () => {
     const external = new Set<string>();
     for (const file of persistenceFiles) for (const node of reachOf(file)) for (const specifier of externalImports(node)) external.add(specifier);
-    expect([...external].sort()).toEqual(['@prisma/client', 'decimal.js', 'node:crypto', 'pino']);
+    expect([...external].sort()).toEqual(['@prisma/client', 'decimal.js', 'node:crypto', 'node:util', 'pino']);
   });
 });
 
@@ -170,17 +170,18 @@ describe('no provider, network, gateway, dispatch, or arm reachability (no new r
       'src/execution/live/practical-shadow/collector.ts',
       // [Checkpoint C] the shadow-only composition root: constructs the ADAPTER and exposes loadAccount only.
       SHADOW_RUNTIME,
-    ]);
-    for (const importer of importers.filter((file) => file !== SHADOW_RUNTIME && file !== MUTATION_ADAPTER)) {
+      'src/integration/coindcx/live/practical-account-coordinator.ts',
+    ].sort());
+    for (const importer of importers.filter((file) => file !== SHADOW_RUNTIME && file !== MUTATION_ADAPTER && file !== 'src/integration/coindcx/live/practical-account-coordinator.ts')) {
       expect((graph.get(importer) ?? []).filter((dependency) => dependency.startsWith(PERSISTENCE_ROOT)), importer).toEqual([`${PERSISTENCE_ROOT}ports.ts`]);
     }
     expect((graph.get(SHADOW_RUNTIME) ?? []).filter((dependency) => dependency.startsWith(PERSISTENCE_ROOT))).toEqual([REPOSITORY]);
     expect((graph.get(MUTATION_ADAPTER) ?? []).filter((dependency) => dependency.startsWith(PERSISTENCE_ROOT)).sort()).toEqual([`${PERSISTENCE_ROOT}ports.ts`, REPOSITORY]);
-    expect(files.filter((file) => file !== REPOSITORY && (graph.get(file) ?? []).includes(REPOSITORY)).sort()).toEqual([MUTATION_ADAPTER, SHADOW_RUNTIME]);
+    expect(files.filter((file) => file !== REPOSITORY && (graph.get(file) ?? []).includes(REPOSITORY)).sort()).toEqual([MUTATION_ADAPTER, SHADOW_RUNTIME, 'src/integration/coindcx/live/practical-account-coordinator.ts'].sort());
     // The mutation adapter takes EXACTLY the repository class and the caller-owned hook (plus the scope type), and
     // builds exactly ONE repository, from its own root client.
     const mutationAdapter = sourceOf(MUTATION_ADAPTER).replace(/\r\n/g, '\n');
-    expect(mutationAdapter).toContain("import {\n  PrismaPracticalSafetyRepository,\n  withLockedPracticalAccountWithinCallerTransaction,\n  type PracticalLockedAccountScope,\n} from '../practical-persistence/repository';");
+    expect(mutationAdapter).toContain("import {\n  PrismaPracticalSafetyRepository,\n  createOwnedPracticalSafetyRepository,\n  withLockedPracticalAccountWithinCallerTransaction,\n  type PracticalLockedAccountScope,\n} from '../practical-persistence/repository';");
     expect(mutationAdapter.match(/new PrismaPracticalSafetyRepository\(/g)).toHaveLength(1);
     expect(mutationAdapter).toContain('this.#practical = new PrismaPracticalSafetyRepository(this.#prisma, newId);');
     // The shadow runtime uses the adapter for ONE read: loadAccount.
@@ -618,7 +619,7 @@ describe('[Wave 2B2d review fix] the TYPED durable lease/certificate contradicti
     expect(onlyLease).toContain("Object.getOwnPropertyDescriptor(row, 'leaseId')?.value");
     expect(onlyLease).toContain("Object.getOwnPropertyDescriptor(row, 'certificateId')?.value");
     expect(onlyLease).toContain('if (!isExactId(storedLeaseId) || storedLeaseId.length > 64) conflict(');
-    expect(onlyLease).toContain("if (typeof storedCertificateId !== 'string' || !PRACTICAL_DIGEST_PATTERN.test(storedCertificateId)) conflict(");
+    expect(onlyLease).toContain("if (typeof storedCertificateId !== 'string' || !isPracticalDigest(storedCertificateId)) conflict(");
     const validated = onlyLease.indexOf('projected.push({ leaseId: storedLeaseId, certificateId: storedCertificateId });');
     const cardinality = onlyLease.indexOf("if (projected.length !== 1) durableContradiction('CERTIFICATE_LEASE_NOT_UNIQUE'");
     const identity = onlyLease.indexOf('if (projected[0]!.leaseId !== leaseId || projected[0]!.certificateId !== certificateId)');

@@ -1,3 +1,5 @@
+import { readPracticalPersistenceError } from './ports';
+import { readPracticalLiveSafetyError } from '../practical/types';
 /**
  * Phase 18B Stage 1B1: strict parsing of durable practical rows (pure,
  * Prisma-free).
@@ -17,9 +19,8 @@ import { readPracticalAccountFence, type PracticalAccountFence } from '../practi
 import { classifyPracticalInvalidation } from '../practical/invalidation';
 import { practicalAccountStateOnStartup } from '../practical/state-machine';
 import {
-  PRACTICAL_DIGEST_PATTERN,
+  isPracticalDigest,
   PRACTICAL_MUTATION_OUTCOMES,
-  PracticalLiveSafetyError,
   isExactId,
   isNonNegativeSafeInteger,
   isPositiveSafeInteger,
@@ -107,7 +108,7 @@ function nullableExactId(row: Readonly<Record<string, unknown>>, name: string, p
 
 function digest(row: Readonly<Record<string, unknown>>, name: string, problem: PracticalMalformedProblem): string {
   const value = field(row, name, problem);
-  if (typeof value !== 'string' || !PRACTICAL_DIGEST_PATTERN.test(value)) malformed(problem, 'A durable digest is not lowercase 64-hex', name);
+  if (typeof value !== 'string' || !isPracticalDigest(value)) malformed(problem, 'A durable digest is not lowercase 64-hex', name);
   return value;
 }
 
@@ -185,7 +186,7 @@ export function parsePracticalStateRow(value: unknown): ParsedPracticalStateRow 
     currentReviewEpisodeId: nullableExactId(row, 'currentReviewEpisodeId', problem),
     currentCertificateId: nullableDigest(row, 'currentCertificateId', problem),
   });
-  requireCoupled(PRACTICAL_RECOVERING_STATES.has(state) === (parsed.currentRecoveryEpisodeId !== null), problem, 'Recovery episode pointer does not match the state');
+  requireCoupled(isPracticalRecoveringState(state) === (parsed.currentRecoveryEpisodeId !== null), problem, 'Recovery episode pointer does not match the state');
   requireCoupled((state === 'MANUAL_REVIEW_REQUIRED') === (parsed.currentReviewEpisodeId !== null), problem, 'Review episode pointer does not match the state');
   requireCoupled((state === 'CERTIFIED_IDLE') === (parsed.currentCertificateId !== null), problem, 'Certificate pointer does not match the state');
   return parsed;
@@ -213,7 +214,7 @@ export function parsePracticalFenceRow(value: unknown): PracticalAccountFence {
     fenceMode = { kind: 'CERTIFYING', runId };
   } else if (mode === 'MUTATION_LEASED') {
     requireCoupled(runId === null, problem, 'MUTATION_LEASED fence carries a run id');
-    if (typeof certificateId !== 'string' || !PRACTICAL_DIGEST_PATTERN.test(certificateId)) malformed(problem, 'Leased certificate id is not a digest', 'certificateId');
+    if (typeof certificateId !== 'string' || !isPracticalDigest(certificateId)) malformed(problem, 'Leased certificate id is not a digest', 'certificateId');
     fenceMode = { kind: 'MUTATION_LEASED', leaseId, certificateId, action: leaseAction };
   } else {
     malformed(problem, 'Unknown durable fence mode', 'mode');
@@ -229,7 +230,7 @@ export function parsePracticalFenceRow(value: unknown): PracticalAccountFence {
     return readPracticalAccountFence(candidate);
   } catch (error) {
     // Only the Stage 1A fence refusal becomes MALFORMED; nothing becomes absent.
-    if (error instanceof PracticalLiveSafetyError && error.code === 'PRACTICAL_FENCE_INVALID') {
+    if ((readPracticalLiveSafetyError(error) !== null) && (readPracticalLiveSafetyError(error))!.code === 'PRACTICAL_FENCE_INVALID') {
       malformed(problem, 'The durable fence failed the Stage 1A validator');
     }
     throw error;
@@ -586,8 +587,8 @@ function pointed<T>(row: unknown, pointer: string | null, parse: (value: unknown
  * converted into a result.
  */
 function malformedProblemOrRethrow(error: unknown): PracticalMalformedProblem {
-  if (error instanceof PracticalPersistenceError && error.code === 'PRACTICAL_PERSISTENCE_MALFORMED' && error.details !== undefined) {
-    const problem = error.details['problem'];
+  if ((readPracticalPersistenceError(error) !== null) && (readPracticalPersistenceError(error))!.code === 'PRACTICAL_PERSISTENCE_MALFORMED' && (readPracticalPersistenceError(error))!.details !== undefined) {
+    const problem = (readPracticalPersistenceError(error))!.details!['problem'];
     if (typeof problem === 'string') return problem as PracticalMalformedProblem;
   }
   throw error;
@@ -660,5 +661,29 @@ export function practicalStartupStateFromLoad(load: PracticalAccountLoad): Pract
       return practicalAccountStateOnStartup(load.account.state);
     default:
       return practicalAccountStateOnStartup(MALFORMED_DURABLE_STATE);
+  }
+}
+
+/** Object.freeze(Set) leaves membership mutable. Trusted decisions use exact private primitives. */
+export function isPracticalRecoveringState(value: unknown): boolean {
+  return value === 'QUARANTINED' || value === 'CERTIFYING' || value === 'PROVIDER_UNAVAILABLE';
+}
+Object.freeze(isPracticalRecoveringState);
+// Reviewed defining-owner binding protection.
+Object.freeze(evaluatePracticalLatch);
+Object.freeze(isPracticalCertificateBoundToLease);
+Object.freeze(isPracticalLeaseBoundToFence);
+Object.freeze(parsePracticalCertificateRow);
+Object.freeze(parsePracticalLeaseRow);
+Object.freeze(singleRowOrNull);
+Object.freeze(toPracticalAccountLoad);
+Object.freeze(toPracticalRecordLoad);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["evaluatePracticalLatch","isPracticalCertificateBoundToLease","isPracticalLeaseBoundToFence","parsePracticalCertificateRow","parsePracticalLeaseRow","singleRowOrNull","toPracticalAccountLoad","toPracticalRecordLoad","PRACTICAL_RECOVERING_STATES","isPracticalRecoveringState"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor !== undefined && descriptor.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
   }
 }

@@ -1,3 +1,4 @@
+import { readLiveExecutionError } from './errors';
 /**
  * Exact-decimal layer for Phase17 live execution (P17-I10).
  *
@@ -26,6 +27,109 @@ export const LiveCalcDecimal = Decimal.clone({
   toExpPos: 160,
 });
 
+const originalLiveConfiguration = Object.freeze({
+  precision: LiveCalcDecimal.precision, rounding: LiveCalcDecimal.rounding,
+  toExpNeg: LiveCalcDecimal.toExpNeg, toExpPos: LiveCalcDecimal.toExpPos,
+  minE: LiveCalcDecimal.minE, maxE: LiveCalcDecimal.maxE,
+  modulo: LiveCalcDecimal.modulo, crypto: LiveCalcDecimal.crypto,
+});
+const originalLiveConfig = LiveCalcDecimal.config;
+const originalLiveMethods = Object.freeze({
+  finite: LiveCalcDecimal.prototype.isFinite,
+  fixed: LiveCalcDecimal.prototype.toFixed as (this: LiveCalc) => string,
+  compare: LiveCalcDecimal.prototype.comparedTo,
+  add: LiveCalcDecimal.prototype.plus,
+  subtract: LiveCalcDecimal.prototype.minus,
+  absolute: LiveCalcDecimal.prototype.abs,
+  negate: LiveCalcDecimal.prototype.negated,
+});
+// Decimal clones share a library prototype and legitimately write configuration
+// during arithmetic. Protect this clone's own bindings, leaving those scalar
+// data properties writable and the shared third-party context/prototype alone.
+for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(LiveCalcDecimal))) {
+  if (!Object.hasOwn(descriptor, 'value') || descriptor.configurable === false) continue;
+  Object.defineProperty(LiveCalcDecimal, name, { ...descriptor, configurable: false,
+    writable: Object.hasOwn(originalLiveConfiguration, name) });
+}
+
+type OwnedLiveOperation = 'CANONICAL' | 'COMPARE' | 'ADD' | 'SUBTRACT' | 'ABSOLUTE' | 'NEGATE';
+function exactPrimitiveSum(left: string, right: string, subtract: boolean): string {
+  const split = (value: string): readonly [bigint, number] => {
+    const negative = value.startsWith('-');
+    const [integer = '0', fraction = ''] = value.replace(/^[+-]/, '').split('.');
+    const magnitude = BigInt(integer + fraction);
+    return [negative ? -magnitude : magnitude, fraction.length];
+  };
+  const [a, aScale] = split(left), [b, bScale] = split(right);
+  const scale = Math.max(aScale, bScale);
+  const result = a * 10n ** BigInt(scale - aScale) + (subtract ? -b : b) * 10n ** BigInt(scale - bScale);
+  if (result === 0n) return '0';
+  const digits = (result < 0n ? -result : result).toString().padStart(scale + 1, '0');
+  const fraction = scale === 0 ? '' : digits.slice(-scale).replace(/0+$/, '');
+  return `${result < 0n ? '-' : ''}${scale === 0 ? digits : digits.slice(0, -scale)}${fraction === '' ? '' : `.${fraction}`}`;
+}
+/** Complete synchronous calculation: primitive inputs and primitive output only. */
+function calculateOwnedLive(operation: OwnedLiveOperation, left: unknown, right?: unknown): string | number {
+  if (typeof left !== 'string' || (right !== undefined && typeof right !== 'string')) {
+    throw new LiveExecutionError('LIVE_NUMERIC_FAILURE', 'Private live arithmetic requires primitive fixed strings');
+  }
+  const a = left.trim(), b = typeof right === 'string' ? right.trim() : undefined;
+  if (!/^[+-]?\d+(?:\.\d+)?$/.test(a) || (b !== undefined && !/^[+-]?\d+(?:\.\d+)?$/.test(b))) {
+    throw new LiveExecutionError('LIVE_NUMERIC_FAILURE', 'Private live arithmetic requires fixed-point syntax');
+  }
+  for (const name of Object.keys(originalLiveConfiguration)) {
+    const descriptor = Object.getOwnPropertyDescriptor(LiveCalcDecimal, name);
+    if (descriptor === undefined || !Object.hasOwn(descriptor, 'value') || descriptor.configurable
+      || descriptor.writable !== true) {
+      throw new LiveExecutionError('LIVE_NUMERIC_FAILURE', 'Private live configuration integrity was lost');
+    }
+  }
+  let output: string | number | undefined;
+  let failure: unknown;
+  try {
+    originalLiveConfig.call(LiveCalcDecimal, originalLiveConfiguration);
+    const first = new LiveCalcDecimal(a);
+    const second = b === undefined ? undefined : new LiveCalcDecimal(b);
+    if (!originalLiveMethods.finite.call(first) || (second !== undefined && !originalLiveMethods.finite.call(second))) {
+      throw new LiveExecutionError('LIVE_NUMERIC_FAILURE', 'Private live arithmetic must be finite');
+    }
+    switch (operation) {
+      case 'COMPARE': output = originalLiveMethods.compare.call(first, second!); break;
+      case 'ADD':
+      case 'SUBTRACT': {
+        const result = originalLiveMethods.fixed.call(operation === 'ADD'
+          ? originalLiveMethods.add.call(first, second!) : originalLiveMethods.subtract.call(first, second!));
+        if (result !== exactPrimitiveSum(a, b!, operation === 'SUBTRACT')) {
+          throw new LiveExecutionError('LIVE_NUMERIC_FAILURE', 'Private live arithmetic would lose exact quantity');
+        }
+        output = result;
+        break;
+      }
+      case 'ABSOLUTE': output = originalLiveMethods.fixed.call(originalLiveMethods.absolute.call(first)); break;
+      case 'NEGATE': output = originalLiveMethods.fixed.call(originalLiveMethods.negate.call(first)); break;
+      case 'CANONICAL': output = originalLiveMethods.fixed.call(first); break;
+      default: throw new LiveExecutionError('LIVE_NUMERIC_FAILURE', 'Private live arithmetic operation is invalid');
+    }
+  } catch (error) {
+    failure = readLiveExecutionError(error) !== null ? error
+      : new LiveExecutionError('LIVE_NUMERIC_FAILURE', 'Private live arithmetic failed', { cause: error });
+  }
+  // Restoration is part of success, including when calculation already failed.
+  // No primitive financial result escapes until the captured configuration is restored.
+  try { originalLiveConfig.call(LiveCalcDecimal, originalLiveConfiguration); }
+  catch { throw new LiveExecutionError('LIVE_NUMERIC_FAILURE', 'Private live configuration could not be restored'); }
+  if (failure !== undefined) throw failure;
+  if (output === undefined) throw new LiveExecutionError('LIVE_NUMERIC_FAILURE', 'Private live arithmetic produced no result');
+  return output;
+}
+
+export function trustedLiveDecimalString(value: unknown): string { return calculateOwnedLive('CANONICAL', value) as string; }
+export function trustedLiveCompare(left: unknown, right: unknown): number { return calculateOwnedLive('COMPARE', left, right) as number; }
+export function trustedLiveAdd(left: unknown, right: unknown): string { return calculateOwnedLive('ADD', left, right) as string; }
+export function trustedLiveSubtract(left: unknown, right: unknown): string { return calculateOwnedLive('SUBTRACT', left, right) as string; }
+export function trustedLiveAbsolute(value: unknown): string { return calculateOwnedLive('ABSOLUTE', value) as string; }
+export function trustedLiveNegate(value: unknown): string { return calculateOwnedLive('NEGATE', value) as string; }
+
 export type LiveCalc = InstanceType<typeof LiveCalcDecimal>;
 export type LiveDecimalInput = string | LiveCalc;
 
@@ -51,7 +155,7 @@ export function liveDecimal(input: LiveDecimalInput): LiveCalc {
     }
     return value;
   } catch (error) {
-    if (error instanceof LiveExecutionError) throw error;
+    if ((readLiveExecutionError(error) !== null)) throw error;
     throw new LiveExecutionError('LIVE_NUMERIC_FAILURE', 'Unable to construct live decimal', { cause: error });
   }
 }
@@ -66,10 +170,7 @@ export function canonicalLiveDecimalString(value: unknown, label = 'decimal'): s
   if (typeof value !== 'string' || !/^-?\d+(?:\.\d+)?$/.test(value)) {
     throw new LiveExecutionError('LIVE_INTENT_INVALID', `${label} must use fixed-point Decimal syntax`);
   }
-  const parsed = new LiveCalcDecimal(value);
-  if (!parsed.isFinite() || parsed.isNaN()) {
-    throw new LiveExecutionError('LIVE_INTENT_INVALID', `${label} must be finite`);
-  }
+  trustedLiveDecimalString(value);
   const negative = value.startsWith('-');
   const unsigned = negative ? value.slice(1) : value;
   const [rawInteger = '0', rawFraction = ''] = unsigned.split('.');
@@ -177,4 +278,26 @@ export function isAlignedToIncrement(value: LiveCalc, increment: LiveCalc): bool
   assertTickable(value, increment);
   const { v, t } = toCommonScale(value, increment);
   return t !== 0n && v % t === 0n;
+}
+
+Object.freeze(trustedLiveDecimalString);
+Object.freeze(trustedLiveCompare);
+Object.freeze(trustedLiveAdd);
+Object.freeze(trustedLiveSubtract);
+Object.freeze(trustedLiveAbsolute);
+Object.freeze(trustedLiveNegate);
+// Reviewed defining-owner binding protection.
+Object.freeze(canonicalPositiveLiveDecimal);
+Object.freeze(canonicalLiveDecimalString);
+Object.freeze(liveDecimal);
+Object.freeze(canonicalNonNegativeLiveDecimal);
+Object.freeze(canonicalPersistedLiveDecimal);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["canonicalPositiveLiveDecimal","canonicalLiveDecimalString","liveDecimal","canonicalNonNegativeLiveDecimal","LiveCalcDecimal","MAX_LIVE_SCALE","MAX_LIVE_INTEGER_DIGITS","MAX_LIVE_PRECISION","canonicalPersistedLiveDecimal","trustedLiveDecimalString","trustedLiveCompare","trustedLiveAdd","trustedLiveSubtract","trustedLiveAbsolute","trustedLiveNegate"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

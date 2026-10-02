@@ -210,6 +210,7 @@ describe('reachability: no practical module, no new integration importer, no net
       'src/execution/live/service.ts',
       // The single approved Phase17 production root (pre-existing; it imports the public repository class only).
       'src/integration/coindcx/live/production-runtime.ts',
+      'src/integration/coindcx/live/practical-account-coordinator.ts',
     ].concat(
       // [Wave 2B1] The reviewed Stage 1B2 adapter (the two claim/arm primitives only; it is itself wired into nothing).
       MUTATION_ADAPTER,

@@ -1,3 +1,5 @@
+import { readPracticalPersistenceError } from '../practical-persistence/ports';
+import { readPracticalLiveSafetyError } from '../practical/types';
 /**
  * Phase 18B Checkpoint B (Stage 1C): the READ-ONLY practical recovery and
  * certification engine.
@@ -101,7 +103,6 @@ import {
 } from '../practical/policy';
 import { PracticalLiveSafetyError, isExactId, isPositiveSafeInteger, type PracticalInvalidationReason } from '../practical/types';
 import {
-  PracticalPersistenceError,
   type PracticalAccountLoad,
   type PracticalAccountSnapshot,
   type PracticalCertificationFailure,
@@ -132,7 +133,7 @@ import type {
 } from './ports';
 import { recordSafely, type PracticalObservationReadKind, type PracticalPassReadSlot, type PracticalRecoveryTelemetry } from './telemetry';
 import { PRACTICAL_RECOVERY_HARD_CEILINGS, practicalCandidateExceeded, type PracticalRecoveryHardCeilings } from './timing';
-import { PracticalPrivateStreamTripwire, practicalDurableSafetyProblem, type PracticalTrip, type PracticalTripwireWatch } from './tripwire';
+import { createOwnedPracticalPrivateStreamTripwire, PracticalPrivateStreamTripwire, practicalDurableSafetyProblem, type PracticalTrip, type PracticalTripwireWatch } from './tripwire';
 
 const logger = createChildLogger('execution:live:practical-recovery');
 
@@ -359,6 +360,8 @@ class RunAbort extends Error {
 // The service
 // ---------------------------------------------------------------------------
 
+const OWNED_RECOVERY = Object.freeze({});
+
 export class PracticalRecoveryService {
   readonly #accountId: string;
   readonly #runtimeEpoch: string;
@@ -392,7 +395,7 @@ export class PracticalRecoveryService {
   /** Our own run whose fence release failed; retried before the next certification. */
   #unreleased: { readonly run: CertificationRun; readonly failure: PracticalCertificationFailure } | null = null;
 
-  public constructor(dependencies: PracticalRecoveryServiceDependencies) {
+  public constructor(dependencies: PracticalRecoveryServiceDependencies, ownership?: unknown) {
     if (!isExactId(dependencies.accountId)) configurationError('accountId must be a non-empty exact string');
     if (!isExactId(dependencies.runtimeEpoch) || dependencies.runtimeEpoch.length > 64) configurationError('runtimeEpoch must be an exact string of at most 64 characters');
     if (!isProviderAccountFingerprint(dependencies.expectedProviderAccountFingerprint)) configurationError('expectedProviderAccountFingerprint must be a lowercase 64-hex fingerprint');
@@ -415,7 +418,7 @@ export class PracticalRecoveryService {
     this.#timing = Object.freeze({ ...timing });
     this.#newRunId = dependencies.newRunId ?? randomUUID;
     const persistence = dependencies.persistence;
-    this.#tripwire = new PracticalPrivateStreamTripwire({
+    const tripwireInput: ConstructorParameters<typeof PracticalPrivateStreamTripwire>[0] = {
       accountId: dependencies.accountId,
       source: dependencies.privateStream,
       // REVOKE-ONLY: the tripwire gets invalidation and nothing else.
@@ -430,7 +433,8 @@ export class PracticalRecoveryService {
           }
         },
       },
-    });
+    };
+    this.#tripwire = ownership === OWNED_RECOVERY ? createOwnedPracticalPrivateStreamTripwire(tripwireInput) : new PracticalPrivateStreamTripwire(tripwireInput);
   }
 
   /** Resolves once every tripwire revocation started so far has finished. */
@@ -790,8 +794,8 @@ export class PracticalRecoveryService {
       certifying = await this.#persistence.startCertification({ accountId: this.#accountId, expected: expectedIdle, runId, nowMs: this.#clock.nowMs() });
     } catch (error) {
       // The durable fence refused: another run or a newer state won. Nothing changed.
-      if (error instanceof PracticalLiveSafetyError || error instanceof PracticalPersistenceError) {
-        return Object.freeze({ kind: 'LOST_RACE' as const, reason: error.code });
+      if ((readPracticalLiveSafetyError(error) !== null) || (readPracticalPersistenceError(error) !== null)) {
+        return Object.freeze({ kind: 'LOST_RACE' as const, reason: (readPracticalLiveSafetyError(error) ?? readPracticalPersistenceError(error))!.code });
       }
       throw error;
     }
@@ -1123,7 +1127,7 @@ export class PracticalRecoveryService {
         return { released: true, account };
       } catch (error) {
         // A stale run (the fence was adopted, finished, or moved by someone else) must not retry: it owns nothing.
-        if (error instanceof PracticalLiveSafetyError || (error instanceof PracticalPersistenceError && error.code !== 'PRACTICAL_PERSISTENCE_FAULT')) {
+        if ((readPracticalLiveSafetyError(error) !== null) || ((readPracticalPersistenceError(error) !== null) && (readPracticalLiveSafetyError(error) ?? readPracticalPersistenceError(error))!.code !== 'PRACTICAL_PERSISTENCE_FAULT')) {
           if (this.#unreleased !== null && this.#unreleased.run.runId === run.runId) this.#unreleased = null;
           return { released: false, account: await this.#loadSnapshot() };
         }
@@ -1400,6 +1404,29 @@ Object.defineProperty(PracticalRecoveryService, 'checkOriginalCertificateWatch',
 // tsc emits CommonJS with mutable export properties. Preserve the lexical
 // class identity as well: preloading this module must not redirect the guard
 // by replacing its exported class before the gateway boundary is imported.
+// Defining-module snapshot: owned instances cannot inherit later replacements.
+const createOwnedPracticalRecoveryServiceDescriptors = Object.freeze(Object.getOwnPropertyDescriptors(PracticalRecoveryService.prototype));
+export function createOwnedPracticalRecoveryService(dependencies: PracticalRecoveryServiceDependencies): PracticalRecoveryService {
+  const instance = new PracticalRecoveryService(dependencies, OWNED_RECOVERY);
+  for (const [key, descriptor] of Object.entries(createOwnedPracticalRecoveryServiceDescriptors)) {
+    if (key === 'constructor') continue;
+    if (typeof descriptor.value === 'function') Object.defineProperty(instance, key, { value: Object.freeze(descriptor.value.bind(instance)), writable: false, configurable: false });
+    else if (descriptor.get !== undefined) Object.defineProperty(instance, key, { get: Object.freeze(descriptor.get.bind(instance)), configurable: false });
+  }
+  Object.freeze(instance);
+  return instance;
+}
+Object.freeze(createOwnedPracticalRecoveryService);
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const [name, value] of Object.entries({ createOwnedPracticalRecoveryService, PracticalRecoveryService })) {
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.get === undefined || descriptor.set !== undefined || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}
+
 if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
   const descriptor = Object.getOwnPropertyDescriptor(module.exports, 'PracticalRecoveryService');
   if (descriptor?.configurable === false) {

@@ -1,3 +1,4 @@
+import { trustedLiveCompare, trustedLiveDecimalString } from '../decimal';
 /**
  * Durable Phase18 reconciliation persistence (§4, §16, §23).
  *
@@ -21,7 +22,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { Prisma, type PrismaClient } from '@prisma/client';
-import { canonicalLiveDecimalString, canonicalNonNegativeLiveDecimal, liveDecimal } from '../decimal';
+import { canonicalLiveDecimalString, canonicalNonNegativeLiveDecimal } from '../decimal';
 import { LiveExecutionError } from '../errors';
 import type { LivePositionOwnershipRecord } from '../repository';
 import { evaluateReconciliationBarrier, initialReconciliationState, readLiveRuntimeEpoch } from './barrier';
@@ -1124,7 +1125,7 @@ export class PrismaLiveReconciliationRepository implements LiveReconciliationRep
           && previous.lineageSha256 === share.lineageSha256
           && previous.side === share.side
           && previous.materialized === input.materializeSingleOwner
-          && liveDecimal(decimalString(previous.quantity)).equals(liveDecimal(quantity));
+          && (trustedLiveCompare(trustedLiveDecimalString(decimalString(previous.quantity)), trustedLiveDecimalString(quantity)) === 0);
         if (unchanged) {
           // Only the generation window moves, and it is not part of any proof,
           // so it does not bump `revision`.
@@ -1192,7 +1193,7 @@ export class PrismaLiveReconciliationRepository implements LiveReconciliationRep
           && current.ownerStrategyVersion === share.ownerStrategyVersion
           && current.ownerParameterHash === share.ownerParameterHash
           && current.instrumentSpecSnapshotId === share.instrumentSpecSnapshotId
-          && liveDecimal(decimalString(current.quantity)).equals(liveDecimal(quantity));
+          && (trustedLiveCompare(trustedLiveDecimalString(decimalString(current.quantity)), trustedLiveDecimalString(quantity)) === 0);
         if (!identical) {
           // `position_instance_id` is derived from the proof, so re-proving the
           // same ownership yields the same identity and a replay cannot fork it.
@@ -1279,6 +1280,29 @@ Object.freeze(LiveReconciliationAuthorization);
 // Protect the private-field authorization reader and concrete persistence
 // implementation from CommonJS export replacement. Durable row validation is
 // still mandatory even for a genuine object.
+// Defining-module snapshot: owned instances cannot inherit later replacements.
+const createOwnedLiveReconciliationRepositoryDescriptors = Object.freeze(Object.getOwnPropertyDescriptors(PrismaLiveReconciliationRepository.prototype));
+export function createOwnedLiveReconciliationRepository(prisma: PrismaClient): PrismaLiveReconciliationRepository {
+  const instance = new PrismaLiveReconciliationRepository(prisma);
+  for (const [key, descriptor] of Object.entries(createOwnedLiveReconciliationRepositoryDescriptors)) {
+    if (key === 'constructor') continue;
+    if (typeof descriptor.value === 'function') Object.defineProperty(instance, key, { value: Object.freeze(descriptor.value.bind(instance)), writable: false, configurable: false });
+    else if (descriptor.get !== undefined) Object.defineProperty(instance, key, { get: Object.freeze(descriptor.get.bind(instance)), configurable: false });
+  }
+  Object.freeze(instance);
+  return instance;
+}
+Object.freeze(createOwnedLiveReconciliationRepository);
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const [name, value] of Object.entries({ createOwnedLiveReconciliationRepository, PrismaLiveReconciliationRepository })) {
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.get === undefined || descriptor.set !== undefined || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}
+
 if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
   for (const [name, value] of Object.entries({
     LiveReconciliationAuthorization,
@@ -1289,4 +1313,16 @@ if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
     }
   }
   Object.freeze(module.exports);
+}
+
+// Reviewed defining-owner binding protection.
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["CLAIM_GENERATION_MAX_ATTEMPTS"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

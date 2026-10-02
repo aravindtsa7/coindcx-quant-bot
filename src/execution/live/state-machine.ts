@@ -1,3 +1,4 @@
+import { trustedLiveCompare, trustedLiveDecimalString, trustedLiveSubtract } from './decimal';
 /**
  * The frozen Phase17 live order state machine (§7, P17-I08/I09/I13/I14).
  *
@@ -19,7 +20,7 @@
  *   - SUBMISSION_AMBIGUOUS is terminal for Phase17. Resolving it is Phase18
  *     reconciliation and is deliberately not implemented here (P17-I20).
  */
-import { canonicalNonNegativeLiveDecimal, canonicalPositiveLiveDecimal, liveDecimal } from './decimal';
+import { canonicalNonNegativeLiveDecimal, canonicalPositiveLiveDecimal } from './decimal';
 import { LiveExecutionError } from './errors';
 import type { LiveOrderObservation, LiveOrderStateName, LiveOrderStateRecord } from './types';
 
@@ -235,7 +236,7 @@ export function requestCancel(current: LiveOrderStateRecord): LiveOrderStateReco
  */
 export function markRejected(current: LiveOrderStateRecord, faultCode: string): LiveOrderStateRecord {
   assertTransitionAllowed(current.state, 'REJECTED', current.intentId);
-  if (!liveDecimal(current.cumulativeFilledQuantity).isZero()) {
+  if (!(trustedLiveCompare(trustedLiveDecimalString(current.cumulativeFilledQuantity), '0') === 0)) {
     stateConflict('A rejected order cannot carry executed quantity', { intentId: current.intentId });
   }
   // [F18-18] Same reasoning as `markSubmissionAmbiguous`: REJECTED is terminal
@@ -260,19 +261,19 @@ export type ObservationApplication =
 function resolveObservedState(
   current: LiveOrderStateRecord,
   observation: LiveOrderObservation,
-  cumulative: ReturnType<typeof liveDecimal>,
-  ordered: ReturnType<typeof liveDecimal>,
+  cumulative: ReturnType<typeof trustedLiveDecimalString>,
+  ordered: ReturnType<typeof trustedLiveDecimalString>,
 ): LiveOrderStateName {
-  const fullyFilled = cumulative.equals(ordered);
+  const fullyFilled = (trustedLiveCompare(cumulative, ordered) === 0);
   switch (observation.kind) {
     case 'ACKNOWLEDGED':
       // An acknowledgement is never a fill. If the venue simultaneously reports
       // executed quantity, the fill facts win and the state reflects them.
       if (fullyFilled) return 'FILLED';
-      return cumulative.greaterThan(0) ? 'PARTIALLY_FILLED' : 'ACKNOWLEDGED';
+      return (trustedLiveCompare(cumulative, "0") > 0) ? 'PARTIALLY_FILLED' : 'ACKNOWLEDGED';
     case 'PARTIAL_FILL':
       if (fullyFilled) return 'FILLED';
-      if (cumulative.lessThanOrEqualTo(0)) {
+      if ((trustedLiveCompare(cumulative, "0") <= 0)) {
         fillInvalid('A partial-fill observation reported no executed quantity', { intentId: current.intentId });
       }
       return 'PARTIALLY_FILLED';
@@ -286,7 +287,7 @@ function resolveObservedState(
       // cancel that races a complete fill resolves as FILLED.
       return fullyFilled ? 'FILLED' : 'CANCELLED';
     case 'REJECTED':
-      if (cumulative.greaterThan(0)) {
+      if ((trustedLiveCompare(cumulative, "0") > 0)) {
         stateConflict('A rejected order cannot carry executed quantity', { intentId: current.intentId });
       }
       return 'REJECTED';
@@ -324,22 +325,22 @@ export function applyLiveOrderObservation(
     });
   }
 
-  const ordered = liveDecimal(current.orderedQuantity);
-  const recorded = liveDecimal(current.cumulativeFilledQuantity);
-  const cumulative = liveDecimal(canonicalNonNegativeLiveDecimal(observation.cumulativeFilledQuantity, 'cumulativeFilledQuantity'));
-  const observedOrdered = liveDecimal(canonicalPositiveLiveDecimal(observation.orderedQuantity, 'orderedQuantity'));
+  const ordered = trustedLiveDecimalString(current.orderedQuantity);
+  const recorded = trustedLiveDecimalString(current.cumulativeFilledQuantity);
+  const cumulative = trustedLiveDecimalString(canonicalNonNegativeLiveDecimal(observation.cumulativeFilledQuantity, 'cumulativeFilledQuantity'));
+  const observedOrdered = trustedLiveDecimalString(canonicalPositiveLiveDecimal(observation.orderedQuantity, 'orderedQuantity'));
 
-  if (!observedOrdered.equals(ordered)) {
+  if (!(trustedLiveCompare(observedOrdered, ordered) === 0)) {
     throw new LiveExecutionError('LIVE_ORDER_IDENTITY_MISMATCH', 'Observation reports a different ordered quantity than this order', {
       details: { intentId: current.intentId },
     });
   }
-  if (cumulative.greaterThan(ordered)) {
+  if ((trustedLiveCompare(cumulative, ordered) > 0)) {
     fillInvalid('Cumulative filled quantity exceeds the ordered quantity', { intentId: current.intentId });
   }
 
   let observedAverage: string | null = null;
-  if (cumulative.greaterThan(0)) {
+  if ((trustedLiveCompare(cumulative, "0") > 0)) {
     if (observation.averageFillPrice === null) {
       fillInvalid('A positive cumulative fill requires the provider cumulative average price', { intentId: current.intentId });
     }
@@ -351,7 +352,7 @@ export function applyLiveOrderObservation(
   const staleByTime = current.lastProviderEventTimeMs !== null
     && observation.providerEventTimeMs < current.lastProviderEventTimeMs;
 
-  if (cumulative.lessThan(recorded)) {
+  if ((trustedLiveCompare(cumulative, recorded) < 0)) {
     // Out-of-order delivery is ignored; a fresh contradiction is a hard fault.
     if (staleByTime) return { kind: 'STALE', order: current };
     fillInvalid('Cumulative filled quantity regressed against durable state', { intentId: current.intentId });
@@ -360,7 +361,7 @@ export function applyLiveOrderObservation(
   let nextState = resolveObservedState(current, observation, cumulative, ordered);
 
   const averageChanged = observedAverage !== current.averageFillPrice;
-  if (staleByTime && nextState === current.state && cumulative.equals(recorded)) {
+  if (staleByTime && nextState === current.state && (trustedLiveCompare(cumulative, recorded) === 0)) {
     return { kind: 'STALE', order: current };
   }
 
@@ -369,7 +370,7 @@ export function applyLiveOrderObservation(
       stateConflict('An ambiguous create cannot be resolved by Phase17 observation folding', { intentId: current.intentId });
     }
     if (current.state === 'FILLED') {
-      if (!cumulative.equals(recorded) || nextState !== 'FILLED') {
+      if (!(trustedLiveCompare(cumulative, recorded) === 0) || nextState !== 'FILLED') {
         stateConflict(`Live order is terminal in ${current.state} and cannot be transitioned to ${nextState}`, {
           intentId: current.intentId, from: current.state, to: nextState,
         });
@@ -377,13 +378,13 @@ export function applyLiveOrderObservation(
       nextState = 'FILLED';
     } else if (current.state === 'RECONCILIATION_REQUIRED') {
       nextState = 'RECONCILIATION_REQUIRED';
-    } else if (cumulative.greaterThan(recorded) || nextState !== current.state) {
+    } else if ((trustedLiveCompare(cumulative, recorded) > 0) || nextState !== current.state) {
       // Financially authoritative late evidence is preserved, but Phase17 does
       // not pretend it can reconcile the terminal contradiction.
       nextState = 'RECONCILIATION_REQUIRED';
     }
     const identicalReplay = nextState === current.state
-      && cumulative.equals(recorded)
+      && (trustedLiveCompare(cumulative, recorded) === 0)
       && !averageChanged
       && observation.exchangeStatus === current.lastExchangeStatus;
     if (identicalReplay) return { kind: 'DUPLICATE', order: current };
@@ -392,7 +393,7 @@ export function applyLiveOrderObservation(
   }
 
   const unchanged = nextState === current.state
-    && cumulative.equals(recorded)
+    && (trustedLiveCompare(cumulative, recorded) === 0)
     && !averageChanged
     && observation.exchangeOrderId === current.exchangeOrderId
     && observation.exchangeStatus === current.lastExchangeStatus;
@@ -404,8 +405,8 @@ export function applyLiveOrderObservation(
       ...current,
       state: nextState,
       exchangeOrderId: observation.exchangeOrderId,
-      cumulativeFilledQuantity: cumulative.toFixed(),
-      remainingQuantity: ordered.minus(cumulative).toFixed(),
+      cumulativeFilledQuantity: cumulative,
+      remainingQuantity: trustedLiveSubtract(ordered, cumulative),
       averageFillPrice: observedAverage,
       lastExchangeStatus: observation.exchangeStatus,
       lastProviderEventTimeMs: current.lastProviderEventTimeMs === null
@@ -420,4 +421,18 @@ export function applyLiveOrderObservation(
       revision: current.revision + 1,
     }),
   };
+}
+
+// Reviewed defining-owner binding protection.
+Object.freeze(applyLiveOrderObservation);
+Object.freeze(reclaimCancelAfterCrash);
+Object.freeze(reclaimDispatchAfterCrash);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["applyLiveOrderObservation","reclaimCancelAfterCrash","reclaimDispatchAfterCrash"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

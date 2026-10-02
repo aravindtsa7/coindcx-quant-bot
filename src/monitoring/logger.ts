@@ -1,4 +1,58 @@
 import pino from 'pino';
+import { types } from 'node:util';
+import { readAppErrorSafetyRecord } from '../core/errors/app-error';
+
+/** Detached data only: never invoke application accessors or Proxy traps. */
+export function snapshotSafetyData<T>(input: T, activePath = new Set<object>()): T {
+  if (input === null || input === undefined || typeof input !== 'object') {
+    return (typeof input === 'function' || typeof input === 'symbol' ? '[UNSAFE_VALUE]' : input) as T;
+  }
+  if (types.isProxy(input)) return '[UNSAFE_VALUE]' as T;
+  if (types.isNativeError(input)) return '[UNHANDLED_ERROR]' as T;
+  if (activePath.has(input)) return '[CIRCULAR]' as T;
+  activePath.add(input);
+  try {
+    const descriptors = Object.getOwnPropertyDescriptors(input);
+    const result: Record<string, unknown> | unknown[] = Array.isArray(input) ? [] : {};
+    for (const key of Object.keys(descriptors)) {
+      const descriptor = descriptors[key]!;
+      if (!descriptor.enumerable) continue;
+      const value = isSensitiveKey(key) ? '[REDACTED]' : !Object.hasOwn(descriptor, 'value')
+        ? '[UNSAFE_VALUE]' : snapshotSafetyData(descriptor.value, activePath);
+      Object.defineProperty(result, key, { value, enumerable: true, configurable: false, writable: false });
+    }
+    return Object.freeze(result) as T;
+  } finally { activePath.delete(input); }
+}
+
+/** Protected safety serialization; the public legacy redactor remains unchanged. */
+export function redactSafetyData<T>(input: T, activePath = new Set<object>()): T {
+  if (input === null || input === undefined || typeof input !== 'object') return snapshotSafetyData(input);
+  if (types.isProxy(input)) return '[UNSAFE_VALUE]' as T;
+  if (activePath.has(input)) return '[CIRCULAR]' as T;
+  if (types.isNativeError(input)) {
+    // Resolve at call time, including during either circular import order.
+    const reader = readAppErrorSafetyRecord;
+    const record = typeof reader === 'function' ? reader(input) : null;
+    if (record !== null) return snapshotSafetyData(record) as T;
+    const code = Object.getOwnPropertyDescriptor(input, 'code');
+    const safeCode = code && Object.hasOwn(code, 'value') && typeof code.value === 'string'
+      && ['EADDRINUSE', 'ENOENT', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'EACCES'].includes(code.value)
+      ? code.value as string : undefined;
+    return Object.freeze({ name: 'Error', message: '[UNHANDLED_ERROR]', ...(safeCode === undefined ? {} : { code: safeCode }) }) as T;
+  }
+  activePath.add(input);
+  try {
+    const result: Record<string, unknown> | unknown[] = Array.isArray(input) ? [] : {};
+    for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(input))) {
+      if (!descriptor.enumerable) continue;
+      Object.defineProperty(result, key, { enumerable: true, configurable: false, writable: false,
+        value: isSensitiveKey(key) ? '[REDACTED]' : !Object.hasOwn(descriptor, 'value') ? '[UNSAFE_VALUE]'
+          : redactSafetyData(descriptor.value, activePath) });
+    }
+    return Object.freeze(result) as T;
+  } finally { activePath.delete(input); }
+}
 
 export const SENSITIVE_KEYS = [
   'apiKey',
@@ -277,4 +331,20 @@ export function createChildLogger(
     module: moduleName,
     ...extraContext,
   });
+}
+
+Object.freeze(snapshotSafetyData);
+Object.freeze(redactSafetyData);
+// Reviewed defining-owner binding protection.
+Object.freeze(isSensitiveKey);
+Object.freeze(redactSensitiveData);
+Object.freeze(isAppError);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["isSensitiveKey","redactSensitiveData","isAppError","snapshotSafetyData","redactSafetyData"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

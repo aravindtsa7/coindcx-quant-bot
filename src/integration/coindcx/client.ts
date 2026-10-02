@@ -1,3 +1,4 @@
+import { parseOwnedUserInfoResponse, parseOwnedOrdersResponse, parseOwnedPositionsResponse, parseOwnedOrdersRequest, parseOwnedPositionsRequest } from './schemas';
 import {
   CoinDcxAuthError,
   CoinDcxProviderError,
@@ -73,11 +74,13 @@ export interface CoinDcxClientOptions {
  * 6. Financial Decimal safety: all prices, quantities, margins, fees represented as Decimal.
  */
 export class CoinDcxClient {
+  readonly #usesOwnedParsers: boolean;
   readonly #transport: CoinDcxTransport;
   readonly #clock: Clock;
   readonly #hasCredentials: boolean;
 
   constructor(options: CoinDcxClientOptions = {}, owned?: unknown) {
+    this.#usesOwnedParsers = owned === OWNED_CONSTRUCTION;
     this.#clock = options.clock ?? new SystemClock();
 
     let signer: RequestSigner | undefined;
@@ -211,7 +214,7 @@ export class CoinDcxClient {
       body: payload,
     });
 
-    const parsed = UserInfoResponseSchema.safeParse(response.data);
+    const parsed = (this.#usesOwnedParsers ? parseOwnedUserInfoResponse(response.data) : UserInfoResponseSchema.safeParse(response.data));
     if (!parsed.success) {
       throw new CoinDcxResponseValidationError('Failed to parse user info response', {
         issues: parsed.error.issues,
@@ -330,7 +333,7 @@ export class CoinDcxClient {
   ): Promise<InrFuturesPosition[]> {
     this.#requireCredentials('listInrFuturesPositions');
 
-    const validated = ListInrPositionsRequestSchema.safeParse(params);
+    const validated = (this.#usesOwnedParsers ? parseOwnedPositionsRequest(params) : ListInrPositionsRequestSchema.safeParse(params));
     if (!validated.success) {
       throw new ValidationError(
         `Invalid positions request parameters: ${validated.error.message}`,
@@ -358,7 +361,7 @@ export class CoinDcxClient {
       body: JSON.stringify(body),
     });
 
-    const parsed = FuturesPositionsResponseSchema.safeParse(response.data);
+    const parsed = (this.#usesOwnedParsers ? parseOwnedPositionsResponse(response.data) : FuturesPositionsResponseSchema.safeParse(response.data));
     if (!parsed.success) {
       throw new CoinDcxResponseValidationError('Failed to parse futures positions response', {
         issues: parsed.error.issues,
@@ -387,7 +390,7 @@ export class CoinDcxClient {
   ): Promise<InrFuturesOrder[]> {
     this.#requireCredentials('listInrFuturesOrders');
 
-    const validated = ListInrOrdersRequestSchema.safeParse(params);
+    const validated = (this.#usesOwnedParsers ? parseOwnedOrdersRequest(params) : ListInrOrdersRequestSchema.safeParse(params));
     if (!validated.success) {
       throw new ValidationError(
         `Invalid list orders parameters: ${validated.error.message}`,
@@ -410,7 +413,7 @@ export class CoinDcxClient {
       body: JSON.stringify(body),
     });
 
-    const parsed = FuturesOrdersResponseSchema.safeParse(response.data);
+    const parsed = (this.#usesOwnedParsers ? parseOwnedOrdersResponse(response.data) : FuturesOrdersResponseSchema.safeParse(response.data));
     if (!parsed.success) {
       throw new CoinDcxResponseValidationError('Failed to parse futures orders response', {
         issues: parsed.error.issues,

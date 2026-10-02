@@ -1,3 +1,4 @@
+import { redactSafetyData, snapshotSafetyData } from '../../../monitoring/logger';
 /**
  * Phase 18B Stage 1B2 (Wave 2B1): the practical CANCEL mutation store PORT.
  *
@@ -88,8 +89,13 @@ export class PracticalMutationError extends Error {
     assertCredentialFree(details);
     this.name = 'PracticalMutationError';
     this.code = code;
-    this.details = details === undefined ? undefined : Object.freeze({ ...details });
+    this.details = details === undefined ? undefined : Object.freeze(redactSafetyData(details));
     Object.setPrototypeOf(this, new.target.prototype);
+    const kind = new.target === PracticalMutationError ? 'PracticalMutationError' : new.target === PracticalAcquireCommitUnknownError ? 'PracticalAcquireCommitUnknownError' : null;
+    if (kind !== null && typeof code === 'string' && nativeErrorCodes.includes(code)) {
+      nativeErrorRecords.set(this, Object.freeze({ kind, code, details: details === undefined ? undefined
+        : snapshotSafetyData(redactSafetyData(details)) as Readonly<Record<string, unknown>> }));
+    }
   }
 }
 
@@ -435,3 +441,30 @@ export interface PracticalPreviousRuntimeRecoveryStore {
 export const PRACTICAL_ACQUIRE_INVALIDATION_REASONS: readonly PracticalAcquireInvalidationReason[] = Object.freeze([
   'PREFLIGHT_MISMATCH', 'GENERATION_CHANGED', 'RUNTIME_EPOCH_CHANGED', 'CONFIG_CHANGED',
 ] satisfies PracticalInvalidationReason[]);
+
+export interface PracticalMutationErrorSafetyRecord { readonly kind: 'PracticalMutationError' | 'PracticalAcquireCommitUnknownError'; readonly code: PracticalMutationErrorCode; readonly details: Readonly<Record<string, unknown>> | undefined }
+const nativeErrorCodes: readonly string[] = Object.freeze(["PRACTICAL_MUTATION_INVALID_INPUT","PRACTICAL_MUTATION_AUTHORITY_INVALID","PRACTICAL_MUTATION_DWELL_NOT_ELAPSED","PRACTICAL_MUTATION_ARM_REFUSED","PRACTICAL_MUTATION_DISPATCH_CONFLICT","PRACTICAL_MUTATION_SELF_CHECK_FAILED","PRACTICAL_MUTATION_FAULT","PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN","PRACTICAL_MUTATION_COMPLETION_REFUSED","PRACTICAL_MUTATION_SPLIT_STATE","PRACTICAL_MUTATION_ALREADY_COMPLETED","PRACTICAL_MUTATION_RECOVERY_REFUSED"]);
+const nativeErrorRecords = new WeakMap<object, PracticalMutationErrorSafetyRecord>();
+export function readPracticalMutationError(value: unknown): PracticalMutationErrorSafetyRecord | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const record = nativeErrorRecords.get(value);
+  if (record === undefined) return null;
+  if (record.kind === 'PracticalAcquireCommitUnknownError' && record.code !== 'PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN') return null;
+  return record;
+}
+Object.freeze(readPracticalMutationError);
+
+// Reviewed defining-owner binding protection.
+Object.freeze(PracticalMutationError.prototype);
+Object.freeze(PracticalMutationError);
+Object.freeze(PracticalAcquireCommitUnknownError.prototype);
+Object.freeze(PracticalAcquireCommitUnknownError);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["PracticalMutationError","PracticalAcquireCommitUnknownError","PRACTICAL_CANCEL_ACQUIRE_INPUT_KEYS","PRACTICAL_CANCEL_ARM_INPUT_KEYS","PRACTICAL_CANCEL_ABANDON_INPUT_KEYS","PRACTICAL_UNKNOWN_ACQUIRE_RESOLUTION_INPUT_KEYS","PRACTICAL_UNDISPATCHED_COMPLETION_INPUT_KEYS","PRACTICAL_NO_DISPATCH_REASONS","PRACTICAL_NOT_DISPATCHED_REPORT_KEYS","PRACTICAL_PREVIOUS_RUNTIME_ESCALATING_REASONS","PRACTICAL_RECOVERY_REFUSAL_REASONS","PRACTICAL_PREVIOUS_RUNTIME_RECOVERY_INPUT_KEYS","readPracticalMutationError"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}

@@ -1,3 +1,4 @@
+import { readPracticalLiveSafetyError } from '../practical/types';
 /**
  * Phase 18B Stage 1B1: Prisma/MySQL implementation of the practical safety
  * persistence port.
@@ -51,7 +52,7 @@ import {
 } from '../practical/state-machine';
 import {
   PRACTICAL_AUTHORIZATION_BASIS,
-  PRACTICAL_DIGEST_PATTERN,
+  isPracticalDigest,
   PRACTICAL_MUTATION_OUTCOMES,
   PracticalLiveSafetyError,
   isExactId,
@@ -271,7 +272,7 @@ function requireId(value: unknown, name: string, maxLength: number): string {
  * case-insensitive database comparison.
  */
 function requireDigestId(value: unknown, name: string): string {
-  if (typeof value !== 'string' || !PRACTICAL_DIGEST_PATTERN.test(value)) invalidInput(`${name} must be a lowercase 64-hex digest`, { field: name });
+  if (typeof value !== 'string' || !isPracticalDigest(value)) invalidInput(`${name} must be a lowercase 64-hex digest`, { field: name });
   return value;
 }
 
@@ -344,7 +345,7 @@ function transitionOrFailClosed(current: PracticalAccountStateName, event: Pract
   try {
     return transitionPracticalAccountState(current, event);
   } catch (error) {
-    if (error instanceof PracticalLiveSafetyError) return practicalStateAfterTransitionFailure(current);
+    if ((readPracticalLiveSafetyError(error) !== null)) return practicalStateAfterTransitionFailure(current);
     throw error;
   }
 }
@@ -2023,7 +2024,7 @@ async function requireOnlyLeaseOfCertificate(tx: Tx, certificateId: string, leas
       conflict('A certificate lease projection is not a readable row', { field: 'lease' });
     }
     if (!isExactId(storedLeaseId) || storedLeaseId.length > 64) conflict('A certificate lease projection has no valid lease id', { field: 'leaseId' });
-    if (typeof storedCertificateId !== 'string' || !PRACTICAL_DIGEST_PATTERN.test(storedCertificateId)) conflict('A certificate lease projection has no valid certificate id', { field: 'certificateId' });
+    if (typeof storedCertificateId !== 'string' || !isPracticalDigest(storedCertificateId)) conflict('A certificate lease projection has no valid certificate id', { field: 'certificateId' });
     projected.push({ leaseId: storedLeaseId, certificateId: storedCertificateId });
   }
   // [Wave 2B2d] Valid locked row sets prove these durable contradictions; code, messages and escalation are unchanged.
@@ -2058,5 +2059,40 @@ export async function withLockedPracticalAccountWithinCallerTransaction<T>(
     return await work(handle.scope);
   } finally {
     handle.close();
+  }
+}
+
+// Defining-module snapshot: owned instances cannot inherit later replacements.
+const createOwnedPracticalSafetyRepositoryDescriptors = Object.freeze(Object.getOwnPropertyDescriptors(PrismaPracticalSafetyRepository.prototype));
+export function createOwnedPracticalSafetyRepository(prisma: PrismaClient): PrismaPracticalSafetyRepository {
+  const instance = new PrismaPracticalSafetyRepository(prisma);
+  for (const [key, descriptor] of Object.entries(createOwnedPracticalSafetyRepositoryDescriptors)) {
+    if (key === 'constructor') continue;
+    if (typeof descriptor.value === 'function') Object.defineProperty(instance, key, { value: Object.freeze(descriptor.value.bind(instance)), writable: false, configurable: false });
+    else if (descriptor.get !== undefined) Object.defineProperty(instance, key, { get: Object.freeze(descriptor.get.bind(instance)), configurable: false });
+  }
+  Object.freeze(instance);
+  return instance;
+}
+Object.freeze(createOwnedPracticalSafetyRepository);
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const [name, value] of Object.entries({ createOwnedPracticalSafetyRepository, PrismaPracticalSafetyRepository })) {
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.get === undefined || descriptor.set !== undefined || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}
+
+// Reviewed defining-owner binding protection.
+Object.freeze(withLockedPracticalAccountWithinCallerTransaction);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["withLockedPracticalAccountWithinCallerTransaction","PRACTICAL_TRANSACTION_MAX_ATTEMPTS"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
   }
 }

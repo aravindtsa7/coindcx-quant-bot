@@ -1,3 +1,4 @@
+import { trustedLiveCompare, trustedLiveDecimalString } from '../decimal';
 /**
  * Order reconciliation, ambiguous-create resolution, cancellation recovery and
  * orphan detection (§6, §7, §8, §9).
@@ -32,7 +33,7 @@
  * ids, no scoring, and no probability anywhere in this file.
  */
 import { sha256CanonicalJson } from '../../../risk';
-import { canonicalLiveDecimalString, liveDecimal } from '../decimal';
+import { canonicalLiveDecimalString } from '../decimal';
 import { classifyPracticalCancelBinding } from '../practical-cancel-binding';
 import type { LiveOrderObservation, LiveOrderObservationKind, LiveOrderStateName } from '../types';
 import { buildFinding } from './findings';
@@ -150,9 +151,9 @@ export function observationFromEvidence(
   order: LiveDurableOrderView,
   evidence: LiveVenueOrderEvidence,
 ): LiveOrderObservation | null {
-  const ordered = liveDecimal(canonicalLiveDecimalString(evidence.orderedQuantity, 'orderedQuantity'));
-  const filled = liveDecimal(canonicalLiveDecimalString(evidence.filledQuantity, 'filledQuantity'));
-  const kind = observationKindForStatus(evidence.venueStatus, filled.equals(ordered), filled.greaterThan(0));
+  const ordered = trustedLiveDecimalString(canonicalLiveDecimalString(evidence.orderedQuantity, 'orderedQuantity'));
+  const filled = trustedLiveDecimalString(canonicalLiveDecimalString(evidence.filledQuantity, 'filledQuantity'));
+  const kind = observationKindForStatus(evidence.venueStatus, (trustedLiveCompare(filled, ordered) === 0), (trustedLiveCompare(filled, "0") > 0));
   if (kind === null) return null;
   return Object.freeze({
     kind,
@@ -166,9 +167,9 @@ export function observationFromEvidence(
     exchangeOrderId: evidence.exchangeOrderId,
     pair: evidence.pair,
     side: evidence.side,
-    cumulativeFilledQuantity: filled.toFixed(),
-    orderedQuantity: ordered.toFixed(),
-    averageFillPrice: filled.isZero() ? null : canonicalLiveDecimalString(evidence.averageFillPrice, 'averageFillPrice'),
+    cumulativeFilledQuantity: filled,
+    orderedQuantity: ordered,
+    averageFillPrice: (trustedLiveCompare(filled, '0') === 0) ? null : canonicalLiveDecimalString(evidence.averageFillPrice, 'averageFillPrice'),
     exchangeStatus: evidence.venueStatus,
     providerEventTimeMs: evidence.providerEventTimeMs,
   });
@@ -177,7 +178,7 @@ export function observationFromEvidence(
 /** Exact decimal equality. Textually different but numerically equal values match. */
 function exactlyEqual(left: string | null, right: string | null): boolean {
   if (left === null || right === null) return left === right;
-  return liveDecimal(canonicalLiveDecimalString(left, 'value')).equals(liveDecimal(canonicalLiveDecimalString(right, 'value')));
+  return (trustedLiveCompare(trustedLiveDecimalString(canonicalLiveDecimalString(left, 'value')), trustedLiveDecimalString(canonicalLiveDecimalString(right, 'value'))) === 0);
 }
 
 /**
@@ -521,9 +522,9 @@ export function resolveAmbiguousCreateByClientOrderId(
     })], [], [candidate.exchangeOrderId]);
   }
 
-  const ordered = liveDecimal(observation.orderedQuantity);
-  const filled = liveDecimal(observation.cumulativeFilledQuantity);
-  const targetState = projectedStateFor(observation.kind, filled.equals(ordered), filled.greaterThan(0));
+  const ordered = trustedLiveDecimalString(observation.orderedQuantity);
+  const filled = trustedLiveDecimalString(observation.cumulativeFilledQuantity);
+  const targetState = projectedStateFor(observation.kind, (trustedLiveCompare(filled, ordered) === 0), (trustedLiveCompare(filled, "0") > 0));
   const permitted = LIVE_RECONCILIATION_TRANSITIONS[order.state] ?? [];
   if (!permitted.includes(targetState)) {
     return outcome([buildFinding({
@@ -763,9 +764,9 @@ export function resolveAmbiguousCreateAgainstObservableCandidates(input: Ambiguo
     })]);
   }
 
-  const ordered = liveDecimal(observation.orderedQuantity);
-  const filled = liveDecimal(observation.cumulativeFilledQuantity);
-  const targetState = projectedStateFor(observation.kind, filled.equals(ordered), filled.greaterThan(0));
+  const ordered = trustedLiveDecimalString(observation.orderedQuantity);
+  const filled = trustedLiveDecimalString(observation.cumulativeFilledQuantity);
+  const targetState = projectedStateFor(observation.kind, (trustedLiveCompare(filled, ordered) === 0), (trustedLiveCompare(filled, "0") > 0));
   const permitted = LIVE_RECONCILIATION_TRANSITIONS[order.state] ?? [];
   if (!permitted.includes(targetState)) {
     return outcome([buildFinding({
@@ -898,29 +899,29 @@ export function reconcileIdentifiedOrder(
     })], [], [exchangeOrderId]);
   }
 
-  const localFilled = liveDecimal(canonicalLiveDecimalString(order.cumulativeFilledQuantity, 'cumulativeFilledQuantity'));
-  const venueFilled = liveDecimal(observation.cumulativeFilledQuantity);
-  const ordered = liveDecimal(observation.orderedQuantity);
+  const localFilled = trustedLiveDecimalString(canonicalLiveDecimalString(order.cumulativeFilledQuantity, 'cumulativeFilledQuantity'));
+  const venueFilled = trustedLiveDecimalString(observation.cumulativeFilledQuantity);
+  const ordered = trustedLiveDecimalString(observation.orderedQuantity);
 
   // A venue that reports LESS cumulative fill than durable truth is either
   // stale delivery or a genuine regression. Either way Phase18 never decreases
   // a durable fill; it records the contradiction.
-  if (venueFilled.lessThan(localFilled)) {
+  if ((trustedLiveCompare(venueFilled, localFilled) < 0)) {
     return outcome([buildFinding({
       category: 'CONFLICT',
       code: 'RECON_ORDER_FILL_REGRESSION',
       subject,
       evidence: {
         reason: 'Venue cumulative fill is below durable cumulative fill',
-        localCumulativeFilledQuantity: localFilled.toFixed(),
-        venueCumulativeFilledQuantity: venueFilled.toFixed(),
+        localCumulativeFilledQuantity: localFilled,
+        venueCumulativeFilledQuantity: venueFilled,
       },
     })], [], [exchangeOrderId]);
   }
 
-  const targetState = projectedStateFor(observation.kind, venueFilled.equals(ordered), venueFilled.greaterThan(0));
+  const targetState = projectedStateFor(observation.kind, (trustedLiveCompare(venueFilled, ordered) === 0), (trustedLiveCompare(venueFilled, "0") > 0));
   const sameState = targetState === order.state;
-  const sameFill = venueFilled.equals(localFilled);
+  const sameFill = (trustedLiveCompare(venueFilled, localFilled) === 0);
   const sameAverage = exactlyEqual(observation.averageFillPrice, order.averageFillPrice);
 
   if (sameState && sameFill && sameAverage) {
@@ -928,7 +929,7 @@ export function reconcileIdentifiedOrder(
       category: 'VERIFIED_MATCH',
       code: 'RECON_ORDER_VERIFIED_MATCH',
       subject,
-      evidence: { state: order.state, cumulativeFilledQuantity: localFilled.toFixed(), venueStatus: venue.venueStatus },
+      evidence: { state: order.state, cumulativeFilledQuantity: localFilled, venueStatus: venue.venueStatus },
     })], [], [exchangeOrderId]);
   }
 
@@ -987,8 +988,8 @@ export function reconcileIdentifiedOrder(
         reason: 'Authoritative venue evidence contradicts a terminal durable order',
         localState: order.state,
         provenVenueState: targetState,
-        localCumulativeFilledQuantity: localFilled.toFixed(),
-        venueCumulativeFilledQuantity: venueFilled.toFixed(),
+        localCumulativeFilledQuantity: localFilled,
+        venueCumulativeFilledQuantity: venueFilled,
       },
     })], [], [exchangeOrderId]);
   }
@@ -1022,8 +1023,8 @@ export function reconcileIdentifiedOrder(
         reason: 'Venue evidence proves a forward advance for this known order, but the provider order read could not prove it inspected everything; withholding the economic effect until completeness is proven',
         fromState: order.state,
         provenToState: targetState,
-        fromCumulativeFilledQuantity: localFilled.toFixed(),
-        provenCumulativeFilledQuantity: venueFilled.toFixed(),
+        fromCumulativeFilledQuantity: localFilled,
+        provenCumulativeFilledQuantity: venueFilled,
         incompleteReason: evidence.ordersProvenance.incompleteReason,
       },
     })], [], [exchangeOrderId]);
@@ -1042,8 +1043,8 @@ export function reconcileIdentifiedOrder(
       evidence: {
         fromState: order.state,
         toState: targetState,
-        fromCumulativeFilledQuantity: localFilled.toFixed(),
-        toCumulativeFilledQuantity: venueFilled.toFixed(),
+        fromCumulativeFilledQuantity: localFilled,
+        toCumulativeFilledQuantity: venueFilled,
         venueStatus: venue.venueStatus,
         cancelState: order.cancelState,
       },
@@ -1218,3 +1219,19 @@ export function isLocallyActive(order: LiveDurableOrderView): boolean {
 }
 
 export { VENUE_OPEN_STATUSES, LOCALLY_ACTIVE_STATES, LOCALLY_TERMINAL_STATES };
+
+// Reviewed defining-owner binding protection.
+Object.freeze(detectOrphanVenueOrders);
+Object.freeze(planClaimRecovery);
+Object.freeze(reconcileIdentifiedOrder);
+Object.freeze(requiresAmbiguousCreateResolution);
+Object.freeze(resolveAmbiguousCreate);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["detectOrphanVenueOrders","planClaimRecovery","reconcileIdentifiedOrder","requiresAmbiguousCreateResolution","resolveAmbiguousCreate"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}

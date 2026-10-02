@@ -19,7 +19,7 @@
  */
 import { sha256CanonicalJson } from '../../../risk';
 import { assertCredentialFree } from '../errors';
-import { redactSensitiveData } from '../../../monitoring/logger';
+import { redactSafetyData } from '../../../monitoring/logger';
 import {
   isBlockingCategory,
   type LiveReconciliationFinding,
@@ -55,7 +55,7 @@ export function buildFinding(input: {
     category: input.category,
     code: input.code,
     subject: Object.freeze({ ...EMPTY_SUBJECT, ...input.subject }),
-    evidence: Object.freeze(redactSensitiveData({ ...evidence })),
+    evidence: Object.freeze(redactSafetyData(evidence)),
   });
 }
 
@@ -119,4 +119,20 @@ export function sortFindings(
       return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
     }),
   );
+}
+
+// Reviewed defining-owner binding protection.
+Object.freeze(buildFinding);
+Object.freeze(findingSha256);
+Object.freeze(isFindingBlocking);
+Object.freeze(countBlocking);
+Object.freeze(sortFindings);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["buildFinding","findingSha256","isFindingBlocking","countBlocking","sortFindings","LIVE_FINDING_IDENTITY_SCHEMA"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

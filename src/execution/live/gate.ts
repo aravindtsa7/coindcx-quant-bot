@@ -195,3 +195,14 @@ export function requireLiveExecutionEnabled(config: LiveExecutionConfigInput): L
   }
   return resolution.enablement;
 }
+
+// Preserve lexical trusted bindings; do not freeze unrelated exports.
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const [name, value] of Object.entries({ LiveExecutionEnablement, resolveLiveExecutionGate, requireLiveExecutionEnabled })) {
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.get === undefined || descriptor.set !== undefined || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}

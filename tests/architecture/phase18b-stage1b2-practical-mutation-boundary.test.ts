@@ -192,7 +192,7 @@ describe('[8][15][16] no strict authority, no continuity claim, no compensation 
     const adapterCode = codeOf(ADAPTER);
     const afterRollback = adapterCode.slice(adapterCode.indexOf('async #afterNoWireRollback('), adapterCode.indexOf('async #enterMismatchReview('));
     expect(afterRollback.length).toBeGreaterThan(0);
-    expect(afterRollback).toContain("if (error instanceof PracticalMutationError && error.code === 'PRACTICAL_MUTATION_SPLIT_STATE') {");
+    expect(afterRollback).toContain("if ((readPracticalMutationError(error) !== null) && (readPracticalMutationError(error))!.code === 'PRACTICAL_MUTATION_SPLIT_STATE') {");
     expect(afterRollback).toContain('await this.#enterMismatchReview(accountId, nowMs);');
     expect(afterRollback).toContain('throw error;');
     // [Wave 2B2c] The ONE manual-review entry is shared by the split pair and the recovery anomaly; always POST_MUTATION_MISMATCH.
@@ -206,7 +206,7 @@ describe('[8][15][16] no strict authority, no continuity claim, no compensation 
     expect(afterRecovery).toContain('if (contradiction || isEscalatingLeaseRecoveryRefusal(error)) {\n      await this.#enterMismatchReview(accountId, nowMs);');
     expect(afterRecovery).toContain('return this.#latchIfMalformed(error, accountId, epoch, nowMs);');
     // [review fix] TYPED classification only: the durable contradiction is an `instanceof`, never the conflict code or a message.
-    expect(afterRecovery).toContain('const contradiction = error instanceof PracticalDurableContradictionError;');
+    expect(afterRecovery).toContain("const contradiction = (readPracticalPersistenceError(error)?.kind === 'PracticalDurableContradictionError');");
     expect(afterRecovery).toContain("if (contradiction) leaseRecoveryRefused('LEASE_CERTIFICATE_MISMATCH', accountId, error);");
     expect(afterRecovery).not.toMatch(/PRACTICAL_PERSISTENCE_CONFLICT|\.message\b|\.code\b/);
     const escalate = functionSource(ADAPTER, 'async #escalateAnomaly(');
@@ -229,6 +229,7 @@ describe('[9][10][17] not wired; no network, gateway, runtime, private-stream, o
       'src/execution/live/practical-cancel/gateway-boundary.ts',
       'src/execution/live/practical-cancel/ports.ts',
       'src/execution/live/practical-cancel/service.ts',
+      'src/integration/coindcx/live/practical-account-coordinator.ts',
     ]);
   });
 
@@ -298,6 +299,7 @@ describe('[9][10][17] not wired; no network, gateway, runtime, private-stream, o
       expect(files.filter((file) => file !== ticketFile && codeOf(file).includes(name))).toEqual(['src/execution/live/practical-cancel/gateway-boundary.ts']);
       expect(testFiles.filter((file) => sourceOf(file).includes(name)).sort()).toEqual([
         'tests/integration/execution/live-practical-cancel-dispatch.integration.test.ts',
+        'tests/unit/coindcx/practical-account-coordinator-trusted-bindings.test.ts',
         'tests/unit/execution/live/practical-mutation/dispatch.test.ts',
       ]);
     }
@@ -325,7 +327,7 @@ describe('[11] the caller-owned Stage 1B1 hook uses ONLY the supplied transactio
     ? repository.indexOf('  async #invalidateLocked(', scopeStart)
     : repository.indexOf('  // ----- internals', scopeStart);
   const scopeSource = repository.slice(scopeStart, scopeEnd);
-  const hookTail = repository.slice(repository.indexOf('export type PracticalPreConsumptionInvalidationReason'));
+  const hookTail = repository.slice(repository.indexOf('export type PracticalPreConsumptionInvalidationReason'), repository.indexOf('const createOwnedPracticalSafetyRepositoryDescriptors'));
 
   it('the static block, #openScope, and the module hook open no transaction and touch no root client', () => {
     expect(scopeStart).toBeGreaterThan(0);
@@ -445,7 +447,7 @@ describe('[12][13][14] the classified Phase 17 pre-write claim failures', () => 
     const order = [
       'if (!isClassifiedPreWriteClaimFailure(error)) throw error;',
       'await requirePhase17Untouched(tx, intentId, before, error);',
-      "return invalidated('PREFLIGHT_MISMATCH', 'PHASE17_CLAIM_REFUSED', error.code);",
+      "return invalidated('PREFLIGHT_MISMATCH', 'PHASE17_CLAIM_REFUSED', readLiveExecutionError(error)!.code as PracticalClassifiedPreWriteClaimFailureCode);",
     ].map((statement) => catchBody.indexOf(statement));
     expect(order.every((index) => index > 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
@@ -630,7 +632,7 @@ describe('[Wave 2B2c] unknown-acquire resolution: read-only, exact, single-use, 
     ]) {
       expect(resolve, sequence).toContain(sequence);
     }
-    expect(functionSource(ADAPTER, 'function isInconclusiveResolution(')).toContain("return error instanceof PracticalMutationError && error.code === 'PRACTICAL_MUTATION_FAULT';");
+    expect(functionSource(ADAPTER, 'function isInconclusiveResolution(')).toContain("return (readPracticalMutationError(error) !== null) && (readPracticalMutationError(error))!.code === 'PRACTICAL_MUTATION_FAULT';");
     const ticket = codeOf(`${MUTATION_ROOT}ticket.ts`);
     expect(ticket).toContain("RESOLVING: Object.freeze<PracticalUnknownAcquireStatus[]>(['SPENT', 'PENDING', 'REFUSED', 'ANOMALY_UNESCALATED']),");
     expect(ticket).toContain("ANOMALY_UNESCALATED: Object.freeze<PracticalUnknownAcquireStatus[]>(['ESCALATING']),");

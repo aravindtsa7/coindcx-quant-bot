@@ -1,3 +1,4 @@
+import { redactSafetyData, snapshotSafetyData } from '../../../monitoring/logger';
 /**
  * Phase 18B Stage 1B1: practical live-safety persistence port.
  *
@@ -92,8 +93,14 @@ export class PracticalPersistenceError extends Error {
     assertCredentialFree(details);
     this.name = 'PracticalPersistenceError';
     this.code = code;
-    this.details = details === undefined ? undefined : Object.freeze({ ...details });
+    this.details = details === undefined ? undefined : Object.freeze(redactSafetyData(details));
     Object.setPrototypeOf(this, new.target.prototype);
+    const target: unknown = new.target;
+    const kind = target === PracticalPersistenceError ? 'PracticalPersistenceError' : target === PracticalDurableContradictionError ? 'PracticalDurableContradictionError' : null;
+    if (kind !== null && typeof code === 'string' && nativeErrorCodes.includes(code)) {
+      nativeErrorRecords.set(this, Object.freeze({ kind, code, details: details === undefined ? undefined
+        : snapshotSafetyData(redactSafetyData(details)) as Readonly<Record<string, unknown>> }));
+    }
   }
 }
 
@@ -448,4 +455,32 @@ export interface PracticalSafetyRepository {
     readonly outcome: PracticalMutationOutcome;
     readonly nowMs: number;
   }): Promise<PracticalAccountSnapshot>;
+}
+
+export interface PracticalPersistenceErrorSafetyRecord { readonly kind: 'PracticalPersistenceError' | 'PracticalDurableContradictionError'; readonly code: PracticalPersistenceErrorCode; readonly details: Readonly<Record<string, unknown>> | undefined }
+const nativeErrorCodes: readonly string[] = Object.freeze(["PRACTICAL_PERSISTENCE_NOT_FOUND","PRACTICAL_PERSISTENCE_MALFORMED","PRACTICAL_PERSISTENCE_LATCHED","PRACTICAL_PERSISTENCE_CONFLICT","PRACTICAL_PERSISTENCE_CERTIFICATE_UNUSABLE","PRACTICAL_PERSISTENCE_INVALID_INPUT","PRACTICAL_PERSISTENCE_FAULT"]);
+const nativeErrorRecords = new WeakMap<object, PracticalPersistenceErrorSafetyRecord>();
+export function readPracticalPersistenceError(value: unknown): PracticalPersistenceErrorSafetyRecord | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const record = nativeErrorRecords.get(value);
+  if (record === undefined) return null;
+  if (record.kind === 'PracticalDurableContradictionError' && (record.code !== 'PRACTICAL_PERSISTENCE_CONFLICT'
+    || !['CERTIFICATE_NOT_BOUND_TO_LEASE', 'CERTIFICATE_LEASE_NOT_UNIQUE'].includes(record.details?.['contradiction'] as string))) return null;
+  return record;
+}
+Object.freeze(readPracticalPersistenceError);
+
+// Reviewed defining-owner binding protection.
+Object.freeze(PracticalPersistenceError.prototype);
+Object.freeze(PracticalPersistenceError);
+Object.freeze(PracticalDurableContradictionError.prototype);
+Object.freeze(PracticalDurableContradictionError);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["PracticalPersistenceError","PracticalDurableContradictionError","PRACTICAL_DURABLE_STATE_MALFORMED","readPracticalPersistenceError"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

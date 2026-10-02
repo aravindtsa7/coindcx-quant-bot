@@ -24,7 +24,8 @@
  * call sites never place credential material in details, and the key rule plus
  * the shared redactor are the repository's established mechanism.
  */
-import { isSensitiveKey, redactSensitiveData } from '../../monitoring/logger';
+import { types } from 'node:util';
+import { isSensitiveKey, redactSafetyData, snapshotSafetyData } from '../../monitoring/logger';
 
 export type LiveExecutionFailureCode =
   /** Live mutation is not enabled by application configuration (default). */
@@ -151,21 +152,24 @@ export const LIVE_AMBIGUOUS_CODES: readonly LiveExecutionFailureCode[] = Object.
   'LIVE_ORPHAN_CANCEL_AMBIGUOUS',
 ]);
 
-function assertCredentialFreeValue(key: string, value: unknown, path: string): void {
-  if (isSensitiveKey(key)) {
-    throw new Error(`LiveExecutionError details may not carry credential-bearing key '${path}'`);
-  }
-  if (value !== null && typeof value === 'object') {
-    for (const [childKey, childValue] of Object.entries(value as Record<string, unknown>)) {
-      assertCredentialFreeValue(childKey, childValue, `${path}.${childKey}`);
-    }
-  }
-}
-
-/** Throws if any key or value in `details` could carry credential material (P17-I15). */
+/** Refuse credentials and executable object surfaces before durable serialization. */
 export function assertCredentialFree(details: Readonly<Record<string, unknown>> | undefined): void {
   if (details === undefined) return;
-  for (const [key, value] of Object.entries(details)) assertCredentialFreeValue(key, value, key);
+  const active = new Set<object>();
+  function visit(value: unknown): void {
+    if (value === null || typeof value !== 'object') return;
+    if (types.isProxy(value) || active.has(value)) throw new Error('LiveExecutionError details contain unsafe data');
+    active.add(value);
+    try {
+      for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
+        if (!descriptor.enumerable) continue;
+        if (isSensitiveKey(key)) throw new Error('LiveExecutionError details may not carry credential-bearing keys');
+        if (!Object.hasOwn(descriptor, 'value')) throw new Error('LiveExecutionError details contain unsafe data');
+        visit(descriptor.value);
+      }
+    } finally { active.delete(value); }
+  }
+  visit(details);
 }
 
 export class LiveExecutionError extends Error {
@@ -181,8 +185,13 @@ export class LiveExecutionError extends Error {
     assertCredentialFree(options?.details);
     this.name = 'LiveExecutionError';
     this.code = code;
-    this.details = options?.details === undefined ? undefined : Object.freeze(redactSensitiveData({ ...options.details }));
+    this.details = options?.details === undefined ? undefined : Object.freeze(redactSafetyData(options.details));
     Object.setPrototypeOf(this, new.target.prototype);
+    const kind = new.target === LiveExecutionError ? 'LiveExecutionError' : null;
+    if (kind !== null && typeof code === 'string' && nativeErrorCodes.includes(code)) {
+      nativeErrorRecords.set(this, Object.freeze({ kind, code, details: options?.details === undefined ? undefined
+        : snapshotSafetyData(redactSafetyData(options?.details)) as Readonly<Record<string, unknown>> }));
+    }
   }
 
   /** True when this fault means the exchange may hold an order this process cannot account for. */
@@ -203,4 +212,29 @@ export function liveIntentInvalid(message: string, details?: Readonly<Record<str
 
 export function liveNumericFailure(message: string): never {
   throw new LiveExecutionError('LIVE_NUMERIC_FAILURE', message);
+}
+
+export interface LiveExecutionErrorSafetyRecord { readonly kind: 'LiveExecutionError'; readonly code: LiveExecutionFailureCode; readonly details: Readonly<Record<string, unknown>> | undefined }
+const nativeErrorCodes: readonly string[] = Object.freeze(["LIVE_EXECUTION_DISABLED","LIVE_AUTHORITY_INVALID","LIVE_POSITION_NOT_AVAILABLE","LIVE_INTENT_INVALID","LIVE_INTENT_CONFLICT","LIVE_DISPATCH_ALREADY_CLAIMED","LIVE_ORDER_REJECTED","LIVE_ORDER_RESPONSE_INVALID","LIVE_ORDER_IDENTITY_MISMATCH","LIVE_ORDER_STATE_CONFLICT","LIVE_FILL_INVALID","LIVE_SUBMISSION_AMBIGUOUS","LIVE_CANCEL_AMBIGUOUS","LIVE_INSTRUMENT_CONSTRAINT","LIVE_UNSUPPORTED_EXECUTION_SEMANTICS","LIVE_PROVIDER_ERROR","LIVE_NUMERIC_FAILURE","LIVE_OVERFLOW","LIVE_PERSISTENCE_FAULT","LIVE_DURABLE_INTEGRITY_VIOLATION","LIVE_RECONCILIATION_REQUIRED","LIVE_RECONCILIATION_STALE_GENERATION","LIVE_RECONCILIATION_EVIDENCE_INVALID","LIVE_RECONCILIATION_MANUAL_REVIEW_REQUIRED","LIVE_ORPHAN_CANCEL_AMBIGUOUS","LIVE_ORPHAN_RESOLUTION_INVALID","LIVE_ORPHAN_RESOLUTION_STALE_REVISION","LIVE_ORPHAN_RESOLUTION_NOT_AMBIGUOUS","LIVE_ORPHAN_RESOLUTION_ALREADY_RESOLVED","LIVE_CANCEL_CLAIM_PRACTICALLY_BOUND"]);
+const nativeErrorRecords = new WeakMap<object, LiveExecutionErrorSafetyRecord>();
+export function readLiveExecutionError(value: unknown): LiveExecutionErrorSafetyRecord | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const record = nativeErrorRecords.get(value);
+  if (record === undefined) return null;
+  return record;
+}
+Object.freeze(readLiveExecutionError);
+
+// Reviewed defining-owner binding protection.
+Object.freeze(LiveExecutionError.prototype);
+Object.freeze(LiveExecutionError);
+Object.freeze(assertCredentialFree);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["LiveExecutionError","LIVE_AMBIGUOUS_CODES","assertCredentialFree","readLiveExecutionError"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

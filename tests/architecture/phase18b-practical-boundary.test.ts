@@ -99,7 +99,7 @@ describe('no practical module reaches persistence, the network, signing, or Coin
         for (const specifier of extractImportSpecifiers(sourceOf(node), node)) if (!specifier.startsWith('.')) external.add(specifier);
       }
     }
-    expect([...external].sort()).toEqual(['decimal.js', 'node:crypto', 'pino']);
+    expect([...external].sort()).toEqual(['decimal.js', 'node:crypto', 'node:util', 'pino']);
   });
 
   it('practical code reads no environment, clock, or network primitive and names no endpoint or signing header', () => {
@@ -144,6 +144,7 @@ describe('no caller-selectable gate and no premature wiring', () => {
       'src/execution/live/practical-shadow/campaign.ts',
       'src/execution/live/practical-shadow/classification.ts',
       'src/execution/live/practical-shadow/config.ts',
+      'src/integration/coindcx/live/practical-account-coordinator.ts',
     ]);
   });
 
@@ -205,7 +206,7 @@ describe('no caller-selectable gate and no premature wiring', () => {
 // caller (composition root, operator-resolution adapter)
 // by editing this table, which makes the widening an explicit, reviewed diff.
 const AUTHORITY_ISSUERS: readonly { readonly symbol: string; readonly definedIn: string; readonly allowedProductionImporters: readonly string[] }[] = [
-  { symbol: 'issuePracticalLiveSafetyEnablement', definedIn: `${PRACTICAL_ROOT}policy.ts`, allowedProductionImporters: [] },
+  { symbol: 'issuePracticalLiveSafetyEnablement', definedIn: `${PRACTICAL_ROOT}policy.ts`, allowedProductionImporters: ['src/integration/coindcx/live/practical-account-coordinator.ts'] },
   { symbol: 'mintPracticalManualReviewResolution', definedIn: `${PRACTICAL_ROOT}state-machine.ts`, allowedProductionImporters: [] },
   // [Checkpoint B] The first reviewed production importer: the read-only recovery service, and nothing else.
   { symbol: 'issuePracticalRecoveryCertificate', definedIn: `${PRACTICAL_ROOT}certificate.ts`, allowedProductionImporters: ['src/execution/live/practical-recovery/service.ts'] },
@@ -226,7 +227,7 @@ describe('authority issuance boundaries are internal and pinned (P18B-1A-01, P18
   it('no src file can reach an issuer indirectly (no `export *`, namespace, dynamic, or require import of the practical tree)', () => {
     for (const file of files) {
       const code = codeOf(file);
-      if (file.startsWith(PRACTICAL_ROOT)) {
+      if (file.startsWith(PRACTICAL_ROOT) || file === 'src/integration/coindcx/live/practical-account-coordinator.ts') {
         expect(code, file).not.toMatch(/export\s*\*|import\s*\*\s*as|\bimport\s*\(|\brequire\s*\(/);
       } else {
         expect(code, file).not.toMatch(/['"`][^'"`]*live\/practical(\/[\w-]+)?['"`]/);

@@ -681,6 +681,25 @@ function requireBookkeeping(result: PracticalCancelResult) {
 }
 
 describe('unwired orchestrator real-MySQL acceptance (synthetic provider fixtures)', () => {
+  it.each(['COMMITTED', 'ROLLED_BACK'] as const)('observation-only drain retains exact %s cleanup ownership without a hidden retry', async truth => {
+    if (skip()) return;
+    const h = await orchestrationFixture();
+    h.after.set('consumeCancelDispatchPermission', () => { h.privateStream.unprove(); });
+    h.overrides.set('completeUnenteredCancelDispatch', truth === 'COMMITTED' ? commitLostClient() : rollbackLostClient());
+    const continuation = requireBookkeeping(await h.service.cancel(h.input));
+    h.service.requestStop();
+    const before = await durable(h.accountId, h.order.intentId), calls = [...h.methods], gatewayCalls = h.calls();
+    expect(h.service.snapshotDrainWithoutRetry()).toMatchObject({ kind: 'BOOKKEEPING_PENDING' });
+    expect(await h.service.observeDrainWithoutRetry()).toMatchObject({ kind: 'BOOKKEEPING_PENDING' });
+    expect(h.service.snapshotDrainWithoutRetry()).toMatchObject({ kind: 'BOOKKEEPING_PENDING' });
+    expect(h.methods).toEqual(calls); expect(h.calls()).toBe(gatewayCalls);
+    expect(await durable(h.accountId, h.order.intentId)).toEqual(before);
+    h.overrides.delete('completeUnenteredCancelDispatch');
+    expect(await h.service.retryBookkeeping({ continuation })).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' });
+    expect(h.service.snapshotDrainWithoutRetry()).toEqual({ kind: 'LOCAL_DRAINED' });
+    expect((h.cleanupInputs[0] as { owner: unknown }).owner).toBe((h.cleanupInputs[1] as { owner: unknown }).owner);
+    expect(h.calls()).toBe(0);
+  });
   it('stop before admission makes no durable calls and local drain is not durable shutdown proof', async () => {
     if (skip()) return;
     const h = await orchestrationFixture(), before = await durable(h.accountId, h.order.intentId);

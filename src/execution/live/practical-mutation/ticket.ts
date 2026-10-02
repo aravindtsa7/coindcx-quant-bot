@@ -1,3 +1,4 @@
+import { readPracticalMutationError } from './ports';
 /**
  * Phase 18B Stage 1B2 (Wave 2B1): the two non-forgeable in-memory values of
  * one order-bound practical CANCEL.
@@ -63,10 +64,10 @@
  * The in-memory states are a convenience only: the database compare-and-sets
  * and row locks are the one-shot authority across processes.
  */
-import { LIVE_CLIENT_ORDER_ID_PATTERN } from '../identity';
+import { isTrustedLiveClientOrderId } from '../identity';
 import {
   PRACTICAL_AUTHORIZATION_BASIS,
-  PRACTICAL_DIGEST_PATTERN,
+  isPracticalDigest,
   isExactId,
   isNonNegativeSafeInteger,
   isPositiveSafeInteger,
@@ -176,7 +177,7 @@ function requireExact(value: unknown, field: string, maxLength: number): string 
 }
 
 function requireDigest(value: unknown, field: string): string {
-  if (typeof value !== 'string' || !PRACTICAL_DIGEST_PATTERN.test(value)) refuse(`${field} must be a lowercase 64-hex digest`, field);
+  if (typeof value !== 'string' || !isPracticalDigest(value)) refuse(`${field} must be a lowercase 64-hex digest`, field);
   return value;
 }
 
@@ -191,7 +192,7 @@ function requireNonNegative(value: unknown, field: string): number {
 }
 
 function requireClientOrderId(value: unknown): string {
-  if (typeof value !== 'string' || !LIVE_CLIENT_ORDER_ID_PATTERN.test(value)) refuse('clientOrderId must be the frozen Phase 17 client order id format', 'clientOrderId');
+  if (typeof value !== 'string' || !isTrustedLiveClientOrderId(value)) refuse('clientOrderId must be the frozen Phase 17 client order id format', 'clientOrderId');
   return value;
 }
 
@@ -820,7 +821,7 @@ export function markPracticalArmedCancelCommitUnknown(value: unknown, reason: st
  * acquire, only for a completed ACQUIRED outcome. Never mints a handle.
  */
 export function issuePracticalUnknownAcquire(record: PracticalAcquiredCancelRecord, error: PracticalAcquireCommitUnknownError): PracticalUnknownAcquire {
-  if (!(error instanceof PracticalAcquireCommitUnknownError) || UNKNOWN_ACQUIRE_RECEIPTS.has(error)) {
+  if (!((readPracticalMutationError(error)?.kind === 'PracticalAcquireCommitUnknownError')) || UNKNOWN_ACQUIRE_RECEIPTS.has(error)) {
     throw new PracticalMutationError('PRACTICAL_MUTATION_AUTHORITY_INVALID', 'A receipt is bound once, to a genuine unknown-acquire error');
   }
   const receipt = new PracticalUnknownAcquire(TICKET_ISSUER, record);
@@ -872,4 +873,53 @@ export function restorePracticalUnknownAcquire(value: unknown): void {
  */
 export function refusePracticalUnknownAcquire(value: unknown, from: 'RESOLVING' | 'ESCALATING', escalated: boolean): void {
   PracticalUnknownAcquire.transition(TICKET_ISSUER, value, from, escalated ? 'REFUSED' : 'ANOMALY_UNESCALATED');
+}
+
+// Reviewed defining-owner binding protection.
+Object.freeze(PracticalAcquiredCancel.prototype);
+Object.freeze(PracticalAcquiredCancel);
+Object.freeze(PracticalArmedCancel.prototype);
+Object.freeze(PracticalArmedCancel);
+Object.freeze(PracticalCancelDispatchOwner.prototype);
+Object.freeze(PracticalCancelDispatchOwner);
+Object.freeze(readPracticalUnknownAcquireReceipt);
+Object.freeze(enterPracticalCancelGateway);
+Object.freeze(issuePracticalCancelOutcome);
+Object.freeze(issuePracticalCancelTransportNoWire);
+Object.freeze(reservePracticalCancelPermitCreation);
+Object.freeze(restorePracticalCancelPermitCreation);
+Object.freeze(markPracticalCancelPermitCreationUnknown);
+Object.freeze(issuePracticalCancelDispatchPermit);
+Object.freeze(issuePracticalCancelDispatchAttempt);
+Object.freeze(issuePracticalCancelCreationCleanup);
+Object.freeze(transitionPracticalCancelDispatchOwner);
+Object.freeze(beginPracticalAcquiredCancelAbandon);
+Object.freeze(beginPracticalArmedCancelNoWireCompletion);
+Object.freeze(beginPracticalUnknownAcquireResolution);
+Object.freeze(finishPracticalAcquiredCancelAbandon);
+Object.freeze(finishPracticalArmedCancelNoWireCompletion);
+Object.freeze(finishPracticalUnknownAcquireResolution);
+Object.freeze(issuePracticalAcquiredCancel);
+Object.freeze(issuePracticalArmedCancel);
+Object.freeze(issuePracticalUnknownAcquire);
+Object.freeze(markPracticalAcquiredCancelAbandonOutcomeUnknown);
+Object.freeze(markPracticalAcquiredCancelArmOutcomeUnknown);
+Object.freeze(markPracticalArmedCancelCommitUnknown);
+Object.freeze(refusePracticalUnknownAcquire);
+Object.freeze(releasePracticalAcquiredCancel);
+Object.freeze(reservePracticalAcquiredCancel);
+Object.freeze(restorePracticalAcquiredCancelAbandon);
+Object.freeze(restorePracticalArmedCancel);
+Object.freeze(restorePracticalUnknownAcquire);
+Object.freeze(spendPracticalAcquiredCancel);
+Object.freeze(PracticalUnknownAcquire.prototype);
+Object.freeze(PracticalUnknownAcquire);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["PracticalAcquiredCancel","PracticalArmedCancel","PracticalCancelDispatchOwner","readPracticalUnknownAcquireReceipt","enterPracticalCancelGateway","issuePracticalCancelOutcome","issuePracticalCancelTransportNoWire","reservePracticalCancelPermitCreation","restorePracticalCancelPermitCreation","markPracticalCancelPermitCreationUnknown","issuePracticalCancelDispatchPermit","issuePracticalCancelDispatchAttempt","issuePracticalCancelCreationCleanup","transitionPracticalCancelDispatchOwner","beginPracticalAcquiredCancelAbandon","beginPracticalArmedCancelNoWireCompletion","beginPracticalUnknownAcquireResolution","finishPracticalAcquiredCancelAbandon","finishPracticalArmedCancelNoWireCompletion","finishPracticalUnknownAcquireResolution","issuePracticalAcquiredCancel","issuePracticalArmedCancel","issuePracticalUnknownAcquire","markPracticalAcquiredCancelAbandonOutcomeUnknown","markPracticalAcquiredCancelArmOutcomeUnknown","markPracticalArmedCancelCommitUnknown","refusePracticalUnknownAcquire","releasePracticalAcquiredCancel","reservePracticalAcquiredCancel","restorePracticalAcquiredCancelAbandon","restorePracticalArmedCancel","restorePracticalUnknownAcquire","spendPracticalAcquiredCancel","PracticalUnknownAcquire","PRACTICAL_ARMED_CANCEL_TRANSITIONS","PRACTICAL_CANCEL_DISPATCH_TRANSITIONS"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

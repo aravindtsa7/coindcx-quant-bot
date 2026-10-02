@@ -44,7 +44,11 @@ describe('Combined correction: private instrument transformation pipeline', () =
     const normalizePatch = vi.spyOn(normalizers, 'normalizeInstrument').mockImplementation(() => { throw new Error('exported normalizer reached'); });
     const numericPatch = vi.spyOn(normalizers, 'toLosslessDecimal').mockImplementation(() => { throw new Error('exported numeric transformer reached'); });
     const schemaPatch = vi.spyOn(schemas.InstrumentDetailsResponseSchema, 'safeParse').mockImplementation(() => ({ success: true, data: { instrument: FABRICATED_WIRE } }) as never);
-    const hashPatch = vi.spyOn(hash, 'sha256CanonicalJson').mockReturnValue('forged-hash');
+    const originalHash = hash.sha256CanonicalJson;
+    const hashPatch = vi.fn(() => 'forged-hash');
+    expect(Reflect.set(hash, 'sha256CanonicalJson', hashPatch)).toBe(false);
+    expect(() => Object.defineProperty(hash, 'sha256CanonicalJson', { value: hashPatch })).toThrow(TypeError);
+    expect(hash.sha256CanonicalJson).toBe(originalHash);
     const authority = before ?? await import('../../../src/integration/coindcx/instrument-authority');
     const interception = interceptProductionInstrumentAcquisition(GENUINE_WIRE);
     const record = authority.TrustedProductionInstrumentBinding.read(await authority.acquireProductionInstrumentBinding(PAIR));

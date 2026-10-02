@@ -62,12 +62,13 @@ describe('module layout', () => {
       'src/execution/live/practical-shadow/config.ts',
       'src/execution/live/practical-shadow/evidence.ts',
       'src/execution/live/practical-shadow/types.ts',
+      'src/integration/coindcx/live/practical-account-coordinator.ts',
       'src/integration/coindcx/live/practical-credential-sources.ts',
     ]);
     const allowed = new Set(['observation.ts', 'private-events.ts', 'ports.ts', 'telemetry.ts', 'timing.ts'].map((name) => `${RECOVERY_ROOT}${name}`));
     for (const importer of importers) {
       for (const dependency of (graph.get(importer) ?? []).filter((node) => node.startsWith(RECOVERY_ROOT))) {
-        const exactCheckerImporter = importer === 'src/execution/live/practical-cancel/gateway-boundary.ts' || importer === 'src/execution/live/practical-cancel/ports.ts';
+        const exactCheckerImporter = importer === 'src/integration/coindcx/live/practical-account-coordinator.ts' || importer === 'src/execution/live/practical-cancel/gateway-boundary.ts' || importer === 'src/execution/live/practical-cancel/ports.ts';
         expect(allowed.has(dependency) || (exactCheckerImporter && dependency === `${RECOVERY_ROOT}service.ts`), `${importer} -> ${dependency}`).toBe(true);
       }
     }
@@ -471,6 +472,6 @@ describe('time and thresholds', () => {
         for (const specifier of extractImportSpecifiers(sourceOf(node), node)) if (!specifier.startsWith('.')) external.add(specifier);
       }
     }
-    expect([...external].sort()).toEqual(['decimal.js', 'node:crypto', 'pino']);
+    expect([...external].sort()).toEqual(['decimal.js', 'node:crypto', 'node:util', 'pino']);
   });
 });

@@ -97,7 +97,7 @@ describe('no new mutation owner and no new authority path', () => {
 
   it('the mutation transport is still reachable only through the one gateway and the one production root', () => {
     const reachers = files.filter((file) => file !== MUTATION_TRANSPORT && computeReachable(graph, file).has(MUTATION_TRANSPORT));
-    expect(reachers.sort()).toEqual([MUTATION_GATEWAY, PRODUCTION_ROOT, 'src/integration/coindcx/live/practical-credential-sources.ts'].sort());
+    expect(reachers.sort()).toEqual([MUTATION_GATEWAY, PRODUCTION_ROOT, 'src/integration/coindcx/live/practical-credential-sources.ts', 'src/integration/coindcx/live/practical-account-coordinator.ts'].sort());
     expect(computeReachable(graph, EVIDENCE_ADAPTER).has(MUTATION_TRANSPORT)).toBe(false);
   });
 

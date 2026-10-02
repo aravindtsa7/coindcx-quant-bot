@@ -81,7 +81,7 @@ describe('F17-14 production capability ownership', () => {
 
   it('pins every module capable of reaching authenticated order mutation', () => {
     const reachers = result.files.filter((file) => file !== MUTATION_TRANSPORT && computeReachable(result.graph, file).has(MUTATION_TRANSPORT));
-    expect(reachers.sort()).toEqual([MUTATION_GATEWAY, PRODUCTION_ROOT, 'src/integration/coindcx/live/practical-credential-sources.ts'].sort());
+    expect(reachers.sort()).toEqual([MUTATION_GATEWAY, PRODUCTION_ROOT, 'src/integration/coindcx/live/practical-credential-sources.ts', 'src/integration/coindcx/live/practical-account-coordinator.ts'].sort());
     expect(inverseDirectImporters(result.graph, MUTATION_TRANSPORT)).toEqual([MUTATION_GATEWAY]);
     expect(inverseDirectImporters(result.graph, MUTATION_GATEWAY)).toEqual([PRODUCTION_ROOT, 'src/integration/coindcx/live/practical-credential-sources.ts'].sort());
   });

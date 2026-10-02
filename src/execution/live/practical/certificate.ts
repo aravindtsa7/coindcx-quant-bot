@@ -45,7 +45,7 @@ import { isProviderAccountFingerprint } from '../reconciliation/account-identity
 import { requirePracticalLiveSafetyEnablement } from './policy';
 import {
   PRACTICAL_AUTHORIZATION_BASIS,
-  PRACTICAL_DIGEST_PATTERN,
+  isPracticalDigest,
   PracticalLiveSafetyError,
   isExactId,
   isNonNegativeSafeInteger,
@@ -186,7 +186,7 @@ export function issuePracticalRecoveryCertificate(input: {
     throw new PracticalLiveSafetyError('PRACTICAL_AUTHORITY_INVALID', 'Tier B is not enabled for this account');
   }
   const { evidence } = input;
-  if (typeof evidence.evidenceDigest !== 'string' || !PRACTICAL_DIGEST_PATTERN.test(evidence.evidenceDigest)) {
+  if (typeof evidence.evidenceDigest !== 'string' || !isPracticalDigest(evidence.evidenceDigest)) {
     invalid('evidenceDigest must be a lowercase 64-hex digest');
   }
   const ceilings = enablement.ceilings;
@@ -324,4 +324,15 @@ export function revokePracticalRecoveryCertificate(
   if (existing !== null) return existing;
   PracticalRecoveryCertificate.applyTermination(CERTIFICATE_ISSUER, certificate, { status: 'REVOKED', atMs: nowMs, leaseId: null, reason });
   return PracticalRecoveryCertificate.termination(certificate)!;
+}
+
+// Preserve lexical trusted bindings; do not freeze unrelated exports.
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const [name, value] of Object.entries({ PracticalRecoveryCertificate, issuePracticalRecoveryCertificate, verifyPracticalRecoveryCertificate, consumePracticalRecoveryCertificate, revokePracticalRecoveryCertificate })) {
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.get === undefined || descriptor.set !== undefined || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

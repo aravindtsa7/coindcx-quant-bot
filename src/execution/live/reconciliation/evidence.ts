@@ -1,3 +1,4 @@
+import { trustedLiveAdd, trustedLiveCompare, trustedLiveDecimalString, trustedLiveSubtract } from '../decimal';
 /**
  * Evidence validation and snapshot identity (§5, §13, §14, §15).
  *
@@ -34,7 +35,7 @@
  * `docs/PHASE18_RECONCILIATION.md` §6 for exactly what is and is not proven.
  */
 import { sha256CanonicalJson } from '../../../risk';
-import { canonicalLiveDecimalString, liveDecimal } from '../decimal';
+import { canonicalLiveDecimalString } from '../decimal';
 import { LiveExecutionError } from '../errors';
 import type {
   LiveEvidenceProvenance,
@@ -59,28 +60,28 @@ function evidenceInvalid(message: string, details: Readonly<Record<string, unkno
  * row to be tolerated with a fudge factor; there are no tolerance bands here.
  */
 export function assertOrderEvidenceConservation(order: LiveVenueOrderEvidence): void {
-  const total = liveDecimal(canonicalLiveDecimalString(order.orderedQuantity, 'orderedQuantity'));
-  const filled = liveDecimal(canonicalLiveDecimalString(order.filledQuantity, 'filledQuantity'));
-  const remaining = liveDecimal(canonicalLiveDecimalString(order.remainingQuantity, 'remainingQuantity'));
-  const cancelled = liveDecimal(canonicalLiveDecimalString(order.cancelledQuantity, 'cancelledQuantity'));
+  const total = trustedLiveDecimalString(canonicalLiveDecimalString(order.orderedQuantity, 'orderedQuantity'));
+  const filled = trustedLiveDecimalString(canonicalLiveDecimalString(order.filledQuantity, 'filledQuantity'));
+  const remaining = trustedLiveDecimalString(canonicalLiveDecimalString(order.remainingQuantity, 'remainingQuantity'));
+  const cancelled = trustedLiveDecimalString(canonicalLiveDecimalString(order.cancelledQuantity, 'cancelledQuantity'));
 
-  if (total.lessThanOrEqualTo(0)) {
+  if ((trustedLiveCompare(total, "0") <= 0)) {
     evidenceInvalid('Venue order evidence reports a non-positive ordered quantity', { exchangeOrderId: order.exchangeOrderId });
   }
-  if (filled.isNegative() || remaining.isNegative() || cancelled.isNegative()) {
+  if ((trustedLiveCompare(filled, '0') < 0) || (trustedLiveCompare(remaining, '0') < 0) || (trustedLiveCompare(cancelled, '0') < 0)) {
     evidenceInvalid('Venue order evidence reports a negative quantity operand', { exchangeOrderId: order.exchangeOrderId });
   }
-  if (remaining.plus(cancelled).greaterThan(total)) {
+  if ((trustedLiveCompare(trustedLiveAdd(remaining, cancelled), total) > 0)) {
     evidenceInvalid('Venue order evidence violates remaining + cancelled <= total', { exchangeOrderId: order.exchangeOrderId });
   }
-  if (!filled.equals(total.minus(remaining).minus(cancelled))) {
+  if (!(trustedLiveCompare(filled, trustedLiveSubtract(trustedLiveSubtract(total, remaining), cancelled)) === 0)) {
     evidenceInvalid('Venue order evidence violates filled = total - remaining - cancelled', { exchangeOrderId: order.exchangeOrderId });
   }
-  if (filled.greaterThan(0)) {
+  if ((trustedLiveCompare(filled, "0") > 0)) {
     if (order.averageFillPrice === null) {
       evidenceInvalid('Venue order evidence reports a positive fill without a cumulative average price', { exchangeOrderId: order.exchangeOrderId });
     }
-    if (!liveDecimal(canonicalLiveDecimalString(order.averageFillPrice, 'averageFillPrice')).greaterThan(0)) {
+    if (!(trustedLiveCompare(trustedLiveDecimalString(canonicalLiveDecimalString(order.averageFillPrice, 'averageFillPrice')), "0") > 0)) {
       evidenceInvalid('Venue order evidence reports a non-positive average price for a positive fill', { exchangeOrderId: order.exchangeOrderId });
     }
   } else if (order.averageFillPrice !== null) {
@@ -468,4 +469,24 @@ export function dedupePositionEvidence(positions: readonly LiveVenuePositionEvid
   const byId = new Map<string, LiveVenuePositionEvidence>();
   for (const position of positions) byId.set(position.venuePositionId, position);
   return Object.freeze([...byId.values()]);
+}
+
+// Reviewed defining-owner binding protection.
+Object.freeze(dedupeOrderEvidence);
+Object.freeze(dedupePositionEvidence);
+Object.freeze(rawOrderSetSha256);
+Object.freeze(rawPositionSetSha256);
+Object.freeze(assertEvidenceSetUsable);
+Object.freeze(evidenceSnapshotSha256);
+Object.freeze(evidenceWindowIsSeparable);
+Object.freeze(mergeEvidenceProvenance);
+Object.freeze(rawEvidenceSnapshotSha256);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["dedupeOrderEvidence","dedupePositionEvidence","rawOrderSetSha256","rawPositionSetSha256","assertEvidenceSetUsable","evidenceSnapshotSha256","evidenceWindowIsSeparable","mergeEvidenceProvenance","rawEvidenceSnapshotSha256"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

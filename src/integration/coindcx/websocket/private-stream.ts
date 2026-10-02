@@ -70,6 +70,7 @@ interface ReconnectToken {
  * - Zero logging of API keys, secrets, signatures, or private record payloads
  */
 export class CoinDcxPrivateAccountStream {
+  readonly #immutableOwnedRouting: boolean;
   readonly #apiKey: string;
   readonly #signer: RequestSigner;
   readonly #endpoint: string;
@@ -120,6 +121,7 @@ export class CoinDcxPrivateAccountStream {
   readonly #subscribers = new Set<StreamEventListener>();
 
   constructor(config: PrivateStreamConfig, owned?: unknown) {
+    this.#immutableOwnedRouting = owned === OWNED_CONSTRUCTION;
     if (!config.apiKey || config.apiKey.trim() === '') {
       throw new CoinDcxConfigError('COINDCX_API_KEY is required for private stream initialization');
     }
@@ -664,16 +666,26 @@ export class CoinDcxPrivateAccountStream {
 
   #dispatchEnvelope<T>(envelope: CoinDcxStreamEnvelope<T>): void {
     const socket = this.#socket;
+    const lifecycle = envelope.eventType === 'PRIVATE_STREAM_CONNECTED'
+      || envelope.eventType === 'PRIVATE_STREAM_DISCONNECTED'
+      || envelope.eventType === 'PRIVATE_RECONCILIATION_REQUIRED';
+    const delivery = this.#immutableOwnedRouting ? Object.freeze({
+      source: envelope.source, stream: envelope.stream, generationId: envelope.generationId,
+      sequence: envelope.sequence, receivedAtMs: envelope.receivedAtMs, eventType: envelope.eventType,
+      providerTimestampMs: envelope.providerTimestampMs, pair: envelope.pair,
+      payload: lifecycle && envelope.payload !== null && typeof envelope.payload === 'object'
+        ? Object.freeze({ ...envelope.payload }) : envelope.payload,
+    }) : envelope;
     for (const subscriber of [...this.#subscribers]) {
-      if (this.#isStopped || envelope.generationId !== this.#generationId || socket !== this.#socket) return;
+      if (this.#isStopped || delivery.generationId !== this.#generationId || socket !== this.#socket) return;
       try {
-        subscriber(envelope as unknown as CoinDcxStreamEnvelope<unknown>);
+        subscriber(delivery as unknown as CoinDcxStreamEnvelope<unknown>);
       } catch {
         this.#logger.error({
           module: 'coindcx:private-stream',
-          generationId: envelope.generationId,
+          generationId: delivery.generationId,
           category: 'DOWNSTREAM_HANDLER_ERROR',
-          eventType: envelope.eventType,
+          eventType: delivery.eventType,
           msg: 'Downstream private subscriber threw an error',
         });
       }
@@ -813,4 +825,16 @@ if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
   if (descriptor?.configurable === false) {
     if (descriptor.get === undefined || descriptor.set !== undefined || module.exports.createOwnedCoinDcxPrivateStream !== createOwnedCoinDcxPrivateStream) throw new Error('CREDENTIAL_CONSTRUCTION_EXPORT_INVALID');
   } else Object.defineProperty(module.exports, 'createOwnedCoinDcxPrivateStream', { get: () => createOwnedCoinDcxPrivateStream, configurable: false });
+}
+
+// Reviewed defining-owner binding protection.
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["PRIVATE_CHANNEL_NAME","CANONICAL_AUTH_BODY"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

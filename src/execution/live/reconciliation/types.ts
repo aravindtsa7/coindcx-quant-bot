@@ -355,3 +355,15 @@ export type LiveReconciliationFindingCode =
   | 'RECON_POSITION_IDENTITY_MISMATCH'
   /** Local believes a position is open; a complete venue read shows flat. */
   | 'RECON_POSITION_LOCAL_OPEN_VENUE_FLAT';
+
+// Reviewed defining-owner binding protection.
+Object.freeze(isBlockingCategory);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["isBlockingCategory","NON_BLOCKING_FINDING_CATEGORIES"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}

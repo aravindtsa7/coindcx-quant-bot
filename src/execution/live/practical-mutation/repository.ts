@@ -1,3 +1,6 @@
+import { readPracticalPersistenceError } from '../practical-persistence/ports';
+import { readLiveExecutionError } from '../errors';
+import { readPracticalMutationError } from './ports';
 /**
  * Phase 18B Stage 1B2 (Wave 2B1): the Prisma/MySQL practical CANCEL
  * mutation store. The ONLY Stage 1B2 Prisma adapter.
@@ -40,8 +43,7 @@
  * still run its own private-stream guard immediately after the arm.
  */
 import { Prisma, type PrismaClient } from '@prisma/client';
-import { LIVE_CLIENT_ORDER_ID_PATTERN } from '../identity';
-import { LiveExecutionError } from '../errors';
+import { isTrustedLiveClientOrderId } from '../identity';
 import {
   armCancelWireWithinCallerFencedTransaction,
   claimCancelWithinCallerFencedTransaction,
@@ -56,9 +58,8 @@ import { readLiveRuntimeEpoch } from '../reconciliation/barrier';
 import { PracticalRecoveryCertificate, type PracticalRecoveryCertificateRecord } from '../practical/certificate';
 import type { PracticalFenceExpectation } from '../practical/fence';
 import { PracticalLiveSafetyEnablement, practicalActionPermission } from '../practical/policy';
-import { PRACTICAL_AUTHORIZATION_BASIS, PRACTICAL_DIGEST_PATTERN, isExactId, isNonNegativeSafeInteger } from '../practical/types';
+import { PRACTICAL_AUTHORIZATION_BASIS, isPracticalDigest, isExactId, isNonNegativeSafeInteger } from '../practical/types';
 import {
-  PracticalDurableContradictionError,
   PracticalPersistenceError,
   type PracticalDurableCertificateRecord,
   type PracticalMalformedEscalation,
@@ -66,6 +67,7 @@ import {
 } from '../practical-persistence/ports';
 import {
   PrismaPracticalSafetyRepository,
+  createOwnedPracticalSafetyRepository,
   withLockedPracticalAccountWithinCallerTransaction,
   type PracticalLockedAccountScope,
 } from '../practical-persistence/repository';
@@ -221,7 +223,7 @@ function requireAccountId(value: unknown): string {
 }
 
 function requireIntentId(value: unknown): string {
-  if (typeof value !== 'string' || !PRACTICAL_DIGEST_PATTERN.test(value)) invalidInput('intentId must be an exact lowercase 64-hex Phase 17 intent id', 'intentId');
+  if (typeof value !== 'string' || !isPracticalDigest(value)) invalidInput('intentId must be an exact lowercase 64-hex Phase 17 intent id', 'intentId');
   return value;
 }
 
@@ -551,8 +553,8 @@ function leaseRecoveryRefused(reason: PracticalPreviousRuntimeRefusalReason, acc
 }
 
 function isEscalatingLeaseRecoveryRefusal(error: unknown): boolean {
-  if (!(error instanceof PracticalMutationError) || error.code !== 'PRACTICAL_MUTATION_RECOVERY_REFUSED') return false;
-  const reason = error.details?.['reason'];
+  if (!((readPracticalMutationError(error) !== null)) || (readPracticalMutationError(error))!.code !== 'PRACTICAL_MUTATION_RECOVERY_REFUSED') return false;
+  const reason = (readPracticalMutationError(error))!.details?.['reason'];
   return typeof reason === 'string' && (PRACTICAL_PREVIOUS_RUNTIME_ESCALATING_REASONS as readonly string[]).includes(reason);
 }
 
@@ -567,7 +569,7 @@ function runtimeSuperseded(leaseId: string): never {
 }
 
 function isRuntimeSuperseded(error: unknown): boolean {
-  return error instanceof PracticalMutationError && error.code === 'PRACTICAL_MUTATION_RECOVERY_REFUSED' && error.details?.['reason'] === 'RUNTIME_SUPERSEDED';
+  return (readPracticalMutationError(error) !== null) && (readPracticalMutationError(error))!.code === 'PRACTICAL_MUTATION_RECOVERY_REFUSED' && (readPracticalMutationError(error))!.details?.['reason'] === 'RUNTIME_SUPERSEDED';
 }
 
 /** The attempted lease, exact on every immutable field of the intended record (the arm and completion state are checked separately). */
@@ -604,26 +606,29 @@ function fenceNamesAttempt(fence: PracticalLockedAccountScope['account']['fence'
  * resolved again. EVERYTHING else a resolution throws is a proven anomaly.
  */
 function isInconclusiveResolution(error: unknown): boolean {
-  return error instanceof PracticalMutationError && error.code === 'PRACTICAL_MUTATION_FAULT';
+  return (readPracticalMutationError(error) !== null) && (readPracticalMutationError(error))!.code === 'PRACTICAL_MUTATION_FAULT';
 }
 
 /** The refusal reason of a proven anomaly: the classified reason, or an unreadable account / row. */
 function refusalReasonOf(error: unknown): PracticalRecoveryRefusalReason {
-  if (error instanceof PracticalMutationError && error.code === 'PRACTICAL_MUTATION_RECOVERY_REFUSED') {
-    const reason = error.details?.['reason'];
+  if ((readPracticalMutationError(error) !== null) && (readPracticalMutationError(error))!.code === 'PRACTICAL_MUTATION_RECOVERY_REFUSED') {
+    const reason = (readPracticalMutationError(error))!.details?.['reason'];
     if (typeof reason === 'string' && (PRACTICAL_RECOVERY_REFUSAL_REASONS as readonly string[]).includes(reason)) return reason as PracticalRecoveryRefusalReason;
   }
   return 'ACCOUNT_UNREADABLE';
 }
 
+const OWNED_MUTATION = Object.freeze({});
+
 export class PrismaPracticalCancelMutationStore implements PracticalCancelMutationStore, PracticalCancelNoWireStore, PracticalUnknownAcquireRecoveryStore, PracticalPreviousRuntimeRecoveryStore, PracticalCancelDispatchStore {
   readonly #prisma: PrismaClient;
   readonly #practical: PrismaPracticalSafetyRepository;
 
-  public constructor(prisma: PrismaClient, newId?: () => string) {
+  public constructor(prisma: PrismaClient, newId?: () => string, ownership?: unknown) {
     this.#prisma = prisma;
     // The SAME root client: the practical scope only ever runs inside this store's own transactions.
-    this.#practical = new PrismaPracticalSafetyRepository(this.#prisma, newId);
+    if (ownership === OWNED_MUTATION) this.#practical = createOwnedPracticalSafetyRepository(this.#prisma);
+    else this.#practical = new PrismaPracticalSafetyRepository(this.#prisma, newId);
   }
 
   /**
@@ -706,8 +711,8 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
         transitionPracticalCancelDispatchOwner(permission, 'CONSUMING', 'CONSUMPTION_UNKNOWN');
         throw new PracticalMutationError('PRACTICAL_MUTATION_COMMIT_OUTCOME_UNKNOWN', 'Consumption was unconfirmed; no attempt issued, dispatch retry prohibited', undefined, error.cause);
       }
-      const loser = (error instanceof PracticalMutationError && error.code === 'PRACTICAL_MUTATION_DISPATCH_CONFLICT')
-        || (error instanceof LiveExecutionError && error.code === 'LIVE_ORDER_STATE_CONFLICT');
+      const loser = ((readPracticalMutationError(error) !== null) && (readPracticalMutationError(error) ?? readLiveExecutionError(error))!.code === 'PRACTICAL_MUTATION_DISPATCH_CONFLICT')
+        || ((readLiveExecutionError(error) !== null) && (readPracticalMutationError(error) ?? readLiveExecutionError(error))!.code === 'LIVE_ORDER_STATE_CONFLICT');
       transitionPracticalCancelDispatchOwner(permission, 'CONSUMING', loser ? 'REFUSED' : 'READY');
       throw error;
     }
@@ -943,7 +948,7 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
       if (before === null
         || before.intentId !== intentId
         || before.accountId !== accountId
-        || !LIVE_CLIENT_ORDER_ID_PATTERN.test(before.clientOrderId)) {
+        || !isTrustedLiveClientOrderId(before.clientOrderId)) {
         return invalidated('PREFLIGHT_MISMATCH', 'PHASE17_ORDER_MISMATCH', null);
       }
 
@@ -954,7 +959,7 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
       } catch (error) {
         if (!isClassifiedPreWriteClaimFailure(error)) throw error;
         await requirePhase17Untouched(tx, intentId, before, error);
-        return invalidated('PREFLIGHT_MISMATCH', 'PHASE17_CLAIM_REFUSED', error.code);
+        return invalidated('PREFLIGHT_MISMATCH', 'PHASE17_CLAIM_REFUSED', readLiveExecutionError(error)!.code as PracticalClassifiedPreWriteClaimFailureCode);
       }
       if (claim.kind !== 'CLAIMED') {
         await requirePhase17Untouched(tx, intentId, before, null);
@@ -1480,7 +1485,7 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
    * rethrown unchanged.
    */
   async #afterNoWireRollback(error: unknown, accountId: string, epoch: string, nowMs: number): Promise<PracticalNoWireCompletion> {
-    if (error instanceof PracticalMutationError && error.code === 'PRACTICAL_MUTATION_SPLIT_STATE') {
+    if ((readPracticalMutationError(error) !== null) && (readPracticalMutationError(error))!.code === 'PRACTICAL_MUTATION_SPLIT_STATE') {
       await this.#enterMismatchReview(accountId, nowMs);
       throw error;
     }
@@ -1659,11 +1664,11 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
       const entry = await this.#enterMismatchReview(accountId, nowMs);
       return Object.freeze({ confirmed: true, reviewEpisodeId: entry.reviewEpisodeId });
     } catch (error) {
-      if (error instanceof PracticalPersistenceError && error.code === 'PRACTICAL_PERSISTENCE_LATCHED') {
-        const reviewEpisodeId = error.details?.['reviewEpisodeId'];
+      if ((readPracticalPersistenceError(error) !== null) && (readPracticalPersistenceError(error))!.code === 'PRACTICAL_PERSISTENCE_LATCHED') {
+        const reviewEpisodeId = (readPracticalPersistenceError(error))!.details?.['reviewEpisodeId'];
         return Object.freeze({ confirmed: true, reviewEpisodeId: typeof reviewEpisodeId === 'string' ? reviewEpisodeId : null });
       }
-      if (error instanceof PracticalPersistenceError && error.code === 'PRACTICAL_PERSISTENCE_MALFORMED') {
+      if ((readPracticalPersistenceError(error) !== null) && (readPracticalPersistenceError(error))!.code === 'PRACTICAL_PERSISTENCE_MALFORMED') {
         return this.#latchIfMalformed(error, accountId, epoch, nowMs).then(
           (latched) => Object.freeze({ confirmed: true, reviewEpisodeId: latched.reviewEpisodeId }),
           () => Object.freeze({ confirmed: false, reviewEpisodeId: null }),
@@ -1800,7 +1805,7 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
    * a database fault) is rethrown UNCHANGED: fail-closed, no review.
    */
   async #afterRecoveryRollback(error: unknown, accountId: string, epoch: string, nowMs: number): Promise<PracticalPreviousRuntimeRecovery> {
-    const contradiction = error instanceof PracticalDurableContradictionError;
+    const contradiction = (readPracticalPersistenceError(error)?.kind === 'PracticalDurableContradictionError');
     if (contradiction || isEscalatingLeaseRecoveryRefusal(error)) {
       await this.#enterMismatchReview(accountId, nowMs);
       if (contradiction) leaseRecoveryRefused('LEASE_CERTIFICATE_MISMATCH', accountId, error);
@@ -1817,13 +1822,13 @@ export class PrismaPracticalCancelMutationStore implements PracticalCancelMutati
    * rolled back. Anything else is rethrown unchanged.
    */
   async #latchIfMalformed(error: unknown, accountId: string, epoch: string, nowMs: number): Promise<{ readonly kind: 'MALFORMED_LATCHED'; readonly reviewEpisodeId: string }> {
-    if (!(error instanceof PracticalPersistenceError) || error.code !== 'PRACTICAL_PERSISTENCE_MALFORMED') throw error;
+    if (!((readPracticalPersistenceError(error) !== null)) || (readPracticalPersistenceError(error))!.code !== 'PRACTICAL_PERSISTENCE_MALFORMED') throw error;
     let escalation: PracticalMalformedEscalation;
     try {
       escalation = await this.#practical.escalateMalformedAccount({ accountId, detectingRuntimeEpoch: epoch, nowMs });
     } catch (escalationError) {
       // e.g. the rows are valid again, or the key is only a collation variant: the original failure stands.
-      if (escalationError instanceof PracticalPersistenceError && escalationError.code === 'PRACTICAL_PERSISTENCE_CONFLICT') throw error;
+      if ((readPracticalPersistenceError(escalationError) !== null) && (readPracticalPersistenceError(escalationError))!.code === 'PRACTICAL_PERSISTENCE_CONFLICT') throw error;
       throw escalationError;
     }
     return Object.freeze({ kind: 'MALFORMED_LATCHED' as const, reviewEpisodeId: escalation.reviewEpisodeId });
@@ -1841,4 +1846,39 @@ function samePresentedCertificate(durable: PracticalDurableCertificateRecord, pr
     && durable.evidenceDigest === presented.evidenceDigest
     && durable.issuedAtMs === presented.issuedAtMs
     && durable.expiresAtMs === presented.expiresAtMs;
+}
+
+// Defining-module snapshot: owned instances cannot inherit later replacements.
+const createOwnedPracticalCancelMutationStoreDescriptors = Object.freeze(Object.getOwnPropertyDescriptors(PrismaPracticalCancelMutationStore.prototype));
+export function createOwnedPracticalCancelMutationStore(prisma: PrismaClient): PrismaPracticalCancelMutationStore {
+  const instance = new PrismaPracticalCancelMutationStore(prisma, undefined, OWNED_MUTATION);
+  for (const [key, descriptor] of Object.entries(createOwnedPracticalCancelMutationStoreDescriptors)) {
+    if (key === 'constructor') continue;
+    if (typeof descriptor.value === 'function') Object.defineProperty(instance, key, { value: Object.freeze(descriptor.value.bind(instance)), writable: false, configurable: false });
+    else if (descriptor.get !== undefined) Object.defineProperty(instance, key, { get: Object.freeze(descriptor.get.bind(instance)), configurable: false });
+  }
+  Object.freeze(instance);
+  return instance;
+}
+Object.freeze(createOwnedPracticalCancelMutationStore);
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const [name, value] of Object.entries({ createOwnedPracticalCancelMutationStore, PrismaPracticalCancelMutationStore })) {
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.get === undefined || descriptor.set !== undefined || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}
+
+// Reviewed defining-owner binding protection.
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["PRACTICAL_MUTATION_TRANSACTION_MAX_ATTEMPTS"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

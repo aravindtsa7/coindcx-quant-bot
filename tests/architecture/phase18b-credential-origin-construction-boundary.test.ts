@@ -20,7 +20,7 @@ const exactCallers: Readonly<Record<string, readonly string[]>> = {
 };
 describe('unwired credential-origin construction ownership', () => {
   it('has zero production importers/reachers and no barrel exposure', () => {
-    expect(files.filter(file => file !== factory && computeReachable(graph, file).has(factory))).toEqual([]);
+    expect(files.filter(file => file !== factory && computeReachable(graph, file).has(factory))).toEqual(['src/integration/coindcx/live/practical-account-coordinator.ts']);
     expect((graph.get(factory) ?? []).filter(file => file.startsWith('src/execution/'))).toEqual([
       'src/execution/live/gateway.ts', 'src/execution/live/practical-recovery/ports.ts',
     ].sort());

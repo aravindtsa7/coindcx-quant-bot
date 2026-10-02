@@ -312,3 +312,21 @@ export function adoptPracticalFenceForNewRuntime(
     mode: IDLE,
   });
 }
+
+// Reviewed defining-owner binding protection.
+Object.freeze(adoptPracticalFenceForNewRuntime);
+Object.freeze(beginPracticalCertification);
+Object.freeze(beginPracticalMutationLease);
+Object.freeze(finishPracticalCertification);
+Object.freeze(initialPracticalFence);
+Object.freeze(releasePracticalMutationLease);
+Object.freeze(readPracticalAccountFence);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["adoptPracticalFenceForNewRuntime","beginPracticalCertification","beginPracticalMutationLease","finishPracticalCertification","initialPracticalFence","releasePracticalMutationLease","readPracticalAccountFence"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}

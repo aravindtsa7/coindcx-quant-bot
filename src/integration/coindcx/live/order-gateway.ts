@@ -1,3 +1,4 @@
+import { parseOwnedCancelResponse, parseOwnedCancelError } from './wire-schemas';
 /** CoinDCX futures live-order adapter for the verified current REST contract. */
 import { isLosslessNumber } from 'lossless-json';
 import type {
@@ -189,12 +190,14 @@ export interface CoinDcxLiveOrderGatewayOptions {
 }
 
 export class CoinDcxLiveFuturesOrderGateway implements CoinDcxFuturesOrderGateway {
+  readonly #usesOwnedParsers: boolean;
   readonly #transport: CoinDcxOrderMutationTransport;
   readonly #clock: Clock;
 
   static { installCancelGatewayBrand((gateway, transport) => typeof gateway === 'object' && gateway !== null && #transport in gateway && gateway.#transport === transport); }
 
   public constructor(options: CoinDcxLiveOrderGatewayOptions, owned?: unknown) {
+    this.#usesOwnedParsers = owned === OWNED_CONSTRUCTION;
     const transportOptions = { apiKey: options.apiKey, apiSecret: options.apiSecret, baseUrl: options.baseUrl };
     this.#transport = owned === OWNED_CONSTRUCTION
       ? createOwnedCoinDcxMutationTransport({ ...transportOptions, baseUrl: options.baseUrl! })
@@ -283,12 +286,12 @@ export class CoinDcxLiveFuturesOrderGateway implements CoinDcxFuturesOrderGatewa
     if (wire.kind === 'PRE_DISPATCH') return { kind: 'PRE_DISPATCH_FAILURE', reasonCode: wire.reasonCode };
     if (wire.kind === 'UNESTABLISHED') return { kind: 'AMBIGUOUS', reasonCode: wire.reasonCode };
     if (wire.statusCode >= 400) {
-      if (!LiveErrorResponseSchema.safeParse(wire.data).success) return { kind: 'AMBIGUOUS', reasonCode: 'LIVE_ERROR_RESPONSE_INVALID' };
+      if (!(this.#usesOwnedParsers ? parseOwnedCancelError(wire.data) : LiveErrorResponseSchema.safeParse(wire.data)).success) return { kind: 'AMBIGUOUS', reasonCode: 'LIVE_ERROR_RESPONSE_INVALID' };
       return wire.statusCode < 500 && wire.statusCode !== 429
         ? { kind: 'REJECTED', reasonCode: `HTTP_${wire.statusCode}` }
         : { kind: 'AMBIGUOUS', reasonCode: `HTTP_${wire.statusCode}` };
     }
-    if (!LiveCancelResponseSchema.safeParse(wire.data).success) {
+    if (!(this.#usesOwnedParsers ? parseOwnedCancelResponse(wire.data) : LiveCancelResponseSchema.safeParse(wire.data)).success) {
       return { kind: 'AMBIGUOUS', reasonCode: 'LIVE_ORDER_RESPONSE_INVALID' };
     }
     return { kind: 'CANCEL_ACCEPTED', observation: null };

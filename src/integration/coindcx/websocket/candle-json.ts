@@ -32,6 +32,11 @@ const stockParser = createRequire(__filename)('socket.io-parser') as {
 };
 
 class ExactCandleDecoder extends stockParser.Decoder {
+  public constructor() {
+    super();
+    Object.defineProperty(this, 'add', { value: Object.freeze(originalExactCandleAdd.bind(this)),
+      writable: false, configurable: false });
+  }
   public override add(packet: unknown): void {
     if (typeof packet === 'string') {
       // EVENT/BINARY_EVENT, optional attachments, namespace and acknowledgment id.
@@ -50,5 +55,22 @@ class ExactCandleDecoder extends stockParser.Decoder {
   }
 }
 
+const originalExactCandleAdd = ExactCandleDecoder.prototype.add;
+Object.freeze(originalExactCandleAdd);
+Object.freeze(ExactCandleDecoder.prototype);
+Object.freeze(ExactCandleDecoder);
+
 /** Installed after caller options so exact candle decoding cannot be overridden. */
 export const EXACT_CANDLE_SOCKET_PARSER = Object.freeze({ Encoder: stockParser.Encoder, Decoder: ExactCandleDecoder });
+
+// Reviewed defining-owner binding protection.
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["EXACT_CANDLE_SOCKET_PARSER"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}

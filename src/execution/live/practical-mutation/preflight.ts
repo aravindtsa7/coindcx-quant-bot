@@ -18,7 +18,7 @@
  *      LIVE_PERSISTENCE_FAULT are deliberately NOT in the set: they are
  *      integrity/persistence faults that must roll the whole acquisition back.
  */
-import { LiveExecutionError } from '../errors';
+import { LiveExecutionError, readLiveExecutionError } from '../errors';
 import type { PracticalSafetyCeilings } from '../practical/policy';
 import { isExactId } from '../practical/types';
 
@@ -115,10 +115,9 @@ export type PracticalClassifiedPreWriteClaimFailureCode = (typeof PRACTICAL_CLAS
  * false, and so escapes to roll the whole transaction back.
  */
 export function isClassifiedPreWriteClaimFailure(error: unknown): error is LiveExecutionError & { readonly code: PracticalClassifiedPreWriteClaimFailureCode } {
-  return error instanceof LiveExecutionError
-    && Object.getPrototypeOf(error) === LiveExecutionError.prototype
-    && Object.prototype.hasOwnProperty.call(error, 'code')
-    && (PRACTICAL_CLASSIFIED_PRE_WRITE_CLAIM_FAILURE_CODES as readonly string[]).includes(error.code);
+  const record = readLiveExecutionError(error);
+  return record !== null && record.kind === 'LiveExecutionError'
+    && (record.code === 'LIVE_INTENT_INVALID' || record.code === 'LIVE_AUTHORITY_INVALID' || record.code === 'LIVE_ORDER_IDENTITY_MISMATCH');
 }
 
 // ---------------------------------------------------------------------------
@@ -128,4 +127,18 @@ export function isClassifiedPreWriteClaimFailure(error: unknown): error is LiveE
 /** The quiet dwell before a Tier-B CANCEL: the stricter of the two dwell ceilings. */
 export function practicalCancelDwellMs(ceilings: PracticalSafetyCeilings): number {
   return Math.max(ceilings.firstMutationDwellMs, ceilings.postIssuanceDwellMs);
+}
+
+// Reviewed defining-owner binding protection.
+Object.freeze(practicalCancelDwellMs);
+Object.freeze(classifyPracticalReconciliationMismatch);
+Object.freeze(isClassifiedPreWriteClaimFailure);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["practicalCancelDwellMs","classifyPracticalReconciliationMismatch","isClassifiedPreWriteClaimFailure","PRACTICAL_CLASSIFIED_PRE_WRITE_CLAIM_FAILURE_CODES"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

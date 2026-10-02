@@ -2,8 +2,25 @@ import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { URL } from 'node:url';
+import https from 'node:https';
 import { PrismaClient } from '@prisma/client';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { createCoinDcxPracticalAccountCoordinator } from '../../../src/integration/coindcx/live/practical-account-coordinator';
+
+// Stock socket dependency double only. The genuine application adapter never
+// receives provider confirmation; existing synthetic recovery fixtures remain separate.
+const genuineSocketCalls = vi.hoisted(() => ({ count: 0 }));
+vi.mock('socket.io-client', () => ({ default: () => {
+  genuineSocketCalls.count++;
+  const listeners = new Map<string, (...args: unknown[]) => void>();
+  const raw = { connected: false,
+    connect() { raw.connected = true; listeners.get('connect')?.(); },
+    disconnect() { raw.connected = false; },
+    on(event: string, listener: (...args: unknown[]) => void) { listeners.set(event, listener); },
+    off(event: string) { listeners.delete(event); }, emit() { return true; },
+  };
+  return raw;
+} }));
 import { FakeClock } from '../../../src/core/time/clock';
 import { PracticalRecoveryCertificate } from '../../../src/execution/live/practical/certificate';
 import { PrismaPracticalSafetyRepository } from '../../../src/execution/live/practical-persistence/repository';
@@ -107,6 +124,38 @@ function freshAccount(): string {
   accountCounter += 1;
   return `p18b-rec-${accountCounter}-${randomBytes(4).toString('hex')}`;
 }
+
+describe('genuine unwired coordinator and actual adapter, real owned MySQL', () => {
+  it('constructs with zero I/O and remains BLOCKED at STREAM_PROOF without provider confirmation', async () => {
+    if (skip()) return;
+    const accountId = freshAccount();
+    const native = vi.spyOn(https, 'request').mockImplementation(() => { throw new Error('UNEXPECTED_PROVIDER_ACCESS'); });
+    const queries = vi.spyOn(connectionA, '$queryRawUnsafe');
+    const beforeSockets = genuineSocketCalls.count;
+    try {
+      const made = createCoinDcxPracticalAccountCoordinator({ prisma: connectionA,
+        credentials: { apiKey: 'synthetic-coordinator-key', apiSecret: 'synthetic-coordinator-secret',
+          configuredAccountId: accountId, expectedProviderAccountFingerprint: FINGERPRINT },
+        policy: { liveExecutionEnabled: 'true', practicalSafetyEnabled: 'true', pairAllowlist: 'B-BTC_USDT',
+          maxOrderNotionalInr: '100', requestTimeoutMs: 1000 } });
+      expect(made.kind).toBe('CONSTRUCTED');
+      expect(queries).not.toHaveBeenCalled(); expect(native).not.toHaveBeenCalled();
+      expect(genuineSocketCalls.count).toBe(beforeSockets);
+      if (made.kind !== 'CONSTRUCTED') throw new Error('COORDINATOR_FIXTURE_CONSTRUCTION_REFUSED');
+      try {
+        expect(await made.coordinator.start()).toEqual({ kind: 'BLOCKED', phase: 'STREAM_PROOF' });
+        expect(made.coordinator.snapshot().admission).toBe('TERMINAL');
+        expect(await made.coordinator.cancel({ intentId: 'a'.repeat(64) })).toMatchObject({ code: 'ADMISSION_CLOSED' });
+        expect(native).not.toHaveBeenCalled(); expect(genuineSocketCalls.count).toBe(beforeSockets + 1);
+        const durable = await new PrismaPracticalSafetyRepository(connectionB).loadAccount(accountId);
+        expect(durable.kind).toBe('FOUND');
+        if (durable.kind === 'FOUND') { expect(durable.account.state).toBe('QUARANTINED'); expect(durable.account.currentCertificate).toBeNull(); }
+      } finally {
+        expect(await made.coordinator.shutdown()).toMatchObject({ kind: 'LOCAL_SHUTDOWN_COMPLETED', status: 'COMPLETE' });
+      }
+    } finally { queries.mockRestore(); native.mockRestore(); }
+  });
+});
 
 /** The venue, stream, Phase 18 state, and clock of one account's world (shared by every "process" that looks at it). */
 interface World {

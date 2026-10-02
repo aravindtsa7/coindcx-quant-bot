@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 /** Strict current CoinDCX futures order wire contracts. */
 import { isLosslessNumber, LosslessNumber } from 'lossless-json';
 import { z } from 'zod';
@@ -153,3 +154,62 @@ export const LiveListOrdersRequestSchema = z.object({
   size: z.literal('200'),
   margin_currency_short_name: z.tuple([z.literal('INR')]),
 }).strict();
+
+/** Independent literal recipes: no public application-owned graph node is reused. */
+function makeOwnedCancelGraphs() {
+const LiveWireNumericSchema = z.union([
+  z.string(),
+  z.number(),
+  z.custom<LosslessNumber>((value) => isLosslessNumber(value), { message: 'Expected LosslessNumber' }),
+]);
+const Wire200Schema = LiveWireNumericSchema.refine((value) => {
+  if (isLosslessNumber(value)) return value.value === '200';
+  return String(value) === '200';
+}, { message: 'Expected provider success code 200' });
+const LiveCancelResponseSchema = z.object({
+  message: z.literal('success'),
+  status: Wire200Schema,
+  code: Wire200Schema,
+}).passthrough();
+const LiveErrorResponseSchema = z.object({
+  message: z.string().min(1),
+  code: z.union([z.string(), z.number()]).optional(),
+  status: z.union([z.string(), z.number()]).optional(),
+}).passthrough();
+return { LiveCancelResponseSchema, LiveErrorResponseSchema };
+}
+const ownedCancelGraphs = makeOwnedCancelGraphs();
+const ownedZodError = z.ZodError;
+function copyOwnedParserIssue(value: unknown): unknown {
+  if (value === null || typeof value !== 'object') return typeof value === 'function' || typeof value === 'symbol' ? '[UNSAFE_PARSE_ISSUE]' : value;
+  if (types.isProxy(value)) throw new Error('UNSAFE_PARSE_ISSUE');
+  if (value instanceof ownedZodError) return new ownedZodError(value.issues.map(issue => copyOwnedParserIssue(issue) as z.ZodIssue));
+  const result: Record<string, unknown> | unknown[] = Array.isArray(value) ? [] : {};
+  for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
+    if (!descriptor.enumerable) continue;
+    if (!Object.hasOwn(descriptor, 'value')) throw new Error('UNSAFE_PARSE_ISSUE');
+    Object.defineProperty(result, key, { value: copyOwnedParserIssue(descriptor.value), enumerable: true, writable: true, configurable: true });
+  }
+  return result;
+}
+function detachOwnedParserResult<T extends z.SafeParseReturnType<unknown, unknown>>(result: T): T {
+  if (result.success) return result;
+  try { return { success: false, error: new ownedZodError(result.error.issues.map(issue => copyOwnedParserIssue(issue) as z.ZodIssue)) } as T; }
+  catch { return { success: false, error: new ownedZodError([{ code: 'custom', path: [], message: 'Unsafe parser issue data' }]) } as T; }
+}
+export function parseOwnedCancelResponse(value: unknown): ReturnType<typeof LiveCancelResponseSchema.safeParse> {
+  return detachOwnedParserResult(ownedCancelGraphs.LiveCancelResponseSchema.safeParse(value));
+}
+Object.freeze(parseOwnedCancelResponse);
+export function parseOwnedCancelError(value: unknown): ReturnType<typeof LiveErrorResponseSchema.safeParse> {
+  return detachOwnedParserResult(ownedCancelGraphs.LiveErrorResponseSchema.safeParse(value));
+}
+Object.freeze(parseOwnedCancelError);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const [name, value] of Object.entries({ parseOwnedCancelResponse, parseOwnedCancelError })) {
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.get === undefined || descriptor.set !== undefined || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}

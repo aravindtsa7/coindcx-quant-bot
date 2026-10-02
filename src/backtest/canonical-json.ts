@@ -1,11 +1,12 @@
 import { createHash, Hash } from 'node:crypto';
-import { BacktestDecimal } from './decimal';
+import { readBacktestDecimalValue } from './decimal';
 import { BacktestError } from './errors';
 
 type JsonPrimitive = string | number | boolean | null;
 
 function serialize(value: unknown, ancestors: Set<object>): string {
-  if (value instanceof BacktestDecimal) return JSON.stringify(value.value);
+  const nativeDecimal = readBacktestDecimalValue(value);
+  if (nativeDecimal !== null) return JSON.stringify(nativeDecimal);
   if (value === null) return 'null';
   if (typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
   if (typeof value === 'number') {
@@ -51,4 +52,16 @@ export function sha256CanonicalJson(value: unknown): string {
 
 export function updateCanonicalEventHash(hash: Hash, event: unknown): void {
   hash.update(Buffer.from(`${canonicalJson(event)}\n`, 'utf8'));
+}
+
+// Reviewed defining-owner binding protection.
+Object.freeze(sha256CanonicalJson);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["sha256CanonicalJson"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

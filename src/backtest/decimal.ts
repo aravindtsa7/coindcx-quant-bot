@@ -72,6 +72,9 @@ export class BacktestDecimal {
     return input instanceof BacktestDecimal ? input : new BacktestDecimal(input);
   }
 
+  public static readNativeValue(value: unknown): string | null {
+    return typeof value === 'object' && value !== null && #value in value ? value.#value : null;
+  }
   public get value(): string { return this.#value; }
   public toString(): string { return this.#value; }
   public toJSON(): string { return this.#value; }
@@ -93,4 +96,19 @@ export function requirePositive(value: BacktestCalc, label: string): void {
 
 export function publicDecimal(value: BacktestCalc): BacktestDecimal {
   return new BacktestDecimal(value);
+}
+
+export function readBacktestDecimalValue(value: unknown): string | null { return BacktestDecimal.readNativeValue(value); }
+Object.freeze(readBacktestDecimalValue);
+// Reviewed defining-owner binding protection.
+Object.freeze(BacktestDecimal.prototype);
+Object.freeze(BacktestDecimal);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["BacktestDecimal","readBacktestDecimalValue"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }

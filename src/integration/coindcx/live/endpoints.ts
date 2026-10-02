@@ -57,3 +57,15 @@ export const COINDCX_ORDER_MUTATION_ENDPOINTS: Readonly<Record<CoinDcxOrderMutat
 
 export const COINDCX_LIVE_BASE_URL = 'https://api.coindcx.com';
 export const COINDCX_LIVE_MAX_RESPONSE_BYTES = 1 * 1024 * 1024;
+
+// Reviewed defining-owner binding protection.
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["COINDCX_ORDER_MUTATION_ENDPOINTS","COINDCX_LIVE_MAX_RESPONSE_BYTES"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}

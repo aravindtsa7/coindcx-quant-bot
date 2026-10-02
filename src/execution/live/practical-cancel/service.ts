@@ -1,9 +1,10 @@
+import { readPracticalLiveSafetyError } from '../practical/types';
+import { readPracticalPersistenceError } from '../practical-persistence/ports';
+import { readLiveExecutionError } from '../errors';
+import { readPracticalMutationError } from '../practical-mutation/ports';
 /** Unwired owner of one cancel chain. Cleanup/retries never enter a gateway. */
-import { LiveExecutionError } from '../errors';
 import { PracticalRecoveryCertificate } from '../practical/certificate';
-import { PracticalLiveSafetyError } from '../practical/types';
-import { PracticalPersistenceError } from '../practical-persistence/ports';
-import { PracticalMutationError, type PracticalNotDispatchedReport } from '../practical-mutation/ports';
+import { type PracticalNotDispatchedReport } from '../practical-mutation/ports';
 import {
   PracticalAcquiredCancel, PracticalArmedCancel, PracticalCancelDispatchOwner,
   readPracticalUnknownAcquireReceipt,
@@ -64,8 +65,8 @@ function fields(value: unknown, expected: readonly string[]): Record<string, unk
   } catch { return null; }
 }
 function codeOf(error: unknown): PracticalCancelCode {
-  if (error instanceof PracticalMutationError || error instanceof LiveExecutionError
-    || error instanceof PracticalPersistenceError || error instanceof PracticalLiveSafetyError) return error.code;
+  if ((readPracticalMutationError(error) !== null) || (readLiveExecutionError(error) !== null)
+    || (readPracticalPersistenceError(error) !== null) || (readPracticalLiveSafetyError(error) !== null)) return (readPracticalMutationError(error) ?? readLiveExecutionError(error) ?? readPracticalPersistenceError(error) ?? readPracticalLiveSafetyError(error))!.code;
   return 'OPERATIONAL_FAILURE';
 }
 function blocked(phase: PracticalCancelPhase, code: PracticalCancelCode): PracticalCancelResult {
@@ -230,6 +231,23 @@ export class PracticalCancelService {
     } finally { clearTimeout(timer); this.#draining = false; }
   }
 
+  /** Observe the existing chain without a second budget or automatic retry. */
+  public async observeDrainWithoutRetry(): Promise<PracticalCancelDrainResult> {
+    if (this.#admissionOpen()) return Object.freeze({ kind: 'REFUSED', code: 'ADMISSION_NOT_CLOSED' });
+    if (this.#draining) return Object.freeze({ kind: 'REFUSED', code: 'DRAIN_IN_PROGRESS' });
+    this.#draining = true;
+    try {
+      if (this.#running) await this.#done;
+      return this.#drainState();
+    } finally { this.#draining = false; }
+  }
+
+  /** No reservation, retry, timer, durable access or gateway entry. */
+  public snapshotDrainWithoutRetry(): PracticalCancelDrainResult {
+    if (this.#admissionOpen()) return Object.freeze({ kind: 'REFUSED', code: 'ADMISSION_NOT_CLOSED' });
+    return this.#drainState();
+  }
+
   #admissionOpen(): boolean { return PracticalCancelLifecycle.open(this.#lifecycle, this, this.#dependencies); }
   #guard(certificate: unknown, time: PracticalCancelTime) {
     if (!this.#admissionOpen()) return Object.freeze({ kind: 'REFUSED' as const, code: 'ADMISSION_CLOSED' as const });
@@ -317,5 +335,18 @@ if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
     } else {
       Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
     }
+  }
+}
+
+// Reviewed defining-owner binding protection.
+Object.freeze(PracticalCancelService.prototype);
+Object.freeze(PracticalCancelService);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["PracticalCancelService"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
   }
 }

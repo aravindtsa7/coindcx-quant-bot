@@ -394,3 +394,26 @@ export function requirePracticalLiveSafetyEnablement(value: unknown): PracticalL
   }
   return record;
 }
+
+// Preserve lexical trusted bindings; do not freeze unrelated exports.
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const [name, value] of Object.entries({ PracticalLiveSafetyEnablement, issuePracticalLiveSafetyEnablement, requirePracticalLiveSafetyEnablement, PRACTICAL_SAFETY_CEILINGS, PRACTICAL_TIMING_CANDIDATES, practicalActionPermission })) {
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.get === undefined || descriptor.set !== undefined || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}
+
+// Reviewed defining-owner binding protection.
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["PRACTICAL_ROLLOUT_STAGES"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}

@@ -33,7 +33,7 @@ describe('unwired practical cancel transport provenance', () => {
   it('keeps execution neutral and the orchestration service operationally unreachable', () => {
     expect([...computeReachable(graph, NEUTRAL)].filter(file => file.startsWith('src/integration/'))).toEqual([]);
     const service = 'src/execution/live/practical-cancel/service.ts';
-    expect(files.filter(file => !file.startsWith('src/execution/live/practical-cancel/') && computeReachable(graph, file).has(service))).toEqual([]);
+    expect(files.filter(file => !file.startsWith('src/execution/live/practical-cancel/') && computeReachable(graph, file).has(service))).toEqual(['src/integration/coindcx/live/practical-account-coordinator.ts']);
     expect(code(NEUTRAL)).not.toMatch(/process\.env|http|https|fetch\(|public\s+barrel/);
   });
   it('uses genuine private producer associations and defining-module protected lookups', () => {

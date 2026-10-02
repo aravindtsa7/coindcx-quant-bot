@@ -177,3 +177,20 @@ export function deriveLiveClientOrderId(content: LiveExecutionIntentContent): st
 export function isLiveClientOrderId(value: unknown): value is string {
   return typeof value === 'string' && LIVE_CLIENT_ORDER_ID_PATTERN.test(value);
 }
+
+const liveClientOrderIdExec = RegExp.prototype.exec;
+export function isTrustedLiveClientOrderId(value: unknown): value is string {
+  return typeof value === 'string' && liveClientOrderIdExec.call(/^p17-[0-9a-f]{32}$/, value) !== null;
+}
+Object.freeze(isTrustedLiveClientOrderId);
+// Reviewed defining-owner binding protection.
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["LIVE_CLIENT_ORDER_ID_PATTERN","isTrustedLiveClientOrderId"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}

@@ -22,3 +22,15 @@ export function evidenceContentSha256(snapshot: { readonly provenance: EvidenceP
   const { contentSha256: _contentSha256, ...provenance } = snapshot.provenance;
   return sha256CanonicalJson({ ...snapshot, provenance });
 }
+
+// Reviewed defining-owner binding protection.
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["sha256CanonicalJson"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}

@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 import { isLosslessNumber, LosslessNumber } from 'lossless-json';
 import { z } from 'zod';
 
@@ -359,3 +360,168 @@ export const FuturesWalletTransactionsResponseSchema = z.array(
 export type FuturesWalletTransactionsResponse = z.infer<
   typeof FuturesWalletTransactionsResponseSchema
 >;
+
+/** Independent literal recipes: no public application-owned graph node is reused. */
+function makeOwnedRestGraphs() {
+const WireNumericSchema = z.union([
+  z.string(),
+  z.number(),
+  z.custom<LosslessNumber>((val) => isLosslessNumber(val), {
+    message: 'Expected LosslessNumber',
+  }),
+]);
+const PositiveIntegerStringSchema = z
+  .string()
+  .regex(/^[1-9]\d*$/, 'Must be a positive integer string (e.g. "1", "100")');
+const VALID_ORDER_STATUSES = [
+  'open',
+  'filled',
+  'partially_filled',
+  'partially_cancelled',
+  'cancelled',
+  'rejected',
+  'untriggered',
+] as const;
+const OrderStatusStringSchema = z
+  .string()
+  .min(1, 'Status must be non-empty')
+  .refine(
+    (val) => {
+      const parts = val.split(',').map((s) => s.trim());
+      if (parts.length === 0 || parts.some((p) => p === '')) return false;
+      return parts.every((p) => (VALID_ORDER_STATUSES as readonly string[]).includes(p));
+    },
+    {
+      message:
+        'Status must be a documented status or comma-separated combination of valid statuses (open, filled, partially_filled, partially_cancelled, cancelled, rejected, untriggered)',
+    }
+  );
+const ListInrOrdersRequestSchema = z.object({
+  status: OrderStatusStringSchema,
+  side: z.enum(['buy', 'sell']),
+  page: PositiveIntegerStringSchema,
+  size: PositiveIntegerStringSchema,
+});
+const ListInrPositionsRequestSchema = z.object({
+  page: PositiveIntegerStringSchema,
+  size: PositiveIntegerStringSchema,
+  pairs: z.string().min(1).optional(),
+  position_ids: z.string().min(1).optional(),
+});
+const UserInfoItemWireSchema = z
+  .object({
+    coindcx_id: z.string(),
+    first_name: z.string().optional().nullable(),
+    last_name: z.string().optional().nullable(),
+    mobile_number: z.string().optional().nullable(),
+    email: z.string().optional().nullable(),
+  })
+  .passthrough();
+const UserInfoResponseSchema = z.union([
+  z.array(UserInfoItemWireSchema),
+  UserInfoItemWireSchema,
+]);
+const FuturesPositionWireSchema = z
+  .object({
+    id: z.string(),
+    pair: z.string(),
+    active_pos: WireNumericSchema,
+    inactive_pos_buy: WireNumericSchema.optional().nullable(),
+    inactive_pos_sell: WireNumericSchema.optional().nullable(),
+    avg_price: WireNumericSchema,
+    liquidation_price: WireNumericSchema.optional().nullable(),
+    locked_margin: WireNumericSchema,
+    locked_user_margin: WireNumericSchema,
+    locked_order_margin: WireNumericSchema,
+    take_profit_trigger: WireNumericSchema.optional().nullable(),
+    stop_loss_trigger: WireNumericSchema.optional().nullable(),
+    leverage: WireNumericSchema,
+    maintenance_margin: WireNumericSchema.nullable(),
+    mark_price: WireNumericSchema.nullable(),
+    margin_type: z.string().nullable(), // null documented as isolated, 'crossed' unsupported for INR
+    settlement_currency_avg_price: WireNumericSchema.nullable(),
+    margin_currency_short_name: z.string(),
+    updated_at: z.union([z.number(), z.custom<LosslessNumber>(isLosslessNumber)]),
+  })
+  .passthrough();
+const FuturesPositionsResponseSchema = z.array(FuturesPositionWireSchema);
+const FuturesOrderWireSchema = z
+  .object({
+    id: z.string(),
+    pair: z.string(),
+    side: z.enum(['buy', 'sell']),
+    status: z.string(),
+    order_type: z.string(),
+    leverage: WireNumericSchema.optional().nullable(),
+    maker_fee: WireNumericSchema.optional().nullable(),
+    taker_fee: WireNumericSchema.optional().nullable(),
+    fee_amount: WireNumericSchema.optional().nullable(),
+    price: WireNumericSchema.optional().nullable(),
+    stop_price: WireNumericSchema.optional().nullable(),
+    avg_price: WireNumericSchema.optional().nullable(),
+    total_quantity: WireNumericSchema,
+    remaining_quantity: WireNumericSchema,
+    cancelled_quantity: WireNumericSchema.optional().nullable(),
+    settlement_currency_conversion_price: WireNumericSchema.optional().nullable(),
+    stage: z.string().optional().nullable(),
+    position_margin_type: z.string().optional().nullable(),
+    margin_currency_short_name: z.string(),
+    created_at: z.union([z.number(), z.custom<LosslessNumber>(isLosslessNumber)]),
+    updated_at: z.union([z.number(), z.custom<LosslessNumber>(isLosslessNumber)]),
+    // Observed by the read-only provider probe (null on orders created without
+    // one) and provider-confirmed on create. Accepted as ANY type so one
+    // unexpected value cannot fail a whole page; `normalizeOrder` keeps only an
+    // exact string and maps everything else to null, which never matches.
+    client_order_id: z.unknown().optional(),
+  })
+  .passthrough();
+const FuturesOrdersResponseSchema = z.array(FuturesOrderWireSchema);
+return { UserInfoResponseSchema, FuturesOrdersResponseSchema, FuturesPositionsResponseSchema, ListInrOrdersRequestSchema, ListInrPositionsRequestSchema };
+}
+const ownedRestGraphs = makeOwnedRestGraphs();
+const ownedZodError = z.ZodError;
+function copyOwnedParserIssue(value: unknown): unknown {
+  if (value === null || typeof value !== 'object') return typeof value === 'function' || typeof value === 'symbol' ? '[UNSAFE_PARSE_ISSUE]' : value;
+  if (types.isProxy(value)) throw new Error('UNSAFE_PARSE_ISSUE');
+  if (value instanceof ownedZodError) return new ownedZodError(value.issues.map(issue => copyOwnedParserIssue(issue) as z.ZodIssue));
+  const result: Record<string, unknown> | unknown[] = Array.isArray(value) ? [] : {};
+  for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
+    if (!descriptor.enumerable) continue;
+    if (!Object.hasOwn(descriptor, 'value')) throw new Error('UNSAFE_PARSE_ISSUE');
+    Object.defineProperty(result, key, { value: copyOwnedParserIssue(descriptor.value), enumerable: true, writable: true, configurable: true });
+  }
+  return result;
+}
+function detachOwnedParserResult<T extends z.SafeParseReturnType<unknown, unknown>>(result: T): T {
+  if (result.success) return result;
+  try { return { success: false, error: new ownedZodError(result.error.issues.map(issue => copyOwnedParserIssue(issue) as z.ZodIssue)) } as T; }
+  catch { return { success: false, error: new ownedZodError([{ code: 'custom', path: [], message: 'Unsafe parser issue data' }]) } as T; }
+}
+export function parseOwnedUserInfoResponse(value: unknown): ReturnType<typeof UserInfoResponseSchema.safeParse> {
+  return detachOwnedParserResult(ownedRestGraphs.UserInfoResponseSchema.safeParse(value));
+}
+Object.freeze(parseOwnedUserInfoResponse);
+export function parseOwnedOrdersResponse(value: unknown): ReturnType<typeof FuturesOrdersResponseSchema.safeParse> {
+  return detachOwnedParserResult(ownedRestGraphs.FuturesOrdersResponseSchema.safeParse(value));
+}
+Object.freeze(parseOwnedOrdersResponse);
+export function parseOwnedPositionsResponse(value: unknown): ReturnType<typeof FuturesPositionsResponseSchema.safeParse> {
+  return detachOwnedParserResult(ownedRestGraphs.FuturesPositionsResponseSchema.safeParse(value));
+}
+Object.freeze(parseOwnedPositionsResponse);
+export function parseOwnedOrdersRequest(value: unknown): ReturnType<typeof ListInrOrdersRequestSchema.safeParse> {
+  return detachOwnedParserResult(ownedRestGraphs.ListInrOrdersRequestSchema.safeParse(value));
+}
+Object.freeze(parseOwnedOrdersRequest);
+export function parseOwnedPositionsRequest(value: unknown): ReturnType<typeof ListInrPositionsRequestSchema.safeParse> {
+  return detachOwnedParserResult(ownedRestGraphs.ListInrPositionsRequestSchema.safeParse(value));
+}
+Object.freeze(parseOwnedPositionsRequest);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const [name, value] of Object.entries({ parseOwnedUserInfoResponse, parseOwnedOrdersResponse, parseOwnedPositionsResponse, parseOwnedOrdersRequest, parseOwnedPositionsRequest })) {
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.get === undefined || descriptor.set !== undefined || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}

@@ -1788,3 +1788,44 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
     }
   }
 }
+
+// Defining-module snapshot: owned instances cannot inherit later replacements.
+const createOwnedLiveExecutionRepositoryDescriptors = Object.freeze(Object.getOwnPropertyDescriptors(PrismaLiveExecutionRepository.prototype));
+export function createOwnedLiveExecutionRepository(prisma: PrismaClient): PrismaLiveExecutionRepository {
+  const instance = new PrismaLiveExecutionRepository(prisma);
+  for (const [key, descriptor] of Object.entries(createOwnedLiveExecutionRepositoryDescriptors)) {
+    if (key === 'constructor') continue;
+    if (typeof descriptor.value === 'function') Object.defineProperty(instance, key, { value: Object.freeze(descriptor.value.bind(instance)), writable: false, configurable: false });
+    else if (descriptor.get !== undefined) Object.defineProperty(instance, key, { get: Object.freeze(descriptor.get.bind(instance)), configurable: false });
+  }
+  Object.freeze(instance);
+  return instance;
+}
+Object.freeze(createOwnedLiveExecutionRepository);
+
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const [name, value] of Object.entries({ createOwnedLiveExecutionRepository, PrismaLiveExecutionRepository })) {
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.get === undefined || descriptor.set !== undefined || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}
+
+// Reviewed defining-owner binding protection.
+Object.freeze(claimCancelWithinCallerFencedTransaction);
+Object.freeze(armCancelWireWithinCallerFencedTransaction);
+Object.freeze(consumeCancelDispatchWithinCallerFencedTransaction);
+Object.freeze(reproveCancelOrderWithinCallerFencedTransaction);
+Object.freeze(completeCancelAttemptWithinCallerFencedTransaction);
+Object.freeze(releaseUnarmedCancelClaimWithinCallerFencedTransaction);
+Object.freeze(releaseArmedUndispatchedCancelClaimWithinCallerFencedTransaction);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["claimCancelWithinCallerFencedTransaction","armCancelWireWithinCallerFencedTransaction","consumeCancelDispatchWithinCallerFencedTransaction","reproveCancelOrderWithinCallerFencedTransaction","completeCancelAttemptWithinCallerFencedTransaction","releaseUnarmedCancelClaimWithinCallerFencedTransaction","releaseArmedUndispatchedCancelClaimWithinCallerFencedTransaction"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
+}

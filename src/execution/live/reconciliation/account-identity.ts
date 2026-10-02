@@ -37,8 +37,9 @@ import type { LiveReconciliationFinding } from './types';
 /** Lowercase 64-hex SHA-256. The only accepted representation of a provider account identity. */
 export const LIVE_PROVIDER_ACCOUNT_FINGERPRINT_PATTERN = /^[0-9a-f]{64}$/;
 
+const providerFingerprintExec = RegExp.prototype.exec;
 export function isProviderAccountFingerprint(value: unknown): value is string {
-  return typeof value === 'string' && LIVE_PROVIDER_ACCOUNT_FINGERPRINT_PATTERN.test(value);
+  return typeof value === 'string' && providerFingerprintExec.call(/^[0-9a-f]{64}$/, value) !== null;
 }
 
 /**
@@ -171,4 +172,21 @@ export function accountIdentityGateSnapshotSha256(verification: LiveProviderAcco
     outcome: verification.kind,
     failure: verification.kind === 'ACCOUNT_IDENTITY_UNVERIFIED' ? verification.reason : null,
   });
+}
+
+// Reviewed defining-owner binding protection.
+Object.freeze(isProviderAccountFingerprint);
+Object.freeze(verifyProviderAccountIdentity);
+Object.freeze(accountIdentityFinding);
+Object.freeze(accountIdentityGateSnapshotSha256);
+Object.freeze(requireExpectedProviderAccountFingerprint);
+Object.freeze(providerAccountFingerprint);
+if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
+  for (const name of ["isProviderAccountFingerprint","verifyProviderAccountIdentity","accountIdentityFinding","accountIdentityGateSnapshotSha256","requireExpectedProviderAccountFingerprint","providerAccountFingerprint","LIVE_PROVIDER_ACCOUNT_FINGERPRINT_PATTERN"]) {
+    const value = module.exports[name] as unknown;
+    const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
+    if (descriptor?.configurable === false) {
+      if (descriptor.set !== undefined || (descriptor.get === undefined && descriptor.writable !== false) || module.exports[name] !== value) throw new Error('OWNED_TRUSTED_EXPORT_INVALID');
+    } else Object.defineProperty(module.exports, name, { get: () => value, configurable: false });
+  }
 }
