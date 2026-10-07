@@ -11,6 +11,7 @@ import { WireNumericSchema } from '../integration/coindcx/schemas';
 import { CanonicalDecimal } from './canonical-decimal';
 import { MIN_CANONICAL_OPEN_TIME_MS } from './models';
 import { CanonicalRecoveryError } from './errors';
+import { boundProductionTransportBudget, readBudgetRefusal, type ReadPermit, type TransportReadBudget } from '../integration/coindcx/rate-limit/runtime/read-budget';
 
 export const DEFAULT_PUBLIC_MARKET_DATA_URL = 'https://public.coindcx.com';
 export const DEFAULT_REST_TIMEOUT_MS = 10_000;
@@ -38,6 +39,12 @@ export interface FuturesCandleRestReaderConfig {
   readonly timeoutMs?: number | undefined;
   readonly clock?: Clock | undefined;
   readonly httpTransport?: ((url: string, timeoutMs: number) => Promise<string>) | undefined;
+  /**
+   * M2 W5: the shared REST read budget paying for every request of the default HTTP transport. Absent: the set-once
+   * production read binding (scope PUBLIC), which refuses while unbound. There is no unpaced fallback. An injected
+   * `httpTransport` replaces the default transport entirely (a test seam; no src caller supplies one).
+   */
+  readonly readBudget?: TransportReadBudget | undefined;
 }
 
 const RawRestCandleItemSchema = z.object({
@@ -77,7 +84,8 @@ export class CoinDcxFuturesCandleRestReader {
     this.#baseUrl = (config.baseUrl ?? DEFAULT_PUBLIC_MARKET_DATA_URL).replace(/\/+$/, '');
     this.#timeoutMs = config.timeoutMs ?? DEFAULT_REST_TIMEOUT_MS;
     this.#clock = config.clock ?? new SystemClock();
-    this.#httpTransport = config.httpTransport ?? defaultHttpTransport;
+    const readBudget = config.readBudget ?? boundProductionTransportBudget('PUBLIC');
+    this.#httpTransport = config.httpTransport ?? ((url, timeoutMs) => defaultHttpTransport(url, timeoutMs, readBudget));
   }
 
   public async fetchClosedCandles(query: FetchCandlesQuery): Promise<readonly RestCandleRecord[]> {
@@ -225,9 +233,30 @@ export class CoinDcxFuturesCandleRestReader {
   }
 }
 
-async function defaultHttpTransport(urlString: string, timeoutMs: number): Promise<string> {
+/** M2 W5: one fresh read permit per candle request, or a refusal before any HTTP (missing, unavailable, refusing). */
+async function acquireReadPermit(budget: TransportReadBudget, lifetimeMs: number): Promise<ReadPermit> {
+  let acquired;
+  try {
+    acquired = await budget.budget.acquire({ scope: budget.scope, lifetimeMs: Math.max(1, lifetimeMs) });
+  } catch {
+    throw new Error(readBudgetRefusal('READ_BUDGET_ERROR').message);
+  }
+  if (acquired.kind !== 'GRANTED') throw new Error(readBudgetRefusal(acquired.reason).message);
+  return acquired.permit;
+}
+
+async function defaultHttpTransport(urlString: string, timeoutMs: number, readBudget: TransportReadBudget): Promise<string> {
   const started = performance.now();
-  const parsedUrl = new URL(urlString);
+  // M2 W5: admission before request preparation. The wait counts against this request's timeout.
+  const permit = await acquireReadPermit(readBudget, timeoutMs);
+  let parsedUrl: URL;
+  try {
+    if (performance.now() - started >= timeoutMs) throw new Error(`Request timed out after ${timeoutMs}ms`);
+    parsedUrl = new URL(urlString);
+  } catch (error) {
+    permit.release(); // preparation failed before any request creation: irrevocable known non-use
+    throw error;
+  }
   const isHttps = parsedUrl.protocol === 'https:';
   const transportModule = isHttps ? https : http;
 
@@ -252,7 +281,8 @@ async function defaultHttpTransport(urlString: string, timeoutMs: number): Promi
       clearDeadline();
       resolveWire(body);
     };
-    const req = transportModule.request(
+    // The request is created inside the permit's synchronous start, which reports STARTED at creation (also on throw).
+    const creation = permit.start(() => transportModule.request(
       parsedUrl,
       {
         method: 'GET',
@@ -263,8 +293,15 @@ async function defaultHttpTransport(urlString: string, timeoutMs: number): Promi
       },
       (res) => {
         response = res;
-        if (settled) { res.destroy(); return; }
         const statusCode = res.statusCode ?? 0;
+        if (statusCode === 429) {
+          // Shared throttle observation (raw headers); the caller-facing error below is unchanged.
+          try {
+            const retryAfter = res.headers['retry-after'], serverDate = res.headers.date;
+            permit.throttled({ ...(typeof retryAfter === 'string' ? { retryAfter } : {}), ...(typeof serverDate === 'string' ? { serverDate } : {}) });
+          } catch { /* budget reporting only */ }
+        }
+        if (settled) { res.destroy(); return; }
         let responseData = '';
         let totalBytes = 0;
 
@@ -299,7 +336,15 @@ async function defaultHttpTransport(urlString: string, timeoutMs: number): Promi
           res.removeAllListeners('aborted');
         });
       }
-    );
+    ));
+    if (creation.kind !== 'STARTED') {
+      // The start check voided the permit (NOT_STARTED reported): no request was created.
+      settled = true;
+      rejectWire(new Error(readBudgetRefusal(`PERMIT_${creation.reason}`).message));
+      return;
+    }
+    const req = creation.value;
+    req.once('close', () => permit.complete()); // positive local completion/teardown evidence
 
     deadline = setTimeout(() => reject(timeoutError()), Math.max(0, timeoutMs - (performance.now() - started)));
 

@@ -6,6 +6,7 @@ import { CoinDcxFuturesCandleRestReader } from '../../../src/market-data/rest-ca
 import { CanonicalMarketDataEngine } from '../../../src/market-data/canonical-engine';
 import { InMemoryCandleRepository } from './test-helpers';
 import { P, T, deferred } from './audit-a1-helpers';
+import { fixtureTransportBudget } from '../../helpers/read-budget-fixture';
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); });
@@ -26,13 +27,13 @@ describe('A-F17 Phase 5 complete-operation deadline', () => {
       res.writeHead(200); res.flushHeaders();
       if (partial) res.write('{"s":"ok",');
     });
-    await expect(new CoinDcxFuturesCandleRestReader({ baseUrl, timeoutMs: 100 }).fetchClosedCandles(query)).rejects.toThrow(/timed out/);
+    await expect(new CoinDcxFuturesCandleRestReader({ baseUrl, timeoutMs: 100, readBudget: fixtureTransportBudget('PUBLIC') }).fetchClosedCandles(query)).rejects.toThrow(/timed out/);
     await closed.promise;
   });
 
   it('partial JSON followed by premature close rejects promptly', async () => {
     const baseUrl = await serve((_req, res) => { res.writeHead(200, { 'Content-Length': '1000' }); res.write('{'); setImmediate(() => res.destroy()); });
-    const result = await new CoinDcxFuturesCandleRestReader({ baseUrl, timeoutMs: 1000 }).fetchClosedCandles(query).catch(error => error as Error);
+    const result = await new CoinDcxFuturesCandleRestReader({ baseUrl, timeoutMs: 1000, readBudget: fixtureTransportBudget('PUBLIC') }).fetchClosedCandles(query).catch(error => error as Error);
     expect(result).toBeInstanceOf(Error);
     expect((result as Error).message).toMatch(/aborted|closed|reset/i);
   });
@@ -46,7 +47,7 @@ describe('A-F17 Phase 5 complete-operation deadline', () => {
       res.once('close', () => { clearInterval(ticker); clearTimeout(end); closed.resolve(); });
     });
     const start = performance.now();
-    await expect(new CoinDcxFuturesCandleRestReader({ baseUrl, timeoutMs: 100 }).fetchClosedCandles(query)).rejects.toThrow(/timed out/);
+    await expect(new CoinDcxFuturesCandleRestReader({ baseUrl, timeoutMs: 100, readBudget: fixtureTransportBudget('PUBLIC') }).fetchClosedCandles(query)).rejects.toThrow(/timed out/);
     expect(performance.now() - start).toBeLessThan(800);
     await closed.promise;
   });
@@ -54,7 +55,7 @@ describe('A-F17 Phase 5 complete-operation deadline', () => {
   it('normal response settles once and survives its former deadline', async () => {
     const baseUrl = await serve((_req, res) => res.end(body));
     let settlements = 0;
-    const result = await new CoinDcxFuturesCandleRestReader({ baseUrl, timeoutMs: 200 }).fetchClosedCandles(query).then(value => { settlements++; return value; });
+    const result = await new CoinDcxFuturesCandleRestReader({ baseUrl, timeoutMs: 200, readBudget: fixtureTransportBudget('PUBLIC') }).fetchClosedCandles(query).then(value => { settlements++; return value; });
     expect(result).toEqual([]);
     await new Promise(resolve => setTimeout(resolve, 220));
     expect(settlements).toBe(1);
@@ -67,7 +68,7 @@ describe('A-F17 Phase 5 complete-operation deadline', () => {
       res.once('close', () => clearTimeout(timer));
     });
     let settlements = 0;
-    const result = await new CoinDcxFuturesCandleRestReader({ baseUrl, timeoutMs: 100 }).fetchClosedCandles(query).then(
+    const result = await new CoinDcxFuturesCandleRestReader({ baseUrl, timeoutMs: 100, readBudget: fixtureTransportBudget('PUBLIC') }).fetchClosedCandles(query).then(
       () => { settlements++; return 'SUCCESS'; }, error => { settlements++; return (error as Error).message; });
     expect(result === 'SUCCESS' || /timed out|deadline/.test(result)).toBe(true);
     await new Promise(resolve => setTimeout(resolve, 120));
@@ -79,18 +80,18 @@ describe('A-F17 Phase 5 complete-operation deadline', () => {
       res.write('{'); const timer = setTimeout(() => res.destroy(), 100);
       res.once('close', () => clearTimeout(timer));
     });
-    await expect(new CoinDcxFuturesCandleRestReader({ baseUrl, timeoutMs: 100 }).fetchClosedCandles(query)).rejects.toThrow();
+    await expect(new CoinDcxFuturesCandleRestReader({ baseUrl, timeoutMs: 100, readBudget: fixtureTransportBudget('PUBLIC') }).fetchClosedCandles(query)).rejects.toThrow();
     await new Promise(resolve => setTimeout(resolve, 120));
   });
 
   it('connection reset before headers rejects', async () => {
     const baseUrl = await serve(req => req.socket.destroy());
-    await expect(new CoinDcxFuturesCandleRestReader({ baseUrl, timeoutMs: 100 }).fetchClosedCandles(query)).rejects.toThrow();
+    await expect(new CoinDcxFuturesCandleRestReader({ baseUrl, timeoutMs: 100, readBudget: fixtureTransportBudget('PUBLIC') }).fetchClosedCandles(query)).rejects.toThrow();
   });
 
   it('canonical recovery receives failure, latches fault and never announces completion', async () => {
     const baseUrl = await serve((_req, res) => { res.write('{'); setImmediate(() => res.destroy()); });
-    const engine = new CanonicalMarketDataEngine({ repository: new InMemoryCandleRepository(), restReader: new CoinDcxFuturesCandleRestReader({ baseUrl, timeoutMs: 100 }) });
+    const engine = new CanonicalMarketDataEngine({ repository: new InMemoryCandleRepository(), restReader: new CoinDcxFuturesCandleRestReader({ baseUrl, timeoutMs: 100, readBudget: fixtureTransportBudget('PUBLIC') }) });
     const events: string[] = []; engine.subscribe(event => events.push(event.eventType));
     try {
       await engine.initializePair(P);

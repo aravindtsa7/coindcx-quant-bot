@@ -10,7 +10,7 @@ import {
 } from '../../../../src/integration/coindcx/rate-limit/runtime/mutation-budget';
 import { createCoordinatorReadBudget } from '../../../../src/integration/coindcx/rate-limit/runtime/read-budget';
 import { CoinDcxTransport } from '../../../../src/integration/coindcx/transport';
-import { cleanup, clientConfig, fixture, limiterFixture, maxInWindow, sleep, waitFor, type Fixture } from './support';
+import { cleanup, clientConfig, fixture, limiterFixture, maxInWindow, recordHttpRequestCreations, sleep, waitFor, type Fixture } from './support';
 
 // M2 W4: the order-mutation transport over the shared coordinator budget. Loopback HTTP servers, temporary state
 // directories, synthetic credentials. No provider, external network or database access.
@@ -145,7 +145,8 @@ describe('M2 W4 shared read/mutation budget', () => {
     await coordinator(f);
     const c = await client(f.pipe);
     const api = await loopback();
-    const starts = () => api.hits;
+    const creations = recordHttpRequestCreations(); stops.push(creations.restore); // actual starts, not server arrival
+    const starts = () => creations.times;
     const reads = new CoinDcxTransport({ baseUrl: api.url, readBudget: { budget: createCoordinatorReadBudget(c, { cls: 'P1', deadlineInMs: 30_000 }), scope: 'API_AUTH' } });
     const mutations = transportFor(api.url);
     const budget = createCoordinatorMutationBudget(c, { cls: 'P0', deadlineInMs: 30_000 });

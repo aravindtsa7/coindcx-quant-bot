@@ -3,7 +3,9 @@
 import { randomBytes } from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
+import { performance } from 'node:perf_hooks';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { validateClientConfig, validateCoordinatorConfig, type ClientConfig, type CoordinatorConfig } from '../../../../src/integration/coindcx/rate-limit/runtime/config';
@@ -49,6 +51,20 @@ export async function waitFor<T>(probe: () => T | null | undefined | false, time
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
     await sleep(10);
   }
+}
+/**
+ * Records when each `node:http` request is actually created. The paced primitives create it inside a permit's
+ * synchronous start, so these are the actual starts (a loopback server's arrival time lags them under load).
+ */
+export function recordHttpRequestCreations(): { readonly times: number[]; readonly restore: () => void } {
+  const times: number[] = [];
+  const original = http.request;
+  const recorder = (...args: unknown[]): http.ClientRequest => {
+    times.push(performance.timeOrigin + performance.now());
+    return (original as (...a: unknown[]) => http.ClientRequest).apply(http, args);
+  };
+  (http as { request: unknown }).request = recorder;
+  return { times, restore: () => { (http as { request: unknown }).request = original; } };
 }
 export function maxInWindow(times: readonly number[], windowMs: number): number {
   const sorted = [...times].sort((a, b) => a - b);

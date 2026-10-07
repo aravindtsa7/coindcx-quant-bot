@@ -9,12 +9,14 @@ import { analyzeModuleReferences, listSourceFiles } from './support/import-graph
 // of scope for this limiter.
 //
 // Covered in W3: the three read primitives. Covered in W4: the order-mutation transport's request site (mutation
-// permits for the practical cancel and Phase 17 create/cancel, a read permit for order observation).
+// permits for the practical cancel and Phase 17 create/cancel, a read permit for order observation). Covered in W5:
+// the candle-reader request site and its callers (accounted for below).
 // Pending (explicit, allowlisted):
-//   - the candle-reader primitive (W5), an unpaced request site;
+//   - no unpaced request site remains;
 //   - the Phase 18 orphan-cancellation mutation PATH (`GatewayOrphanCancellation`): not integrated with the budget. It
 //     carries no permit, so the transport refuses it before any request; it is disabled/unwired, not paced.
-// Complete mutation-path coverage and final no-bypass completion are NOT claimed until both pending lists are empty.
+// Complete mutation-path coverage, complete M2 coverage and final no-bypass completion are NOT claimed while the
+// orphan-cancellation path is pending.
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const SRC_ROOT = path.join(REPO_ROOT, 'src');
 const rel = (abs: string): string => path.relative(REPO_ROOT, abs).split(path.sep).join('/');
@@ -24,10 +26,9 @@ const importsOf = (file: string): readonly string[] => analyzeModuleReferences(r
 const REQUEST_SITE = /\b[A-Za-z]+\.request\(/g;
 
 const MUTATION_TRANSPORT = 'src/integration/coindcx/live/mutation-transport.ts';
-const COVERED = ['src/integration/coindcx/instrument-authority.ts', MUTATION_TRANSPORT, 'src/integration/coindcx/paper-evidence.ts', 'src/integration/coindcx/transport.ts'];
-const PENDING: Readonly<Record<string, 'W5'>> = {
-  'src/market-data/rest-candle-reader.ts': 'W5',
-};
+const CANDLE_READER = 'src/market-data/rest-candle-reader.ts';
+const COVERED = ['src/integration/coindcx/instrument-authority.ts', MUTATION_TRANSPORT, 'src/integration/coindcx/paper-evidence.ts', 'src/integration/coindcx/transport.ts', CANDLE_READER];
+const PENDING: Readonly<Record<string, 'W5'>> = {};
 /** Mutation paths through a covered request site that are NOT integrated with the budget (refused, not paced). */
 const PENDING_MUTATION_PATHS: Readonly<Record<string, 'ORPHAN_CANCEL_UNINTEGRATED'>> = {
   'src/execution/live/reconciliation/gateway-orphan-cancellation.ts': 'ORPHAN_CANCEL_UNINTEGRATED',
@@ -38,7 +39,7 @@ const LOCAL_PIPE_IPC = ['src/integration/coindcx/rate-limit/runtime/client.ts', 
 const httpImporters = files.filter((file) => importsOf(file).some((s) => ['node:http', 'node:https', 'http', 'https'].includes(s)));
 const requestSites = httpImporters.filter((file) => (code(file).match(REQUEST_SITE) ?? []).length > 0);
 
-describe('M2 REST limiter coverage (W3/W4)', () => {
+describe('M2 REST limiter coverage (W3/W4/W5)', () => {
   it('every provider HTTP request site is either covered or explicitly pending', () => {
     expect(requestSites).toEqual([...COVERED, ...Object.keys(PENDING)].sort());
   });
@@ -86,7 +87,24 @@ describe('M2 REST limiter coverage (W3/W4)', () => {
       expect((code(file).match(REQUEST_SITE) ?? []).length, `${file} (${wave})`).toBeGreaterThan(0);
       expect(importsOf(file).some((s) => s.includes('read-budget') || s.includes('mutation-budget')), `${file} must flip to COVERED when integrated in ${wave}`).toBe(false);
     }
-    expect(Object.keys(PENDING)).toEqual(['src/market-data/rest-candle-reader.ts']);
+    expect(Object.keys(PENDING)).toEqual([]); // W5 covered the last unpaced request site; the orphan PATH stays pending below
+  });
+
+  it('W5: the candle reader is covered with every caller accounted for (no unpaced construction or transport seam in src)', () => {
+    const text = code(CANDLE_READER);
+    // Admission before request preparation; the only request is created inside the permit start.
+    const transport = text.slice(text.indexOf('async function defaultHttpTransport('));
+    expect(transport.indexOf('await acquireReadPermit(readBudget, timeoutMs)')).toBeGreaterThan(0);
+    expect(transport.indexOf('await acquireReadPermit(readBudget, timeoutMs)')).toBeLessThan(transport.indexOf('new URL(urlString)'));
+    expect(text).toContain("config.readBudget ?? boundProductionTransportBudget('PUBLIC')"); // no unpaced default
+    expect(text.match(/defaultHttpTransport\(/g)).toHaveLength(2); // definition and the single budgeted binding
+    // Callers: the only constructions in src are the engine's default reader (budget passed through); nothing in src
+    // supplies the unpaced `httpTransport` test seam; the historical backfill has no src construction (injected reader).
+    const constructs = files.filter((file) => /new CoinDcxFuturesCandleRestReader\(/.test(code(file)));
+    expect(constructs).toEqual(['src/market-data/canonical-engine.ts']);
+    expect(code('src/market-data/canonical-engine.ts')).toContain('readBudget: config.readBudget');
+    expect(files.filter((file) => file !== CANDLE_READER && /httpTransport\s*:/.test(code(file)))).toEqual([]);
+    expect(files.filter((file) => /new HistoricalBackfillService\(|new CanonicalMarketDataEngine\(/.test(code(file)))).toEqual([]);
   });
 
   it('pending mutation path: orphan cancellation calls the gateway without a budget permit and has no admission (refused, not covered)', () => {

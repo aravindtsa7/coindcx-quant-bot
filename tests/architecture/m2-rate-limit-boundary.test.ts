@@ -81,6 +81,8 @@ describe('M2 W2 rate-limit runtime boundary', () => {
       // the integration-layer implementations of the two execution budget ports.
       'src/integration/coindcx/live/mutation-transport.ts': [...mutation, ...read],
       'src/integration/coindcx/live/mutation-budget-ports.ts': mutation,
+      // W5: the candle-reader primitive (read permits for every candle request).
+      'src/market-data/rest-candle-reader.ts': read,
     });
     // Both budget modules have type-only imports, so no primitive loads the IPC runtime (node:net).
     for (const budgetModule of ['read-budget.ts', 'mutation-budget.ts']) {

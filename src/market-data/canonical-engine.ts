@@ -11,7 +11,7 @@ import { createCanonicalCandle1m } from './models';
 import { PairPersistenceCoordinator } from './pair-persistence-coordinator';
 import { CommitOrigin, EpochToken, PairCanonicalStateMachine, PairStateCallbacks } from './pair-state';
 import { Candle1mRepository, PrismaCandle1mRepository } from './persistence/candle-repository';
-import { CoinDcxFuturesCandleRestReader } from './rest-candle-reader';
+import { CoinDcxFuturesCandleRestReader, type FuturesCandleRestReaderConfig } from './rest-candle-reader';
 import {
   CanonicalCandle1m,
   CanonicalEventListener,
@@ -46,6 +46,8 @@ interface StartOperation {
 export interface CanonicalMarketDataEngineConfig {
   readonly repository?: Candle1mRepository | undefined;
   readonly restReader?: CoinDcxFuturesCandleRestReader | undefined;
+  /** M2 W5: read budget for the default REST reader. Absent: the unbound production binding (every read refused). */
+  readonly readBudget?: FuturesCandleRestReaderConfig['readBudget'];
   readonly clock?: Clock | undefined;
   readonly scheduler?: StreamScheduler | undefined;
   readonly finalizationGraceMs?: number | undefined;
@@ -143,7 +145,7 @@ export class CanonicalMarketDataEngine {
     this.#repository = config.repository ?? new PrismaCandle1mRepository();
     this.#restReader =
       config.restReader ??
-      new CoinDcxFuturesCandleRestReader(config.clock !== undefined ? { clock: config.clock } : {});
+      new CoinDcxFuturesCandleRestReader({ ...(config.clock !== undefined ? { clock: config.clock } : {}), readBudget: config.readBudget });
     this.#clock = config.clock ?? new SystemClock();
     this.#scheduler = config.scheduler ?? SystemStreamScheduler;
     this.#finalizationGraceMs = config.finalizationGraceMs ?? 1000;
