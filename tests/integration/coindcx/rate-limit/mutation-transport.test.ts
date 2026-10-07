@@ -113,7 +113,9 @@ describe('M2 W4 mutation transport: consumption, actual start and completion acc
     expect((await c.control('STOP')).result).toBe('APPLIED');
     await waitFor(() => c.view.admission === 'STOPPED', 5000, 'stop observed');
     expect(await transport.execute('CANCEL_ORDER', { timestamp: 1, id: 'x' }, 2000, revoked)).toEqual({ kind: 'PRE_DISPATCH', reasonCode: 'BUDGET_REFUSED' });
-    expect(await budget.acquire({ operation: 'CREATE', lifetimeMs: 1000 })).toEqual({ kind: 'REFUSED', reason: 'ADMISSION_STOPPED' });
+    // W6: the client that sent STOP refuses locally; another client still meets the coordinator's STOP.
+    expect(await budget.acquire({ operation: 'CREATE', lifetimeMs: 1000 })).toEqual({ kind: 'REFUSED', reason: 'LOCAL_STOP' });
+    expect(await createCoordinatorMutationBudget(await client(f.pipe), { cls: 'P0', deadlineInMs: 5000 }).acquire({ operation: 'CREATE', lifetimeMs: 1000 })).toEqual({ kind: 'REFUSED', reason: 'ADMISSION_STOPPED' });
     expect((await c.control('RESET_STOP')).result).toBe('APPLIED');
     await waitFor(() => c.view.admission === 'OPEN', 5000, 'stop reset');
     const disconnected = await grant(budget, 'CREATE');

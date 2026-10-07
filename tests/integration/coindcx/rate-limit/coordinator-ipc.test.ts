@@ -136,7 +136,9 @@ describe('M2 W2 coordinator: STOP, throttle and probes (acknowledged after durab
       await probe.complete();
     }
     expect([coordinator.state.admission, coordinator.state.scopes.API_AUTH.kind, coordinator.state.scopes.PUBLIC.kind]).toEqual(['STOPPED', 'CLEAR', 'CLEAR']);
-    expect(await c.acquire(read({ operation: 'CREATE' }))).toEqual({ kind: 'REFUSED', code: 'ADMISSION_STOPPED' });
+    // W6: the client that sent STOP refuses its own mutations locally; another client still meets the coordinator's STOP.
+    expect(await c.acquire(read({ operation: 'CREATE' }))).toEqual({ kind: 'REFUSED', code: 'LOCAL_STOP' });
+    expect(await prober.acquire(read({ operation: 'CREATE' }))).toEqual({ kind: 'REFUSED', code: 'ADMISSION_STOPPED' });
     expect((await c.acquire(read())).kind).toBe('GRANTED');
   }, 30_000);
 

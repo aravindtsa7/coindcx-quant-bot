@@ -87,8 +87,10 @@ describe('M2 W1 operator STOP is orthogonal to the throttle', () => {
     expect(stop).toContainEqual({ kind: 'REVOKE', sessionId: 'S1', grantIds: ['g-create'] });
     expect(d.state.charges.find((c) => c.grantId === 'g-create')).toBeDefined(); // held until NOT_STARTED arrives
     expect(refused(d.send(2, { type: 'ENQUEUE', request: req('c1', 2, { operation: 'CANCEL' }) }))).toEqual([['c1', 'ADMISSION_STOPPED']]);
-    expect(refused(d.send(3, { type: 'ENQUEUE', request: req('c2', 3, { operation: 'CANCEL', hookToken: {} }) }))).toEqual([['c2', 'HOOK_TOKEN_MISMATCH']]);
+    // No registered hook (always so in production until M6): a caller-supplied token is CANCELLATION_HOOK_ABSENT (V3 R2-05).
+    expect(refused(d.send(3, { type: 'ENQUEUE', request: req('c2', 3, { operation: 'CANCEL', hookToken: {} }) }))).toEqual([['c2', 'CANCELLATION_HOOK_ABSENT']]);
     d.send(4, { type: 'HOOK_REGISTERED', token });
+    expect(refused(d.send(5, { type: 'ENQUEUE', request: req('c4', 5, { operation: 'CANCEL', hookToken: {} }) }))).toEqual([['c4', 'HOOK_TOKEN_MISMATCH']]);
     expect(delivered(d.send(5, { type: 'ENQUEUE', request: req('c3', 5, { operation: 'CANCEL', hookToken: token }) }))).toEqual(['c3']);
     expect(refused(d.send(6, { type: 'ENQUEUE', request: req('r', 6, { hookToken: token }) }))).toEqual([['r', 'INVALID_REQUEST']]);
   });

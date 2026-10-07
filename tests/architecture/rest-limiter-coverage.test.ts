@@ -118,4 +118,16 @@ describe('M2 REST limiter coverage (W3/W4/W5)', () => {
     const callers = files.filter((file) => /budgetPermit/.test(code(file)) && /\.(?:placeOrder|cancelOrder)\(/.test(code(file)));
     expect(callers).toEqual(['src/execution/live/service.ts']);
   });
+
+  it('W6 final no-bypass exit (empty allowlist): BLOCKED while an integration gap remains; the pending path is kept, not removed', () => {
+    // Every provider REST request site in src is a covered primitive and no unpaced request site remains...
+    expect(requestSites).toEqual([...COVERED].sort());
+    expect(Object.keys(PENDING)).toEqual([]);
+    // ...but the design's W6 exit requires the WHOLE allowlist to be empty, and the Phase 18 orphan-cancellation mutation
+    // path is still unintegrated (refused before transmission). The exit is therefore BLOCKED; it is not claimed.
+    const exitBlockedBy = Object.keys(PENDING_MUTATION_PATHS);
+    expect(exitBlockedBy).toEqual(['src/execution/live/reconciliation/gateway-orphan-cancellation.ts']);
+    // Deferred G-RX acquisition/downloader sources stay outside this implementation.
+    expect(files.filter((file) => /historical\/acquisition\.ts$|coindcx-historical-candles/.test(file))).toEqual([]);
+  });
 });

@@ -25,7 +25,7 @@ export type BudgetOperation = 'READ' | 'PROBE' | 'CREATE' | 'CANCEL';
 export type ReportKind = 'RECEIVED' | 'STARTED' | 'NOT_STARTED' | 'COMPLETED';
 export type UnknownReason = 'SNAPSHOT_UNREADABLE' | 'CLOCK_REGRESSION' | 'PERSISTENCE_FAILED' | 'RETRY_AFTER_UNBOUNDED';
 export type RefusalCode = 'DEADLINE' | 'INVALID_REQUEST' | 'INVALID_DEADLINE' | 'DUPLICATE_ID' | 'SESSION_INVALID' | 'SESSION_CLOSED'
-  | 'HOOK_TOKEN_MISMATCH' | 'ADMISSION_STOPPED' | 'STALE_PROBE' | 'STATE_UNKNOWN';
+  | 'HOOK_TOKEN_MISMATCH' | 'CANCELLATION_HOOK_ABSENT' | 'ADMISSION_STOPPED' | 'STALE_PROBE' | 'STATE_UNKNOWN';
 export type AlertCode = 'UNCERTAIN_CHARGE_OUTSTANDING' | 'SLOT_OVERDUE' | 'WAIT_EXCEEDS_OPERATIONAL_CAP' | 'RETRY_AFTER_OVERFLOW'
   | 'RETRY_AFTER_PRESENT_BUT_UNPARSEABLE' | 'DATE_CONVERSION_UNCERTAIN' | 'PROTOCOL_VIOLATION' | 'REPORT_FROM_OTHER_CLIENT'
   | 'INVENTORY_CONTRADICTION' | 'STALE_PROBE_RESULT' | 'RESET_REFUSED_STATE_UNKNOWN' | 'UNKNOWN_PERSIST_REVISION'
@@ -285,7 +285,9 @@ function enqueue(ctx: Ctx, request: BudgetRequest): void {
   if (!Number.isSafeInteger(request.deadlineMs) || request.deadlineMs <= ctx.now || request.deadlineMs > ctx.now + config.maxRequestDeadlineMs) { refuse(ctx, request, 'INVALID_DEADLINE'); return; }
   let viaHook = false;
   if (request.hookToken !== undefined) {
-    if (s.hookToken === null || request.hookToken !== s.hookToken) { refuse(ctx, request, 'HOOK_TOKEN_MISMATCH'); return; }
+    // Design V3 §3.4 R2-05: no registered hook (always, until M6) is CANCELLATION_HOOK_ABSENT; any other token is a mismatch.
+    if (s.hookToken === null) { refuse(ctx, request, 'CANCELLATION_HOOK_ABSENT'); return; }
+    if (request.hookToken !== s.hookToken) { refuse(ctx, request, 'HOOK_TOKEN_MISMATCH'); return; }
     viaHook = true;
   }
   s.queue.push(Object.freeze({ request: Object.freeze({ ...request }), viaHook }));

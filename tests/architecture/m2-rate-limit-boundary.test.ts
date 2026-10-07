@@ -47,7 +47,7 @@ describe('M2 W1 rate-limit boundary (pure scheduler/protocol)', () => {
 
 describe('M2 W2 rate-limit runtime boundary', () => {
   it('contains exactly the reviewed W2 files', () => {
-    expect(runtimeFiles).toEqual(['client.ts', 'config.ts', 'coordinator.ts', 'framing.ts', 'mutation-budget.ts', 'protocol.ts', 'read-budget.ts', 'read-probe.ts', 'state-store.ts'].map((f) => `${RUNTIME}${f}`));
+    expect(runtimeFiles).toEqual(['admission-stop.ts', 'client.ts', 'config.ts', 'coordinator.ts', 'framing.ts', 'mutation-budget.ts', 'protocol.ts', 'read-budget.ts', 'read-probe.ts', 'state-store.ts'].map((f) => `${RUNTIME}${f}`));
   });
 
   it('imports only the pure W1 module, its own files, zod and a fixed set of Node built-ins', () => {
@@ -100,5 +100,29 @@ describe('M2 W2 rate-limit runtime boundary', () => {
     expect(coordinator).toMatch(/localClockTrusted: false/);
     expect(coordinator).not.toMatch(/localClockTrusted: true|SAME_BOOT_ELAPSED|TERMINATION_EVIDENCE|HOOK_REGISTERED/);
     expect(coordinator).toMatch(/restoreLimiterState\([^)]*, null\)/);
+  });
+
+  it('W6 (M10A): the admission-stop interlock is unwired, type-only, cancel-free, and no hook can be registered or claimed', () => {
+    const module = `${RUNTIME}admission-stop.ts`;
+    const imports = readFileSync(path.join(REPO_ROOT, module), 'utf8').split(/\r?\n/).filter((line) => /^import /.test(line));
+    expect(imports).toEqual(["import type { CoordinatorStopStatus, StopAcknowledgement } from './client';"]);
+    for (const [, edges] of graph) expect(edges).not.toContain(module); // not composed anywhere in src (production wiring absent)
+    const text = code(module);
+    expect(text).not.toMatch(/cancelOrder|placeOrder|\.cancelOutstanding\(|hookToken|HOOK_REGISTERED|register[A-Z]\w*Hook|viaHook\s*:\s*true/);
+    expect(text).toContain("return CANCELLATION_HOOK_ABSENT;");
+    // Nothing in src registers a hook; the IPC request schema carries no hook field; a delivered grant is never via a hook.
+    for (const file of files) expect(code(file)).not.toMatch(/type:\s*'HOOK_REGISTERED'\s*,/); // a dispatched event, not the type declaration
+    const protocol = code(`${RUNTIME}protocol.ts`);
+    const request = protocol.slice(protocol.indexOf("t: z.literal('REQUEST')"), protocol.indexOf("t: z.literal('REPORT')"));
+    expect(request).not.toMatch(/hook/i);
+    expect(protocol).toContain('viaHook: z.literal(false)');
+    // The client's local STOP latch feeds the synchronous start check and clears only on a durably applied RESET_STOP.
+    const client = code(`${RUNTIME}client.ts`);
+    expect(client).toContain('knownStop: this.#localStop || this.#view.admission');
+    expect(client).toContain("if (action !== 'RESET_STOP' || ack.result !== 'APPLIED') return;");
+    // ...and only when no newer STOP was latched after that reset was sent (the stop generation).
+    expect(client).toContain("if (generation === this.#stopGeneration) { this.#localStop = false;");
+    expect(client.match(/this\.#stopGeneration \+= 1/g)).toHaveLength(1);
+    expect(client.match(/this\.#localStop = false/g)).toHaveLength(1);
   });
 });

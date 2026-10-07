@@ -10,6 +10,14 @@
  *
  * Pinned limit: a process suspension inside `start` delays the actual request without bound; the coordinator keeps
  * the charge uncertain until STARTED arrives. A local deadline refusal can likewise be delayed by suspension.
+ *
+ * M2 W6 (M10A) local STOP latch: any STOP request latches local mutation refusal synchronously, before any
+ * acknowledgement is awaited. While latched, mutation acquisitions are refused locally (`LOCAL_STOP`, no IPC), pending
+ * mutation acquisitions are refused, unused mutation grants are voided, and the start check fails every mutation grant.
+ * Reads are unaffected (throttle and UNKNOWN still apply). The latch is cleared only by this client's own RESET_STOP that
+ * the coordinator durably applied, and only when no newer STOP was requested after that reset was sent (an older reset
+ * acknowledgement, delayed or replayed after reconnection, never clears a newer latch). STOP cannot revoke a request that already passed its synchronous start check (the
+ * suspension limit above), and it never touches a request already started.
  */
 import net from 'node:net';
 import { performance } from 'node:perf_hooks';
@@ -30,6 +38,15 @@ export type AcquireResult =
   | Readonly<{ kind: 'REFUSED'; code: string }>
   | Readonly<{ kind: 'UNAVAILABLE'; reason: 'NOT_CONNECTED' | 'DISCONNECTED' | 'LOCAL_DEADLINE' | 'OUTBOX_FULL' }>;
 export type AckResult = Readonly<{ result: 'APPLIED' | 'IGNORED' | 'REJECTED'; reason?: string }>;
+/**
+ * M10A STOP acknowledgement. `DURABLE` only for the coordinator's APPLIED acknowledgement, which it sends after its durable
+ * commit of STOP. Anything else is `NOT_ACKNOWLEDGED`; the local latch stays, and the queued STOP is re-sent after
+ * reconnection.
+ */
+export type StopAcknowledgement = Readonly<{ kind: 'DURABLE' }>
+  | Readonly<{ kind: 'NOT_ACKNOWLEDGED'; reason: 'NOT_CONNECTED' | 'DISCONNECTED' | 'ACK_TIMEOUT' | 'REJECTED'; detail?: string }>;
+export type CoordinatorStopStatus = 'NONE' | 'PENDING' | 'DURABLE' | 'REJECTED';
+const isMutationOperation = (operation: BudgetOperation): boolean => operation === 'CREATE' || operation === 'CANCEL';
 type Outgoing = Extract<ClientMessage, { ackId: string }>;
 type OutgoingBody = Outgoing extends infer M ? (M extends Outgoing ? Omit<M, 'ackId'> : never) : never;
 
@@ -44,7 +61,11 @@ export class RateLimitClient {
   #ackSeq = 0; #refSeq = 0;
   readonly #outbox = new Map<string, Outgoing>();
   readonly #ackWaiters = new Map<string, (ack: AckResult) => void>();
-  readonly #pending = new Map<string, { resolve: (result: AcquireResult) => void; timer: NodeJS.Timeout }>();
+  readonly #pending = new Map<string, { resolve: (result: AcquireResult) => void; timer: NodeJS.Timeout; mutation: boolean }>();
+  #localStop = false;
+  #stopGeneration = 0;
+  #coordinatorStop: CoordinatorStopStatus = 'NONE';
+  readonly #disconnectListeners = new Set<() => void>();
   readonly #probeListeners = new Set<(scope: BudgetScope, probeGen: number) => void>();
   readonly #stateListeners = new Set<(view: StateView) => void>();
   #welcome: ((ok: boolean) => void) | null = null;
@@ -56,6 +77,8 @@ export class RateLimitClient {
   get clientInstanceId(): string | null { return this.#identity?.clientInstanceId ?? null; }
   get view(): StateView { return this.#view; }
   get outboxSize(): number { return this.#outbox.size; }
+  /** M10A: the local latch and the coordinator's last known STOP acknowledgement for this client's STOP requests. */
+  get stopStatus(): Readonly<{ localLatch: boolean; coordinator: CoordinatorStopStatus }> { return Object.freeze({ localLatch: this.#localStop, coordinator: this.#coordinatorStop }); }
   onProbeDue(listener: (scope: BudgetScope, probeGen: number) => void): void { this.#probeListeners.add(listener); }
   onState(listener: (view: StateView) => void): void { this.#stateListeners.add(listener); }
   #localNow(): number { return Math.floor(performance.now()); }
@@ -103,19 +126,73 @@ export class RateLimitClient {
   close(): void { this.#socket?.destroy(); }
 
   acquire(request: AcquireRequest): Promise<AcquireResult> {
+    if (this.#localStop && isMutationOperation(request.operation)) return Promise.resolve(Object.freeze({ kind: 'REFUSED', code: 'LOCAL_STOP' }));
     if (this.#session === null || this.#socket === null) return Promise.resolve(Object.freeze({ kind: 'UNAVAILABLE', reason: 'NOT_CONNECTED' }));
     if (this.#outbox.size >= this.#config.maxOutbox) return Promise.resolve(Object.freeze({ kind: 'UNAVAILABLE', reason: 'OUTBOX_FULL' }));
     const ref = `q${++this.#refSeq}`;
     return new Promise((resolve) => {
       // Local bounded refusal: the coordinator also refuses at the deadline; a grant arriving later is voided.
       const timer = setTimeout(() => { this.#pending.delete(ref); resolve(Object.freeze({ kind: 'UNAVAILABLE', reason: 'LOCAL_DEADLINE' })); }, request.deadlineInMs);
-      this.#pending.set(ref, { resolve, timer });
+      this.#pending.set(ref, { resolve, timer, mutation: isMutationOperation(request.operation) });
       this.#write({ t: 'REQUEST', ref, cls: request.cls, operation: request.operation, scope: request.scope, deadlineInMs: request.deadlineInMs, lifetimeMs: request.lifetimeMs, ...(request.probeGen === undefined ? {} : { probeGen: request.probeGen }) });
     });
   }
 
-  /** Operator control over the trusted-host IPC prototype. Resolves after the coordinator's durable commit. */
-  control(action: 'STOP' | 'RESET_STOP'): Promise<AckResult> { return this.#send({ t: 'CONTROL', action }); }
+  /**
+   * Operator control over the trusted-host IPC prototype. Resolves after the coordinator's durable commit. STOP latches
+   * local mutation refusal synchronously first; only a durably APPLIED RESET_STOP from this client clears the latch.
+   */
+  control(action: 'STOP' | 'RESET_STOP'): Promise<AckResult> {
+    if (action === 'STOP') this.#latchLocalStop();
+    const generation = this.#stopGeneration; // a RESET_STOP resets only the STOP requests made before it was sent
+    const acked = this.#send({ t: 'CONTROL', action });
+    void acked.then((ack) => {
+      if (action === 'STOP') this.#coordinatorStop = ack.result === 'APPLIED' ? 'DURABLE' : this.#coordinatorStop === 'DURABLE' ? 'DURABLE' : 'REJECTED';
+      if (action !== 'RESET_STOP' || ack.result !== 'APPLIED') return;
+      if (generation === this.#stopGeneration) { this.#localStop = false; this.#coordinatorStop = 'NONE'; return; }
+      // A newer STOP was requested after this reset was sent: its latch stays, and the earlier durable STOP is no longer
+      // in force at the coordinator until the newer STOP is acknowledged.
+      if (this.#coordinatorStop === 'DURABLE') this.#coordinatorStop = 'PENDING';
+    });
+    return acked;
+  }
+
+  /**
+   * M10A stop request. The local latch is set before this returns. The acknowledgement settles `DURABLE` only on the
+   * coordinator's APPLIED acknowledgement; no connection, a disconnect before it, a rejection (for example a failed
+   * persistence or UNKNOWN state) or `ackTimeoutMs` without it is `NOT_ACKNOWLEDGED`.
+   */
+  requestStop(ackTimeoutMs: number): Readonly<{ latched: true; acknowledgement: Promise<StopAcknowledgement> }> {
+    if (!Number.isSafeInteger(ackTimeoutMs) || ackTimeoutMs <= 0) throw new TypeError('requestStop: invalid acknowledgement timeout');
+    const connected = this.#session !== null && this.#socket !== null;
+    if (this.#coordinatorStop !== 'DURABLE') this.#coordinatorStop = 'PENDING';
+    const acked = this.control('STOP');
+    const acknowledgement = new Promise<StopAcknowledgement>((resolve) => {
+      let settled = false;
+      const settle = (result: StopAcknowledgement): void => {
+        if (settled) return; settled = true; clearTimeout(timer); this.#disconnectListeners.delete(onDisconnect); resolve(Object.freeze(result));
+      };
+      const onDisconnect = (): void => settle({ kind: 'NOT_ACKNOWLEDGED', reason: 'DISCONNECTED' });
+      const timer = setTimeout(() => settle({ kind: 'NOT_ACKNOWLEDGED', reason: 'ACK_TIMEOUT' }), ackTimeoutMs);
+      if (!connected) { settle({ kind: 'NOT_ACKNOWLEDGED', reason: 'NOT_CONNECTED' }); return; }
+      this.#disconnectListeners.add(onDisconnect);
+      void acked.then((ack) => settle(ack.result === 'APPLIED' ? { kind: 'DURABLE' }
+        : { kind: 'NOT_ACKNOWLEDGED', reason: 'REJECTED', ...(ack.reason === undefined ? {} : { detail: ack.reason }) }));
+    });
+    return Object.freeze({ latched: true, acknowledgement });
+  }
+
+  /** Synchronous local STOP latch: refuse pending mutation acquisitions and void unused mutation grants. */
+  #latchLocalStop(): void {
+    this.#stopGeneration += 1;
+    this.#localStop = true;
+    for (const [ref, pending] of this.#pending) {
+      if (!pending.mutation) continue;
+      clearTimeout(pending.timer); this.#pending.delete(ref);
+      pending.resolve(Object.freeze({ kind: 'REFUSED', code: 'LOCAL_STOP' })); // a grant arriving later is released unused
+    }
+    for (const held of Object.values(this.#book.grants)) if (held.state === 'UNUSED' && isMutationOperation(held.grant.operation)) this.releaseGrant(held.grant);
+  }
 
   #send(body: OutgoingBody): Promise<AckResult> {
     const ackId = `a${++this.#ackSeq}`;
@@ -155,7 +232,7 @@ export class RateLimitClient {
     const session = this.#session;
     const check = checkStart(this.#book, this.#localNow(), grant.grantId, {
       sessionId: session?.sessionId ?? '', sessionOpen: session !== null && this.#socket !== null, epoch: session?.epoch ?? '',
-      knownStop: this.#view.admission === 'STOPPED', knownBlockedScopes: this.#view.unknown ? ['API_AUTH', 'PUBLIC'] : this.#view.blockedScopes,
+      knownStop: this.#localStop || this.#view.admission === 'STOPPED', knownBlockedScopes: this.#view.unknown ? ['API_AUTH', 'PUBLIC'] : this.#view.blockedScopes,
     });
     this.#book = check.book;
     if (check.kind === 'REFUSED') return Object.freeze({ kind: 'NOT_STARTED', reason: check.reason });
@@ -182,6 +259,7 @@ export class RateLimitClient {
     if (this.#session !== null) this.#closedSessions.push(this.#session);
     this.#session = null;
     for (const [ref, pending] of this.#pending) { clearTimeout(pending.timer); pending.resolve(Object.freeze({ kind: 'UNAVAILABLE', reason: 'DISCONNECTED' })); this.#pending.delete(ref); }
+    for (const listener of [...this.#disconnectListeners]) listener();
     this.#welcome?.(false);
   }
 
