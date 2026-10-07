@@ -459,6 +459,7 @@ const PROGRAM = String.raw`
 const assert=require('node:assert/strict'),path=require('node:path'),crypto=require('node:crypto'),{EventEmitter}=require('node:events');
 const [base,extension,timing,order]=process.argv.slice(1);
 const load=n=>require(path.join(base,n+'.'+extension));
+{const rb=load('integration/coindcx/rate-limit/runtime/read-budget');rb.bindProductionReadBudget({acquire:async()=>({kind:'GRANTED',permit:rb.disciplinedPermit({start:c=>({kind:'STARTED',value:c()}),complete(){},release(){},throttled(){}})})});} /* M2 W3: test-only granting production read budget */
 let sockets=0,requests=0,raw,body='{"coindcx_id":"synthetic-provider-id"}',status=200;
 const socketPath=require.resolve('socket.io-client');require(socketPath);
 require.cache[socketPath].exports=()=>{sockets++;raw=new EventEmitter();raw.connected=false;

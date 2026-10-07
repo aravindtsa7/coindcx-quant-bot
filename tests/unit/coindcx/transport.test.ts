@@ -11,6 +11,7 @@ import {
 } from '../../../src/core/errors/app-error';
 import { HmacSha256Signer } from '../../../src/integration/coindcx/signer';
 import { CoinDcxTransport } from '../../../src/integration/coindcx/transport';
+import { fixtureTransportBudget } from '../../helpers/read-budget-fixture';
 
 describe('CoinDCX Transport', () => {
   let server: http.Server;
@@ -86,7 +87,7 @@ describe('CoinDCX Transport', () => {
   };
 
   it('strictly rejects any endpoint not in CoinDcxReadEndpoint union', async () => {
-    const transport = new CoinDcxTransport({ baseUrl: serverUrl });
+    const transport = new CoinDcxTransport({ readBudget: fixtureTransportBudget(),  baseUrl: serverUrl });
 
     // Attempting to pass an unlisted/mutating endpoint ID
     await expect(
@@ -103,7 +104,7 @@ describe('CoinDCX Transport', () => {
   });
 
   it('does NOT provide any public method accepting arbitrary URL paths', () => {
-    const transport = new CoinDcxTransport({ baseUrl: serverUrl });
+    const transport = new CoinDcxTransport({ readBudget: fixtureTransportBudget(),  baseUrl: serverUrl });
     const proto = Object.getPrototypeOf(transport) as Record<string, unknown>;
 
     expect(proto['request']).toBeUndefined();
@@ -113,7 +114,7 @@ describe('CoinDCX Transport', () => {
 
   it('GET-with-signed-body wire invariant: transmits GET with exact body and signature', async () => {
     resetMock();
-    const transport = new CoinDcxTransport({
+    const transport = new CoinDcxTransport({ readBudget: fixtureTransportBudget(),
       baseUrl: serverUrl,
       apiKey: testApiKey,
       signer,
@@ -146,7 +147,7 @@ describe('CoinDCX Transport', () => {
 
   it('lossless JSON parsing preserves exact high-precision numeric tokens', async () => {
     resetMock();
-    const transport = new CoinDcxTransport({ baseUrl: serverUrl });
+    const transport = new CoinDcxTransport({ readBudget: fixtureTransportBudget(),  baseUrl: serverUrl });
 
     // Exact high-precision tokens that standard JavaScript Number / JSON.parse would corrupt
     const preciseToken = '0.011572734637194769';
@@ -166,7 +167,7 @@ describe('CoinDCX Transport', () => {
 
   it('serializes query parameters correctly for public requests', async () => {
     resetMock();
-    const transport = new CoinDcxTransport({ baseUrl: serverUrl });
+    const transport = new CoinDcxTransport({ readBudget: fixtureTransportBudget(),  baseUrl: serverUrl });
     mockResponseBody = JSON.stringify(['B-BTC_USDT', 'B-ETH_USDT']);
 
     await transport.executeRead({
@@ -184,7 +185,7 @@ describe('CoinDCX Transport', () => {
 
   it('maps HTTP 401 and 403 to CoinDcxAuthError without reflecting provider messages or secrets', async () => {
     resetMock();
-    const transport = new CoinDcxTransport({
+    const transport = new CoinDcxTransport({ readBudget: fixtureTransportBudget(),
       baseUrl: serverUrl,
       apiKey: testApiKey,
       signer,
@@ -236,7 +237,7 @@ describe('CoinDCX Transport', () => {
 
   it('maps HTTP 429 to CoinDcxRateLimitError without reflecting provider message', async () => {
     resetMock();
-    const transport = new CoinDcxTransport({ baseUrl: serverUrl });
+    const transport = new CoinDcxTransport({ readBudget: fixtureTransportBudget(),  baseUrl: serverUrl });
 
     mockStatusCode = 429;
     mockHeaders = {
@@ -263,7 +264,7 @@ describe('CoinDCX Transport', () => {
 
   it('maps HTTP 500, 502, 503 to CoinDcxProviderError without reflecting provider message or internal trace', async () => {
     resetMock();
-    const transport = new CoinDcxTransport({ baseUrl: serverUrl });
+    const transport = new CoinDcxTransport({ readBudget: fixtureTransportBudget(),  baseUrl: serverUrl });
 
     mockStatusCode = 502;
     mockResponseBody = JSON.stringify({
@@ -289,7 +290,7 @@ describe('CoinDCX Transport', () => {
 
   it('maps request timeout to CoinDcxTimeoutError', async () => {
     resetMock();
-    const transport = new CoinDcxTransport({
+    const transport = new CoinDcxTransport({ readBudget: fixtureTransportBudget(),
       baseUrl: serverUrl,
       timeoutMs: 50,
     });
@@ -305,7 +306,7 @@ describe('CoinDCX Transport', () => {
 
   it('maps invalid JSON responses to CoinDcxResponseValidationError without reflecting raw body', async () => {
     resetMock();
-    const transport = new CoinDcxTransport({ baseUrl: serverUrl });
+    const transport = new CoinDcxTransport({ readBudget: fixtureTransportBudget(),  baseUrl: serverUrl });
 
     mockStatusCode = 200;
     mockResponseBody = '<html><body>CANARY_HTML_SECRET_BODY_999</body></html>';
@@ -327,7 +328,7 @@ describe('CoinDCX Transport', () => {
 
   it('enforces maximum response byte limits', async () => {
     resetMock();
-    const transport = new CoinDcxTransport({
+    const transport = new CoinDcxTransport({ readBudget: fixtureTransportBudget(),
       baseUrl: serverUrl,
       maxResponseBytes: 50,
     });
@@ -343,7 +344,7 @@ describe('CoinDCX Transport', () => {
   });
 
   it('throws CoinDcxAuthError if authentication is required but API key or signer is missing', async () => {
-    const transportNoKey = new CoinDcxTransport({ baseUrl: serverUrl, signer });
+    const transportNoKey = new CoinDcxTransport({ readBudget: fixtureTransportBudget(),  baseUrl: serverUrl, signer });
     await expect(
       transportNoKey.executeRead({
         endpoint: 'USER_INFO',
@@ -351,7 +352,7 @@ describe('CoinDCX Transport', () => {
       })
     ).rejects.toThrow(CoinDcxAuthError);
 
-    const transportNoSigner = new CoinDcxTransport({ baseUrl: serverUrl, apiKey: 'my-key' });
+    const transportNoSigner = new CoinDcxTransport({ readBudget: fixtureTransportBudget(),  baseUrl: serverUrl, apiKey: 'my-key' });
     await expect(
       transportNoSigner.executeRead({
         endpoint: 'USER_INFO',

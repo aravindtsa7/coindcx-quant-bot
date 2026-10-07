@@ -2,6 +2,7 @@ import http from 'node:http';
 import { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CoinDcxTransport } from '../../../src/integration/coindcx/transport';
+import { fixtureTransportBudget } from '../../helpers/read-budget-fixture';
 import { deferred } from './audit-a2-helpers';
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -21,14 +22,14 @@ describe('Audit A2 full transport deadline', () => {
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.flushHeaders();
       if (partial) res.write('{"value":');
     });
-    const transport = new CoinDcxTransport({ baseUrl, timeoutMs: 100 });
+    const transport = new CoinDcxTransport({ readBudget: fixtureTransportBudget(),  baseUrl, timeoutMs: 100 });
     await expect(transport.executeRead({ endpoint: 'ACTIVE_INSTRUMENTS' })).rejects.toMatchObject({ code: 'COINDCX_TIMEOUT' });
     await closed.promise;
   });
 
   it('normal completion before deadline survives its former timeout boundary', async () => {
     const baseUrl = await serverFor((_req, res) => res.end('{"ok":true}'));
-    const transport = new CoinDcxTransport({ baseUrl, timeoutMs: 100 });
+    const transport = new CoinDcxTransport({ readBudget: fixtureTransportBudget(),  baseUrl, timeoutMs: 100 });
     let settlements = 0;
     expect((await transport.executeRead({ endpoint: 'ACTIVE_INSTRUMENTS' }).then(value => { settlements++; return value; })).data).toEqual({ ok: true });
     await new Promise(resolve => setTimeout(resolve, 120));
@@ -37,7 +38,7 @@ describe('Audit A2 full transport deadline', () => {
 
   it('premature body close rejects instead of hanging', async () => {
     const baseUrl = await serverFor((_req, res) => { res.writeHead(200); res.write('{'); setImmediate(() => res.destroy()); });
-    await expect(new CoinDcxTransport({ baseUrl, timeoutMs: 500 }).executeRead({ endpoint: 'ACTIVE_INSTRUMENTS' })).rejects.toMatchObject({ code: 'COINDCX_PROVIDER_ERROR' });
+    await expect(new CoinDcxTransport({ readBudget: fixtureTransportBudget(),  baseUrl, timeoutMs: 500 }).executeRead({ endpoint: 'ACTIVE_INSTRUMENTS' })).rejects.toMatchObject({ code: 'COINDCX_PROVIDER_ERROR' });
   });
 
   it('body completion racing the deadline settles exactly once', async () => {
@@ -47,7 +48,7 @@ describe('Audit A2 full transport deadline', () => {
       res.once('close', () => clearTimeout(timer));
     });
     let settlements = 0;
-    const result = await new CoinDcxTransport({ baseUrl, timeoutMs: 100 }).executeRead({ endpoint: 'ACTIVE_INSTRUMENTS' }).then(
+    const result = await new CoinDcxTransport({ readBudget: fixtureTransportBudget(),  baseUrl, timeoutMs: 100 }).executeRead({ endpoint: 'ACTIVE_INSTRUMENTS' }).then(
       () => { settlements++; return 'SUCCESS'; }, error => { settlements++; return (error as { code: string }).code; });
     expect(['SUCCESS', 'COINDCX_TIMEOUT']).toContain(result);
     await new Promise(resolve => setTimeout(resolve, 120)); expect(settlements).toBe(1);
@@ -56,7 +57,7 @@ describe('Audit A2 full transport deadline', () => {
   it('size-limit abort settles and cleans up the body socket', async () => {
     const closed = deferred<void>();
     const baseUrl = await serverFor((_req, res) => { res.once('close', () => closed.resolve()); res.write('123456789'); });
-    await expect(new CoinDcxTransport({ baseUrl, timeoutMs: 500, maxResponseBytes: 4 }).executeRead({ endpoint: 'ACTIVE_INSTRUMENTS' })).rejects.toMatchObject({ code: 'COINDCX_PROVIDER_ERROR' });
+    await expect(new CoinDcxTransport({ readBudget: fixtureTransportBudget(),  baseUrl, timeoutMs: 500, maxResponseBytes: 4 }).executeRead({ endpoint: 'ACTIVE_INSTRUMENTS' })).rejects.toMatchObject({ code: 'COINDCX_PROVIDER_ERROR' });
     await closed.promise;
   });
 });

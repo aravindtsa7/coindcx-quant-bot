@@ -9,6 +9,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CoinDcxTransport, ExecuteReadOptions, HttpResponse } from '../../../src/integration/coindcx/transport';
 import { interceptProductionInstrumentAcquisition } from '../../helpers/production-instrument-acquisition-harness';
+import { ensureFreshFixtureProductionReadBudget } from '../../helpers/read-budget-fixture';
 import { wire } from './audit-a2-helpers';
 
 const PAIR = 'B-BTC_USDT';
@@ -31,6 +32,7 @@ afterEach(() => {
 describe('Combined correction: private instrument transformation pipeline', () => {
   it.each(['pre-import', 'post-import'])('%s exported mapper/normalizer/schema/hash replacement cannot forge economics', async timing => {
     vi.resetModules();
+    await ensureFreshFixtureProductionReadBudget(); // M2 W3: bind the fixture budget in the fresh registry
     const before = timing === 'post-import' ? await import('../../../src/integration/coindcx/instrument-authority') : null;
     const mapper = await import('../../../src/coin-runtime/instrument-mapper');
     const normalizers = await import('../../../src/integration/coindcx/normalizers');
@@ -62,6 +64,7 @@ describe('Combined correction: private instrument transformation pipeline', () =
 describe('F14-03 trusted instrument authority prototype bypass', () => {
   it('post-import prototype patch cannot mint fabricated metadata', async () => {
     vi.resetModules();
+    await ensureFreshFixtureProductionReadBudget(); // M2 W3: bind the fixture budget in the fresh registry
     const authority = await import('../../../src/integration/coindcx/instrument-authority');
     const transport = await import('../../../src/integration/coindcx/transport');
     const interception = interceptProductionInstrumentAcquisition(GENUINE_WIRE);
@@ -83,6 +86,7 @@ describe('F14-03 trusted instrument authority prototype bypass', () => {
 
   it('pre-import prototype patch cannot capture or replace privileged acquisition', async () => {
     vi.resetModules();
+    await ensureFreshFixtureProductionReadBudget(); // M2 W3: bind the fixture budget in the fresh registry
     const transport = await import('../../../src/integration/coindcx/transport');
     let patchCalls = 0;
     vi.spyOn(transport.CoinDcxTransport.prototype, 'executeRead').mockImplementation(async () => {
@@ -106,6 +110,7 @@ describe('F14-03 trusted instrument authority prototype bypass', () => {
 
   it('subclass, Proxy, structural fake, and public injected readers remain untrusted', async () => {
     vi.resetModules();
+    await ensureFreshFixtureProductionReadBudget(); // M2 W3: bind the fixture budget in the fresh registry
     const authority = await import('../../../src/integration/coindcx/instrument-authority');
     const reader = await import('../../../src/integration/coindcx/instrument-reader');
     const transportModule = await import('../../../src/integration/coindcx/transport');

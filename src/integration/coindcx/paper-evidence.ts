@@ -10,6 +10,7 @@ import { PaperMarkSnapshot } from '../../execution/mark';
 
 import { type PaperEvidenceAcquisition } from './acquisition-capability';
 import type { Clock } from './clock';
+import { acquireProductionPermit, boundProductionTransportBudget, readBudgetRefusal } from './rate-limit/runtime/read-budget';
 import { CoinDcxTransport } from './transport';
 import { ProductionCoinDcxSocketFactory } from './websocket/socket-adapter';
 import { createRequire } from 'node:module';
@@ -256,6 +257,12 @@ const PRODUCTION_MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
  * exported method.
  */
 async function privilegedGetJson(url: string): Promise<unknown> {
+  // M2 W3: one fresh permit from the set-once production read budget; without it the read is refused before any
+  // HTTP. The budget can only delay or refuse; it supplies no data and is not an acquisition dependency.
+  const acquired = await acquireProductionPermit(new URL(url), PRODUCTION_REQUEST_TIMEOUT_MS);
+  const refused = (reason: string): CoinDcxProviderError => { const refusal = readBudgetRefusal(reason); return new CoinDcxProviderError(refusal.message, 503, { ...refusal.details, url }); };
+  if (acquired.kind !== 'GRANTED') throw refused(acquired.reason);
+  const permit = acquired.permit;
   return new Promise<unknown>((resolve, reject) => {
     let settled = false;
     let receivedBytes = 0;
@@ -266,7 +273,7 @@ async function privilegedGetJson(url: string): Promise<unknown> {
       clearTimeout(deadline);
       action();
     };
-    const request = https.request(url, { method: 'GET', headers: { Accept: 'application/json' } }, (response) => {
+    const started = permit.start(() => https.request(url, { method: 'GET', headers: { Accept: 'application/json' } }, (response) => {
       response.on('data', (chunk: Buffer) => {
         if (settled) return;
         receivedBytes += chunk.length;
@@ -280,6 +287,11 @@ async function privilegedGetJson(url: string): Promise<unknown> {
       response.on('error', (error: Error) => settle(() => reject(error)));
       response.on('end', () => settle(() => {
         const status = response.statusCode ?? 500;
+        if (status === 429) {
+          // Shared throttle observation; the caller-facing error below is unchanged.
+          const retryAfter = response.headers['retry-after'], serverDate = response.headers.date;
+          permit.throttled({ ...(typeof retryAfter === 'string' ? { retryAfter } : {}), ...(typeof serverDate === 'string' ? { serverDate } : {}) });
+        }
         if (status < 200 || status >= 300) {
           reject(new CoinDcxProviderError(`CoinDCX production acquisition failed with status ${status}`, status, { url }));
           return;
@@ -292,7 +304,15 @@ async function privilegedGetJson(url: string): Promise<unknown> {
           reject(new CoinDcxResponseValidationError('CoinDCX production acquisition returned unparseable JSON', { url }));
         }
       }));
-    });
+    }));
+    if (started.kind !== 'STARTED') {
+      // The local start check voided the permit (NOT_STARTED already reported): no HTTP request was created.
+      settled = true;
+      reject(refused(`PERMIT_${started.reason}`));
+      return;
+    }
+    const request = started.value;
+    request.once('close', () => permit.complete()); // positive local completion/teardown evidence
     const deadline = setTimeout(() => settle(() => {
       reject(new CoinDcxTimeoutError(`CoinDCX request timed out after ${PRODUCTION_REQUEST_TIMEOUT_MS}ms`, { url }));
       request.destroy();
@@ -565,9 +585,9 @@ export class CoinDcxPaperEvidence {
     this.#policy = validPolicy(captured.policy ?? DEFAULT_PAPER_EVIDENCE_POLICY);
     this.#clock = captured.clock ?? Object.freeze({ nowMs: () => Date.now() });
     this.#socketFactory = captured.socketFactory ?? new ProductionCoinDcxSocketFactory();
-    this.#orderbookRestTransport = captured.orderbookRestTransport ?? new CoinDcxTransport({ baseUrl: 'https://public.coindcx.com' });
-    this.#markRestTransport = captured.markRestTransport ?? new CoinDcxTransport({ baseUrl: 'https://public.coindcx.com' });
-    this.#conversionTransport = captured.conversionTransport ?? new CoinDcxTransport();
+    this.#orderbookRestTransport = captured.orderbookRestTransport ?? new CoinDcxTransport({ baseUrl: 'https://public.coindcx.com', readBudget: boundProductionTransportBudget('PUBLIC') });
+    this.#markRestTransport = captured.markRestTransport ?? new CoinDcxTransport({ baseUrl: 'https://public.coindcx.com', readBudget: boundProductionTransportBudget('PUBLIC') });
+    this.#conversionTransport = captured.conversionTransport ?? new CoinDcxTransport({ readBudget: boundProductionTransportBudget('API_AUTH') });
     for (const instrument of captured.instruments) {
       if (!/^B-[A-Z0-9]+_[A-Z0-9]+$/.test(instrument.pair) || instrument.instrumentSpecSnapshotId.trim() === '') throw new Error('Invalid P14-B evidence instrument');
       const symbol = providerSymbol(instrument);

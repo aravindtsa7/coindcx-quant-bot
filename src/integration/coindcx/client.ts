@@ -48,6 +48,7 @@ import {
 } from './schemas';
 import { HmacSha256Signer, RequestSigner, createOwnedCoinDcxSigner } from './signer';
 import { createOwnedCoinDcxReadTransport, CoinDcxTransport, TransportOptions } from './transport';
+import type { TransportReadBudget } from './rate-limit/runtime/read-budget';
 import { readInrFuturesInstrument } from './instrument-reader';
 
 const logger = createChildLogger('coindcx:client');
@@ -60,6 +61,8 @@ export interface CoinDcxClientOptions {
   readonly timeoutMs?: number | undefined;
   readonly maxResponseBytes?: number | undefined;
   readonly transport?: CoinDcxTransport | undefined;
+  /** M2 W3: the shared read budget for a non-owned internally constructed transport (owned construction uses the bound production budget). */
+  readonly readBudget?: TransportReadBudget | undefined;
 }
 
 /**
@@ -102,6 +105,7 @@ export class CoinDcxClient {
         maxResponseBytes: options.maxResponseBytes,
         apiKey,
         signer,
+        readBudget: options.readBudget,
       };
       this.#transport = owned === OWNED_CONSTRUCTION ? createOwnedCoinDcxReadTransport(transportOpts) : new CoinDcxTransport(transportOpts);
     }

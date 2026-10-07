@@ -45,16 +45,30 @@ describe('Phase14 combined authority and durable mutation architecture', () => {
         else for (const binding of clause.namedBindings.elements) if (!binding.isTypeOnly) imported.add(binding.name.text);
       }
     }
+    // M2 W3 (reviewed narrow amendment): exactly one budget-only import may be invoked on the success path. It returns a
+    // read permit (pacing/refusal only) before any request exists and never receives response data.
+    const BUDGET_ONLY = new Set(['acquireProductionPermit']);
+    const budgetCalls: string[] = [];
     const violations: string[] = [];
     function visit(node: ts.Node): void {
       // Error construction can only reject acquisition, never bless data.
       if (ts.isThrowStatement(node) || ts.isImportDeclaration(node) || ts.isTypeNode(node)) return;
       if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'reject') return;
+      if (ts.isIdentifier(node) && BUDGET_ONLY.has(node.text) && ts.isCallExpression(node.parent) && node.parent.expression === node) { budgetCalls.push(node.parent.getText(file)); return; }
       if (ts.isIdentifier(node) && imported.has(node.text)) violations.push(node.getText(file));
       node.forEachChild(visit);
     }
     visit(file);
     expect(violations).toEqual([]);
+    expect(budgetCalls).toEqual(['acquireProductionPermit(url, PRODUCTION_INSTRUMENT_REQUEST_TIMEOUT_MS)']);
+    const budgetImport = file.statements.filter(ts.isImportDeclaration).find((d) => d.getText(file).includes('acquireProductionPermit'));
+    expect((budgetImport?.moduleSpecifier as ts.StringLiteral | undefined)?.text).toBe('./rate-limit/runtime/read-budget');
+    // Companion: the permit is used only to start the request, report teardown and report a 429's headers;
+    // response bytes/parsing never flow through it.
+    const text = file.getText();
+    expect([...text.matchAll(/\bpermit\.([A-Za-z]+)\(/g)].map((m) => m[1]).sort()).toEqual(['complete', 'start', 'throttled']);
+    const throttled = text.slice(text.indexOf('permit.throttled('), text.indexOf(');', text.indexOf('permit.throttled(')));
+    expect(throttled).not.toMatch(/chunks|rawBody|parse|instrument/);
   });
 
   it('authority module namespaces are immutable in fresh CommonJS processes, before and after consumer import', () => {

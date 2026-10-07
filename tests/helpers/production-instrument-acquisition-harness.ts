@@ -8,6 +8,7 @@
 import { EventEmitter } from 'node:events';
 import https from 'node:https';
 import { vi } from 'vitest';
+import { ensureFixtureProductionReadBudget } from './read-budget-fixture';
 
 export interface ProductionInstrumentAcquisitionInterception {
   readonly urls: readonly string[];
@@ -17,6 +18,8 @@ export interface ProductionInstrumentAcquisitionInterception {
 export function interceptProductionInstrumentAcquisition(
   ...instrumentResponses: readonly Record<string, unknown>[]
 ): ProductionInstrumentAcquisitionInterception {
+  // M2 W3: the privileged acquisition refuses without a production read budget; bind the granting test fixture once.
+  ensureFixtureProductionReadBudget();
   const urls: string[] = [];
   let index = 0;
 

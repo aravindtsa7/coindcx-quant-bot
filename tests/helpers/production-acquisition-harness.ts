@@ -34,6 +34,7 @@ import {
   type PaperEvidencePolicy,
 } from '../../src/integration/coindcx/paper-evidence';
 import { createdFakeSockets, type FakeIoSocket } from './fake-socket-io';
+import { ensureFixtureProductionReadBudget } from './read-budget-fixture';
 
 export { FakeIoSocket, socketIoClientMock } from './fake-socket-io';
 
@@ -60,6 +61,8 @@ export interface ProductionAcquisitionInterception {
  * (an `afterEach` is enough), exactly as the Wave3-A tests already do.
  */
 export function interceptProductionAcquisition(): ProductionAcquisitionInterception {
+  // M2 W3: the privileged GET refuses without a production read budget; bind the granting test fixture once.
+  ensureFixtureProductionReadBudget();
   createdFakeSockets.length = 0;
   const responses = new Map<string, unknown>();
   const restCalls: string[] = [];

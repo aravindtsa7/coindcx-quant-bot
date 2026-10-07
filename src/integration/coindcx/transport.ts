@@ -9,9 +9,15 @@ import {
   CoinDcxTimeoutError,
 } from '../../core/errors/app-error';
 import { createChildLogger } from '../../monitoring/logger';
+import {
+  productionReadBudget, productionReadScope, readBudgetRefusal,
+  type ReadPermit, type TransportReadBudget,
+} from './rate-limit/runtime/read-budget';
 import { RequestSigner } from './signer';
 
 const logger = createChildLogger('coindcx:transport');
+/** M2 W3: module-private marker; only owned construction selects the set-once production read budget. */
+const OWNED_READ_TRANSPORT = Symbol('CoinDCX owned read transport');
 
 export const DEFAULT_BASE_URL = 'https://api.coindcx.com';
 export const DEFAULT_TIMEOUT_MS = 10_000;
@@ -123,6 +129,12 @@ export interface TransportOptions {
   readonly maxResponseBytes?: number | undefined;
   readonly signer?: RequestSigner | undefined;
   readonly apiKey?: string | undefined;
+  /**
+   * M2 W3: the shared read budget for this (non-owned) transport and the scope of its host. Required to perform any
+   * request: without it every read is refused before any HTTP request (no unpaced fallback). Owned transports
+   * (`createOwnedCoinDcxReadTransport`) ignore this and use the process's set-once production read budget.
+   */
+  readonly readBudget?: TransportReadBudget | undefined;
 }
 
 export interface ExecuteReadOptions {
@@ -157,13 +169,33 @@ export class CoinDcxTransport {
   readonly #maxResponseBytes: number;
   readonly #signer: RequestSigner | undefined;
   readonly #apiKey: string | undefined;
+  readonly #readBudget: TransportReadBudget | 'PRODUCTION' | null;
 
-  constructor(options: TransportOptions = {}) {
+  constructor(options: TransportOptions = {}, owned?: unknown) {
     this.#baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.#maxResponseBytes = options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
     this.#signer = options.signer;
     this.#apiKey = options.apiKey;
+    this.#readBudget = owned === OWNED_READ_TRANSPORT ? 'PRODUCTION' : (options.readBudget ?? null);
+  }
+
+  /** M2 W3: one fresh permit per wire request (every caller retry acquires its own). Refuses before any HTTP. */
+  async #acquirePermit(url: URL, path: string): Promise<ReadPermit> {
+    const refuse = (reason: string): CoinDcxProviderError => {
+      const refusal = readBudgetRefusal(reason);
+      return new CoinDcxProviderError(refusal.message, 503, { ...refusal.details, path });
+    };
+    let binding: TransportReadBudget | null;
+    if (this.#readBudget === 'PRODUCTION') {
+      const budget = productionReadBudget();
+      binding = budget === null ? null : { budget, scope: productionReadScope(url) };
+    } else binding = this.#readBudget;
+    if (binding === null) throw refuse(this.#readBudget === 'PRODUCTION' ? 'PRODUCTION_READ_BUDGET_UNBOUND' : 'READ_BUDGET_MISSING');
+    let acquired;
+    try { acquired = await binding.budget.acquire({ scope: binding.scope, lifetimeMs: this.#timeoutMs }); } catch { throw refuse('READ_BUDGET_ERROR'); }
+    if (acquired.kind !== 'GRANTED') throw refuse(acquired.reason);
+    return acquired.permit;
   }
 
   /**
@@ -217,7 +249,6 @@ export class CoinDcxTransport {
     queryParams?: Record<string, string | number | boolean | readonly string[]> | undefined,
     body?: string | undefined
   ): Promise<HttpResponse<T>> {
-    const startTime = Date.now();
     const headers: Record<string, string> = {
       Accept: 'application/json',
     };
@@ -239,19 +270,6 @@ export class CoinDcxTransport {
           { path }
         );
       }
-
-      if (serializedPayload === undefined) {
-        serializedPayload = '{}';
-      }
-
-      const signature = this.#signer.sign(serializedPayload);
-      headers['X-AUTH-APIKEY'] = this.#apiKey;
-      headers['X-AUTH-SIGNATURE'] = signature;
-      headers['Content-Type'] = 'application/json';
-      headers['Content-Length'] = String(Buffer.byteLength(serializedPayload, 'utf8'));
-    } else if (serializedPayload !== undefined) {
-      headers['Content-Type'] = 'application/json';
-      headers['Content-Length'] = String(Buffer.byteLength(serializedPayload, 'utf8'));
     }
 
     const fullUrl = new URL(path, this.#baseUrl);
@@ -270,6 +288,30 @@ export class CoinDcxTransport {
 
     const isHttps = fullUrl.protocol === 'https:';
     const requestModule = isHttps ? https : http;
+
+    // M2 W3 (U-M2-3): acquire the read permit before final request preparation and request creation. The caller-built
+    // body (including any timestamp) is signed as given after the wait; no timestamp freshness is claimed.
+    const permit = await this.#acquirePermit(fullUrl, path);
+    const startTime = Date.now();
+    try {
+      if (requiresAuth) {
+        if (serializedPayload === undefined) {
+          serializedPayload = '{}';
+        }
+
+        const signature = this.#signer!.sign(serializedPayload);
+        headers['X-AUTH-APIKEY'] = this.#apiKey!;
+        headers['X-AUTH-SIGNATURE'] = signature;
+        headers['Content-Type'] = 'application/json';
+        headers['Content-Length'] = String(Buffer.byteLength(serializedPayload, 'utf8'));
+      } else if (serializedPayload !== undefined) {
+        headers['Content-Type'] = 'application/json';
+        headers['Content-Length'] = String(Buffer.byteLength(serializedPayload, 'utf8'));
+      }
+    } catch (error) {
+      permit.release(); // preparation failed before any request creation: irrevocable known non-use
+      throw error;
+    }
 
     return new Promise<HttpResponse<T>>((resolveWire, rejectWire) => {
       let reqTimeout: NodeJS.Timeout | null = null;
@@ -299,7 +341,9 @@ export class CoinDcxTransport {
         resolveWire(value);
       };
 
-      const req = requestModule.request(
+      // The permit's synchronous start check and the request creation form one synchronous region; STARTED is
+      // reported here (also when request creation throws).
+      const started = permit.start(() => requestModule.request(
         fullUrl,
         {
           method,
@@ -364,6 +408,12 @@ export class CoinDcxTransport {
 
             if (statusCode === 429) {
               const retryAfterHeader = res.headers['retry-after'];
+              // Shared throttle: the raw Retry-After/Date values go to the coordinator (full waits, all three
+              // HTTP-date forms, fail-closed parsing). The caller-facing error below keeps its existing semantics.
+              permit.throttled({
+                ...(typeof retryAfterHeader === 'string' ? { retryAfter: retryAfterHeader } : {}),
+                ...(typeof res.headers.date === 'string' ? { serverDate: res.headers.date } : {}),
+              });
               let retryAfterMs = 60_000;
               if (retryAfterHeader) {
                 const parsed = Number(retryAfterHeader);
@@ -426,7 +476,15 @@ export class CoinDcxTransport {
             res.removeAllListeners('aborted');
           });
         }
-      );
+      ));
+      if (started.kind !== 'STARTED') {
+        // The local start check voided the permit (NOT_STARTED already reported): no HTTP request was created.
+        settled = true;
+        const refusal = readBudgetRefusal(`PERMIT_${started.reason}`);
+        rejectWire(new CoinDcxProviderError(refusal.message, 503, { ...refusal.details, path }));
+        return;
+      }
+      const req = started.value;
 
       reqTimeout = setTimeout(() => {
         reject(timeoutError());
@@ -442,6 +500,7 @@ export class CoinDcxTransport {
       req.once('close', () => {
         if (!response && !settled) reject(new CoinDcxProviderError('CoinDCX request closed before response', 502, { path }));
         req.removeAllListeners('error');
+        permit.complete(); // positive local completion/teardown evidence: the request is closed
       });
 
       if (serializedPayload !== undefined) {
@@ -468,7 +527,7 @@ function protectOwnedInstance<T extends object>(instance: T): T {
 }
 
 /** Internal owned construction; callers are pinned, never an injectable authority port. */
-export function createOwnedCoinDcxReadTransport(options: TransportOptions) : CoinDcxTransport { return protectOwnedInstance(new CoinDcxTransport(options)); }
+export function createOwnedCoinDcxReadTransport(options: TransportOptions) : CoinDcxTransport { return protectOwnedInstance(new CoinDcxTransport(options, OWNED_READ_TRANSPORT)); }
 Object.freeze(createOwnedCoinDcxReadTransport);
 if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
   const descriptor = Object.getOwnPropertyDescriptor(module.exports, 'createOwnedCoinDcxReadTransport');

@@ -10,6 +10,7 @@ import {
   CoinDcxTimeoutError,
   ValidationError,
 } from '../../core/errors/app-error';
+import { acquireProductionPermit, readBudgetRefusal } from './rate-limit/runtime/read-budget';
 
 
 
@@ -171,6 +172,14 @@ async function privilegedAcquireProductionInstrument(pair: string): Promise<Inst
   url.searchParams.set('pair', requestedPair);
   url.searchParams.set('margin_currency_short_name', 'INR');
 
+  // M2 W3: one fresh permit from the set-once production read budget; without it the read is refused before any HTTP.
+  // The budget can only delay or refuse; it supplies no data and is not an acquisition dependency.
+  const acquired = await acquireProductionPermit(url, PRODUCTION_INSTRUMENT_REQUEST_TIMEOUT_MS);
+  if (acquired.kind !== 'GRANTED') {
+    throw new CoinDcxProviderError(readBudgetRefusal(acquired.reason).message, 503, { ...readBudgetRefusal(acquired.reason).details, path: PRODUCTION_INSTRUMENT_PATH });
+  }
+  const permit = acquired.permit;
+
   const data = await new Promise<unknown>((resolve, reject) => {
     let settled = false;
     let receivedBytes = 0;
@@ -181,7 +190,7 @@ async function privilegedAcquireProductionInstrument(pair: string): Promise<Inst
       clearTimeout(deadline);
       action();
     };
-    const request = https.request(url, { method: 'GET', headers: { Accept: 'application/json' } }, response => {
+    const started = permit.start(() => https.request(url, { method: 'GET', headers: { Accept: 'application/json' } }, response => {
       response.on('data', (chunk: Buffer) => {
         if (settled) return;
         receivedBytes += chunk.length;
@@ -199,6 +208,11 @@ async function privilegedAcquireProductionInstrument(pair: string): Promise<Inst
       response.on('error', (error: Error) => settle(() => reject(error)));
       response.on('end', () => settle(() => {
         const status = response.statusCode ?? 500;
+        if (status === 429) {
+          // Shared throttle observation; the caller-facing error below is unchanged.
+          const retryAfter = response.headers['retry-after'], serverDate = response.headers.date;
+          permit.throttled({ ...(typeof retryAfter === 'string' ? { retryAfter } : {}), ...(typeof serverDate === 'string' ? { serverDate } : {}) });
+        }
         if (status < 200 || status >= 300) {
           reject(new CoinDcxProviderError(
             `CoinDCX production instrument acquisition failed with status ${status}`,
@@ -221,7 +235,15 @@ async function privilegedAcquireProductionInstrument(pair: string): Promise<Inst
           ));
         }
       }));
-    });
+    }));
+    if (started.kind !== 'STARTED') {
+      // The local start check voided the permit (NOT_STARTED already reported): no HTTP request was created.
+      settled = true;
+      reject(new CoinDcxProviderError(readBudgetRefusal(`PERMIT_${started.reason}`).message, 503, { ...readBudgetRefusal(`PERMIT_${started.reason}`).details, path: PRODUCTION_INSTRUMENT_PATH }));
+      return;
+    }
+    const request = started.value;
+    request.once('close', () => permit.complete()); // positive local completion/teardown evidence
     const deadline = setTimeout(() => settle(() => {
       reject(new CoinDcxTimeoutError(
         `CoinDCX request timed out after ${PRODUCTION_INSTRUMENT_REQUEST_TIMEOUT_MS}ms`,

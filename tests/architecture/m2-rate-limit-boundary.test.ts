@@ -46,7 +46,7 @@ describe('M2 W1 rate-limit boundary (pure scheduler/protocol)', () => {
 
 describe('M2 W2 rate-limit runtime boundary', () => {
   it('contains exactly the reviewed W2 files', () => {
-    expect(runtimeFiles).toEqual(['client.ts', 'config.ts', 'coordinator.ts', 'framing.ts', 'protocol.ts', 'state-store.ts'].map((f) => `${RUNTIME}${f}`));
+    expect(runtimeFiles).toEqual(['client.ts', 'config.ts', 'coordinator.ts', 'framing.ts', 'protocol.ts', 'read-budget.ts', 'read-probe.ts', 'state-store.ts'].map((f) => `${RUNTIME}${f}`));
   });
 
   it('imports only the pure W1 module, its own files, zod and a fixed set of Node built-ins', () => {
@@ -69,9 +69,17 @@ describe('M2 W2 rate-limit runtime boundary', () => {
     expect(code(`${RUNTIME}config.ts`)).toContain(String.raw`const PIPE = /^\\\\\.\\pipe\\`);
   });
 
-  it('is unwired: no module outside the rate-limit directory imports it', () => {
-    const importers = [...graph].filter(([file, edges]) => !file.startsWith(DIR) && edges.some((edge) => edge.startsWith(DIR))).map(([file]) => file);
-    expect(importers).toEqual([]);
+  it('W3 wiring: only the three read primitives and the read client import the limiter, and only the read-budget interface', () => {
+    const importers = [...graph].filter(([file, edges]) => !file.startsWith(DIR) && edges.some((edge) => edge.startsWith(DIR)));
+    expect(importers.map(([file]) => file).sort()).toEqual([
+      'src/integration/coindcx/client.ts', 'src/integration/coindcx/instrument-authority.ts', 'src/integration/coindcx/paper-evidence.ts', 'src/integration/coindcx/transport.ts',
+    ]);
+    for (const [, edges] of importers) expect(edges.filter((edge) => edge.startsWith(DIR))).toEqual([`${RUNTIME}read-budget.ts`]);
+    // The read-budget module has type-only imports, so no read primitive loads the IPC runtime (node:net).
+    const imports = readFileSync(path.join(REPO_ROOT, `${RUNTIME}read-budget.ts`), 'utf8').split(/\r?\n/).filter((line) => /^import /.test(line));
+    expect(imports.every((line) => line.startsWith('import type '))).toBe(true);
+    // Nothing imports the coordinator, the IPC client, the store or the probe responder outside the runtime.
+    for (const [file, edges] of graph) if (!file.startsWith(RUNTIME)) for (const target of ['coordinator', 'client', 'state-store', 'read-probe', 'framing']) expect(edges).not.toContain(`${RUNTIME}${target}.ts`);
   });
 
   it('never passes the optional trusted-clock or elapsed-time inputs, and offers no reset from UNKNOWN', () => {

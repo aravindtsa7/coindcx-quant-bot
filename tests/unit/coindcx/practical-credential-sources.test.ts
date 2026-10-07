@@ -9,10 +9,13 @@ import { beforeAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { practicalPrivateStreamReadiness } from '../../../src/execution/live/practical-recovery/private-events';
 import { currentAccountContinuityCapability } from '../../../src/execution/live/reconciliation/barrier';
 import { PracticalRecoveryService } from '../../../src/execution/live/practical-recovery/service';
+import { ensureFixtureProductionReadBudget } from '../../helpers/read-budget-fixture';
 import { createCoinDcxPracticalCredentialSources as construct, readCoinDcxPracticalCredentialSources as read,
   checkCoinDcxPracticalCredentialSources as check, checkCoinDcxCredentialScope as checkScope,
   CoinDcxCredentialOriginAssociation, type CoinDcxCredentialConstructionOptions } from '../../../src/integration/coindcx/live/practical-credential-sources';
 
+// M2 W3: owned read paths refuse without a production read budget; bind the granting test fixture.
+ensureFixtureProductionReadBudget();
 const sockets = vi.hoisted(() => ({ created: 0, raw: null as unknown }));
 vi.mock('socket.io-client', () => ({ default: vi.fn(() => {
   sockets.created++;
@@ -207,6 +210,7 @@ describe('defining-module owned lookup protection in actual module formats', () 
         const emit=socket.emit.bind(socket); socket.emit=(event,...args)=>{if(event==='join') { assert.equal(args[0].apiKey,'synthetic-process-key'); assert.equal(args[0].authSignature,crypto.createHmac('sha256','synthetic-process-secret').update('{"channel":"coindcx"}').digest('hex')); return true; }return emit(event,...args);};return socket; };
       const socketPath=require.resolve('socket.io-client'); require(socketPath); require.cache[socketPath].exports=socketFactory;
       const load=name=>require(path.join(base,'integration/coindcx',name+'.'+extension));
+      {const rb=load('rate-limit/runtime/read-budget');rb.bindProductionReadBudget({acquire:async()=>({kind:'GRANTED',permit:rb.disciplinedPermit({start:c=>({kind:'STARTED',value:c()}),complete(){},release(){},throttled(){}})})});} /* M2 W3: test-only granting production read budget */
       const modules=[['client','CoinDcxClient','createOwnedCoinDcxReadClient','getUserInfoSafe'],['transport','CoinDcxTransport','createOwnedCoinDcxReadTransport','executeRead'],
         ['signer','HmacSha256Signer','createOwnedCoinDcxSigner','sign'],['websocket/private-stream','CoinDcxPrivateAccountStream','createOwnedCoinDcxPrivateStream','getHealthSnapshot'],
         ['websocket/socket-adapter','ProductionCoinDcxSocketFactory','createOwnedCoinDcxSocketFactory','createSocket'],
