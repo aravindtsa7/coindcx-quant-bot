@@ -74,7 +74,9 @@ import {
 import { OrphanCleanupPolicy, type OrphanCleanupPolicyRecord } from './orphan-policy';
 import type {
   LiveDurableOrderView,
+  LiveOrphanCancelBudgetPort,
   LiveOrphanCancellationPort,
+  LiveOrphanCancelResult,
   LiveReconciliationLease,
   LiveReconciliationRepository,
   LiveReconciliationStateRecord,
@@ -126,6 +128,16 @@ export interface LiveReconciliationServiceDependencies {
    */
   readonly orphanCancellation?: LiveOrphanCancellationPort | undefined;
   readonly orphanPolicy?: OrphanCleanupPolicy | undefined;
+  /**
+   * M2 (U-M2-1): the shared REST budget for orphan cancellation, satisfied by
+   * the same integration-layer port as the Phase17 service
+   * (`createLiveMutationBudgetPort`). Absent or refusing: the request
+   * carries no permit, and the genuine adapter refuses it before any request
+   * (PRE_DISPATCH_FAILURE, existing classification). There is no unpaced
+   * fallback, and a permit is never authority: the policy and the durable
+   * claim and arm above still decide everything.
+   */
+  readonly orphanCancellationBudget?: LiveOrphanCancelBudgetPort | undefined;
   readonly requestTimeoutMs?: number | undefined;
   /**
    * Allowance applied when testing a venue-clock `created_at` against a
@@ -295,6 +307,7 @@ export class LiveReconciliationService {
   readonly #clock: ReconciliationClock;
   readonly #orphanCancellation: LiveOrphanCancellationPort | null;
   readonly #orphanPolicy: OrphanCleanupPolicyRecord | null;
+  readonly #orphanCancellationBudget: LiveOrphanCancelBudgetPort | null;
   readonly #requestTimeoutMs: number;
   readonly #submissionWindowToleranceMs: number;
   readonly #maxSnapshotAttempts: number;
@@ -309,9 +322,33 @@ export class LiveReconciliationService {
     this.#clock = dependencies.clock ?? new SystemReconciliationClock();
     this.#orphanCancellation = dependencies.orphanCancellation ?? null;
     this.#orphanPolicy = readGenuineOrphanPolicy(dependencies.orphanPolicy);
+    this.#orphanCancellationBudget = dependencies.orphanCancellationBudget ?? null;
     this.#requestTimeoutMs = dependencies.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.#submissionWindowToleranceMs = dependencies.submissionWindowToleranceMs ?? DEFAULT_SUBMISSION_WINDOW_TOLERANCE_MS;
     this.#maxSnapshotAttempts = validateMaxSnapshotAttempts(dependencies.maxSnapshotAttempts);
+  }
+
+  /** The orphan cleanup capability and its genuine policy, when both are present and permit this account; else null. */
+  #permittedOrphanCleanup(accountId: string): { readonly port: LiveOrphanCancellationPort; readonly policy: OrphanCleanupPolicyRecord } | null {
+    const port = this.#orphanCancellation;
+    const policy = this.#orphanPolicy;
+    return port === null || policy === null || !policy.accountAllowlist.includes(accountId) ? null : { port, policy };
+  }
+
+  /** M2: budget only. A missing, refusing, throwing or malformed port yields no permit (the adapter then refuses). */
+  async #admitOrphanCancelBudget(): Promise<object | null> {
+    const budget = this.#orphanCancellationBudget;
+    if (budget === null) return null;
+    try {
+      const permit: unknown = await budget.admit(Object.freeze({ gatewayCall: 'cancelOrder' as const, lifetimeMs: this.#requestTimeoutMs }));
+      return typeof permit === 'object' && permit !== null ? permit : null;
+    } catch { return null; }
+  }
+
+  /** M2: voids a permit the adapter never consumed (irrevocable known non-use); a consumed permit is never released. */
+  #releaseOrphanCancelBudget(permit: object | null): void {
+    if (permit === null || this.#orphanCancellationBudget === null) return;
+    try { this.#orphanCancellationBudget.release(permit); } catch { /* budget only: an unreleased permit stays charged */ }
   }
 
   /**
@@ -994,9 +1031,8 @@ export class LiveReconciliationService {
       await this.#repository.recordOrphanOrder(lease, orphan, this.#clock.nowMs());
     }
 
-    const port = this.#orphanCancellation;
-    const policy = this.#orphanPolicy;
-    if (port === null || policy === null || !policy.accountAllowlist.includes(accountId)) {
+    const permitted = this.#permittedOrphanCleanup(accountId);
+    if (permitted === null) {
       // Cleanup off or this account not allowlisted: the orphan finding already
       // blocks the account. Nothing is cancelled and nothing pretends to be
       // healthy (§9 final paragraph).
@@ -1013,7 +1049,7 @@ export class LiveReconciliationService {
 
     let attempted = 0;
     for (const orphan of orphans) {
-      if (attempted >= policy.maxCancellationsPerRun) break;
+      if (attempted >= permitted.policy.maxCancellationsPerRun) break;
 
       const claim = await this.#repository.claimOrphanCancellation(lease, authorization, orphan.exchangeOrderId, this.#clock.nowMs());
       if (claim.kind === 'NOT_CLAIMABLE') {
@@ -1044,13 +1080,35 @@ export class LiveReconciliationService {
       // so a crash between the request leaving this process and the response
       // being durably recorded was indistinguishable from "never sent" and the
       // unarmed-reclaim path would resend it on the next run.
-      await this.#repository.armOrphanCancelWire(lease, authorization, orphan.exchangeOrderId, generation);
+      //
+      // M2 (U-M2-1): the shared REST budget admission is awaited AFTER the
+      // durable claim and BEFORE that durable arm, exactly as for the Phase17
+      // cancel, so the arm stays the last check before the wire. A budget can
+      // only delay or refuse: a refusal is carried as no permit, the adapter
+      // refuses before any request, and the existing PRE_DISPATCH_FAILURE
+      // classification below follows. Every check is re-evaluated after the
+      // wait with fresh observations: the cleanup policy here; ownership,
+      // lease, fence, runtime epoch, authorization and the claim itself inside
+      // the arm's transaction; and STOP, expiry, revocation, binding and reuse
+      // when the transport consumes the permit, synchronously before signing.
+      const budgetPermit = await this.#admitOrphanCancelBudget();
+      let result: LiveOrphanCancelResult;
+      try {
+        const current = this.#permittedOrphanCleanup(accountId);
+        // Not armed: the claim stays CANCEL_CLAIMED and unarmed, which the next
+        // generation's recovery reclaims as never sent (zero wire requests).
+        if (current === null) break;
+        await this.#repository.armOrphanCancelWire(lease, authorization, orphan.exchangeOrderId, generation);
 
-      const result = await port.cancelVenueOrder({
-        exchangeOrderId: orphan.exchangeOrderId,
-        pair: orphan.pair,
-        timeoutMs: this.#requestTimeoutMs,
-      });
+        result = await current.port.cancelVenueOrder({
+          exchangeOrderId: orphan.exchangeOrderId,
+          pair: orphan.pair,
+          timeoutMs: this.#requestTimeoutMs,
+          budgetPermit,
+        });
+      } finally {
+        this.#releaseOrphanCancelBudget(budgetPermit);
+      }
 
       if (result.kind === 'CANCELLED') {
         await this.#repository.completeOrphanCancellation(lease, authorization, orphan.exchangeOrderId, generation, 'CANCEL_ACKNOWLEDGED', null);

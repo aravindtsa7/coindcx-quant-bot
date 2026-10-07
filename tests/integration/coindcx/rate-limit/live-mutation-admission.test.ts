@@ -173,7 +173,7 @@ describe('M2 W4 Phase 17 cancel admission and orphan cleanup', () => {
     expect(h.venue.hits).toHaveLength(0);
   }, TIMEOUT);
 
-  it('Phase 18 orphan cleanup carries no permit and is refused before any request (not yet integrated)', async () => {
+  it('the Phase 18 orphan adapter called without a permit is refused before any request (the reconciliation service supplies it)', async () => {
     const h = await acknowledged();
     const orphan = new GatewayOrphanCancellation(h.gateway);
     expect(await orphan.cancelVenueOrder({ exchangeOrderId: 'venue-orphan', pair: h.record.content.pair, timeoutMs: 1000 })).toEqual({ kind: 'PRE_DISPATCH_FAILURE', reasonCode: 'BUDGET_REFUSED' });

@@ -28,6 +28,7 @@ export class GatewayOrphanCancellation implements LiveOrphanCancellationPort {
     readonly exchangeOrderId: string;
     readonly pair: string;
     readonly timeoutMs: number;
+    readonly budgetPermit?: object | null | undefined;
   }): Promise<LiveOrphanCancelResult> {
     const result = await this.#gateway.cancelOrder({
       // An orphan has no local intent, so there is no local client order id to
@@ -37,6 +38,10 @@ export class GatewayOrphanCancellation implements LiveOrphanCancellationPort {
       exchangeOrderId: request.exchangeOrderId,
       pair: request.pair,
       timeoutMs: request.timeoutMs,
+      // M2 (U-M2-1): the service's opaque budget permit, unchanged. The
+      // transport consumes it synchronously before signing (CANCEL, derived
+      // from its closed endpoint) or refuses before any request.
+      budgetPermit: request.budgetPermit ?? null,
     });
 
     switch (result.kind) {

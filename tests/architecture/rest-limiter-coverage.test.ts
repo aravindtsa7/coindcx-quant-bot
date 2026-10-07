@@ -11,12 +11,11 @@ import { analyzeModuleReferences, listSourceFiles } from './support/import-graph
 // Covered in W3: the three read primitives. Covered in W4: the order-mutation transport's request site (mutation
 // permits for the practical cancel and Phase 17 create/cancel, a read permit for order observation). Covered in W5:
 // the candle-reader request site and its callers (accounted for below).
-// Pending (explicit, allowlisted):
-//   - no unpaced request site remains;
-//   - the Phase 18 orphan-cancellation mutation PATH (`GatewayOrphanCancellation`): not integrated with the budget. It
-//     carries no permit, so the transport refuses it before any request; it is disabled/unwired, not paced.
-// Complete mutation-path coverage, complete M2 coverage and final no-bypass completion are NOT claimed while the
-// orphan-cancellation path is pending.
+// Covered after W6: the Phase 18 orphan-cancellation mutation PATH (`GatewayOrphanCancellation`): admission is awaited
+// before the durable arm and the opaque CANCEL permit is consumed by the transport (pinned below). The path stays
+// disabled/unwired: production composes no orphan budget, so it is refused before any request.
+// Pending: nothing. The coverage allowlist is empty. That is coverage only, NOT M2 acceptance: the DB acceptance suites
+// are NOT RUN, and production budget binding and the remaining production decisions are open.
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const SRC_ROOT = path.join(REPO_ROOT, 'src');
 const rel = (abs: string): string => path.relative(REPO_ROOT, abs).split(path.sep).join('/');
@@ -30,9 +29,9 @@ const CANDLE_READER = 'src/market-data/rest-candle-reader.ts';
 const COVERED = ['src/integration/coindcx/instrument-authority.ts', MUTATION_TRANSPORT, 'src/integration/coindcx/paper-evidence.ts', 'src/integration/coindcx/transport.ts', CANDLE_READER];
 const PENDING: Readonly<Record<string, 'W5'>> = {};
 /** Mutation paths through a covered request site that are NOT integrated with the budget (refused, not paced). */
-const PENDING_MUTATION_PATHS: Readonly<Record<string, 'ORPHAN_CANCEL_UNINTEGRATED'>> = {
-  'src/execution/live/reconciliation/gateway-orphan-cancellation.ts': 'ORPHAN_CANCEL_UNINTEGRATED',
-};
+const PENDING_MUTATION_PATHS: Readonly<Record<string, 'ORPHAN_CANCEL_UNINTEGRATED'>> = {};
+const ORPHAN_ADAPTER = 'src/execution/live/reconciliation/gateway-orphan-cancellation.ts';
+const RECONCILIATION_SERVICE = 'src/execution/live/reconciliation/service.ts';
 const LOCAL_HTTP_SERVER = ['src/app/bootstrap/server.ts', 'src/app/lifecycle/shutdown.ts'];
 const LOCAL_PIPE_IPC = ['src/integration/coindcx/rate-limit/runtime/client.ts', 'src/integration/coindcx/rate-limit/runtime/coordinator.ts'];
 
@@ -107,26 +106,40 @@ describe('M2 REST limiter coverage (W3/W4/W5)', () => {
     expect(files.filter((file) => /new HistoricalBackfillService\(|new CanonicalMarketDataEngine\(/.test(code(file)))).toEqual([]);
   });
 
-  it('pending mutation path: orphan cancellation calls the gateway without a budget permit and has no admission (refused, not covered)', () => {
-    expect(Object.keys(PENDING_MUTATION_PATHS)).toEqual(['src/execution/live/reconciliation/gateway-orphan-cancellation.ts']);
-    for (const file of Object.keys(PENDING_MUTATION_PATHS)) {
-      const text = code(file);
-      expect(text).toMatch(/this\.#gateway\.cancelOrder\(/);
-      expect(text, `${file} must move out of PENDING_MUTATION_PATHS when its admission is integrated`).not.toMatch(/budgetPermit|admit\(|budget/i);
-    }
-    // The only callers of the gateway mutation methods with a permit are the two integrated paths.
+  it('orphan cancellation is integrated: admission before the durable arm, the permit carried unchanged, consumed by the transport', () => {
+    // The adapter passes the service's opaque permit, unchanged, to the gateway's budgetPermit (no other permit source).
+    const adapter = code(ORPHAN_ADAPTER);
+    expect(adapter).toMatch(/this\.#gateway\.cancelOrder\(/);
+    expect(adapter).toContain('budgetPermit: request.budgetPermit ?? null,');
+    expect(adapter).not.toMatch(/mutation-budget|read-budget|rate-limit|admit\(/);
+    // The service: claim, then budget admission (a cancelOrder permit), then the fresh policy re-check and the durable
+    // arm, then the port call carrying the permit; the permit is released in finally (a no-op once consumed).
+    const service = code(RECONCILIATION_SERVICE);
+    const orphans = service.slice(service.indexOf('async #handleOrphans('), service.indexOf('async #verifyAccountIdentity('));
+    const order = ['await this.#repository.claimOrphanCancellation(', 'await this.#admitOrphanCancelBudget()', 'const current = this.#permittedOrphanCleanup(accountId)',
+      'await this.#repository.armOrphanCancelWire(', 'await current.port.cancelVenueOrder({', 'budgetPermit,', 'this.#releaseOrphanCancelBudget(budgetPermit)'].map((needle) => orphans.indexOf(needle));
+    expect(order.every((index) => index > 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // Between the durable arm and the gateway call: no other await (the arm is the last check before the wire).
+    expect(orphans.slice(order[3], order[4]).match(/\bawait\b/g)).toHaveLength(1);
+    expect(service).toContain("budget.admit(Object.freeze({ gatewayCall: 'cancelOrder' as const, lifetimeMs: this.#requestTimeoutMs }))");
+    // The budget port type is declared in reconciliation (structural), so the service does not reach the gateway module.
+    expect(importsOf(RECONCILIATION_SERVICE)).not.toContain('../gateway');
+    // The transport is the single synchronous consumption point for every Phase 17 / Phase 18 gateway mutation.
+    expect(code(MUTATION_TRANSPORT)).toContain('consumeMutationPermit(budgetPermit, kind)');
+    // Exactly the integrated paths pass a permit into a gateway mutation; production composes no orphan budget (refused).
     const callers = files.filter((file) => /budgetPermit/.test(code(file)) && /\.(?:placeOrder|cancelOrder)\(/.test(code(file)));
-    expect(callers).toEqual(['src/execution/live/service.ts']);
+    expect(callers).toEqual([ORPHAN_ADAPTER, 'src/execution/live/service.ts']);
+    expect(files.filter((file) => /(?<![#\w])orphanCancellationBudget\s*:/.test(code(file)))).toEqual([]); // no composition passes one
+    expect(Object.keys(PENDING_MUTATION_PATHS)).toEqual([]);
   });
 
-  it('W6 final no-bypass exit (empty allowlist): BLOCKED while an integration gap remains; the pending path is kept, not removed', () => {
-    // Every provider REST request site in src is a covered primitive and no unpaced request site remains...
+  it("coverage allowlist empty (the design's no-bypass coverage exit): every site covered and every mutation path integrated; NOT M2 acceptance", () => {
     expect(requestSites).toEqual([...COVERED].sort());
     expect(Object.keys(PENDING)).toEqual([]);
-    // ...but the design's W6 exit requires the WHOLE allowlist to be empty, and the Phase 18 orphan-cancellation mutation
-    // path is still unintegrated (refused before transmission). The exit is therefore BLOCKED; it is not claimed.
-    const exitBlockedBy = Object.keys(PENDING_MUTATION_PATHS);
-    expect(exitBlockedBy).toEqual(['src/execution/live/reconciliation/gateway-orphan-cancellation.ts']);
+    expect(Object.keys(PENDING_MUTATION_PATHS)).toEqual([]);
+    // This is a static coverage result only. M2 acceptance additionally requires the DB acceptance suites (NOT RUN),
+    // production budget binding and the open production decisions; none of that is claimed here.
     // Deferred G-RX acquisition/downloader sources stay outside this implementation.
     expect(files.filter((file) => /historical\/acquisition\.ts$|coindcx-historical-candles/.test(file))).toEqual([]);
   });

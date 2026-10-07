@@ -109,7 +109,31 @@ export interface LiveOrphanCancellationPort {
     readonly exchangeOrderId: string;
     readonly pair: string;
     readonly timeoutMs: number;
+    /**
+     * M2 (U-M2-1): the opaque budget permit from the service's admission,
+     * passed through unchanged to the gateway's `budgetPermit`. Budget only,
+     * never authority. Absent, null, forged, a read permit, for another
+     * operation, expired, revoked or already used: the adapter refuses before
+     * any request (`PRE_DISPATCH_FAILURE`).
+     */
+    readonly budgetPermit?: object | null | undefined;
   }): Promise<LiveOrphanCancelResult>;
+}
+
+/**
+ * M2 (U-M2-1): budget-only admission for one orphan cancel. Structurally the
+ * cancel half of the Phase17 `LiveMutationBudgetPort` (the same integration-
+ * layer implementation, `createLiveMutationBudgetPort`, satisfies it); declared
+ * here so reconciliation does not reach the gateway module. It can only delay
+ * or refuse; a permit is opaque, never authority, never provider data.
+ *   - `admit` is awaited BEFORE the durable pre-wire arm and resolves to the
+ *     permit carried in `budgetPermit`, or null when refused.
+ *   - `release` voids a permit that was never consumed; a consumed one is
+ *     never released.
+ */
+export interface LiveOrphanCancelBudgetPort {
+  admit(request: { readonly gatewayCall: 'cancelOrder'; readonly lifetimeMs: number }): Promise<object | null>;
+  release(permit: object): void;
 }
 
 export type LiveOrphanCancelResult =
