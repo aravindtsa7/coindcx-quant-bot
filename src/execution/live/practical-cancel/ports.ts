@@ -29,6 +29,22 @@ export interface PracticalCancelDependencies {
   readonly gateway: Pick<CoinDcxFuturesOrderGateway, 'cancelOrder'>;
   /** Trusted validated policy value; never a per-call field. */
   readonly requestTimeoutMs: number;
+  /** M2 W4 (U-M2-1): the shared REST budget. Required; an unavailable or refusing budget is `BUDGET_REFUSED`. */
+  readonly budget: PracticalCancelBudgetPort;
+}
+
+/**
+ * M2 W4 (U-M2-1): the budget-only admission port for one practical cancel, implemented by the integration layer.
+ * It can only delay or refuse. An admission is opaque: never authority, never provider data, never a certificate.
+ *   - `admit` is awaited before the final guard sequence, which then re-observes everything after the wait;
+ *   - `consume` is the synchronous start check after the last lifecycle observation and before gateway entry
+ *     (null: `BUDGET_REFUSED`); it never awaits and never reports a start;
+ *   - `release` voids an admission that was never consumed (irrevocable known non-use); a consumed one is kept.
+ */
+export interface PracticalCancelBudgetPort {
+  admit(request: { readonly lifetimeMs: number }): Promise<object | null>;
+  consume(admission: object): object | null;
+  release(admission: object): void;
 }
 
 export interface PracticalCancelInput {
@@ -41,7 +57,7 @@ export type PracticalCancelPhase = 'PREFLIGHT' | 'ACQUIRE' | 'ARM' | 'PERMISSION
 export type PracticalCancelLocalRefusal = 'INVALID_INPUT' | 'OPERATION_IN_PROGRESS'
   | 'ENABLEMENT_REFUSED' | 'ACCOUNT_BINDING_REFUSED' | 'RUNTIME_BINDING_REFUSED'
   | 'ORIGINAL_WATCH_REFUSED' | 'DISPATCH_WINDOW_CLOSED' | 'CLOCK_ANOMALY'
-  | 'ENTRY_REFUSED' | 'OPERATIONAL_FAILURE' | 'MANUAL_REVIEW_REQUIRED' | 'ADMISSION_CLOSED';
+  | 'ENTRY_REFUSED' | 'OPERATIONAL_FAILURE' | 'MANUAL_REVIEW_REQUIRED' | 'ADMISSION_CLOSED' | 'BUDGET_REFUSED';
 export type PracticalCancelCode = PracticalCancelLocalRefusal | PracticalMutationErrorCode | LiveExecutionFailureCode
   | PracticalPersistenceErrorCode | PracticalLiveSafetyErrorCode;
 export type PracticalCancelReportedOutcome = 'ACCEPTED' | 'REJECTED' | 'AMBIGUOUS' | 'PRE_DISPATCH_FAILURE';

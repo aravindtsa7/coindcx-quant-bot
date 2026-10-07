@@ -64,6 +64,7 @@ import {
 import { CoinDcxClient } from '../client';
 import { acquireProductionInstrumentBinding, TrustedProductionInstrumentBinding } from '../instrument-authority';
 import type { InrFuturesInstrument } from '../models';
+import { productionLiveMutationBudgetPort } from './mutation-budget-ports';
 import { CoinDcxLiveFuturesOrderGateway } from './order-gateway';
 import { CoinDcxReconciliationEvidenceAdapter } from './reconciliation-evidence-adapter';
 
@@ -301,7 +302,8 @@ export function composeLiveExecutionRuntime(input: ComposeLiveExecutionRuntimeIn
   });
 
   return new LiveExecutionRuntime(LIVE_RUNTIME_CONSTRUCTOR, {
-    service: new LiveExecutionService({ gateway, repository, policy }),
+    // M2 W4: the set-once production mutation budget, which nothing binds: every mutation is refused before any request.
+    service: new LiveExecutionService({ gateway, repository, policy, budget: productionLiveMutationBudgetPort() }),
     repository,
     enablement,
     policy,

@@ -10,6 +10,7 @@ import { practicalPrivateStreamReadiness } from '../../../src/execution/live/pra
 import { currentAccountContinuityCapability } from '../../../src/execution/live/reconciliation/barrier';
 import { PracticalRecoveryService } from '../../../src/execution/live/practical-recovery/service';
 import { ensureFixtureProductionReadBudget } from '../../helpers/read-budget-fixture';
+import { fixtureMutationPermitSync } from '../../helpers/mutation-budget-fixture';
 import { createCoinDcxPracticalCredentialSources as construct, readCoinDcxPracticalCredentialSources as read,
   checkCoinDcxPracticalCredentialSources as check, checkCoinDcxCredentialScope as checkScope,
   CoinDcxCredentialOriginAssociation, type CoinDcxCredentialConstructionOptions } from '../../../src/integration/coindcx/live/practical-credential-sources';
@@ -125,7 +126,7 @@ describe('unwired genuine credential origin', () => {
       expect(raw.joins).toHaveLength(1);
       expect(raw.joins[0]![0].apiKey).toBe(values.apiKey);
       expect(raw.joins[0]![0].authSignature).toBe(createHmac('sha256', values.apiSecret).update('{"channel":"coindcx"}').digest('hex'));
-      await h.sources.gateway.cancelOrder({ clientOrderId: 'original-client', exchangeOrderId: 'original-exchange', pair: 'B-BTC_USDT', timeoutMs: 100 });
+      await h.sources.gateway.cancelOrder({ clientOrderId: 'original-client', exchangeOrderId: 'original-exchange', pair: 'B-BTC_USDT', timeoutMs: 100, budgetPermit: fixtureMutationPermitSync('CANCEL') });
       expect(network.requests).toHaveLength(2);
       for (const request of network.requests) {
         expect(request.url.origin).toBe('https://api.coindcx.com'); expect(request.headers['X-AUTH-APIKEY']).toBe(values.apiKey);
@@ -211,6 +212,7 @@ describe('defining-module owned lookup protection in actual module formats', () 
       const socketPath=require.resolve('socket.io-client'); require(socketPath); require.cache[socketPath].exports=socketFactory;
       const load=name=>require(path.join(base,'integration/coindcx',name+'.'+extension));
       {const rb=load('rate-limit/runtime/read-budget');rb.bindProductionReadBudget({acquire:async()=>({kind:'GRANTED',permit:rb.disciplinedPermit({start:c=>({kind:'STARTED',value:c()}),complete(){},release(){},throttled(){}})})});} /* M2 W3: test-only granting production read budget */
+      const mb=load('rate-limit/runtime/mutation-budget'),permit=()=>mb.disciplinedMutationPermit('CANCEL',{consume:()=>({kind:'USED'}),started(){},complete(){},release(){},throttled(){}}); /* M2 W4: test-only genuine fixture cancel permit */
       const modules=[['client','CoinDcxClient','createOwnedCoinDcxReadClient','getUserInfoSafe'],['transport','CoinDcxTransport','createOwnedCoinDcxReadTransport','executeRead'],
         ['signer','HmacSha256Signer','createOwnedCoinDcxSigner','sign'],['websocket/private-stream','CoinDcxPrivateAccountStream','createOwnedCoinDcxPrivateStream','getHealthSnapshot'],
         ['websocket/socket-adapter','ProductionCoinDcxSocketFactory','createOwnedCoinDcxSocketFactory','createSocket'],
@@ -231,7 +233,7 @@ describe('defining-module owned lookup protection in actual module formats', () 
       const https=require('node:https'); https.request=(url,options,callback)=>{assert.equal(url.origin,'https://api.coindcx.com');assert.equal(options.headers['X-AUTH-APIKEY'],'synthetic-process-key');const req=new EventEmitter();let body='';req.destroy=()=>{};req.write=b=>{body=b;writes++;assert.equal(options.headers['X-AUTH-SIGNATURE'],crypto.createHmac('sha256','synthetic-process-secret').update(b).digest('hex'));};req.end=()=>queueMicrotask(()=>{const res=new EventEmitter();res.statusCode=200;res.headers={};res.destroy=()=>{};callback(res);res.emit('data',Buffer.from(url.pathname.includes('users/info')?'{"coindcx_id":"synthetic-process-provider"}':'{"message":"success","status":200,"code":200}'));res.emit('end');});return req;};
       (async()=>{ assert.equal((await tuple.reader.readAccountIdentity({accountId:'synthetic-process-account',timeoutMs:100})).kind,'OBSERVED');
         await tuple.privateStream.start();try{assert.equal(tuple.privateStream.getHealthSnapshot().authJoinSent,true);
-          assert.equal((await tuple.gateway.cancelOrder({clientOrderId:'original',exchangeOrderId:'venue',pair:'B-BTC_USDT',timeoutMs:100})).kind,'CANCEL_ACCEPTED');
+          assert.equal((await tuple.gateway.cancelOrder({clientOrderId:'original',exchangeOrderId:'venue',pair:'B-BTC_USDT',timeoutMs:100,budgetPermit:permit()})).kind,'CANCEL_ACCEPTED');
           assert.equal(writes,2);assert.equal(socketCalls,1);assert.equal(factory.checkCoinDcxPracticalCredentialSources(result.association,tuple).kind,'LOCAL_CONSTRUCTION_ASSOCIATED');
           console.log('RESULT:'+JSON.stringify({writes,socketCalls}));}finally{tuple.privateStream.stop();}})().catch(()=>{console.error('BEHAVIORAL_PROBE_FAILED');process.exitCode=1;});
     `;

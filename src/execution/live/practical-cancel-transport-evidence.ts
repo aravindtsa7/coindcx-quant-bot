@@ -39,6 +39,8 @@ export class CancelTransportInvocation {
   #evidence: CancelTransportNoWriteEvidence | null = null;
   #result: unknown;
   #propagated = false;
+  /** M2 W4: the opaque budget permit consumed at the boundary before entry; budget only, taken once by the transport. */
+  #budget: object | null = null;
   public constructor(issuer: unknown, attempt: object, request: LiveCancelOrderRequest, source: CancelTransportSource, invoke: (invocation: CancelTransportInvocation) => Promise<unknown>) {
     if (issuer !== ISSUER) refuse(); this.#attempt = attempt; this.#request = request; this.#source = source; this.#invoke = invoke; Object.freeze(this);
   }
@@ -52,6 +54,19 @@ export class CancelTransportInvocation {
     const v = this.read(value);
     if (issuer !== ISSUER || v === null || v.#state !== 'RESERVED' || PracticalCancelDispatchOwner.status(v.#attempt) !== 'ENTERED') refuse();
     v.#state = 'INVOKING'; return v.#invoke(v);
+  }
+  /** Boundary only, before invocation, once. The value is opaque here: never authority, never inspected. */
+  public static attachBudget(issuer: unknown, value: unknown, consumed: unknown): void {
+    const v = this.read(value);
+    if (issuer !== ISSUER || v === null || v.#state !== 'RESERVED' || v.#budget !== null || typeof consumed !== 'object' || consumed === null) refuse();
+    v.#budget = consumed;
+  }
+  /** The genuine transport source only, while invoking; returns the consumed permit once, then null. */
+  public static takeBudget(issuer: unknown, value: unknown, source: unknown): object | null {
+    const v = this.read(value);
+    if (issuer !== ISSUER || v === null || v.#source !== (typeof source === 'object' && source !== null ? transports.get(source) : undefined)) refuse();
+    if (v.#state !== 'INVOKING') return null;
+    const budget = v.#budget; v.#budget = null; return budget;
   }
   public static observe(issuer: unknown, value: unknown, source: unknown, action: 'BEGIN' | 'POSSIBLE' | 'NO_WRITE'): CancelTransportNoWriteEvidence | null {
     const v = this.read(value);
@@ -82,12 +97,12 @@ export class CancelTransportInvocation {
     const valid = record !== undefined && record.envelope === returned && v.#propagated;
     const noWrite = valid && v.#observation === 'NO_WRITE' && record.evidence === v.#evidence && v.#evidence !== null
       && CancelTransportNoWriteEvidence.consume(ISSUER, v.#evidence, v) && PracticalCancelDispatchOwner.status(v.#attempt) === 'ENTERED';
-    v.#state = 'CLOSED'; v.#evidence = null; v.#result = undefined;
+    v.#state = 'CLOSED'; v.#evidence = null; v.#result = undefined; v.#budget = null;
     return valid ? Object.freeze({ result: record.result, noWrite }) : null;
   }
   public static close(issuer: unknown, value: unknown): void {
     const v = this.read(value); if (issuer !== ISSUER || v === null) refuse();
-    v.#state = 'CLOSED'; v.#evidence = null; v.#result = undefined;
+    v.#state = 'CLOSED'; v.#evidence = null; v.#result = undefined; v.#budget = null;
   }
   public toJSON(): never { return refuse(); }
 }
@@ -137,12 +152,17 @@ export function issueCancelTransportNoWrite(value: unknown, source: unknown): Ca
 export function propagateCancelTransportResult(value: unknown, source: unknown, result: unknown, evidence: unknown): object { return CancelTransportInvocation.propagate(ISSUER, value, source, result, evidence); }
 export function settleCancelTransportInvocation(value: unknown, returned: unknown): { readonly result: unknown; readonly noWrite: boolean } | null { return CancelTransportInvocation.settle(ISSUER, value, returned); }
 export function closeCancelTransportInvocation(value: unknown): void { CancelTransportInvocation.close(ISSUER, value); }
+/** M2 W4: boundary only, after synchronous budget consumption and before entry. */
+export function attachCancelTransportBudget(value: unknown, consumed: unknown): void { CancelTransportInvocation.attachBudget(ISSUER, value, consumed); }
+/** M2 W4: the genuine transport only, once; the consumed budget permit (opaque here), or null. */
+export function takeCancelTransportBudget(value: unknown, source: unknown): object | null { return CancelTransportInvocation.takeBudget(ISSUER, value, source); }
 
 for (const value of [CancelTransportSource, CancelTransportInvocation, CancelTransportNoWriteEvidence]) { Object.freeze(value.prototype); Object.freeze(value); }
 if (typeof module !== 'undefined' && typeof exports !== 'undefined') {
   for (const [name, value] of Object.entries({ CancelTransportInvocation, CancelTransportNoWriteEvidence, installCancelTransportBrand, installCancelGatewayBrand, registerCancelTransportSource,
     registerCancelGatewaySource, hasCancelTransportSource, reserveCancelTransportInvocation, invokeCancelTransport, readCancelTransportRequest, beginCancelTransportPreparation,
-    markCancelTransmissionPossible, issueCancelTransportNoWrite, propagateCancelTransportResult, settleCancelTransportInvocation, closeCancelTransportInvocation })) {
+    markCancelTransmissionPossible, issueCancelTransportNoWrite, propagateCancelTransportResult, settleCancelTransportInvocation, closeCancelTransportInvocation,
+    attachCancelTransportBudget, takeCancelTransportBudget })) {
     const descriptor = Object.getOwnPropertyDescriptor(module.exports, name);
     if (descriptor?.configurable === false) {
       if (descriptor.get === undefined || descriptor.set !== undefined || module.exports[name] !== value) throw new Error('CANCEL_PROVENANCE_EXPORT_BINDING_INVALID');

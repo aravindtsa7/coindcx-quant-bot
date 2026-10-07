@@ -13,6 +13,8 @@ import {
   classifyCreateHttpFailure,
 } from '../../../../src/integration/coindcx/live/order-gateway';
 import { LiveCreateRequestSchema } from '../../../../src/integration/coindcx/live/wire-schemas';
+import { fixtureMutationPermitSync } from '../../../helpers/mutation-budget-fixture';
+import { fixtureTransportBudget } from '../../../helpers/read-budget-fixture';
 
 const API_KEY = 'unit-test-api-key';
 const API_SECRET = 'unit-test-api-secret-value';
@@ -114,6 +116,7 @@ function placeRequest(overrides: Partial<LivePlaceOrderRequest> = {}): LivePlace
     settlementRateInrPerQuote: '89',
     timeInForce: 'UNSPECIFIED',
     timeoutMs: 2_000,
+    budgetPermit: fixtureMutationPermitSync('CREATE'), // M2 W4: one fresh permit per wire request
     ...overrides,
   };
 }
@@ -139,7 +142,7 @@ let gateway: CoinDcxLiveFuturesOrderGateway;
 
 beforeAll(async () => {
   await venue.start();
-  gateway = new CoinDcxLiveFuturesOrderGateway({ apiKey: API_KEY, apiSecret: API_SECRET, baseUrl: venue.baseUrl });
+  gateway = new CoinDcxLiveFuturesOrderGateway({ apiKey: API_KEY, apiSecret: API_SECRET, baseUrl: venue.baseUrl, readBudget: fixtureTransportBudget() });
 });
 afterAll(async () => venue.stop());
 beforeEach(() => venue.reset());
@@ -364,19 +367,19 @@ describe('documented list-orders observation and hostile response validation', (
 describe('mutation outcome and cancel contracts', () => {
   it('cancels only by exchange-confirmed id and does not send local client id', async () => {
     venue.respondJson(200, { message: 'success', status: 200, code: 200 });
-    expect((await gateway.cancelOrder({ clientOrderId: CLIENT_ORDER_ID, exchangeOrderId: 'venue-order-1', pair: PAIR, timeoutMs: 2_000 })).kind).toBe('CANCEL_ACCEPTED');
+    expect((await gateway.cancelOrder({ clientOrderId: CLIENT_ORDER_ID, exchangeOrderId: 'venue-order-1', pair: PAIR, timeoutMs: 2_000, budgetPermit: fixtureMutationPermitSync('CANCEL') })).kind).toBe('CANCEL_ACCEPTED');
     expect(venue.requests[0]?.body).toEqual({ timestamp: expect.any(Number), id: 'venue-order-1' });
   });
 
   it('requires the documented cancel acknowledgement', async () => {
     venue.respondJson(200, { message: 'maybe' });
-    expect(await gateway.cancelOrder({ clientOrderId: CLIENT_ORDER_ID, exchangeOrderId: 'venue-order-1', pair: PAIR, timeoutMs: 2_000 }))
+    expect(await gateway.cancelOrder({ clientOrderId: CLIENT_ORDER_ID, exchangeOrderId: 'venue-order-1', pair: PAIR, timeoutMs: 2_000, budgetPermit: fixtureMutationPermitSync('CANCEL') }))
       .toEqual({ kind: 'AMBIGUOUS', reasonCode: 'LIVE_ORDER_RESPONSE_INVALID' });
   });
 
   it('uses the same short-page-safe observation after cancellation', async () => {
     venue.respondJson(200, { message: 'success', status: 200, code: 200 });
-    expect((await gateway.cancelOrder({ clientOrderId: CLIENT_ORDER_ID, exchangeOrderId: 'venue-order-1', pair: PAIR, timeoutMs: 2_000 })).kind)
+    expect((await gateway.cancelOrder({ clientOrderId: CLIENT_ORDER_ID, exchangeOrderId: 'venue-order-1', pair: PAIR, timeoutMs: 2_000, budgetPermit: fixtureMutationPermitSync('CANCEL') })).kind)
       .toBe('CANCEL_ACCEPTED');
     venue.respondSequence(
       nonTargetOrders(100, 'cancel-page-1'),
@@ -566,7 +569,7 @@ describe('[PROVIDER-IDEMP-01] create HTTP failures are ambiguous unless they are
     await new Promise<void>((resolve) => closed.listen(0, '127.0.0.1', () => resolve()));
     const port = (closed.address() as AddressInfo).port;
     await new Promise<void>((resolve) => closed.close(() => resolve()));
-    const unreachable = new CoinDcxLiveFuturesOrderGateway({ apiKey: API_KEY, apiSecret: API_SECRET, baseUrl: `http://127.0.0.1:${port}` });
+    const unreachable = new CoinDcxLiveFuturesOrderGateway({ apiKey: API_KEY, apiSecret: API_SECRET, baseUrl: `http://127.0.0.1:${port}`, readBudget: fixtureTransportBudget() });
     const result = await unreachable.placeOrder(placeRequest());
     expect(result.kind).toBe('PRE_DISPATCH_FAILURE');
   });

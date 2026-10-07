@@ -36,6 +36,12 @@ export interface LivePlaceOrderRequest {
   readonly settlementRateInrPerQuote: string | null;
   readonly timeInForce: LiveTimeInForce;
   readonly timeoutMs: number;
+  /**
+   * M2 W4 (U-M2-1): the opaque budget permit from `LiveMutationBudgetPort.admit`. Budget only, never authority.
+   * Absent, null, forged, a read permit, for the other operation, expired, revoked or already used: the adapter
+   * refuses before any request (`PRE_DISPATCH_FAILURE`).
+   */
+  readonly budgetPermit?: object | null | undefined;
 }
 
 export type LivePlaceOrderResult =
@@ -70,6 +76,8 @@ export interface LiveCancelOrderRequest {
   readonly exchangeOrderId: string;
   readonly pair: string;
   readonly timeoutMs: number;
+  /** M2 W4 (U-M2-1): as `LivePlaceOrderRequest.budgetPermit`, for a cancel permit. */
+  readonly budgetPermit?: object | null | undefined;
 }
 
 export type LiveCancelOrderResult =
@@ -113,4 +121,18 @@ export interface CoinDcxFuturesOrderGateway {
   placeOrder(request: LivePlaceOrderRequest): Promise<LivePlaceOrderResult>;
   cancelOrder(request: LiveCancelOrderRequest): Promise<LiveCancelOrderResult>;
   fetchOrder(request: LiveFetchOrderRequest): Promise<LiveFetchOrderResult>;
+}
+
+/**
+ * M2 W4 (U-M2-1): budget-only admission for one Phase 17 mutation, implemented by the integration layer. It can only
+ * delay or refuse; a permit is opaque, never authority, never provider data.
+ *   - `admit` is awaited BEFORE the durable pre-wire arm (`armDispatchWire` / `armCancelWire`). It resolves to the
+ *     permit carried in the request's `budgetPermit`, or null when refused (the adapter then refuses before any request).
+ *     `gatewayCall` names the gateway operation the permit pays for; the adapter re-derives the mutation kind from its
+ *     closed endpoint and refuses a mismatch, so the label cannot widen a permit.
+ *   - `release` voids a permit that was never consumed (irrevocable known non-use); a consumed one is never released.
+ */
+export interface LiveMutationBudgetPort {
+  admit(request: { readonly gatewayCall: 'placeOrder' | 'cancelOrder'; readonly lifetimeMs: number }): Promise<object | null>;
+  release(permit: object): void;
 }

@@ -8,7 +8,7 @@ import { EventEmitter } from 'node:events';
 import { CoinDcxLiveFuturesOrderGateway } from '../../../../../src/integration/coindcx/live/order-gateway';
 import { CoinDcxOrderMutationTransport } from '../../../../../src/integration/coindcx/live/mutation-transport';
 import * as provenance from '../../../../../src/execution/live/practical-cancel-transport-evidence';
-import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FakeClock } from '../../../../../src/core/time/clock';
 import { resolveLiveExecutionGate } from '../../../../../src/execution/live/gate';
 import { PracticalRecoveryCertificate, consumePracticalRecoveryCertificate } from '../../../../../src/execution/live/practical/certificate';
@@ -25,6 +25,9 @@ import {
   type PracticalAcquiredCancelRecord,
 } from '../../../../../src/execution/live/practical-mutation/ticket';
 import { newLiveRuntimeIdentity, readLiveRuntimeEpoch } from '../../../../../src/execution/live/reconciliation/barrier';
+import { createPracticalCancelBudgetPort } from '../../../../../src/integration/coindcx/live/mutation-budget-ports';
+import { disciplinedMutationPermit } from '../../../../../src/integration/coindcx/rate-limit/runtime/mutation-budget';
+import { disciplinedPermit } from '../../../../../src/integration/coindcx/rate-limit/runtime/read-budget';
 import { FINGERPRINT, FakePrivateStream, FakeReconciliation, FakeScheduler, FakeVenue, MemoryPracticalPersistence, T0, enablementFor } from '../practical-recovery/support';
 
 const ACCOUNT = 'orchestration-test-account';
@@ -75,7 +78,8 @@ describe('genuine practical cancel transport provenance', () => {
     }) as never);
     try {
       const transport = new CoinDcxOrderMutationTransport(options);
-      expect(await transport.execute('CANCEL_ORDER', { timestamp: T0, id: 'exact-venue-order' }, 20)).toMatchObject({ kind: 'PRE_DISPATCH' });
+      const permit = disciplinedMutationPermit('CANCEL', { consume: () => ({ kind: 'USED' }), started: () => undefined, complete: () => undefined, release: () => undefined, throttled: () => undefined });
+      expect(await transport.execute('CANCEL_ORDER', { timestamp: T0, id: 'exact-venue-order' }, 20, permit)).toMatchObject({ kind: 'PRE_DISPATCH' });
       expect(reads).toEqual({ key: 1, secret: 1, base: 1, limit: 1 }); expect(hooks).toBe(0); expect(writes).toBe(1); expect(native).toHaveBeenCalledTimes(1);
     } finally { native.mockRestore(); }
   });
@@ -397,11 +401,19 @@ async function harness(timeoutMs = 1000) {
     async resolveUnknownAcquire() { throw new Error('NOT_A_UNIT_RECOVERY_FIXTURE'); },
   };
   const gateway = { cancelOrder: vi.fn(async (_request: unknown): Promise<unknown> => ({ kind: 'CANCEL_ACCEPTED', observation: null })) };
+  // M2 W4: a granting fixture budget minting genuine limiter permits (pacing is exercised in the rate-limit suites).
+  const budgetRecord = { acquired: 0, consumed: 0, started: 0, completed: 0, released: 0, refuse: null as string | null };
+  const budget = createPracticalCancelBudgetPort({ async acquire(request) {
+    budgetRecord.acquired++;
+    return { kind: 'GRANTED' as const, permit: disciplinedMutationPermit(request.operation, {
+      consume: () => { if (budgetRecord.refuse !== null) return { kind: 'NOT_STARTED' as const, reason: budgetRecord.refuse }; budgetRecord.consumed++; return { kind: 'USED' as const }; },
+      started: () => { budgetRecord.started++; }, complete: () => { budgetRecord.completed++; }, release: () => { budgetRecord.released++; }, throttled: () => undefined }) };
+  } });
   const dependencies: PracticalCancelDependencies = { store, clock, runtimeIdentity: identity, enablement, liveEnablement: liveGate(), recovery,
-    gateway: gateway as unknown as PracticalCancelDependencies['gateway'], requestTimeoutMs: timeoutMs };
+    gateway: gateway as unknown as PracticalCancelDependencies['gateway'], requestTimeoutMs: timeoutMs, budget };
   const input = { intentId: INTENT, expected: { accountId: ACCOUNT, runtimeEpoch: epoch, reconciliationGeneration: record.reconciliationGeneration, revision: certified.account.fence.revision }, certificate };
   const service = new PracticalCancelService(dependencies);
-  return { clock, stream, persistence, reconciliation, recovery, certificate, record, dependencies, service, input, calls, hooks, cleanups, gateway,
+  return { clock, stream, persistence, reconciliation, recovery, certificate, record, dependencies, service, input, calls, hooks, cleanups, gateway, budgetRecord,
     setStop: (kind: typeof acquisitionStop) => { acquisitionStop = kind; }, setMalformed: () => { malformedCleanup = true; }, setUnknown: () => { completionUnknown = true; } };
 }
 
@@ -780,6 +792,10 @@ describe('unwired orchestration and gateway boundary', () => {
 });
 
 describe('trusted cancel lookup replacement through actual CommonJS loaders', () => {
+  // Runner hygiene: these synchronous child-process tests otherwise run back to back as microtasks, so the vitest
+  // worker cannot read its IPC replies for the whole block and its 60 s RPC timer fires first ("Timeout calling
+  // onTaskUpdate"). One macrotask turn before each test lets the worker service IPC. No assertion depends on it.
+  beforeEach(() => new Promise<void>(resolve => setImmediate(resolve)));
   let compiledRoot: string;
   let fixtureFile: string;
   let tsxFixtureFile: string;
@@ -1067,5 +1083,140 @@ describe('trusted cancel lookup replacement through actual CommonJS loaders', ()
       console.log('NATIVE_LIFECYCLE_BINDINGS_PINNED');
     `, format === 'tsc' ? compiledRoot : path.resolve('src'), format === 'tsc' ? 'js' : 'ts'], { cwd: process.cwd(), encoding: 'utf8', timeout: 30_000, windowsHide: true });
     expect(output.trim()).toBe('NATIVE_LIFECYCLE_BINDINGS_PINNED');
+  });
+});
+
+// M2 W4 (U-M2-1): the shared REST budget at the practical cancel gateway boundary.
+type BudgetHarness = Awaited<ReturnType<typeof harness>>;
+/** A fixture budget port whose admission waits until released, so state can change while admission is pending. */
+function waitingBudget(h: BudgetHarness, inner: PracticalCancelDependencies['budget'] = h.dependencies.budget) {
+  const gate = deferred(); let admitted!: () => void; const pending = new Promise<void>(resolve => { admitted = resolve; });
+  const port: PracticalCancelDependencies['budget'] = {
+    admit: async request => { admitted(); await gate.promise; return inner.admit(request); },
+    consume: admission => inner.consume(admission), release: admission => inner.release(admission),
+  };
+  return { port, pending, open: () => gate.resolve() };
+}
+async function withNative<T>(run: () => Promise<T>): Promise<{ result: T; native: number }> {
+  const native = vi.spyOn(http, 'request').mockImplementation(() => { throw new Error('UNEXPECTED_NATIVE_REQUEST'); });
+  try { const result = await run(); return { result, native: native.mock.calls.length }; } finally { native.mockRestore(); }
+}
+
+describe('M2 W4 practical cancel budget admission', () => {
+  it.each(['ordinary', 'provenance'].flatMap(source => ['UNPROVEN', 'LATCH', 'DISCONNECTED', 'JOIN_LOST', 'INCARNATION', 'CONFIRMATION', 'INVALID_EVENT', 'STATE', 'TRIP',
+    'EXPIRED', 'CLOCK', 'REGRESSION', 'STOP', 'OWNERSHIP'].map(reason => [source, reason] as const)))('%s: %s invalidated while admission waits refuses at the final guards; nothing consumed, entered or sent', async (source, reason) => {
+    const h = await harness();
+    const waiting = waitingBudget(h);
+    let attempt: unknown = null;
+    const consume = h.dependencies.store.consumeCancelDispatchPermission.bind(h.dependencies.store);
+    h.dependencies.store.consumeCancelDispatchPermission = async input => { const consumed = await consume(input); attempt = consumed.attempt; return consumed; };
+    const service = new PracticalCancelService({ ...h.dependencies, budget: waiting.port, ...(source === 'provenance' ? { gateway: genuineGateway() } : {}) });
+    const { result, native } = await withNative(async () => {
+      const running = service.cancel(h.input);
+      await waiting.pending; // admission requested: every durable step and every earlier guard already passed
+      switch (reason) {
+        case 'UNPROVEN': h.stream.unprove(); break;
+        case 'LATCH': h.stream.health = { ...h.stream.health, reconciliationRequired: true }; break;
+        case 'DISCONNECTED': h.stream.health = { ...h.stream.health, connected: false }; break;
+        case 'JOIN_LOST': h.stream.health = { ...h.stream.health, authJoinSent: false }; break;
+        case 'INCARNATION': h.stream.health = { ...h.stream.health, generationId: 2 }; break;
+        case 'CONFIRMATION': h.stream.confirmSubscription(T0 + 1); break;
+        case 'INVALID_EVENT': h.stream.health = { ...h.stream.health, invalidEventCount: 1 }; break;
+        case 'STATE': h.stream.health = { ...h.stream.health, state: 'DEGRADED' }; break;
+        case 'TRIP': h.stream.emit('df-order-update'); break;
+        case 'EXPIRED': h.clock.setTime(h.record.expiresAtMs); break; // certificate TTL closed during the wait
+        case 'CLOCK': h.clock.setTime(Number.NaN); break;
+        case 'REGRESSION': h.clock.advance(-1); break;
+        case 'STOP': service.requestStop(); break; // admission stop
+        case 'OWNERSHIP': transitionPracticalCancelDispatchOwner(attempt, 'UNENTERED', 'CLEANING', 'ABORTED_BEFORE_DISPATCH'); break; // the attempt is no longer ours to enter
+      }
+      waiting.open();
+      return running;
+    });
+    expect(h.gateway.cancelOrder).not.toHaveBeenCalled(); expect(native).toBe(0);
+    expect(h.calls).toEqual(['ACQUIRE', 'ARM', 'PERMISSION', 'CONSUMPTION']); // no new certificate consumption or durable step
+    expect(h.budgetRecord).toMatchObject({ acquired: 1, consumed: 0, started: 0, released: 1 }); // the unconsumed admission is voided
+    if (reason === 'OWNERSHIP') { expect(result).toMatchObject({ kind: 'BLOCKED', phase: 'CLEANUP' }); return; } // existing handling of a foreign transition
+    if (reason === 'CLOCK') { expect(result).toMatchObject({ kind: 'BOOKKEEPING_PENDING', phase: 'CLEANUP' }); return; } // cleanup itself needs valid time (existing)
+    expect(result).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' });
+    expect(h.cleanups.map(c => c.kind)).toEqual(['UNENTERED']); // existing UNENTERED no-wire cleanup
+    expect(PracticalCancelDispatchOwner.status(h.cleanups[0]!.owner)).toBe('SPENT');
+  });
+
+  it.each(['REFUSED', 'THROWS', 'MALFORMED'] as const)('limiter admission %s: BUDGET_REFUSED before any final guard, existing UNENTERED cleanup, nothing sent', async kind => {
+    const h = await harness();
+    const budget: PracticalCancelDependencies['budget'] = {
+      admit: async () => { if (kind === 'THROWS') throw new Error('SYNTHETIC_LIMITER_DISCONNECT'); return kind === 'MALFORMED' ? 'not-an-admission' as never : null; },
+      consume: () => { throw new Error('UNEXPECTED_CONSUME'); }, release: () => undefined,
+    };
+    const { result, native } = await withNative(() => new PracticalCancelService({ ...h.dependencies, budget, gateway: genuineGateway() }).cancel(h.input));
+    expect(result).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' }); expect(native).toBe(0);
+    expect(h.cleanups.map(c => c.kind)).toEqual(['UNENTERED']);
+    expect(h.cleanups[0]!.report).toEqual({ kind: 'NOT_DISPATCHED', reason: 'ABORTED_BEFORE_DISPATCH' });
+  });
+
+  it.each(['LOCAL_DEADLINE_PASSED', 'REVOKED', 'SESSION_CLOSED', 'EPOCH_CHANGED', 'LOCAL_STOP'])('consumption refused at the boundary (%s): BUDGET_REFUSED, UNENTERED cleanup, no entry, no start', async reason => {
+    const h = await harness(); h.budgetRecord.refuse = reason;
+    const { result, native } = await withNative(() => new PracticalCancelService({ ...h.dependencies, gateway: genuineGateway() }).cancel(h.input));
+    expect(result).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' }); expect(native).toBe(0);
+    expect(h.cleanups.map(c => c.kind)).toEqual(['UNENTERED']);
+    expect(h.budgetRecord).toMatchObject({ acquired: 1, consumed: 0, started: 0, released: 0 }); // the voided grant already reported NOT_STARTED
+  });
+
+  it.each(['CREATE_PERMIT', 'FORGED', 'READ_PERMIT'] as const)('a %s admission is refused at consumption (wrong binding); nothing enters', async kind => {
+    const h = await harness(); let released = 0;
+    const admission = kind === 'CREATE_PERMIT'
+      ? disciplinedMutationPermit('CREATE', { consume: () => ({ kind: 'USED' }), started: () => undefined, complete: () => undefined, release: () => { released++; }, throttled: () => undefined })
+      : kind === 'FORGED' ? Object.freeze({ consume: () => ({ kind: 'USED' }), start: (create: () => unknown) => ({ kind: 'STARTED', value: create() }) })
+        : disciplinedPermit({ start: create => ({ kind: 'STARTED', value: create() }), complete: () => undefined, release: () => { released++; }, throttled: () => undefined });
+    const port = createPracticalCancelBudgetPort({ acquire: async () => ({ kind: 'GRANTED', permit: admission as never }) });
+    const { result, native } = await withNative(() => new PracticalCancelService({ ...h.dependencies, budget: port, gateway: genuineGateway() }).cancel(h.input));
+    expect(result).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' }); expect(native).toBe(0);
+    expect(h.cleanups.map(c => c.kind)).toEqual(['UNENTERED']);
+    expect(released).toBe(kind === 'CREATE_PERMIT' ? 1 : 0); // a genuine unconsumed mutation permit is voided; foreign objects are not ours
+  });
+
+  it('the genuine transport creates exactly one request inside the consumed permit; STARTED at creation, completion after teardown, no resend', async () => {
+    const h = await harness(); let requests = 0;
+    const server = http.createServer((request, response) => {
+      requests++; request.resume();
+      request.on('end', () => { response.writeHead(200, { 'Content-Type': 'application/json' }); response.end('{"message":"success","status":200,"code":200}'); });
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = server.address(); if (address === null || typeof address === 'string') throw new Error('LOCAL_LISTENER_FAILED');
+      expect(await new PracticalCancelService({ ...h.dependencies, gateway: genuineGateway(`http://127.0.0.1:${address.port}`) }).cancel(h.input)).toMatchObject({ outcome: 'ACCEPTED' });
+      for (let i = 0; i < 50 && h.budgetRecord.completed === 0; i++) await new Promise(resolve => setTimeout(resolve, 10));
+      expect(requests).toBe(1);
+      expect(h.budgetRecord).toMatchObject({ acquired: 1, consumed: 1, started: 1, completed: 1, released: 0 });
+    } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); }
+  });
+
+  it('an uncertain outcome stays ambiguous: one start, no resend', async () => {
+    const h = await harness(); let requests = 0;
+    const server = http.createServer(request => { requests++; request.resume(); request.on('end', () => request.socket.destroy()); });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = server.address(); if (address === null || typeof address === 'string') throw new Error('LOCAL_LISTENER_FAILED');
+      expect(await new PracticalCancelService({ ...h.dependencies, gateway: genuineGateway(`http://127.0.0.1:${address.port}`) }).cancel(h.input)).toMatchObject({ outcome: 'AMBIGUOUS' });
+      expect(requests).toBe(1); expect(h.budgetRecord).toMatchObject({ consumed: 1, started: 1, released: 0 });
+    } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); }
+  });
+
+  it('a consumed permit whose request is never created keeps its capacity uncertain (no start, no release); the no-write proof is unchanged', async () => {
+    const h = await harness();
+    const { result, native } = await withNative(() => new PracticalCancelService({ ...h.dependencies, gateway: genuineGateway('invalid-local-url') }).cancel(h.input));
+    expect(result).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' }); expect(native).toBe(0);
+    expect(h.cleanups.map(c => c.kind)).toEqual(['OUTCOME']); // entered, then genuine transport no-write proof
+    expect(h.budgetRecord).toMatchObject({ acquired: 1, consumed: 1, started: 0, completed: 0, released: 0 });
+  });
+
+  it('a budget refusal never reissues or reconsumes a certificate and starts no automatic retry', async () => {
+    const h = await harness(); h.budgetRecord.refuse = 'REVOKED';
+    expect(await h.service.cancel(h.input)).toMatchObject({ kind: 'COMPLETED', outcome: 'PRE_DISPATCH_FAILURE' });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(h.calls).toEqual(['ACQUIRE', 'ARM', 'PERMISSION', 'CONSUMPTION']);
+    expect(h.budgetRecord.acquired).toBe(1); expect(h.gateway.cancelOrder).not.toHaveBeenCalled();
+    expect(h.cleanups.map(c => c.kind)).toEqual(['UNENTERED']);
   });
 });

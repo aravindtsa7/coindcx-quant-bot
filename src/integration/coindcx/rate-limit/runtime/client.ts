@@ -138,6 +138,20 @@ export class RateLimitClient {
 
   /** Synchronous start check for `grant`; USE runs `create` in the same synchronous region. */
   startGrant<T>(grant: Grant, create: () => T): Readonly<{ kind: 'STARTED'; value: T }> | Readonly<{ kind: 'NOT_STARTED'; reason: string }> {
+    const consumed = this.consumeGrant(grant);
+    if (consumed.kind === 'NOT_STARTED') return consumed;
+    try {
+      return Object.freeze({ kind: 'STARTED', value: create() });
+    } finally {
+      void this.report(grant, 'STARTED'); // also when `create` throws: a start cannot be excluded
+    }
+  }
+  /**
+   * M2 W4: the synchronous start check alone, for a mutation consumed at its last dispatch boundary. USE marks the grant
+   * used and reports nothing; the caller reports STARTED (`report(grant, 'STARTED')`) at the actual request creation. A
+   * used grant whose request is never created stays uncertain at the coordinator until the reconnect inventory lists it.
+   */
+  consumeGrant(grant: Grant): Readonly<{ kind: 'USED' }> | Readonly<{ kind: 'NOT_STARTED'; reason: string }> {
     const session = this.#session;
     const check = checkStart(this.#book, this.#localNow(), grant.grantId, {
       sessionId: session?.sessionId ?? '', sessionOpen: session !== null && this.#socket !== null, epoch: session?.epoch ?? '',
@@ -146,11 +160,7 @@ export class RateLimitClient {
     this.#book = check.book;
     if (check.kind === 'REFUSED') return Object.freeze({ kind: 'NOT_STARTED', reason: check.reason });
     if (check.kind === 'VOID') { void this.report(grant, 'NOT_STARTED'); return Object.freeze({ kind: 'NOT_STARTED', reason: check.report.reason }); }
-    try {
-      return Object.freeze({ kind: 'STARTED', value: create() });
-    } finally {
-      void this.report(grant, 'STARTED'); // also when `create` throws: a start cannot be excluded
-    }
+    return Object.freeze({ kind: 'USED' });
   }
   /** Voids an unused grant (NOT_STARTED). A used grant cannot be released. */
   releaseGrant(grant: Grant): boolean {
@@ -244,6 +254,9 @@ export class BudgetPermit {
   constructor(client: RateLimitClient, grant: Grant) { this.#client = client; this.grant = grant; }
   /** Synchronous: start check, then `create` in the same synchronous region. */
   start<T>(create: () => T): Readonly<{ kind: 'STARTED'; value: T }> | Readonly<{ kind: 'NOT_STARTED'; reason: string }> { return this.#client.startGrant(this.grant, create); }
+  /** M2 W4, mutations: the synchronous start check only; STARTED is reported later by `reportStarted`, at request creation. */
+  consume(): Readonly<{ kind: 'USED' }> | Readonly<{ kind: 'NOT_STARTED'; reason: string }> { return this.#client.consumeGrant(this.grant); }
+  reportStarted(): Promise<AckResult> { return this.#client.report(this.grant, 'STARTED'); }
   /** Positive completion/teardown evidence; call after the response ended or the request was destroyed and closed. */
   complete(): Promise<AckResult> { return this.#client.report(this.grant, 'COMPLETED'); }
   release(): boolean { return this.#client.releaseGrant(this.grant); }

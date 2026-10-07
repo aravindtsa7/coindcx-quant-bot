@@ -14,6 +14,7 @@ import { newLiveRuntimeIdentity, readLiveRuntimeEpoch } from '../../../execution
 import { createOwnedLiveReconciliationRepository } from '../../../execution/live/reconciliation/repository';
 import { createOwnedLiveReconciliationService } from '../../../execution/live/reconciliation/service';
 import { createOwnedLiveExecutionRepository } from '../../../execution/live/repository';
+import { productionPracticalCancelBudgetPort } from './mutation-budget-ports';
 import {
   createCoinDcxPracticalCredentialSources, readCoinDcxPracticalCredentialSources, checkCoinDcxCredentialScope,
   type CoinDcxCredentialConstructionOptions, type CoinDcxCredentialOriginAssociation, type CoinDcxPracticalSourceSet,
@@ -575,7 +576,8 @@ export function createCoinDcxPracticalAccountCoordinator(input: PracticalAccount
       evidenceProvider: sources.reader, runtimeIdentity, credentialAccountId: accountId, expectedProviderAccountFingerprint: fingerprint,
       clock, requestTimeoutMs: policy['requestTimeoutMs'] });
     const cancel = new PracticalCancelService({ store: mutation, clock, runtimeIdentity, enablement: practical.enablement,
-      liveEnablement: live.enablement, recovery, gateway: sources.gateway, requestTimeoutMs: policy['requestTimeoutMs'] });
+      liveEnablement: live.enablement, recovery, gateway: sources.gateway, requestTimeoutMs: policy['requestTimeoutMs'],
+      budget: productionPracticalCancelBudgetPort() }); // M2 W4: unbound production mutation budget, so every cancel is BUDGET_REFUSED
     const owned = Object.freeze({ association, sources, accountId, runtimeEpoch, ceilings: practical.enablement.ceilings,
       recovery, mutation, persistence, reconciliation, cancel, runtimeIdentity });
     const coordinator = new CoinDcxPracticalAccountCoordinator(ISSUER, owned);

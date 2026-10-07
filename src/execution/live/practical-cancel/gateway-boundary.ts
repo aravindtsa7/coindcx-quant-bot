@@ -10,10 +10,10 @@ import {
 } from '../practical-mutation/ticket';
 import { PracticalRecoveryService } from '../practical-recovery/service';
 import { readLiveRuntimeEpoch } from '../reconciliation/barrier';
-import type { PracticalCancelDependencies, PracticalCancelLocalRefusal, PracticalCancelTime } from './ports';
+import type { PracticalCancelBudgetPort, PracticalCancelDependencies, PracticalCancelLocalRefusal, PracticalCancelTime } from './ports';
 import { PracticalCancelLifecycle } from './lifecycle';
 import { hasCancelTransportSource, reserveCancelTransportInvocation, invokeCancelTransport, settleCancelTransportInvocation, closeCancelTransportInvocation,
-  type CancelTransportInvocation } from '../practical-cancel-transport-evidence';
+  attachCancelTransportBudget, type CancelTransportInvocation } from '../practical-cancel-transport-evidence';
 
 export type PracticalCancelGuard = { readonly kind: 'UNCHANGED'; readonly nowMs: number }
   | { readonly kind: 'REFUSED'; readonly code: PracticalCancelLocalRefusal };
@@ -102,6 +102,26 @@ function boundedReport(invocation: Promise<unknown>, timeoutMs: number, context:
 export type PracticalCancelGatewayResult =
   | { readonly kind: 'NOT_ENTERED'; readonly code: PracticalCancelLocalRefusal }
   | { readonly kind: 'REPORTED'; readonly outcome: PracticalCancelOutcomeReceipt };
+type Entered = { readonly kind: 'NOT_ENTERED'; readonly code: PracticalCancelLocalRefusal }
+  | { readonly kind: 'ENTERED'; readonly invocation: Promise<unknown>; readonly context: CancelTransportInvocation | null };
+
+// M2 W4 (U-M2-1) budget port calls. Budget only: a missing, throwing or malformed port is a refusal, never authority.
+async function admitCancelBudget(budget: PracticalCancelBudgetPort, lifetimeMs: number): Promise<object | null> {
+  try {
+    if (typeof budget !== 'object' || budget === null || typeof budget.admit !== 'function') return null;
+    const admission: unknown = await budget.admit(Object.freeze({ lifetimeMs }));
+    return typeof admission === 'object' && admission !== null ? admission : null;
+  } catch { return null; }
+}
+function consumeCancelBudget(budget: PracticalCancelBudgetPort, admission: object): object | null {
+  try {
+    const consumed: unknown = budget.consume(admission);
+    return typeof consumed === 'object' && consumed !== null ? consumed : null;
+  } catch { return null; }
+}
+function releaseCancelBudget(budget: PracticalCancelBudgetPort, admission: object): void {
+  try { budget.release(admission); } catch { /* budget only: an unreleased admission stays charged */ }
+}
 
 export class PracticalCancelGatewayBoundary {
   readonly #dependencies: PracticalCancelDependencies;
@@ -122,6 +142,23 @@ export class PracticalCancelGatewayBoundary {
   }
 
   public async invoke(attempt: unknown, certificate: unknown, time: PracticalCancelTime): Promise<PracticalCancelGatewayResult> {
+    // M2 W4 (U-M2-1): the budget admission is awaited FIRST, before the final guard sequence. #enter then runs after the
+    // wait, synchronously, and re-observes ownership, certificate, clock, runtime, enablement, window, watch and
+    // lifecycle. The budget only delays or refuses; a refusal keeps the attempt UNENTERED (existing no-wire cleanup).
+    const budget = this.#dependencies.budget;
+    const admission = await admitCancelBudget(budget, this.#dependencies.requestTimeoutMs);
+    if (admission === null) return Object.freeze({ kind: 'NOT_ENTERED', code: 'BUDGET_REFUSED' });
+    const entered = this.#enter(attempt, certificate, time, admission);
+    if (entered.kind === 'NOT_ENTERED') {
+      releaseCancelBudget(budget, admission); // voids only an admission never consumed; a consumed one stays charged
+      return entered;
+    }
+    const outcome = await boundedReport(entered.invocation, this.#dependencies.requestTimeoutMs, entered.context, attempt);
+    return Object.freeze({ kind: 'REPORTED', outcome });
+  }
+
+  /** Synchronous from the first guard to the sole invocation: no await, queue or unrelated callback. */
+  #enter(attempt: unknown, certificate: unknown, time: PracticalCancelTime, admission: object): Entered {
     const owner = PracticalCancelDispatchOwner.read(attempt);
     const original = PracticalRecoveryCertificate.read(certificate);
     const live = LiveExecutionEnablement.read(this.#dependencies.liveEnablement);
@@ -150,6 +187,14 @@ export class PracticalCancelGatewayBoundary {
       if (context !== null) closeCancelTransportInvocation(context);
       return Object.freeze({ kind: 'NOT_ENTERED', code: 'ADMISSION_CLOSED' });
     }
+    // M2 W4: synchronous budget consumption (the limiter's start check: session, epoch, TTL, revoke, STOP, block) after
+    // the last observation and before entry. It never reports a start: the transport reports STARTED at request creation.
+    const consumed = consumeCancelBudget(this.#dependencies.budget, admission);
+    if (consumed === null) {
+      if (context !== null) closeCancelTransportInvocation(context);
+      return Object.freeze({ kind: 'NOT_ENTERED', code: 'BUDGET_REFUSED' });
+    }
+    if (context !== null) attachCancelTransportBudget(context, consumed);
     try {
       enterPracticalCancelGateway(attempt);
     } catch {
@@ -162,8 +207,7 @@ export class PracticalCancelGatewayBoundary {
     } catch {
       invocation = Promise.reject(new Error('CANCEL_INVOCATION_UNCERTAIN'));
     }
-    const outcome = await boundedReport(invocation, this.#dependencies.requestTimeoutMs, context, attempt);
-    return Object.freeze({ kind: 'REPORTED', outcome });
+    return Object.freeze({ kind: 'ENTERED', invocation, context });
   }
 }
 

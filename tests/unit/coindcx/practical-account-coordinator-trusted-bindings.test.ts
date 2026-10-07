@@ -460,6 +460,7 @@ const assert=require('node:assert/strict'),path=require('node:path'),crypto=requ
 const [base,extension,timing,order]=process.argv.slice(1);
 const load=n=>require(path.join(base,n+'.'+extension));
 {const rb=load('integration/coindcx/rate-limit/runtime/read-budget');rb.bindProductionReadBudget({acquire:async()=>({kind:'GRANTED',permit:rb.disciplinedPermit({start:c=>({kind:'STARTED',value:c()}),complete(){},release(){},throttled(){}})})});} /* M2 W3: test-only granting production read budget */
+const mb=load('integration/coindcx/rate-limit/runtime/mutation-budget'),permit=()=>mb.disciplinedMutationPermit('CANCEL',{consume:()=>({kind:'USED'}),started(){},complete(){},release(){},throttled(){}}); /* M2 W4: test-only genuine fixture cancel permit */
 let sockets=0,requests=0,raw,body='{"coindcx_id":"synthetic-provider-id"}',status=200;
 const socketPath=require.resolve('socket.io-client');require(socketPath);
 require.cache[socketPath].exports=()=>{sockets++;raw=new EventEmitter();raw.connected=false;
@@ -571,8 +572,8 @@ assert.equal(load('execution/live/practical-recovery/private-events').practicalP
 const beforeInvalid=tuple.privateStream.getHealthSnapshot().invalidEventCount;raw.emit('df-order-update',[{bad:true}]);
 const health=tuple.privateStream.getHealthSnapshot();assert.equal(health.reconciliationRequired,false);assert.equal(health.invalidEventCount,beforeInvalid+1);
 tuple.privateStream.stop();await tuple.privateStream.start();assert.equal(tuple.privateStream.getHealthSnapshot().reconciliationRequired,true);
-body='{"message":"success","status":200,"code":200}';status=200;assert.equal((await tuple.gateway.cancelOrder({clientOrderId:'synthetic-client',exchangeOrderId:'synthetic-exchange',pair:'B-BTC_USDT',timeoutMs:100})).kind,'CANCEL_ACCEPTED');
-body='{"message":"unexpected","status":200,"code":200}';assert.notEqual((await tuple.gateway.cancelOrder({clientOrderId:'synthetic-client',exchangeOrderId:'synthetic-exchange',pair:'B-BTC_USDT',timeoutMs:100})).kind,'CANCEL_ACCEPTED');
+body='{"message":"success","status":200,"code":200}';status=200;assert.equal((await tuple.gateway.cancelOrder({clientOrderId:'synthetic-client',exchangeOrderId:'synthetic-exchange',pair:'B-BTC_USDT',timeoutMs:100,budgetPermit:permit()})).kind,'CANCEL_ACCEPTED');
+body='{"message":"unexpected","status":200,"code":200}';assert.notEqual((await tuple.gateway.cancelOrder({clientOrderId:'synthetic-client',exchangeOrderId:'synthetic-exchange',pair:'B-BTC_USDT',timeoutMs:100,budgetPermit:permit()})).kind,'CANCEL_ACCEPTED');
 tuple.privateStream.stop();
 const parser=load('integration/coindcx/websocket/candle-json').EXACT_CANDLE_SOCKET_PARSER,decoder=new parser.Decoder();
 assert.equal(Object.getOwnPropertyDescriptor(decoder,'add').writable,false);substitute(decoder,'add');substitute(parser,'Decoder');substitute(parser.Decoder.prototype,'add');

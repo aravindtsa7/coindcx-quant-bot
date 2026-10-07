@@ -20,14 +20,25 @@
  * private fields and in the outbound header map. No returned value, no thrown
  * error, and no log line here carries a key, a secret, a signature, or the
  * signed payload bytes.
+ *
+ * SHARED REST BUDGET (M2 W4): every request this transport creates is paced, and is created inside a permit's
+ * synchronous start, which reports STARTED at that moment. The budget kind comes from the closed endpoint:
+ *   CREATE_ORDER / CANCEL_ORDER  the caller's opaque mutation permit, consumed synchronously before signing (no await
+ *                  until the request exists). Missing, forged, a read permit, for the other operation, expired, revoked
+ *                  or used: PRE_DISPATCH 'BUDGET_REFUSED', before any request.
+ *   LIST_ORDERS    a read permit acquired here, as the W3 read primitives do.
+ * The practical cancel consumed its permit at the gateway boundary; it arrives with the invocation. A budget can only
+ * delay or refuse; it never supplies or alters response data.
  */
 import http from 'node:http';
 import https from 'node:https';
 import { createHmac } from 'node:crypto';
 import { installCancelTransportBrand, registerCancelTransportSource, beginCancelTransportPreparation, markCancelTransmissionPossible, issueCancelTransportNoWrite,
-  readCancelTransportRequest, type CancelTransportInvocation, type CancelTransportNoWriteEvidence } from '../../../execution/live/practical-cancel-transport-evidence';
+  readCancelTransportRequest, takeCancelTransportBudget, type CancelTransportInvocation, type CancelTransportNoWriteEvidence } from '../../../execution/live/practical-cancel-transport-evidence';
 import { parse as parseLosslessJson } from 'lossless-json';
 import { CoinDcxConfigError } from '../../../core/errors/app-error';
+import { boundProductionTransportBudget, type ReadPermit, type TransportReadBudget } from '../rate-limit/runtime/read-budget';
+import { consumeMutationPermit, readConsumedMutationPermit, type MutationOperation } from '../rate-limit/runtime/mutation-budget';
 import { createChildLogger } from '../../../monitoring/logger';
 import type { RequestSigner } from '../signer';
 import { HmacSha256Signer, createOwnedCoinDcxSigner } from '../signer';
@@ -37,6 +48,13 @@ import {
   COINDCX_ORDER_MUTATION_ENDPOINTS,
   type CoinDcxOrderMutationEndpoint,
 } from './endpoints';
+
+/** The budget kind of each closed endpoint. Never a caller label. */
+const ENDPOINT_BUDGET: Readonly<Record<CoinDcxOrderMutationEndpoint, MutationOperation | 'READ'>> = Object.freeze({
+  CREATE_ORDER: 'CREATE', CANCEL_ORDER: 'CANCEL', LIST_ORDERS: 'READ',
+});
+/** A read permit or a consumed mutation permit: the only way this transport creates a request. */
+type WirePermit = Pick<ReadPermit, 'start' | 'complete' | 'throttled'>;
 
 const logger = createChildLogger('coindcx:live-order-transport');
 
@@ -50,6 +68,8 @@ export interface OrderMutationTransportOptions {
   readonly apiSecret: string;
   readonly baseUrl?: string | undefined;
   readonly maxResponseBytes?: number | undefined;
+  /** M2 W4: the read budget for LIST_ORDERS (non-owned transports). Absent: every LIST_ORDERS is refused. */
+  readonly readBudget?: TransportReadBudget | undefined;
 }
 
 export class CoinDcxOrderMutationTransport {
@@ -59,6 +79,7 @@ export class CoinDcxOrderMutationTransport {
   readonly #maxResponseBytes: number;
   readonly #practicalSecret: string;
   readonly #practicalBaseUrl: unknown;
+  readonly #readBudget: TransportReadBudget | null;
 
   static { installCancelTransportBrand(value => typeof value === 'object' && value !== null && #practicalSecret in value); }
 
@@ -73,11 +94,13 @@ export class CoinDcxOrderMutationTransport {
     }
     this.#apiKey = apiKey;
     this.#signer = owned === OWNED_CONSTRUCTION ? createOwnedCoinDcxSigner(apiSecret) : new HmacSha256Signer(apiSecret);
-    const baseUrl = options.baseUrl, maxResponseBytes = options.maxResponseBytes;
+    const baseUrl = options.baseUrl, maxResponseBytes = options.maxResponseBytes, readBudget = options.readBudget;
     this.#baseUrl = baseUrl ?? COINDCX_LIVE_BASE_URL;
     this.#practicalBaseUrl = baseUrl === undefined ? COINDCX_LIVE_BASE_URL : baseUrl;
     this.#maxResponseBytes = maxResponseBytes ?? COINDCX_LIVE_MAX_RESPONSE_BYTES;
     this.#practicalSecret = apiSecret;
+    // Owned construction paces LIST_ORDERS through the set-once production read binding (refused while unbound).
+    this.#readBudget = owned === OWNED_CONSTRUCTION ? boundProductionTransportBudget('API_AUTH') : (readBudget ?? null);
     registerCancelTransportSource(this);
   }
 
@@ -97,8 +120,12 @@ export class CoinDcxOrderMutationTransport {
       || typeof baseUrl !== 'string' || typeof apiKey !== 'string' || typeof secret !== 'string'
       || typeof id !== 'string' || typeof cancelPath !== 'string') throw new Error('CANCEL_LOCAL_INPUT_INVALID');
     beginCancelTransportPreparation(invocation, this);
-    let payload: string, url: URL, headers: Record<string, string>;
+    let payload: string, url: URL, headers: Record<string, string>, consumed: WirePermit;
     try {
+      // M2 W4: the CANCEL permit the boundary consumed before entry. Anything else is a local refusal with no-write proof.
+      const taken = readConsumedMutationPermit(takeCancelTransportBudget(invocation, this), 'CANCEL');
+      if (taken === null) throw new Error('CANCEL_BUDGET_REFUSED');
+      consumed = taken;
       // Plain locally built body, private secret and native HMAC: no preparation callbacks.
       payload = JSON.stringify({ timestamp, id });
       url = new URL(cancelPath, baseUrl);
@@ -110,7 +137,7 @@ export class CoinDcxOrderMutationTransport {
     }
     // From before factory invocation onward no failure can issue practical proof.
     try {
-      const wire = await this.#executePrepared('CANCEL_ORDER', payload, url, headers, request.timeoutMs, invocation);
+      const wire = await this.#executePrepared('CANCEL_ORDER', payload, url, headers, request.timeoutMs, consumed, invocation);
       return { wire, evidence: null };
     } catch { return { wire: { kind: 'UNESTABLISHED', reasonCode: 'CANCEL_INVOCATION_UNCERTAIN' }, evidence: null }; }
   }
@@ -124,6 +151,7 @@ export class CoinDcxOrderMutationTransport {
     endpoint: CoinDcxOrderMutationEndpoint,
     body: Readonly<Record<string, unknown>>,
     timeoutMs: number,
+    budgetPermit?: unknown,
   ): Promise<OrderMutationWireResult> {
     const definition = COINDCX_ORDER_MUTATION_ENDPOINTS[endpoint];
     if (definition === undefined) {
@@ -138,18 +166,49 @@ export class CoinDcxOrderMutationTransport {
     }
 
     const url = new URL(definition.path, this.#baseUrl);
-    const headers: Record<string, string> = {
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-      'Content-Length': String(Buffer.byteLength(payload, 'utf8')),
-      'X-AUTH-APIKEY': this.#apiKey,
-      'X-AUTH-SIGNATURE': this.#signer.sign(payload),
-    };
+    // M2 W4: the permit for this request, by the closed endpoint's budget kind (see the header).
+    const kind = ENDPOINT_BUDGET[endpoint];
+    let permit: WirePermit;
+    if (kind === 'READ') {
+      if (budgetPermit !== undefined && budgetPermit !== null) return { kind: 'PRE_DISPATCH', reasonCode: 'BUDGET_REFUSED' }; // never pays for a read
+      const read = await this.#acquireReadPermit(timeoutMs);
+      if (read === null) return { kind: 'PRE_DISPATCH', reasonCode: 'READ_BUDGET_REFUSED' };
+      permit = read;
+    } else {
+      // Synchronous consumption before signing; from here to request creation nothing awaits.
+      const consumption = consumeMutationPermit(budgetPermit, kind);
+      if (consumption.kind === 'REFUSED') return { kind: 'PRE_DISPATCH', reasonCode: 'BUDGET_REFUSED' };
+      permit = consumption.consumed;
+    }
+    let headers: Record<string, string>;
+    try {
+      headers = {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'Content-Length': String(Buffer.byteLength(payload, 'utf8')),
+        'X-AUTH-APIKEY': this.#apiKey,
+        'X-AUTH-SIGNATURE': this.#signer.sign(payload),
+      };
+    } catch (error) {
+      // An unused read permit is released (known non-use); a consumed mutation permit stays charged.
+      if (kind === 'READ') (permit as ReadPermit).release();
+      throw error;
+    }
 
-    return this.#executePrepared(endpoint, payload, url, headers, timeoutMs);
+    return this.#executePrepared(endpoint, payload, url, headers, timeoutMs, permit);
   }
 
-  #executePrepared(endpoint: CoinDcxOrderMutationEndpoint, payload: string, url: URL, headers: Record<string, string>, timeoutMs: number, invocation?: CancelTransportInvocation): Promise<OrderMutationWireResult> {
+  /** A fresh read permit for one LIST_ORDERS request, or null (missing, unbound, unavailable or refusing budget). */
+  async #acquireReadPermit(timeoutMs: number): Promise<ReadPermit | null> {
+    const binding = this.#readBudget;
+    if (binding === null) return null;
+    try {
+      const acquired = await binding.budget.acquire({ scope: binding.scope, lifetimeMs: Math.max(1, timeoutMs) });
+      return acquired.kind === 'GRANTED' ? acquired.permit : null;
+    } catch { return null; }
+  }
+
+  #executePrepared(endpoint: CoinDcxOrderMutationEndpoint, payload: string, url: URL, headers: Record<string, string>, timeoutMs: number, permit: WirePermit, invocation?: CancelTransportInvocation): Promise<OrderMutationWireResult> {
     const definition = COINDCX_ORDER_MUTATION_ENDPOINTS[endpoint];
     const requestModule = url.protocol === 'https:' ? https : http;
     return new Promise<OrderMutationWireResult>((resolve) => {
@@ -174,10 +233,17 @@ export class CoinDcxOrderMutationTransport {
         (connected ? { kind: 'UNESTABLISHED', reasonCode } : { kind: 'PRE_DISPATCH', reasonCode });
 
       if (invocation !== undefined) markCancelTransmissionPossible(invocation, this);
-      const request = requestModule.request(url, { method: definition.method, headers }, (response) => {
+      const started = permit.start(() => requestModule.request(url, { method: definition.method, headers }, (response) => {
         const statusCode = response.statusCode ?? 0;
         const chunks: Buffer[] = [];
         let received = 0;
+        if (statusCode === 429) {
+          // Shared throttle observation (raw headers); the outcome classification below is unchanged.
+          try {
+            const retryAfter = response.headers['retry-after'], serverDate = response.headers.date;
+            permit.throttled({ ...(typeof retryAfter === 'string' ? { retryAfter } : {}), ...(typeof serverDate === 'string' ? { serverDate } : {}) });
+          } catch { /* budget reporting only: never affects the outcome */ }
+        }
 
         response.on('data', (chunk: Buffer) => {
           if (settled) return;
@@ -205,7 +271,15 @@ export class CoinDcxOrderMutationTransport {
             settle(unresolvedOutcome('UNPARSEABLE_RESPONSE_BODY'));
           }
         });
-      });
+      }));
+      if (started.kind !== 'STARTED') {
+        // A read permit's start check voided it (NOT_STARTED reported): no request was created.
+        settled = true;
+        resolve({ kind: 'PRE_DISPATCH', reasonCode: 'READ_BUDGET_REFUSED' });
+        return;
+      }
+      const request = started.value;
+      request.once('close', () => permit.complete()); // positive local completion/teardown evidence
 
       request.on('socket', (socket) => {
         if (socket.connecting === false) {

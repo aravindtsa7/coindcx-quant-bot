@@ -20,8 +20,8 @@ describe('unwired practical cancel transport provenance', () => {
   it('pins neutral importers and privileged operations to exact modules', () => {
     expect(files.filter(file => (graph.get(file) ?? []).includes(NEUTRAL)).sort()).toEqual([BOUNDARY, TRANSPORT, GATEWAY].sort());
     const callers = (symbol: string) => files.filter(file => file !== NEUTRAL && new RegExp(`\\b${symbol}\\s*\\(`).test(code(file))).sort();
-    for (const symbol of ['hasCancelTransportSource', 'reserveCancelTransportInvocation', 'invokeCancelTransport', 'settleCancelTransportInvocation', 'closeCancelTransportInvocation']) expect(callers(symbol)).toEqual([BOUNDARY]);
-    for (const symbol of ['installCancelTransportBrand', 'registerCancelTransportSource', 'beginCancelTransportPreparation', 'markCancelTransmissionPossible', 'issueCancelTransportNoWrite']) expect(callers(symbol)).toEqual([TRANSPORT]);
+    for (const symbol of ['hasCancelTransportSource', 'reserveCancelTransportInvocation', 'invokeCancelTransport', 'settleCancelTransportInvocation', 'closeCancelTransportInvocation', 'attachCancelTransportBudget']) expect(callers(symbol)).toEqual([BOUNDARY]);
+    for (const symbol of ['installCancelTransportBrand', 'registerCancelTransportSource', 'beginCancelTransportPreparation', 'markCancelTransmissionPossible', 'issueCancelTransportNoWrite', 'takeCancelTransportBudget']) expect(callers(symbol)).toEqual([TRANSPORT]);
     for (const symbol of ['installCancelGatewayBrand', 'registerCancelGatewaySource', 'propagateCancelTransportResult']) expect(callers(symbol)).toEqual([GATEWAY]);
     expect(callers('readCancelTransportRequest')).toEqual([GATEWAY, TRANSPORT].sort());
     expect(callers('executePracticalCancel')).toEqual([GATEWAY, TRANSPORT].sort());
@@ -51,7 +51,10 @@ describe('unwired practical cancel transport provenance', () => {
   });
   it('places the irreversible marker directly before the factory, outside preparation catch', () => {
     const transport = code(TRANSPORT);
-    expect(transport).toContain('if (invocation !== undefined) markCancelTransmissionPossible(invocation, this);\n      const request = requestModule.request');
+    // M2 W4 (reviewed narrow amendment): the factory is now created inside the budget permit's synchronous start, which
+    // reports STARTED at creation. The marker still immediately precedes the factory call.
+    expect(transport).toContain('if (invocation !== undefined) markCancelTransmissionPossible(invocation, this);\n      const started = permit.start(() => requestModule.request');
+    expect(transport.match(/requestModule\.request\(/g)).toHaveLength(1);
     const start = transport.indexOf('async #executePracticalCancel');
     const preparation = transport.slice(start, transport.indexOf('const wire = await this.#executePrepared', start));
     expect(preparation).toContain('issueCancelTransportNoWrite(invocation, this)');
@@ -90,5 +93,28 @@ describe('unwired practical cancel transport provenance', () => {
     const entry = boundary.indexOf('enterPracticalCancelGateway(attempt);');
     expect(boundary.lastIndexOf('PracticalCancelLifecycle.open', entry)).toBeGreaterThan(boundary.indexOf('const guard = checkPracticalCancelGuard', boundary.indexOf('public async invoke')));
     expect(boundary.slice(entry, boundary.indexOf('invokeCancelTransport(context)', entry))).not.toMatch(/\bawait\b|drain\(|requestStop\(|setTimeout/);
+  });
+  it('M2 W4: admission is awaited before every final guard; consumption is synchronous after the last observation and before entry', () => {
+    const boundary = code(BOUNDARY);
+    const invoke = boundary.indexOf('public async invoke'), enter = boundary.indexOf('#enter(attempt: unknown');
+    const admission = boundary.indexOf('await admitCancelBudget(', invoke);
+    expect(admission).toBeGreaterThan(invoke);
+    expect(admission).toBeLessThan(boundary.indexOf('this.#enter(attempt, certificate, time, admission)', invoke));
+    // The only awaits in invoke are the admission and the bounded report; #enter (every guard through invocation) has none.
+    expect(boundary.slice(invoke, enter).match(/\bawait\b/g)).toHaveLength(2);
+    const synchronous = boundary.slice(enter, boundary.indexOf('Object.freeze(PracticalCancelGatewayBoundary.prototype)'));
+    expect(enter).toBeGreaterThan(invoke);
+    expect(synchronous).not.toMatch(/\bawait\b|\basync\b|setTimeout|queueMicrotask|\.then\(/);
+    for (const guard of ['PracticalCancelDispatchOwner.read(attempt)', 'const context = reserveCancelTransportInvocation', 'const guard = checkPracticalCancelGuard(this.#dependencies, certificate, time)',
+      'PracticalCancelLifecycle.open(this.#lifecycle', 'const consumed = consumeCancelBudget(', 'attachCancelTransportBudget(context, consumed)', 'enterPracticalCancelGateway(attempt);', 'invokeCancelTransport(context)']) {
+      expect(synchronous.indexOf(guard), guard).toBeGreaterThan(-1);
+    }
+    const order = ['PracticalCancelLifecycle.open(this.#lifecycle', 'const consumed = consumeCancelBudget(', 'attachCancelTransportBudget(context, consumed)', 'enterPracticalCancelGateway(attempt);'].map(text => synchronous.indexOf(text));
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    expect(synchronous.match(/consumeCancelBudget\(/g)).toHaveLength(1);
+    // The transport takes the consumed permit only inside the no-write preparation region.
+    const transport = code(TRANSPORT), method = transport.slice(transport.indexOf('async #executePracticalCancel'), transport.indexOf('const wire = await this.#executePrepared'));
+    expect(method.indexOf('takeCancelTransportBudget(invocation, this)')).toBeGreaterThan(method.indexOf('try {'));
+    expect(method.indexOf('takeCancelTransportBudget(invocation, this)')).toBeLessThan(method.indexOf('} catch {'));
   });
 });

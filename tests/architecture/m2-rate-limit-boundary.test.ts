@@ -6,8 +6,9 @@ import { analyzeModuleReferences, buildImportGraph } from './support/import-grap
 // M2 W1/W2 rate-limit boundary.
 // W1: the scheduler/protocol files are pure: they import only each other, `zod` and `node:util`; read no clock; do no I/O.
 // W2: the runtime (coordinator, client, durable store, IPC) imports only the pure W1 module, its own files, `zod`
-// and a fixed set of Node built-ins. Nothing outside the rate-limit directory imports either (unwired: no provider
-// request or mutation path uses the limiter; W3-W6 are not authorized).
+// and a fixed set of Node built-ins.
+// W3/W4: outside the rate-limit directory only the reviewed REST primitives and the budget port adapters import the
+// limiter, and only its type-only budget interfaces; nothing outside imports the IPC runtime itself.
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const DIR = 'src/integration/coindcx/rate-limit/';
 const RUNTIME = `${DIR}runtime/`;
@@ -46,7 +47,7 @@ describe('M2 W1 rate-limit boundary (pure scheduler/protocol)', () => {
 
 describe('M2 W2 rate-limit runtime boundary', () => {
   it('contains exactly the reviewed W2 files', () => {
-    expect(runtimeFiles).toEqual(['client.ts', 'config.ts', 'coordinator.ts', 'framing.ts', 'protocol.ts', 'read-budget.ts', 'read-probe.ts', 'state-store.ts'].map((f) => `${RUNTIME}${f}`));
+    expect(runtimeFiles).toEqual(['client.ts', 'config.ts', 'coordinator.ts', 'framing.ts', 'mutation-budget.ts', 'protocol.ts', 'read-budget.ts', 'read-probe.ts', 'state-store.ts'].map((f) => `${RUNTIME}${f}`));
   });
 
   it('imports only the pure W1 module, its own files, zod and a fixed set of Node built-ins', () => {
@@ -69,15 +70,25 @@ describe('M2 W2 rate-limit runtime boundary', () => {
     expect(code(`${RUNTIME}config.ts`)).toContain(String.raw`const PIPE = /^\\\\\.\\pipe\\`);
   });
 
-  it('W3 wiring: only the three read primitives and the read client import the limiter, and only the read-budget interface', () => {
+  it('W3/W4 wiring: only the REST primitives and the budget port adapters import the limiter, and only its budget interfaces', () => {
     const importers = [...graph].filter(([file, edges]) => !file.startsWith(DIR) && edges.some((edge) => edge.startsWith(DIR)));
-    expect(importers.map(([file]) => file).sort()).toEqual([
-      'src/integration/coindcx/client.ts', 'src/integration/coindcx/instrument-authority.ts', 'src/integration/coindcx/paper-evidence.ts', 'src/integration/coindcx/transport.ts',
-    ]);
-    for (const [, edges] of importers) expect(edges.filter((edge) => edge.startsWith(DIR))).toEqual([`${RUNTIME}read-budget.ts`]);
-    // The read-budget module has type-only imports, so no read primitive loads the IPC runtime (node:net).
-    const imports = readFileSync(path.join(REPO_ROOT, `${RUNTIME}read-budget.ts`), 'utf8').split(/\r?\n/).filter((line) => /^import /.test(line));
-    expect(imports.every((line) => line.startsWith('import type '))).toBe(true);
+    const limiterEdges = Object.fromEntries(importers.map(([file, edges]) => [file, edges.filter((edge) => edge.startsWith(DIR)).sort()]));
+    const read = [`${RUNTIME}read-budget.ts`], mutation = [`${RUNTIME}mutation-budget.ts`];
+    expect(limiterEdges).toEqual({
+      'src/integration/coindcx/client.ts': read, 'src/integration/coindcx/instrument-authority.ts': read,
+      'src/integration/coindcx/paper-evidence.ts': read, 'src/integration/coindcx/transport.ts': read,
+      // W4: the order-mutation transport (mutation permits for create/cancel, a read permit for order observation) and
+      // the integration-layer implementations of the two execution budget ports.
+      'src/integration/coindcx/live/mutation-transport.ts': [...mutation, ...read],
+      'src/integration/coindcx/live/mutation-budget-ports.ts': mutation,
+    });
+    // Both budget modules have type-only imports, so no primitive loads the IPC runtime (node:net).
+    for (const budgetModule of ['read-budget.ts', 'mutation-budget.ts']) {
+      const imports = readFileSync(path.join(REPO_ROOT, `${RUNTIME}${budgetModule}`), 'utf8').split(/\r?\n/).filter((line) => /^import /.test(line));
+      expect(imports.every((line) => line.startsWith('import type ')), budgetModule).toBe(true);
+    }
+    // The limiter imports no execution (or any other non-limiter) module; the port adapters live in the integration layer.
+    for (const [file, edges] of graph) if (file.startsWith(DIR)) expect(edges.filter((edge) => !edge.startsWith(DIR))).toEqual([]);
     // Nothing imports the coordinator, the IPC client, the store or the probe responder outside the runtime.
     for (const [file, edges] of graph) if (!file.startsWith(RUNTIME)) for (const target of ['coordinator', 'client', 'state-store', 'read-probe', 'framing']) expect(edges).not.toContain(`${RUNTIME}${target}.ts`);
   });

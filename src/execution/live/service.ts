@@ -26,7 +26,7 @@ import { readLiveAuthorityForIntent } from './authority';
 import { consumeLiveAdmissionForIntent } from '../../dispatch/admission';
 import { LiveExecutionError } from './errors';
 import type { LiveExecutionPolicySnapshot } from './execution-policy';
-import type { CoinDcxFuturesOrderGateway } from './gateway';
+import type { CoinDcxFuturesOrderGateway, LiveCancelOrderResult, LiveMutationBudgetPort, LivePlaceOrderResult } from './gateway';
 import { assertLiveExecutionIntentIdentity, LiveExecutionIntent, type LiveExecutionIntentRecord } from './intent';
 import type { LiveExecutionRepository } from './repository';
 import {
@@ -56,17 +56,39 @@ export interface LiveExecutionServiceDependencies {
   readonly gateway: CoinDcxFuturesOrderGateway;
   readonly repository: LiveExecutionRepository;
   readonly policy: LiveExecutionPolicySnapshot;
+  /**
+   * M2 W4 (U-M2-1): the shared REST budget. Absent or refusing: the request carries no permit, and the genuine adapter
+   * refuses it before any request (PRE_DISPATCH_FAILURE, existing release). There is no unpaced fallback.
+   */
+  readonly budget?: LiveMutationBudgetPort | undefined;
 }
 
 export class LiveExecutionService {
   readonly #gateway: CoinDcxFuturesOrderGateway;
   readonly #repository: LiveExecutionRepository;
   readonly #policy: LiveExecutionPolicySnapshot;
+  readonly #budget: LiveMutationBudgetPort | null;
 
   public constructor(dependencies: LiveExecutionServiceDependencies) {
     this.#gateway = dependencies.gateway;
     this.#repository = dependencies.repository;
     this.#policy = dependencies.policy;
+    this.#budget = dependencies.budget ?? null;
+  }
+
+  /** Budget only: a missing, refusing, throwing or malformed port yields no permit (the adapter then refuses). */
+  async #admitBudget(gatewayCall: 'placeOrder' | 'cancelOrder'): Promise<object | null> {
+    const budget = this.#budget;
+    if (budget === null) return null;
+    try {
+      const permit: unknown = await budget.admit(Object.freeze({ gatewayCall, lifetimeMs: this.#policy.content.requestTimeoutMs }));
+      return typeof permit === 'object' && permit !== null ? permit : null;
+    } catch { return null; }
+  }
+  /** Voids a permit the adapter never consumed (irrevocable known non-use); a consumed permit is never released. */
+  #releaseBudget(permit: object | null): void {
+    if (permit === null || this.#budget === null) return;
+    try { this.#budget.release(permit); } catch { /* budget only: an unreleased permit stays charged */ }
   }
 
   /**
@@ -107,23 +129,34 @@ export class LiveExecutionService {
       return Object.freeze({ kind: 'ALREADY_DISPATCHED' as const, order: claim.order, faultCode: claim.order.faultCode });
     }
 
-    // [P18 Wave A2 / F18-14] The durable pre-wire checkpoint. Committing this
-    // BEFORE the HTTP call means a worker whose reconciliation generation was
-    // superseded since the claim above sends ZERO wire requests: the arm
-    // itself is refused, fenced out, before the gateway is ever reached.
-    const reserved = await this.#repository.armDispatchWire(claim.order.intentId, claim.order.revision, reconciliationAuthorization);
-    const result = await this.#gateway.placeOrder({
-      clientOrderId: intentRecord.clientOrderId,
-      pair: intentRecord.content.pair,
-      side: intentRecord.content.side,
-      wireOrderType: intentRecord.wireOrderType,
-      quantity: intentRecord.content.quantity,
-      price: intentRecord.content.price,
-      leverage: intentRecord.content.leverage,
-      settlementRateInrPerQuote: intentRecord.content.settlementRateInrPerQuote,
-      timeInForce: intentRecord.content.timeInForce,
-      timeoutMs: this.#policy.content.requestTimeoutMs,
-    });
+    // M2 W4 (U-M2-1): the budget admission is awaited BEFORE the durable pre-wire arm, so the arm stays the last
+    // check before the wire. A refusal is carried as no permit: the adapter refuses before any request and the
+    // existing PRE_DISPATCH_FAILURE release below follows. A later attempt passes every gate again; nothing resends.
+    const budgetPermit = await this.#admitBudget('placeOrder');
+    let reserved: LiveOrderStateRecord;
+    let result: LivePlaceOrderResult;
+    try {
+      // [P18 Wave A2 / F18-14] The durable pre-wire checkpoint. Committing this
+      // BEFORE the HTTP call means a worker whose reconciliation generation was
+      // superseded since the claim above sends ZERO wire requests: the arm
+      // itself is refused, fenced out, before the gateway is ever reached.
+      reserved = await this.#repository.armDispatchWire(claim.order.intentId, claim.order.revision, reconciliationAuthorization);
+      result = await this.#gateway.placeOrder({
+        clientOrderId: intentRecord.clientOrderId,
+        pair: intentRecord.content.pair,
+        side: intentRecord.content.side,
+        wireOrderType: intentRecord.wireOrderType,
+        quantity: intentRecord.content.quantity,
+        price: intentRecord.content.price,
+        leverage: intentRecord.content.leverage,
+        settlementRateInrPerQuote: intentRecord.content.settlementRateInrPerQuote,
+        timeInForce: intentRecord.content.timeInForce,
+        timeoutMs: this.#policy.content.requestTimeoutMs,
+        budgetPermit,
+      });
+    } finally {
+      this.#releaseBudget(budgetPermit);
+    }
 
     switch (result.kind) {
       case 'ACCEPTED': {
@@ -214,17 +247,26 @@ export class LiveExecutionService {
     const exchangeOrderId = claim.order.exchangeOrderId;
     if (exchangeOrderId === null) throw new LiveExecutionError('LIVE_PERSISTENCE_FAULT', 'Cancellation claim lost its exchange order identity', { details: { intentId } });
 
-    // [P18 Wave A2 / F18-14] The durable pre-wire checkpoint for cancel. A
-    // worker whose reconciliation generation was superseded since the claim
-    // above is fenced out here, before the gateway is ever reached.
-    const requested = await this.#repository.armCancelWire(intentId, claim.order.revision, reconciliationAuthorization);
+    // M2 W4 (U-M2-1): budget admission BEFORE the durable pre-wire arm, exactly as for create.
+    const budgetPermit = await this.#admitBudget('cancelOrder');
+    let requested: LiveOrderStateRecord;
+    let result: LiveCancelOrderResult;
+    try {
+      // [P18 Wave A2 / F18-14] The durable pre-wire checkpoint for cancel. A
+      // worker whose reconciliation generation was superseded since the claim
+      // above is fenced out here, before the gateway is ever reached.
+      requested = await this.#repository.armCancelWire(intentId, claim.order.revision, reconciliationAuthorization);
 
-    const result = await this.#gateway.cancelOrder({
-      clientOrderId: requested.clientOrderId,
-      exchangeOrderId,
-      pair: requested.pair,
-      timeoutMs: this.#policy.content.requestTimeoutMs,
-    });
+      result = await this.#gateway.cancelOrder({
+        clientOrderId: requested.clientOrderId,
+        exchangeOrderId,
+        pair: requested.pair,
+        timeoutMs: this.#policy.content.requestTimeoutMs,
+        budgetPermit,
+      });
+    } finally {
+      this.#releaseBudget(budgetPermit);
+    }
 
     if (result.kind === 'AMBIGUOUS') {
       const order = await this.#repository.completeCancelAttempt(intentId, claim.generation, 'AMBIGUOUS', 'LIVE_CANCEL_AMBIGUOUS', reconciliationAuthorization);

@@ -24,6 +24,7 @@ import { PracticalCancelService } from '../../../src/execution/live/practical-ca
 import { PracticalCancelGatewayBoundary } from '../../../src/execution/live/practical-cancel/gateway-boundary';
 import type { PracticalCancelStore, PracticalCancelResult, PracticalCancelDependencies } from '../../../src/execution/live/practical-cancel/ports';
 import { FakePrivateStream, FakeReconciliation, FakeScheduler, FakeVenue } from '../../unit/execution/live/practical-recovery/support';
+import { fixturePracticalCancelBudgetPort } from '../../helpers/mutation-budget-fixture';
 
 // Test-only synthetic authority. No provider, capture database or production issuer.
 const STRICT = process.env['REQUIRE_LIVE_PRACTICAL_CANCEL_DISPATCH_DB_INTEGRATION'] === '1';
@@ -670,7 +671,7 @@ async function orchestrationFixture(provenance: boolean | 'clock' | 'base-url' =
     clock: provenance === 'clock' ? { nowMs: () => malformed as never } : clock };
   if (provenance === 'base-url') practicalGatewayOptions.baseUrl = malformed as never;
   const service = new PracticalCancelService({ store: port, clock, runtimeIdentity: IDENTITY, enablement, liveEnablement: gate.enablement, recovery, requestTimeoutMs: 1000,
-    gateway: provenance ? new CoinDcxLiveFuturesOrderGateway(practicalGatewayOptions) : gateway });
+    gateway: provenance ? new CoinDcxLiveFuturesOrderGateway(practicalGatewayOptions) : gateway, budget: fixturePracticalCancelBudgetPort() }); // M2 W4 fixture budget
   const input = { intentId: order.intentId, expected: expectationOf(certified.account), certificate: certified.certificate };
   return { accountId, clock, privateStream, recovery, certificate: certified.certificate, order, exchangeOrderId, service, input, methods, cleanupInputs, overrides, after,
     gateway, calls: () => calls, inputHookCalls: () => inputHookCalls, result: (value: unknown) => { gatewayResult = value; } };

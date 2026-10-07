@@ -14,7 +14,7 @@ import { liveDecimal } from '../../../execution/live/decimal';
 import { isSendableLiveClientOrderId } from '../../../execution/live/identity';
 import type { LiveOrderObservation, LiveOrderObservationKind, LiveOrderSide, LiveTimeInForce } from '../../../execution/live/types';
 import { Clock, SystemClock } from '../clock';
-import { createOwnedCoinDcxMutationTransport, CoinDcxOrderMutationTransport, type OrderMutationWireResult } from './mutation-transport';
+import { createOwnedCoinDcxMutationTransport, CoinDcxOrderMutationTransport, type OrderMutationTransportOptions, type OrderMutationWireResult } from './mutation-transport';
 import { installCancelGatewayBrand, registerCancelGatewaySource, readCancelTransportRequest, propagateCancelTransportResult, type CancelTransportInvocation } from '../../../execution/live/practical-cancel-transport-evidence';
 import {
   LiveCancelResponseSchema,
@@ -187,6 +187,8 @@ export interface CoinDcxLiveOrderGatewayOptions {
   readonly apiSecret: string;
   readonly baseUrl?: string | undefined;
   readonly clock?: Clock | undefined;
+  /** M2 W4: read budget for order observation (non-owned construction; owned uses the production binding). */
+  readonly readBudget?: OrderMutationTransportOptions['readBudget'];
 }
 
 export class CoinDcxLiveFuturesOrderGateway implements CoinDcxFuturesOrderGateway {
@@ -198,7 +200,7 @@ export class CoinDcxLiveFuturesOrderGateway implements CoinDcxFuturesOrderGatewa
 
   public constructor(options: CoinDcxLiveOrderGatewayOptions, owned?: unknown) {
     this.#usesOwnedParsers = owned === OWNED_CONSTRUCTION;
-    const transportOptions = { apiKey: options.apiKey, apiSecret: options.apiSecret, baseUrl: options.baseUrl };
+    const transportOptions = { apiKey: options.apiKey, apiSecret: options.apiSecret, baseUrl: options.baseUrl, readBudget: options.readBudget };
     this.#transport = owned === OWNED_CONSTRUCTION
       ? createOwnedCoinDcxMutationTransport({ ...transportOptions, baseUrl: options.baseUrl! })
       : new CoinDcxOrderMutationTransport(transportOptions);
@@ -250,7 +252,8 @@ export class CoinDcxLiveFuturesOrderGateway implements CoinDcxFuturesOrderGatewa
       return { kind: 'PRE_DISPATCH_FAILURE', reasonCode: 'LIVE_CREATE_REQUEST_INVALID' };
     }
 
-    const wire = await this.#transport.execute('CREATE_ORDER', body, request.timeoutMs);
+    // M2 W4: the caller's opaque budget permit; the transport consumes it before signing or refuses (PRE_DISPATCH).
+    const wire = await this.#transport.execute('CREATE_ORDER', body, request.timeoutMs, request.budgetPermit);
     const failure = this.#classifyMutationFailure(wire);
     if (failure !== null) return failure;
     if (wire.kind !== 'RESPONSE') return { kind: 'AMBIGUOUS', reasonCode: 'LIVE_ORDER_RESPONSE_INVALID' };
@@ -277,7 +280,7 @@ export class CoinDcxLiveFuturesOrderGateway implements CoinDcxFuturesOrderGatewa
     const wire = await this.#transport.execute('CANCEL_ORDER', {
       timestamp: this.#clock.nowMs(),
       id: request.exchangeOrderId,
-    }, request.timeoutMs);
+    }, request.timeoutMs, request.budgetPermit);
 
     return this.#cancelResult(wire);
   }
