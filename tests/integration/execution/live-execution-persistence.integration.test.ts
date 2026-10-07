@@ -13,6 +13,7 @@ import type { LiveOrderObservation, LiveOrderStateRecord } from '../../../src/ex
 import { newLiveRuntimeIdentity, readLiveRuntimeEpoch, type LiveRuntimeIdentity } from '../../../src/execution/live/reconciliation/barrier';
 import { PrismaLiveReconciliationRepository } from '../../../src/execution/live/reconciliation/repository';
 import { FakeOrderGateway, livePolicy, mintGenuineLiveOpen } from '../../unit/execution/live/helpers';
+import { fixtureLiveMutationBudgetPort } from '../../helpers/mutation-budget-fixture';
 
 // [P17-DB] Real MySQL proof of the Phase17 idempotence guarantees, over two
 // INDEPENDENT connections — not two Promises racing inside one process, and
@@ -529,13 +530,13 @@ describe('P17 Wave C durable cancellation claim', () => {
     const gateway = new FakeOrderGateway().queueCancel({ kind: 'CANCEL_ACCEPTED', observation: observation(record.clientOrderId, {
       kind: 'CANCELLED', exchangeStatus: 'cancelled', providerEventTimeMs: 1_700_000_002_000,
     }) });
-    const restarted = new LiveExecutionService({ gateway, repository: new PrismaLiveExecutionRepository(connectionB), policy: livePolicy() });
+    const restarted = new LiveExecutionService({ gateway, repository: new PrismaLiveExecutionRepository(connectionB), policy: livePolicy(), budget: fixtureLiveMutationBudgetPort() });
     const outcome = await restarted.cancelDurable(record.intentId, record.content.accountId);
     expect(outcome.kind).toBe('CANCELLED');
     expect(gateway.cancelCallCount).toBe(1);
     expect((await repository.load(record.intentId))?.cancelState).toBe('CANCEL_ACKNOWLEDGED');
     const duplicateGateway = new FakeOrderGateway();
-    const duplicateRuntime = new LiveExecutionService({ gateway: duplicateGateway, repository: new PrismaLiveExecutionRepository(connectionA), policy: livePolicy() });
+    const duplicateRuntime = new LiveExecutionService({ gateway: duplicateGateway, repository: new PrismaLiveExecutionRepository(connectionA), policy: livePolicy(), budget: fixtureLiveMutationBudgetPort() });
     expect((await duplicateRuntime.cancelDurable(record.intentId, record.content.accountId)).kind).toBe('NOT_CANCELLABLE');
     expect(duplicateGateway.cancelCallCount).toBe(0);
   }, 60_000);
@@ -551,7 +552,7 @@ describe('P17 Wave C durable cancellation claim', () => {
     const gateway = new FakeOrderGateway().queueCancel({ kind: 'CANCEL_ACCEPTED', observation: observation(record.clientOrderId, {
       kind: 'CANCELLED', cumulativeFilledQuantity: '0.1', averageFillPrice: '64001', exchangeStatus: 'partially_cancelled', providerEventTimeMs: 1_700_000_002_000,
     }) });
-    const restarted = new LiveExecutionService({ gateway, repository: new PrismaLiveExecutionRepository(connectionB), policy: livePolicy() });
+    const restarted = new LiveExecutionService({ gateway, repository: new PrismaLiveExecutionRepository(connectionB), policy: livePolicy(), budget: fixtureLiveMutationBudgetPort() });
     const outcome = await restarted.cancelDurable(record.intentId, record.content.accountId);
     expect(outcome.order.state).toBe('CANCELLED');
     expect(outcome.order.cumulativeFilledQuantity).toBe('0.1');
@@ -567,8 +568,8 @@ describe('P17 Wave C durable cancellation claim', () => {
     const gateway = new FakeOrderGateway().queueCancel({ kind: 'CANCEL_ACCEPTED', observation: observation(record.clientOrderId, {
       kind: 'CANCELLED', exchangeStatus: 'cancelled', providerEventTimeMs: 1_700_000_002_000,
     }) });
-    const serviceA = new LiveExecutionService({ gateway, repository: repositoryA, policy: livePolicy() });
-    const serviceB = new LiveExecutionService({ gateway, repository: repositoryB, policy: livePolicy() });
+    const serviceA = new LiveExecutionService({ gateway, repository: repositoryA, policy: livePolicy(), budget: fixtureLiveMutationBudgetPort() });
+    const serviceB = new LiveExecutionService({ gateway, repository: repositoryB, policy: livePolicy(), budget: fixtureLiveMutationBudgetPort() });
     const settled = await Promise.all([serviceA.cancelDurable(record.intentId, record.content.accountId), serviceB.cancelDurable(record.intentId, record.content.accountId)]);
     expect(gateway.cancelCallCount).toBe(1);
     expect(settled.some((result) => result.kind === 'CANCELLED')).toBe(true);
@@ -581,10 +582,10 @@ describe('P17 Wave C durable cancellation claim', () => {
     const repositoryA = new PrismaLiveExecutionRepository(connectionA);
     await acknowledgedOrder(repositoryA, record);
     const gatewayA = new FakeOrderGateway().queueCancel({ kind: 'AMBIGUOUS', reasonCode: 'TIMEOUT' });
-    const first = new LiveExecutionService({ gateway: gatewayA, repository: repositoryA, policy: livePolicy() });
+    const first = new LiveExecutionService({ gateway: gatewayA, repository: repositoryA, policy: livePolicy(), budget: fixtureLiveMutationBudgetPort() });
     expect((await first.cancelDurable(record.intentId, record.content.accountId)).kind).toBe('AMBIGUOUS');
     const gatewayB = new FakeOrderGateway();
-    const restarted = new LiveExecutionService({ gateway: gatewayB, repository: new PrismaLiveExecutionRepository(connectionB), policy: livePolicy() });
+    const restarted = new LiveExecutionService({ gateway: gatewayB, repository: new PrismaLiveExecutionRepository(connectionB), policy: livePolicy(), budget: fixtureLiveMutationBudgetPort() });
     expect((await restarted.cancelDurable(record.intentId, record.content.accountId)).kind).toBe('AMBIGUOUS');
     expect(gatewayA.cancelCallCount).toBe(1);
     expect(gatewayB.cancelCallCount).toBe(0);
@@ -953,6 +954,7 @@ describe('P17 final-blocker current admission validity on real MySQL', () => {
       gateway: firstGateway,
       repository: new PrismaLiveExecutionRepository(connectionA),
       policy: livePolicy(),
+      budget: fixtureLiveMutationBudgetPort(),
     });
 
     await expect(firstService.dispatch(minted.authority, minted.intent)).rejects.toThrow(/LIVE_PROVIDER_ERROR/);
@@ -962,8 +964,8 @@ describe('P17 final-blocker current admission validity on real MySQL', () => {
     await coordinator.release(record.content.accountId, authority.admission.admissionId);
 
     const retryGateway = new FakeOrderGateway();
-    const retryA = new LiveExecutionService({ gateway: retryGateway, repository: new PrismaLiveExecutionRepository(connectionA), policy: livePolicy() });
-    const retryB = new LiveExecutionService({ gateway: retryGateway, repository: new PrismaLiveExecutionRepository(connectionB), policy: livePolicy() });
+    const retryA = new LiveExecutionService({ gateway: retryGateway, repository: new PrismaLiveExecutionRepository(connectionA), policy: livePolicy(), budget: fixtureLiveMutationBudgetPort() });
+    const retryB = new LiveExecutionService({ gateway: retryGateway, repository: new PrismaLiveExecutionRepository(connectionB), policy: livePolicy(), budget: fixtureLiveMutationBudgetPort() });
     const retries = await Promise.allSettled([
       retryA.dispatch(minted.authority, minted.intent),
       retryB.dispatch(minted.authority, minted.intent),

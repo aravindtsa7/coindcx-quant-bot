@@ -41,6 +41,7 @@ import {
   venuePosition,
 } from '../../unit/execution/live/reconciliation/helpers';
 import { FakeOrderGateway, genuineEnablement, livePolicy, mintGenuineLiveOpen } from '../../unit/execution/live/helpers';
+import { fixtureLiveMutationBudgetPort } from '../../helpers/mutation-budget-fixture';
 
 // [P18-DB] Real MySQL proof of the Phase18 reconciliation guarantees, over two
 // INDEPENDENT connections — not two Promises racing inside one process, and not
@@ -253,8 +254,11 @@ function buildService<P extends MinimalEvidenceProvider = FakeEvidenceProvider>(
     expectedProviderAccountFingerprint: EXPECTED_PROVIDER_ACCOUNT_FINGERPRINT,
     clock: new FixedClock(),
     maxSnapshotAttempts: options.maxSnapshotAttempts,
+    // M2: an enabled orphan cleanup is configured with the synthetic granting budget, as production would need one.
+    // The fake port sits above the transport, so budget refusal itself is proven with the real adapter in
+    // tests/integration/coindcx/rate-limit/orphan-cancel-admission-db.integration.test.ts.
     ...(resolution.status === 'ENABLED' && options.orphanCancellation !== undefined
-      ? { orphanPolicy: resolution.policy, orphanCancellation: options.orphanCancellation }
+      ? { orphanPolicy: resolution.policy, orphanCancellation: options.orphanCancellation, orphanCancellationBudget: fixtureLiveMutationBudgetPort() }
       : {}),
   });
   return { service, reconciliation, execution, provider, runtimeIdentity };
@@ -1531,7 +1535,7 @@ describe('P18-DB Wave A2 §18 exact F18-14 regression reproduction', () => {
         exchangeStatus: 'open', providerEventTimeMs: Date.now(),
       },
     });
-    const serviceF = new LiveExecutionService({ gateway: gatewayF, repository: new PrismaLiveExecutionRepository(connectionB), policy: livePolicy() });
+    const serviceF = new LiveExecutionService({ gateway: gatewayF, repository: new PrismaLiveExecutionRepository(connectionB), policy: livePolicy(), budget: fixtureLiveMutationBudgetPort() });
     const dispatched = await serviceF.dispatch(minted.authority, minted.intent, authorizationF);
     expect(dispatched.kind).toBe('SUBMITTED');
     expect(gatewayF.placeCallCount).toBe(1);
@@ -1551,7 +1555,7 @@ describe('P18-DB Wave A2 §18 exact F18-14 regression reproduction', () => {
 
     // -> cancel reaches CANCEL_RESERVED.
     const gatewayE = new FakeOrderGateway();
-    const serviceE = new LiveExecutionService({ gateway: gatewayE, repository: new PrismaLiveExecutionRepository(connectionA), policy: livePolicy() });
+    const serviceE = new LiveExecutionService({ gateway: gatewayE, repository: new PrismaLiveExecutionRepository(connectionA), policy: livePolicy(), budget: fixtureLiveMutationBudgetPort() });
     void serviceE; // the durable claim below is taken directly, mirroring §16/§18's "reaches the reserved state" framing
     const claim = await e.execution.claimCancel(intent.intentId, accountId, authorizationE);
     expect(claim.kind).toBe('CLAIMED');
@@ -1584,7 +1588,7 @@ describe('P18-DB Wave A2 §18 exact F18-14 regression reproduction', () => {
         exchangeStatus: 'cancelled', providerEventTimeMs: Date.now(),
       },
     });
-    const serviceF = new LiveExecutionService({ gateway: gatewayF, repository: new PrismaLiveExecutionRepository(connectionB), policy: livePolicy() });
+    const serviceF = new LiveExecutionService({ gateway: gatewayF, repository: new PrismaLiveExecutionRepository(connectionB), policy: livePolicy(), budget: fixtureLiveMutationBudgetPort() });
     const cancelled = await serviceF.cancelDurable(intent.intentId, accountId, authorizationF);
     expect(cancelled.kind).toBe('CANCELLED');
     expect(gatewayF.cancelCallCount).toBe(1);
@@ -1765,7 +1769,7 @@ describe('P18-DB Wave A3 §F18-18 contradictory wire-armed state fails closed (r
     // No live mutation: a service bound to a real gateway, holding a genuine
     // CURRENT authorization, still never reaches the gateway.
     const gateway = new FakeOrderGateway();
-    const liveService = new LiveExecutionService({ gateway, repository: execution, policy: livePolicy() });
+    const liveService = new LiveExecutionService({ gateway, repository: execution, policy: livePolicy(), budget: fixtureLiveMutationBudgetPort() });
     await expect(liveService.cancelDurable(intent.intentId, accountId, authorization)).rejects.toThrow(/LIVE_DURABLE_INTEGRITY_VIOLATION/);
     expect(gateway.placeCallCount + gateway.cancelCallCount).toBe(0);
 
@@ -1809,7 +1813,7 @@ describe('P18-DB Wave A3 §F18-18 contradictory wire-armed state fails closed (r
     await expect(execution.load(intent.intentId)).rejects.toThrow(/LIVE_DURABLE_INTEGRITY_VIOLATION/);
 
     const gateway = new FakeOrderGateway();
-    const liveService = new LiveExecutionService({ gateway, repository: execution, policy: livePolicy() });
+    const liveService = new LiveExecutionService({ gateway, repository: execution, policy: livePolicy(), budget: fixtureLiveMutationBudgetPort() });
     await expect(liveService.cancelDurable(intent.intentId, accountId, authorization)).rejects.toThrow(/LIVE_DURABLE_INTEGRITY_VIOLATION/);
     expect(gateway.placeCallCount + gateway.cancelCallCount).toBe(0);
 
