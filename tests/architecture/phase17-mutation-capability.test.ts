@@ -17,6 +17,10 @@ const APPROVED_NETWORK_OWNERS = Object.freeze([
   'src/integration/coindcx/instrument-authority.ts',
   'src/integration/coindcx/live/mutation-transport.ts',
   'src/integration/coindcx/paper-evidence.ts',
+  // M2 W2 limiter runtime: local Windows named-pipe IPC only (no provider host, no HTTP/TLS); unwired; pinned by
+  // tests/architecture/m2-rate-limit-boundary.test.ts.
+  'src/integration/coindcx/rate-limit/runtime/client.ts',
+  'src/integration/coindcx/rate-limit/runtime/coordinator.ts',
   'src/integration/coindcx/transport.ts',
   'src/integration/coindcx/websocket/socket-adapter.ts',
   'src/market-data/rest-candle-reader.ts',
@@ -26,6 +30,9 @@ const APPROVED_COINDCX_CRYPTO_OWNERS = Object.freeze([
   'src/integration/coindcx/live/mutation-transport.ts',
   'src/integration/coindcx/instrument-authority.ts',
   'src/integration/coindcx/paper-evidence.ts',
+  // M2 W2 limiter runtime: SHA-256 integrity/secret hashing and random identifiers only (no signing, no credentials).
+  'src/integration/coindcx/rate-limit/runtime/coordinator.ts',
+  'src/integration/coindcx/rate-limit/runtime/state-store.ts',
   'src/integration/coindcx/signer.ts',
 ]);
 

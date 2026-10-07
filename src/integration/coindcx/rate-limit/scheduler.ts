@@ -482,6 +482,11 @@ function snapshotOf(s: Draft, now: number): LimiterSnapshot {
   });
 }
 
+/** The durable snapshot of the current state (revision `state.revision`). Pure; used by the W2 durable store. */
+export function snapshotLimiterState(state: LimiterState): LimiterSnapshot {
+  return snapshotOf(draft(state), state.lastNowMs);
+}
+
 /** Trustworthy elapsed-time evidence (U-M2-11; default none): same boot session, boot-relative monotonic elapsed time. */
 export type ElapsedEvidence = Readonly<{ kind: 'SAME_BOOT_ELAPSED'; elapsedSinceSnapshotMs: number }>;
 export type RestoreResult =
