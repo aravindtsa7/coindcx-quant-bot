@@ -541,19 +541,34 @@ const STREAM_UNAVAILABLE: PrivateStreamObservation = Object.freeze({
 // The engine
 // ---------------------------------------------------------------------------
 
-function runCycle(config: SynchronizationConfig, source: SynchronizationSource, cycle: number): SyncCycleResult {
-  const call = <T>(work: () => T, fallback: T): T => { try { return work(); } catch { return fallback; } };
-  const start = call(() => source.stream({ cycle, point: 'CYCLE_START' }), STREAM_UNAVAILABLE);
-  const outcomes: ScanOutcome[][] = [];
-  for (const pass of [0, 1] as const) {
-    outcomes.push(config.scope.components.map((component) => {
-      const limits = config.scanLimits[component]!;
-      const scan = call(() => source.scan({ cycle, pass, component, accountId: config.scope.accountId, limits, history: config.scope.history }), null as unknown);
-      return evaluateScan(pass, component, limits, config.scope.history, config.contracts, scan);
-    }));
-  }
-  const evaluation = call(() => source.stream({ cycle, point: 'EVALUATION' }), STREAM_UNAVAILABLE);
-  const evaluatedAtMs = call(() => source.clock({ cycle }), -1);
+/**
+ * Everything one cycle collected: the stream at cycle start and at evaluation, the scans by [pass][declared component
+ * index], and the evaluation time. Every value is validated here, never trusted.
+ */
+export interface CollectedCycle {
+  readonly start: unknown;
+  readonly scans: readonly (readonly unknown[])[];
+  readonly evaluation: unknown;
+  readonly evaluatedAtMs: unknown;
+}
+
+/** A stream observation of the expected shape, or the unavailable observation (which revokes). */
+function asStream(value: unknown): PrivateStreamObservation {
+  return isRecord(value) && typeof value['connected'] === 'boolean' && typeof value['disconnectObservedSinceWindowStart'] === 'boolean'
+    && typeof value['reconnectLatched'] === 'boolean' && Array.isArray(value['events'])
+    ? value as unknown as PrivateStreamObservation : STREAM_UNAVAILABLE;
+}
+
+/**
+ * Pure: evaluates one collected cycle with the engine's normalization, scan, ownership and M3 rules. Both the
+ * synchronous runner and the asynchronous orchestration candidate use it, so no rule is duplicated.
+ */
+export function evaluateCollectedCycle(config: SynchronizationConfig, cycle: number, collected: CollectedCycle): SyncCycleResult {
+  const start = asStream(collected.start);
+  const evaluation = asStream(collected.evaluation);
+  const evaluatedAtMs = typeof collected.evaluatedAtMs === 'number' ? collected.evaluatedAtMs : -1;
+  const outcomes: ScanOutcome[][] = ([0, 1] as const).map((pass) => config.scope.components.map((component, index) =>
+    evaluateScan(pass, component, config.scanLimits[component]!, config.scope.history, config.contracts, collected.scans[pass]?.[index])));
 
   // Ownership per pass (fills inherit the classification of their parent order in the same pass).
   const recordViews: Array<Readonly<{ pass: 0 | 1; component: ObservationComponent; records: readonly SyncRecordView[] }>> = [];
@@ -603,6 +618,22 @@ function runCycle(config: SynchronizationConfig, source: SynchronizationSource, 
     scanFindings: Object.freeze(findings), records: Object.freeze(recordViews), assessment,
   });
 }
+
+function runCycle(config: SynchronizationConfig, source: SynchronizationSource, cycle: number): SyncCycleResult {
+  const call = <T>(work: () => T, fallback: T): T => { try { return work(); } catch { return fallback; } };
+  const start = call((): unknown => source.stream({ cycle, point: 'CYCLE_START' }), STREAM_UNAVAILABLE);
+  const scans = ([0, 1] as const).map((pass) => config.scope.components.map((component) =>
+    call((): unknown => source.scan({ cycle, pass, component, accountId: config.scope.accountId, limits: config.scanLimits[component]!, history: config.scope.history }), null)));
+  const evaluation = call((): unknown => source.stream({ cycle, point: 'EVALUATION' }), STREAM_UNAVAILABLE);
+  const evaluatedAtMs = call((): unknown => source.clock({ cycle }), -1);
+  return evaluateCollectedCycle(config, cycle, { start, scans, evaluation, evaluatedAtMs });
+}
+
+/** The explicit configuration check shared with the asynchronous orchestration candidate. */
+export function isValidSynchronizationConfig(value: unknown): value is SynchronizationConfig { return validConfig(value); }
+export const SYNC_HISTORY_UNPROVEN = HISTORY_UNPROVEN;
+export { GRANTS_NOTHING };
+export type { ObservationComponent, PrivateStreamObservation };
 
 /**
  * Runs observation cycles until one is not revoked, or `maxCycles` is reached. A revoked cycle (private event,

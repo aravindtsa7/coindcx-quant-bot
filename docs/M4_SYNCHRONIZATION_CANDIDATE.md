@@ -122,6 +122,47 @@
 Complete fill reconstruction, exactly-once execution accounting and fee accounting stay `UNKNOWN`. A scope that
 requires any of them is blocked. `FULL_EVIDENCE` keeps blocking on missing fill identifiers.
 
+## Asynchronous orchestration (separate unwired candidate, uncommitted)
+- **Placement:** `src/execution/live/practical-synchronization/async-orchestrator.ts`,
+  `runAsyncSynchronizationCandidate`. It imports only `./engine`. The engine's pure `evaluateCollectedCycle` (shared
+  with the synchronous runner) applies every normalization, scan, ownership and assessment rule, so none is duplicated.
+- **Pins:**
+  - only the orchestration imports the engine;
+  - nothing imports the orchestration;
+  - nothing in `src/` names either.
+- **Inputs:** an injected async source (`scan`, `observeStream`, `subscribeEvents`), an injected clock (`now`,
+  `delay`), and an optional cancellation signal. Read and stream timeouts are explicit limits, with no defaults.
+- **One cycle:** the initial stream observation, pass 0 then pass 1, the final observation, then
+  `evaluateCollectedCycle`. Components of a pass run concurrently and may complete out of order.
+- **Bindings:** every scan request is bound to account, scope id, cycle, pass, component, the cycle-start epoch and a
+  request id, and a response must echo that exact binding. A late response from an abandoned or superseded cycle is
+  never awaited by, and cannot enter, a newer cycle; a misrouted one fails its binding.
+- **Failures:** a timeout on the injected clock, a rejection, cancellation, a malformed response or a binding mismatch
+  is an explicit orchestration reason, and the engine also sees a failed read. An unavailable stream observation
+  revokes. Outer cancellation aborts in-flight reads and ends the run as `CANCELLED`.
+- **Events:** every event delivered during an active cycle increments a local observed-event counter and revokes the
+  cycle at once. It stays revocation evidence even when the stream later reports an empty buffer. The counter is not
+  a provider sequence (`providerSequence: 'NOT_AVAILABLE'`, `gapDetection: 'NOT_CLAIMED'`).
+- **Restarts:** a revoked cycle restarts only within `maxCycles`.
+- **Unchanged:** the reconnect latch and the strict reconciliation requirement pass through unchanged. Every result
+  grants nothing.
+- **Tests:** `async-orchestrator.test.ts` (31), covering:
+  - order and bindings;
+  - out-of-order and delayed completion;
+  - six binding mismatches;
+  - timeout, rejection, malformed responses and cancellation;
+  - stream failures;
+  - events between reads and during the final observation with a drained buffer;
+  - malformed events;
+  - late responses after a fresh cycle;
+  - a misrouted stale response;
+  - epoch and account changes;
+  - the latch;
+  - cycle-limit exhaustion;
+  - parity with the synchronous engine;
+  - cumulative limits;
+  - no grants.
+
 ## Flat positions (decided for the candidate)
 A flat position without durable ownership lineage stays UNRESOLVED (`FLAT_POSITION_WITHOUT_DURABLE_OWNERSHIP`).
 Ownership is never inferred from zero quantity, and the record is never excluded to reach convergence. The production
