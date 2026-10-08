@@ -58,7 +58,11 @@ export interface SyncTransactionEvidence {
   readonly providerEventTimeMs: number | null;
 }
 
-/** What the injected source returns for one component scan. Records are validated, never trusted. */
+/**
+ * What the injected source returns for one component scan. Records are validated, never trusted. A scan is either one
+ * unnamed page sequence (`pages`) or several named sub-scans (`segments`, for example an endpoint that must be read
+ * once per side); each segment is bounded by the same limits and must terminate on its own.
+ */
 export type SyncComponentScan =
   | Readonly<{ kind: 'FAILED' }>
   | Readonly<{
@@ -67,6 +71,13 @@ export type SyncComponentScan =
     startedAtMs: number;
     endedAtMs: number;
     pages: readonly (readonly unknown[])[];
+  }>
+  | Readonly<{
+    kind: 'SCANNED';
+    accountScope: Readonly<{ kind: 'CONFIRMED'; accountId: string }> | Readonly<{ kind: 'UNKNOWN' }>;
+    startedAtMs: number;
+    endedAtMs: number;
+    segments: readonly Readonly<{ segment: string; pages: readonly (readonly unknown[])[] }>[];
   }>;
 
 /** Durable local lineage, injected. Only these establish OWNED; a tag alone never does. */
@@ -142,7 +153,7 @@ export type SyncOwnershipReason =
   | 'NO_DURABLE_POSITION_OWNERSHIP' | 'FLAT_POSITION_WITHOUT_DURABLE_OWNERSHIP' | 'FILL_PARENT_NOT_OWNED' | 'WALLET_CHANGE_UNEXPLAINED';
 
 /** Where a record occurred in one scan: zero-based page and position within the page. */
-export type SyncOccurrence = Readonly<{ page: number; position: number }>;
+export type SyncOccurrence = Readonly<{ segment?: string; page: number; position: number }>;
 
 export type SyncRecordView = Readonly<{
   key: string;
@@ -170,6 +181,8 @@ export type SyncScanFinding = Readonly<{
   blocking: boolean;
   key?: string;
   occurrences?: readonly SyncOccurrence[];
+  /** The named segment a termination finding belongs to. */
+  segment?: string;
 }>;
 
 /**
@@ -184,7 +197,8 @@ export type SyncCycleResult = Readonly<{
   cycle: number;
   status: 'OBSERVED_CONVERGENCE' | 'UNRESOLVED' | 'REVOKED';
   reasons: readonly string[];
-  terminations: readonly Readonly<{ pass: 0 | 1; component: ObservationComponent; termination: SyncScanTermination }>[];
+  terminations: readonly Readonly<{ pass: 0 | 1; component: ObservationComponent; termination: SyncScanTermination;
+    segments?: readonly Readonly<{ segment: string; termination: SyncScanTermination }>[] }>[];
   scanFindings: readonly SyncScanFinding[];
   records: readonly Readonly<{ pass: 0 | 1; component: ObservationComponent; records: readonly SyncRecordView[] }>[];
   assessment: PracticalObservationAssessment;
@@ -397,6 +411,7 @@ type ScannedRecord = Normalized & Readonly<{
 type ScanOutcome = Readonly<{
   read: ComponentRead;
   termination: SyncScanTermination;
+  segments: readonly Readonly<{ segment: string; termination: SyncScanTermination }>[] | null;
   findings: SyncScanFinding[];
   records: ScannedRecord[];
 }>;
@@ -404,64 +419,81 @@ type ScanOutcome = Readonly<{
 function evaluateScan(pass: 0 | 1, component: ObservationComponent, limits: SyncScanLimits, history: SyncHistoryScope,
   contracts: SyncProviderContracts, scan: unknown): ScanOutcome {
   const findings: SyncScanFinding[] = [];
-  const finding = (kind: SyncScanFinding['finding'], blocking: boolean, key?: string, occurrences?: readonly SyncOccurrence[]): void => {
+  const finding = (kind: SyncScanFinding['finding'], blocking: boolean, key?: string, occurrences?: readonly SyncOccurrence[], segment?: string | null): void => {
     findings.push(Object.freeze({ pass, component, finding: kind, blocking, ...(key === undefined ? {} : { key }),
-      ...(occurrences === undefined ? {} : { occurrences: Object.freeze([...occurrences]) }) }));
+      ...(occurrences === undefined ? {} : { occurrences: Object.freeze([...occurrences]) }),
+      ...(segment === undefined || segment === null ? {} : { segment }) }));
   };
   const failed = (kind: 'READ_FAILED' | 'SCAN_LIMIT_VIOLATED'): ScanOutcome => {
     finding(kind, true);
-    return Object.freeze({ read: Object.freeze({ component, kind: 'FAILED' as const }), termination: 'FAILED' as const, findings, records: [] });
+    return Object.freeze({ read: Object.freeze({ component, kind: 'FAILED' as const }), termination: 'FAILED' as const, segments: null, findings, records: [] });
   };
   if (!isRecord(scan) || scan['kind'] !== 'SCANNED') return failed('READ_FAILED');
   const accountScope = scan['accountScope'];
-  const pages = scan['pages'];
+  // One unnamed segment (`pages`), or several named, independently terminated sub-scans (`segments`); never both.
+  const segmented = 'segments' in scan;
+  const rawSegments: unknown = segmented ? scan['segments'] : [{ segment: null, pages: scan['pages'] }];
+  const validPages = (value: unknown): value is unknown[][] => Array.isArray(value) && value.every((page: unknown) => Array.isArray(page));
   if (!isRecord(accountScope) || !(accountScope['kind'] === 'UNKNOWN' || (accountScope['kind'] === 'CONFIRMED' && isNonEmpty(accountScope['accountId'])))
-    || !isTime(scan['startedAtMs']) || !isTime(scan['endedAtMs']) || !Array.isArray(pages) || !pages.every((page: unknown) => Array.isArray(page))) {
+    || !isTime(scan['startedAtMs']) || !isTime(scan['endedAtMs']) || (segmented && 'pages' in scan)
+    || !Array.isArray(rawSegments) || rawSegments.length === 0
+    || !rawSegments.every((entry: unknown) => isRecord(entry) && (segmented ? isNonEmpty(entry['segment']) : entry['segment'] === null) && validPages(entry['pages']))) {
     return failed('READ_FAILED');
   }
-  if (pages.length > limits.maxPages) return failed('SCAN_LIMIT_VIOLATED');
+  const segments = rawSegments as { segment: string | null; pages: unknown[][] }[];
+  if (new Set(segments.map((entry) => entry.segment)).size !== segments.length) return failed('READ_FAILED');
+  if (segments.some((entry) => entry.pages.length > limits.maxPages)) return failed('SCAN_LIMIT_VIOLATED');
 
-  // Termination (register B9). An empty page ends a scan. A short non-empty page ends it only under a confirmed
-  // terminal-page contract for this endpoint; otherwise the source must continue (to an empty page or the bound), and
-  // a scan stopping there is unresolved. Records after any short page contradict termination and are never ignored.
-  let termination: SyncScanTermination;
-  const sizes = (pages as unknown[][]).map((page) => page.length);
-  const firstShort = sizes.findIndex((size) => size < limits.pageSize);
-  if (sizes.some((size) => size > limits.pageSize)) { finding('IRREGULAR_PAGE', true); termination = 'UNOBSERVED'; }
-  else if (sizes.length === 0) { finding('TERMINATION_UNOBSERVED', true); termination = 'UNOBSERVED'; }
-  else if (firstShort === -1) {
-    if (sizes.length === limits.maxPages) { finding('SCAN_BOUNDARY_REACHED', true); termination = 'SCAN_BOUNDARY_REACHED'; }
-    else { finding('TERMINATION_UNOBSERVED', true); termination = 'UNOBSERVED'; }
-  } else if (sizes.slice(firstShort + 1).some((size) => size > 0)) { finding('RECORDS_AFTER_SHORT_PAGE', true); termination = 'UNOBSERVED'; }
-  else if (sizes[firstShort] === 0 || firstShort < sizes.length - 1) termination = 'OBSERVED_EMPTY_PAGE';
-  else if (contracts.terminalShortPage[component] === 'CONFIRMED') termination = 'CONFIRMED_TERMINAL_SHORT_PAGE';
-  else { finding('SHORT_PAGE_TERMINALITY_UNCONFIRMED', true); termination = 'SHORT_PAGE_TERMINALITY_UNCONFIRMED'; }
+  // Termination (register B9), per segment. An empty page ends a segment. A short non-empty page ends it only under a
+  // confirmed terminal-page contract for this endpoint; otherwise the source must continue (to an empty page or the
+  // bound), and a segment stopping there is unresolved. Records after any short page contradict termination and are
+  // never ignored. The scan is clean only when every segment is.
+  const segmentTerminations = segments.map((entry): SyncScanTermination => {
+    const note = (kind: SyncScanFinding['finding']): void => finding(kind, true, undefined, undefined, entry.segment);
+    const sizes = entry.pages.map((page) => page.length);
+    const firstShort = sizes.findIndex((size) => size < limits.pageSize);
+    if (sizes.some((size) => size > limits.pageSize)) { note('IRREGULAR_PAGE'); return 'UNOBSERVED'; }
+    if (sizes.length === 0) { note('TERMINATION_UNOBSERVED'); return 'UNOBSERVED'; }
+    if (firstShort === -1) {
+      if (sizes.length === limits.maxPages) { note('SCAN_BOUNDARY_REACHED'); return 'SCAN_BOUNDARY_REACHED'; }
+      note('TERMINATION_UNOBSERVED'); return 'UNOBSERVED';
+    }
+    if (sizes.slice(firstShort + 1).some((size) => size > 0)) { note('RECORDS_AFTER_SHORT_PAGE'); return 'UNOBSERVED'; }
+    if (sizes[firstShort] === 0 || firstShort < sizes.length - 1) return 'OBSERVED_EMPTY_PAGE';
+    if (contracts.terminalShortPage[component] === 'CONFIRMED') return 'CONFIRMED_TERMINAL_SHORT_PAGE';
+    note('SHORT_PAGE_TERMINALITY_UNCONFIRMED'); return 'SHORT_PAGE_TERMINALITY_UNCONFIRMED';
+  });
+  const clean = (value: SyncScanTermination): boolean => value === 'OBSERVED_EMPTY_PAGE' || value === 'CONFIRMED_TERMINAL_SHORT_PAGE';
+  const termination: SyncScanTermination = segmentTerminations.find((value) => !clean(value))
+    ?? (segmentTerminations.every((value) => value === 'OBSERVED_EMPTY_PAGE') ? 'OBSERVED_EMPTY_PAGE' : 'CONFIRMED_TERMINAL_SHORT_PAGE');
 
-  // Identity and duplicates within one scan, with every occurrence retained.
+  // Identity and duplicates within one scan (across all its segments), with every occurrence retained.
   const entries = new Map<string, { record: Normalized; occurrences: SyncOccurrence[]; anomalies: Set<ScannedRecord['anomalies'][number]> }>();
   const order: string[] = [];
   let malformed = false;
   let timestamps = true;
-  (pages as unknown[][]).forEach((page, pageIndex) => {
-    page.forEach((value, position) => {
-      const record = NORMALIZERS[component](value);
-      if (record === null) { malformed = true; return; }
-      if (!record.timestamps) timestamps = false;
-      const occurrence = Object.freeze({ page: pageIndex, position });
-      const previous = entries.get(record.key);
-      if (previous === undefined) { entries.set(record.key, { record, occurrences: [occurrence], anomalies: new Set() }); order.push(record.key); return; }
-      previous.occurrences.push(occurrence);
-      if (record.identity === 'CONTENT_ONLY') {
-        // Identical content without a provider fill id: a duplicate or a genuine twin. Undecidable, never collapsed.
-        previous.anomalies.add('CONTENT_ONLY_TWIN_UNRESOLVED');
-        finding('CONTENT_IDENTITY_AMBIGUOUS', true, record.key, previous.occurrences);
-        return;
-      }
-      if (previous.record.fingerprint !== record.fingerprint) finding('CONFLICTING_DUPLICATE', true, record.key, previous.occurrences);
-      else if (previous.occurrences.some((entry) => entry.page !== pageIndex)) finding('PAGE_SHIFT_OBSERVED', true, record.key, previous.occurrences);
-      else { previous.anomalies.add('IDENTICAL_DUPLICATE_DEDUPED'); finding('IDENTICAL_DUPLICATE_DEDUPED', false, record.key, previous.occurrences); }
+  for (const segment of segments) {
+    segment.pages.forEach((page, pageIndex) => {
+      page.forEach((value, position) => {
+        const record = NORMALIZERS[component](value);
+        if (record === null) { malformed = true; return; }
+        if (!record.timestamps) timestamps = false;
+        const occurrence: SyncOccurrence = Object.freeze({ ...(segment.segment === null ? {} : { segment: segment.segment }), page: pageIndex, position });
+        const previous = entries.get(record.key);
+        if (previous === undefined) { entries.set(record.key, { record, occurrences: [occurrence], anomalies: new Set() }); order.push(record.key); return; }
+        previous.occurrences.push(occurrence);
+        if (record.identity === 'CONTENT_ONLY') {
+          // Identical content without a provider fill id: a duplicate or a genuine twin. Undecidable, never collapsed.
+          previous.anomalies.add('CONTENT_ONLY_TWIN_UNRESOLVED');
+          finding('CONTENT_IDENTITY_AMBIGUOUS', true, record.key, previous.occurrences);
+          return;
+        }
+        if (previous.record.fingerprint !== record.fingerprint) finding('CONFLICTING_DUPLICATE', true, record.key, previous.occurrences);
+        else if (previous.occurrences.some((entry) => entry.page !== pageIndex || entry.segment !== occurrence.segment)) finding('PAGE_SHIFT_OBSERVED', true, record.key, previous.occurrences);
+        else { previous.anomalies.add('IDENTICAL_DUPLICATE_DEDUPED'); finding('IDENTICAL_DUPLICATE_DEDUPED', false, record.key, previous.occurrences); }
+      });
     });
-  });
+  }
   if (malformed) finding('RECORD_MALFORMED', true);
   const records: ScannedRecord[] = order.map((key) => {
     const entry = entries.get(key)!;
@@ -493,7 +525,8 @@ function evaluateScan(pass: 0 | 1, component: ObservationComponent, limits: Sync
     startedAtMs: scan['startedAtMs'], endedAtMs: scan['endedAtMs'],
     records: Object.freeze([]), // filled after ownership classification
   });
-  return Object.freeze({ read, termination, findings, records });
+  return Object.freeze({ read, termination, findings, records,
+    segments: segmented ? Object.freeze(segments.map((entry, index) => Object.freeze({ segment: entry.segment as string, termination: segmentTerminations[index]! }))) : null });
 }
 
 // ---------------------------------------------------------------------------
@@ -614,7 +647,8 @@ export function evaluateCollectedCycle(config: SynchronizationConfig, cycle: num
   const status = revoked ? 'REVOKED' as const : reasons.length === 0 && assessment.kind === 'OBSERVED_CONVERGENCE' ? 'OBSERVED_CONVERGENCE' as const : 'UNRESOLVED' as const;
   return Object.freeze({
     cycle, status, reasons: Object.freeze(reasons),
-    terminations: Object.freeze(outcomes.flat().map((outcome, index) => Object.freeze({ pass: (index < config.scope.components.length ? 0 : 1) as 0 | 1, component: outcome.read.component, termination: outcome.termination }))),
+    terminations: Object.freeze(outcomes.flat().map((outcome, index) => Object.freeze({ pass: (index < config.scope.components.length ? 0 : 1) as 0 | 1, component: outcome.read.component, termination: outcome.termination,
+      ...(outcome.segments === null ? {} : { segments: outcome.segments }) }))),
     scanFindings: Object.freeze(findings), records: Object.freeze(recordViews), assessment,
   });
 }

@@ -163,6 +163,45 @@ requires any of them is blocked. `FULL_EVIDENCE` keeps blocking on missing fill 
   - cumulative limits;
   - no grants.
 
+## Named scan segments and the CoinDCX read adapter (unwired candidate)
+- **Segments (engine):** a scan may carry named `segments` instead of `pages`. Each segment is bounded by the same
+  limits and terminated by the same reviewed rules on its own, and the scan is clean only when every segment is. A
+  record appearing in two segments is a page shift. The `pages` form is unchanged.
+- **Adapter:** `src/integration/coindcx/live/sync-read-adapter.ts` implements the orchestration's `scan` structurally.
+  - **Imports:** only `type CoinDcxClient` and the order/position model types. It imports no candidate module.
+  - **Reads:** through an injected, already-constructed, M2-budgeted `CoinDcxClient`. It adds no request site,
+    signing, budget acquisition, unpaced fallback or client construction, and is imported by nothing.
+  - **ORDERS (supported):** `listInrFuturesOrders`, read as segments `side=buy` and `side=sell`, for an explicit status
+    list.
+  - **POSITIONS (supported):** `listInrFuturesPositions`.
+  - **TRANSACTIONS (`CLIENT_ADAPTER_UNSUPPORTED`):** an explicit failure. The label describes this client path only:
+    no committed read method's normalized model exposes a fill identity with an established order linkage. It is not
+    evidence that CoinDCX lacks transaction history or fill identifiers. Observing transaction records (not
+    implemented here) and confirmed fill-level reconstruction or accounting (stable fill semantics unresolved) are
+    separate questions. A scope that requires TRANSACTIONS keeps it and stays unresolved; the component is never
+    dropped, and no other endpoint is substituted.
+- **Pagination:** bounded, sequential, using the request's page size and page bound. A short page is never assumed
+  terminal: reading continues to an empty page or the bound. Every page carries its provenance (segment, page,
+  requested size, record count, local times), and every segment its stop reason. A declared window is reported as
+  `UNSUPPORTED_BY_ENDPOINT_NOT_APPLIED`, and nothing is filtered. History completeness is `UNKNOWN`.
+- **Provenance:** the echoed binding is `ADAPTER_LOCAL_ECHO` with no provider-returned identity. Account provenance
+  is separate: the injected credential binding of the authenticated client (`BOUND`, `MISMATCH` or `UNKNOWN`).
+  Unknown provenance gives the engine an unknown account scope; another account gives a mismatch.
+- **Fields:** each mapped field is listed with its provider field and basis (committed schema field, derived, or not
+  exposed), and `providerSemantics: 'NOT_CONFIRMED'`.
+  - `client_order_id` is carried exactly as the committed normalizer keeps it.
+  - `client_id` is not exposed by the committed read path, and is never renamed into `client_order_id`.
+  - A missing `cancelled_quantity` is an explicit gap, never defaulted, so the record fails the engine's validation.
+  - `filledQuantity` is derived and labelled as such.
+- **Cancellation:** the read primitive accepts no signal. After an abort, no further page is requested, and a late page
+  result is abandoned, not recorded. The in-flight request keeps its budget capacity until it completes; the adapter
+  never releases it.
+- **Tests:**
+  - `tests/integration/coindcx/rate-limit/sync-read-adapter.test.ts` (16): loopback venue, M2-budgeted client and
+    shared coordinator.
+  - `tests/architecture/m4-sync-read-adapter-boundary.test.ts` (5).
+  - Engine segment tests (3).
+
 ## Flat positions (decided for the candidate)
 A flat position without durable ownership lineage stays UNRESOLVED (`FLAT_POSITION_WITHOUT_DURABLE_OWNERSHIP`).
 Ownership is never inferred from zero quantity, and the record is never excluded to reach convergence. The production

@@ -491,3 +491,37 @@ describe('M4 closeout counterexamples: flat positions', () => {
     expect(record(run(config(), flat('0')), 'position:pos-1')).toMatchObject({ ownership: 'OWNED', reason: 'DURABLE_OWNERSHIP_RECORD' });
   });
 });
+
+describe('M4 named scan segments (for endpoints read once per side)', () => {
+  const buy = order({ exchangeOrderId: 'b-1', side: 'BUY', clientOrderId: 'bot-b1' });
+  const sell = order({ exchangeOrderId: 's-1', side: 'SELL', clientOrderId: 'bot-s1' });
+  const owning = config({ lineage: { ...config().lineage, ownedOrders: [{ exchangeOrderId: 'b-1', intentId: 'i-b' }, { exchangeOrderId: 's-1', intentId: 'i-s' }] } });
+  const segmented = (segments: readonly { segment: string; pages: unknown[][] }[]) => ({ pages: (_c: number, pass: 0 | 1, component: ObservationComponent) => (component === 'ORDERS'
+    ? { kind: 'SCANNED', accountScope: { kind: 'CONFIRMED', accountId: ACCOUNT }, startedAtMs: 10_000 + pass * 300, endedAtMs: 10_050 + pass * 300, segments } as SyncComponentScan
+    : DEFAULT_PAGES[component]) });
+
+  it('each segment terminates on its own; records of every segment are compared', () => {
+    const result = run(owning, segmented([{ segment: 'side=buy', pages: [[buy], []] }, { segment: 'side=sell', pages: [[sell], []] }]));
+    expect(result.status).toBe('OBSERVED_CONVERGENCE');
+    expect(last(result).terminations.find((t) => t.component === 'ORDERS')).toMatchObject({ termination: 'OBSERVED_EMPTY_PAGE',
+      segments: [{ segment: 'side=buy', termination: 'OBSERVED_EMPTY_PAGE' }, { segment: 'side=sell', termination: 'OBSERVED_EMPTY_PAGE' }] });
+    expect(record(result, 'order:s-1')).toMatchObject({ occurrences: [{ segment: 'side=sell', page: 0, position: 0 }] });
+  });
+
+  it('one segment that does not terminate cleanly makes the scan unresolved, with the segment named', () => {
+    const result = run(owning, segmented([{ segment: 'side=buy', pages: [[buy], []] }, { segment: 'side=sell', pages: [[sell]] }]));
+    expect(result.status).toBe('UNRESOLVED');
+    expect(last(result).scanFindings.filter((f) => f.pass === 0).map((f) => `${f.finding}:${f.segment ?? ''}`)).toEqual(['SHORT_PAGE_TERMINALITY_UNCONFIRMED:side=sell']);
+  });
+
+  it('page bounds apply per segment; a record in two segments is a page shift; malformed segment shapes fail the read', () => {
+    expect(last(run(owning, segmented([{ segment: 'side=buy', pages: [[buy], [], [], []] }, { segment: 'side=sell', pages: [[]] }]))).reasons).toContain('SCAN_LIMIT_VIOLATED');
+    expect(last(run(owning, segmented([{ segment: 'side=buy', pages: [[buy], []] }, { segment: 'side=sell', pages: [[buy], []] }]))).reasons).toContain('PAGE_SHIFT_OBSERVED');
+    expect(last(run(owning, segmented([{ segment: 'x', pages: [[]] }, { segment: 'x', pages: [[]] }]))).reasons).toContain('READ_FAILED');
+    expect(last(run(owning, segmented([]))).reasons).toContain('READ_FAILED');
+    const both = { pages: (_c: number, _p: 0 | 1, component: ObservationComponent) => (component === 'ORDERS'
+      ? { kind: 'SCANNED', accountScope: { kind: 'CONFIRMED', accountId: ACCOUNT }, startedAtMs: 10_000, endedAtMs: 10_050, pages: [[]], segments: [{ segment: 'a', pages: [[]] }] } as unknown as SyncComponentScan
+      : DEFAULT_PAGES[component]) };
+    expect(last(run(owning, both)).reasons).toContain('READ_FAILED');
+  });
+});
