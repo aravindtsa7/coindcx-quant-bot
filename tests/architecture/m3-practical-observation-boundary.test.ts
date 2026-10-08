@@ -20,13 +20,17 @@ describe('M3 practical observation evaluator boundary', () => {
     expect(graph.get(MODULE) ?? []).toEqual([]);
   });
 
-  it('only the unwired M4 synchronization candidate imports it, and only its unwired orchestration imports that, so no production path can reach it', () => {
+  it('only the M4 engine imports it; candidate importers end at the unwired campaign, so no production path can reach it', () => {
     const M4_ENGINE = 'src/execution/live/practical-synchronization/engine.ts';
     const M4_ORCHESTRATOR = 'src/execution/live/practical-synchronization/async-orchestrator.ts';
+    const PREFLIGHT = 'src/integration/coindcx/live/sync-read-campaign-preflight.ts';
+    const CAMPAIGN = 'src/integration/coindcx/live/sync-read-campaign.ts';
     const importers = [...graph].filter(([, edges]) => edges.includes(MODULE)).map(([file]) => file);
     expect(importers).toEqual([M4_ENGINE]);
-    expect([...graph].filter(([, edges]) => edges.includes(M4_ENGINE)).map(([file]) => file)).toEqual([M4_ORCHESTRATOR]);
-    for (const [file, edges] of graph) expect(edges, file).not.toContain(M4_ORCHESTRATOR);
+    expect([...graph].filter(([, edges]) => edges.includes(M4_ENGINE)).map(([file]) => file)).toEqual([M4_ORCHESTRATOR, PREFLIGHT]);
+    expect([...graph].filter(([, edges]) => edges.includes(M4_ORCHESTRATOR)).map(([file]) => file)).toEqual([CAMPAIGN]);
+    expect([...graph].filter(([, edges]) => edges.includes(PREFLIGHT)).map(([file]) => file)).toEqual([CAMPAIGN]);
+    for (const [file, edges] of graph) expect(edges, file).not.toContain(CAMPAIGN);
     for (const file of files.filter((candidate) => candidate !== MODULE && candidate !== M4_ENGINE)) {
       expect(readFileSync(path.join(REPO_ROOT, file), 'utf8').includes('practical-observation'), file).toBe(false);
     }

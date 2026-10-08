@@ -8,6 +8,7 @@ import { analyzeModuleReferences, buildImportGraph } from './support/import-grap
 // imported by nothing in src.
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const ADAPTER = 'src/integration/coindcx/live/sync-read-adapter.ts';
+const CAMPAIGN = 'src/integration/coindcx/live/sync-read-campaign.ts';
 const { graph, files } = buildImportGraph(path.join(REPO_ROOT, 'src'), REPO_ROOT);
 const raw = readFileSync(path.join(REPO_ROOT, ADAPTER), 'utf8');
 const code = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
@@ -24,9 +25,9 @@ describe('M4 read adapter boundary', () => {
     ]);
   });
 
-  it('is imported by nothing in src and named by nothing else in src (unwired; no production composition)', () => {
-    for (const [file, edges] of graph) expect(edges, file).not.toContain(ADAPTER);
-    for (const file of files.filter((candidate) => candidate !== ADAPTER)) {
+  it('is imported and named only by the isolated campaign (no production composition)', () => {
+    expect([...graph].filter(([, edges]) => edges.includes(ADAPTER)).map(([file]) => file)).toEqual([CAMPAIGN]);
+    for (const file of files.filter((candidate) => candidate !== ADAPTER && candidate !== CAMPAIGN)) {
       expect(readFileSync(path.join(REPO_ROOT, file), 'utf8').includes('sync-read-adapter'), file).toBe(false);
     }
   });

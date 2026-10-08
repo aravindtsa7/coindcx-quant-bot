@@ -9,6 +9,8 @@ import { analyzeModuleReferences, buildImportGraph } from './support/import-grap
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const ENGINE = 'src/execution/live/practical-synchronization/engine.ts';
 const ORCHESTRATOR = 'src/execution/live/practical-synchronization/async-orchestrator.ts';
+const CAMPAIGN = 'src/integration/coindcx/live/sync-read-campaign.ts';
+const PREFLIGHT = 'src/integration/coindcx/live/sync-read-campaign-preflight.ts';
 const { graph, files } = buildImportGraph(path.join(REPO_ROOT, 'src'), REPO_ROOT);
 const rawOf = (file: string): string => readFileSync(path.join(REPO_ROOT, file), 'utf8');
 const codeOf = (file: string): string => rawOf(file).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
@@ -32,10 +34,10 @@ describe('M4 practical synchronization candidate boundary', () => {
     expect(graph.get(ORCHESTRATOR) ?? []).toEqual([ENGINE]);
   });
 
-  it('only the orchestration imports the engine; nothing imports the orchestration; nothing else names either', () => {
-    expect([...graph].filter(([, edges]) => edges.includes(ENGINE)).map(([file]) => file)).toEqual([ORCHESTRATOR]);
-    for (const [file, edges] of graph) expect(edges, file).not.toContain(ORCHESTRATOR);
-    for (const file of files.filter((candidate) => candidate !== ENGINE && candidate !== ORCHESTRATOR)) {
+  it('only the orchestration and isolated preflight import the engine; only the isolated campaign imports the orchestration', () => {
+    expect([...graph].filter(([, edges]) => edges.includes(ENGINE)).map(([file]) => file)).toEqual([ORCHESTRATOR, PREFLIGHT]);
+    expect([...graph].filter(([, edges]) => edges.includes(ORCHESTRATOR)).map(([file]) => file)).toEqual([CAMPAIGN]);
+    for (const file of files.filter((candidate) => ![ENGINE, ORCHESTRATOR, CAMPAIGN, PREFLIGHT].includes(candidate))) {
       expect(rawOf(file).includes('practical-synchronization'), file).toBe(false);
     }
   });

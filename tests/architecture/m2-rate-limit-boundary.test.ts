@@ -83,6 +83,8 @@ describe('M2 W2 rate-limit runtime boundary', () => {
       'src/integration/coindcx/live/mutation-budget-ports.ts': mutation,
       // W5: the candle-reader primitive (read permits for every candle request).
       'src/market-data/rest-candle-reader.ts': read,
+      // Unwired M4 preflight validates explicit policy with the pure config validator; it cannot acquire a permit.
+      'src/integration/coindcx/live/sync-read-campaign-preflight.ts': [`${DIR}config.ts`],
     });
     // Both budget modules have type-only imports, so no primitive loads the IPC runtime (node:net).
     for (const budgetModule of ['read-budget.ts', 'mutation-budget.ts']) {

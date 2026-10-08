@@ -6,7 +6,7 @@
   - real provider reads;
   - the separately authorized read-only shadow campaign;
   - the roadmap clean gate.
-- Nothing is composed into production. There are no HTTP adapters, provider requests, runtime binding, database access
+- Nothing is composed into production. There are no provider requests, runtime binding, database access
   or migrations.
 - Sources: `FULL_BOT_ROADMAP_V3.md` §6 M4 and §7 O1–O6; `CAPABILITY_REGISTER_V3.md` B3/B8/B9/B12/B13, C1–C5,
   D2–D5 and the §5 ownership classes with their seven M4 scenarios.
@@ -15,7 +15,7 @@
 - `src/execution/live/practical-synchronization/engine.ts`: `runSynchronizationCandidate(config, source)`.
   - **Imports:** only the M3 evaluator and, type-only, `reconciliation/types` (`LiveVenueOrderEvidence`,
     `LiveVenuePositionEvidence`; that module imports nothing).
-  - **Importers:** none; nothing in `src/` names the engine.
+  - **Importers:** only the unwired asynchronous orchestration and isolated campaign preflight.
   - **Purity:** no I/O, clock or environment. All of these are inputs:
     - the read source, injected (`scan`, `stream`, `clock`);
     - scan limits;
@@ -122,14 +122,14 @@
 Complete fill reconstruction, exactly-once execution accounting and fee accounting stay `UNKNOWN`. A scope that
 requires any of them is blocked. `FULL_EVIDENCE` keeps blocking on missing fill identifiers.
 
-## Asynchronous orchestration (separate unwired candidate, uncommitted)
+## Asynchronous orchestration (separate unwired candidate, checkpoint 1aab232)
 - **Placement:** `src/execution/live/practical-synchronization/async-orchestrator.ts`,
   `runAsyncSynchronizationCandidate`. It imports only `./engine`. The engine's pure `evaluateCollectedCycle` (shared
   with the synchronous runner) applies every normalization, scan, ownership and assessment rule, so none is duplicated.
 - **Pins:**
-  - only the orchestration imports the engine;
-  - nothing imports the orchestration;
-  - nothing in `src/` names either.
+  - only the orchestration and isolated campaign preflight import the engine;
+  - only the isolated campaign runner imports the orchestration;
+  - nothing in `src/` imports the runner; no production entry point reaches these candidates.
 - **Inputs:** an injected async source (`scan`, `observeStream`, `subscribeEvents`), an injected clock (`now`,
   `delay`), and an optional cancellation signal. Read and stream timeouts are explicit limits, with no defaults.
 - **One cycle:** the initial stream observation, pass 0 then pass 1, the final observation, then
@@ -170,7 +170,7 @@ requires any of them is blocked. `FULL_EVIDENCE` keeps blocking on missing fill 
 - **Adapter:** `src/integration/coindcx/live/sync-read-adapter.ts` implements the orchestration's `scan` structurally.
   - **Imports:** only `type CoinDcxClient` and the order/position model types. It imports no candidate module.
   - **Reads:** through an injected, already-constructed, M2-budgeted `CoinDcxClient`. It adds no request site,
-    signing, budget acquisition, unpaced fallback or client construction, and is imported by nothing.
+    signing, budget acquisition, unpaced fallback or client construction, and is imported only by the isolated runner.
   - **ORDERS (supported):** `listInrFuturesOrders`, read as segments `side=buy` and `side=sell`, for an explicit status
     list.
   - **POSITIONS (supported):** `listInrFuturesPositions`.
@@ -209,7 +209,26 @@ treatment is a later scope decision.
 
 ## Open review questions
 - The production treatment of flat positions (above).
-- Real reads: a real-read adapter, the shadow campaign and its coverage criteria. These are separate authorizations.
+- Real provider reads, the shadow campaign and its coverage criteria. These require separate authorization.
+
+## Isolated read-only collection runner (unwired review candidate)
+
+The adapter and scan segments were checkpointed locally as `72b08dffb4378e1d1f8f212e4f921bd3a0a95fd8`.
+The isolated `src/integration/coindcx/live/sync-read-campaign.ts` now composes that adapter with the orchestration;
+`sync-read-campaign-preflight.ts` uses the engine's configuration validator and pure limiter configuration validator.
+Only those two isolated files add candidate imports; nothing in `src` imports the runner. The adapter implementation,
+engine and orchestration remain unchanged. The architecture tests pin the exact isolated campaign/preflight importers.
+No production composition exists.
+
+Preflight requires explicit account/scope, independent authenticated-client provenance and budget connection, bounds,
+timeouts, thresholds, duration, schedule, lineage and report destination. It separates start blockers from limitations
+preventing convergence or formal acceptance, keeps required unsupported transactions in scope, and approves no value.
+Identity verifies before each evaluation's account scans. Missing/unavailable stream observations stay UNKNOWN. The
+read gate checks stop/duration/coordinator before each client call; cancellation, timeout and duration abandon late
+pages without refunding active request capacity. Reports separate coverage classes, partial scope, gaps, revocations,
+in-flight uncertainty and delivery outcome. All grants remain false; D4c and AS1 remain pending.
+
+See [the launch checklist](M4_READ_ONLY_CAMPAIGN_LAUNCH_CHECKLIST.md) for separately authorized real collection.
 
 ## Tests
 - `tests/unit/execution/live/practical-synchronization/engine.test.ts` (53 tests). The closeout counterexamples:
