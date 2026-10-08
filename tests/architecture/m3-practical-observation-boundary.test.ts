@@ -20,9 +20,12 @@ describe('M3 practical observation evaluator boundary', () => {
     expect(graph.get(MODULE) ?? []).toEqual([]);
   });
 
-  it('nothing in src imports it, so no production path (including production-runtime) can reach it', () => {
-    for (const [file, edges] of graph) expect(edges, file).not.toContain(MODULE);
-    for (const file of files.filter((candidate) => candidate !== MODULE)) {
+  it('only the unwired M4 synchronization candidate imports it, and nothing imports that, so no production path can reach it', () => {
+    const M4_ENGINE = 'src/execution/live/practical-synchronization/engine.ts';
+    const importers = [...graph].filter(([, edges]) => edges.includes(MODULE)).map(([file]) => file);
+    expect(importers).toEqual([M4_ENGINE]);
+    for (const [file, edges] of graph) expect(edges, file).not.toContain(M4_ENGINE);
+    for (const file of files.filter((candidate) => candidate !== MODULE && candidate !== M4_ENGINE)) {
       expect(readFileSync(path.join(REPO_ROOT, file), 'utf8').includes('practical-observation'), file).toBe(false);
     }
   });

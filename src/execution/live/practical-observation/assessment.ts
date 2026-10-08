@@ -58,10 +58,13 @@ export type ObservationMode = 'FULL_EVIDENCE' | 'CUMULATIVE_STATE';
 
 /**
  * Ownership evidence for one observed record, in the register §5 classes. A tag is correlation evidence only:
- * `TAG_CORRELATED_ONLY` is treated as UNRESOLVED. OWNED must name established local lineage.
+ * `TAG_CORRELATED_ONLY` is treated as UNRESOLVED. OWNED must name established local lineage: this bot's own create
+ * response, an ambiguous create resolved under a confirmed contract, or a durable ownership record (positions).
  */
+export type ObservationLineage = 'BOT_CREATE_RESPONSE' | 'RESOLVED_UNDER_CONFIRMED_CONTRACT' | 'DURABLE_OWNERSHIP_RECORD';
+const LINEAGES: readonly ObservationLineage[] = Object.freeze(['BOT_CREATE_RESPONSE', 'RESOLVED_UNDER_CONFIRMED_CONTRACT', 'DURABLE_OWNERSHIP_RECORD']);
 export type ObservationOwnership =
-  | Readonly<{ kind: 'OWNED'; lineage: 'BOT_CREATE_RESPONSE' | 'RESOLVED_UNDER_CONFIRMED_CONTRACT' }>
+  | Readonly<{ kind: 'OWNED'; lineage: ObservationLineage }>
   | Readonly<{ kind: 'TAG_CORRELATED_ONLY' }>
   | Readonly<{ kind: 'UNRESOLVED' }>
   | Readonly<{ kind: 'FOREIGN_OBSERVED' }>
@@ -235,7 +238,7 @@ function validThresholds(value: unknown): value is PracticalObservationThreshold
 const OWNERSHIP_KINDS = ['OWNED', 'TAG_CORRELATED_ONLY', 'UNRESOLVED', 'FOREIGN_OBSERVED', 'VENUE_GENERATED'];
 function validOwnership(value: unknown): value is ObservationOwnership {
   if (!isRecord(value) || !OWNERSHIP_KINDS.includes(value['kind'] as string)) return false;
-  return value['kind'] !== 'OWNED' || value['lineage'] === 'BOT_CREATE_RESPONSE' || value['lineage'] === 'RESOLVED_UNDER_CONFIRMED_CONTRACT';
+  return value['kind'] !== 'OWNED' || LINEAGES.includes(value['lineage'] as ObservationLineage);
 }
 function validRead(value: unknown): value is ComponentRead {
   if (!isRecord(value) || !isComponent(value['component'])) return false;

@@ -51,8 +51,9 @@ review. The formal M3 milestone is not complete.**
   - The scope's required `requiredAccounting` list declares what accounting the selected scope needs. Any entry blocks
     (`ACCOUNTING_UNSUPPORTED_FOR_SCOPE`) in both modes, even with fill identifiers present, because no fill-level
     capability is supported.
-- **Ownership (§5).** A record must be OWNED with named lineage (`BOT_CREATE_RESPONSE` or
-  `RESOLVED_UNDER_CONFIRMED_CONTRACT`). `TAG_CORRELATED_ONLY` is treated as UNRESOLVED: a tag is correlation evidence,
+- **Ownership (§5).** A record must be OWNED with named lineage (`BOT_CREATE_RESPONSE`,
+  `RESOLVED_UNDER_CONFIRMED_CONTRACT`, or `DURABLE_OWNERSHIP_RECORD` for positions; the last was added with the M4
+  candidate). `TAG_CORRELATED_ONLY` is treated as UNRESOLVED: a tag is correlation evidence,
   not proof of ownership. UNRESOLVED, FOREIGN_OBSERVED and VENUE_GENERATED records, or a class that differs between
   passes, prevent convergence. OWNED without lineage, or an unknown class, is invalid input.
 - **Private stream (O3, O4, D2, D4b).** Events are revocation inputs only. These revoke:

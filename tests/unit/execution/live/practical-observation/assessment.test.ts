@@ -256,6 +256,8 @@ describe('M3 ownership: unknown or conflicting ownership is never accepted', () 
 
   it('an OWNED claim without established lineage, or an unknown class, is invalid input', () => {
     expect(assessPracticalObservation(both({ kind: 'OWNED' } as never)).kind).toBe('INVALID_INPUT');
+    expect(assessPracticalObservation(both({ kind: 'OWNED', lineage: 'MATCHING_TAG' } as never)).kind).toBe('INVALID_INPUT');
+    expect(assessPracticalObservation(both({ kind: 'OWNED', lineage: 'DURABLE_OWNERSHIP_RECORD' })).kind).toBe('OBSERVED_CONVERGENCE');
     expect(assessPracticalObservation(both({ kind: 'ADOPTED' } as never)).kind).toBe('INVALID_INPUT');
   });
 });
