@@ -49,7 +49,7 @@ const recordSchema = z.object({
   clients: z.array(z.object({ clientInstanceId: hex32, resumeSecretSha256: z.string().regex(/^[0-9a-f]{64}$/) }).strict()),
 }).strict();
 export type DurableRecord = z.infer<typeof recordSchema>;
-const markerSchema = z.object({ format: z.literal(MARKER_FORMAT), installationId: hex32, pipePath: z.string().max(256), initialization: z.literal('DISPOSABLE_TEST_DIRECTORY') }).strict();
+const markerSchema = z.object({ format: z.literal(MARKER_FORMAT), installationId: hex32, pipePath: z.string().max(256), initialization: z.enum(['DISPOSABLE_TEST_DIRECTORY', 'NEW_READ_ONLY_CAMPAIGN']) }).strict();
 
 export type OpenResult =
   | Readonly<{ kind: 'OPEN'; store: StateStore; record: DurableRecord; recoveredFrom: 'BOTH' | 'A_ONLY' | 'B_ONLY' }>
@@ -100,13 +100,25 @@ function writeSlot(file: string, bytes: Buffer, flags: 'r+' | 'wx'): void {
  */
 export function initializeDisposableStateDirectory(directory: string, pipePath: string, installationId: string, confirmation: 'DISPOSABLE_TEST_DIRECTORY'): void {
   if (confirmation !== 'DISPOSABLE_TEST_DIRECTORY' || !hex32.safeParse(installationId).success) throw new Error('initialization refused');
+  initializeStateDirectory(directory, pipePath, installationId, confirmation);
+}
+
+/** Deliberate isolated campaign initialization: a nonexistent directory only, never replacement or repair. */
+export function initializeCampaignStateDirectory(directory: string, pipePath: string, installationId: string, confirmation: 'NEW_READ_ONLY_CAMPAIGN'): void {
+  if (confirmation !== 'NEW_READ_ONLY_CAMPAIGN' || !hex32.safeParse(installationId).success || !path.isAbsolute(directory)
+    || pipePath !== `\\\\.\\pipe\\coindcx-readonly-campaign-${installationId}` || fs.existsSync(directory)) throw new Error('campaign initialization refused');
+  fs.mkdirSync(directory); // Exclusive namespace claim; parent must already exist. No repair after failure.
+  initializeStateDirectory(directory, pipePath, installationId, confirmation);
+}
+
+function initializeStateDirectory(directory: string, pipePath: string, installationId: string, initialization: 'DISPOSABLE_TEST_DIRECTORY' | 'NEW_READ_ONLY_CAMPAIGN'): void {
   if (fs.existsSync(directory) && fs.readdirSync(directory).length > 0) throw new Error('initialization refused: directory is not new or empty');
   fs.mkdirSync(directory, { recursive: true });
   const initial: DurableRecord = { format: STATE_FORMAT, installationId, journalSeq: 0, scheduler: null, clients: [] };
   const bytes = encodeRecord(0, Buffer.from(JSON.stringify(initial), 'utf8'));
   writeSlot(path.join(directory, SLOT_FILES.A), bytes, 'wx');
   writeSlot(path.join(directory, SLOT_FILES.B), bytes, 'wx');
-  const marker = Buffer.from(JSON.stringify({ format: MARKER_FORMAT, installationId, pipePath, initialization: 'DISPOSABLE_TEST_DIRECTORY' }), 'utf8');
+  const marker = Buffer.from(JSON.stringify({ format: MARKER_FORMAT, installationId, pipePath, initialization }), 'utf8');
   writeSlot(path.join(directory, MARKER_FILE), marker, 'wx');
 }
 

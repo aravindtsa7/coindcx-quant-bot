@@ -27,7 +27,7 @@ import {
 } from '../index';
 import type { ClientConfig } from './config';
 import { encodeFrame, FrameDecoder } from './framing';
-import { coordinatorMessageSchema, PROTOCOL_VERSION, type ClientMessage, type CoordinatorMessage, type StateView } from './protocol';
+import { coordinatorMessageSchema, PROTOCOL_VERSION, type ClientMessage, type CoordinatorMessage, type StateView, type ClientAccessPolicy, type HandshakeMessage } from './protocol';
 
 export interface AcquireRequest {
   readonly cls: PriorityClass; readonly operation: BudgetOperation; readonly scope: BudgetScope;
@@ -71,7 +71,9 @@ export class RateLimitClient {
   #welcome: ((ok: boolean) => void) | null = null;
   #resumeRejected = false;
 
-  constructor(config: ClientConfig) { this.#config = config; }
+  readonly #access: ClientAccessPolicy | undefined;
+  #challenge: string | null = null;
+  constructor(config: ClientConfig, access?: ClientAccessPolicy) { this.#config = config; this.#access = access; }
 
   get session(): Readonly<{ epoch: string; sessionId: string }> | null { return this.#session; }
   get clientInstanceId(): string | null { return this.#identity?.clientInstanceId ?? null; }
@@ -90,6 +92,7 @@ export class RateLimitClient {
       const socket = net.connect(this.#config.pipePath);
       const decoder = new FrameDecoder(this.#config.maxFrameBytes);
       this.#socket = socket;
+      this.#challenge = null;
       const timer = setTimeout(() => { socket.destroy(); }, this.#config.connectTimeoutMs);
       this.#welcome = (ok) => {
         clearTimeout(timer); this.#welcome = null;
@@ -103,10 +106,7 @@ export class RateLimitClient {
         resolve(ok);
       };
       socket.on('connect', () => {
-        const scopes = [...this.#config.probeScopes];
-        this.#write(this.#identity === null
-          ? { t: 'HELLO', v: PROTOCOL_VERSION, probeScopes: scopes }
-          : { t: 'RESUME', v: PROTOCOL_VERSION, clientInstanceId: this.#identity.clientInstanceId, resumeSecret: this.#identity.resumeSecret, probeScopes: scopes });
+        if (this.#access === undefined) this.#hello();
       });
       socket.on('data', (chunk: Buffer) => {
         const decoded = decoder.push(chunk);
@@ -120,6 +120,16 @@ export class RateLimitClient {
       socket.on('error', () => undefined);
       socket.on('close', () => { clearTimeout(timer); this.#closed(socket); });
     });
+  }
+  #hello(): void {
+    const scopes = [...this.#config.probeScopes];
+    const message: HandshakeMessage = this.#identity === null ? { t: 'HELLO', v: PROTOCOL_VERSION, probeScopes: scopes }
+      : { t: 'RESUME', v: PROTOCOL_VERSION, clientInstanceId: this.#identity.clientInstanceId, resumeSecret: this.#identity.resumeSecret, probeScopes: scopes };
+    if (this.#access !== undefined) {
+      if (this.#challenge === null) { this.#socket?.destroy(); return; }
+      message.access = { installationId: this.#access.installationId, capability: this.#access.capability, proof: this.#access.helloProof(this.#challenge, message) };
+    }
+    this.#write(message);
   }
 
   /** Closes the connection. Unused grants are voided at the next reconnection; nothing is released by closing. */
@@ -265,7 +275,16 @@ export class RateLimitClient {
 
   #message(message: CoordinatorMessage): void {
     switch (message.t) {
+      case 'CHALLENGE': {
+        if (this.#access === undefined || this.#challenge !== null || this.#session !== null || message.installationId !== this.#access.installationId) { this.#socket?.destroy(); return; }
+        this.#challenge = message.nonce; this.#hello(); return;
+      }
       case 'WELCOME': {
+        if (this.#access !== undefined) {
+          let valid = false;
+          try { valid = this.#challenge !== null && this.#access.verifyWelcome(this.#challenge, message); } catch { /* refusal */ }
+          if (!valid) { this.#socket?.destroy(); return; }
+        } else if (message.access !== undefined) { this.#socket?.destroy(); return; }
         if (this.#identity === null) {
           if (message.resumeSecret === undefined) { this.#socket?.destroy(); return; }
           this.#identity = { clientInstanceId: message.clientInstanceId, resumeSecret: message.resumeSecret };

@@ -21,7 +21,7 @@ import {
 } from '../index';
 import type { CoordinatorConfig } from './config';
 import { encodeFrame, FrameDecoder } from './framing';
-import { clientMessageSchema, PROTOCOL_VERSION, type ClientMessage, type CoordinatorMessage, type StateView } from './protocol';
+import { clientMessageSchema, PROTOCOL_VERSION, type ClientMessage, type CoordinatorMessage, type StateView, type CoordinatorAccessPolicy, type CampaignCapability } from './protocol';
 import { openStateStore, type DurableRecord, type StateStore, type StateStoreFaults } from './state-store';
 
 export const newId = (prefix: 'e' | 's' | 'g' | 'c' | 'r'): string => `${prefix}${randomBytes(16).toString('hex')}`;
@@ -39,6 +39,7 @@ export interface CoordinatorAlert { readonly atMs: number; readonly code: string
 interface Session {
   readonly id: string; readonly socket: net.Socket; readonly decoder: FrameDecoder;
   clientInstanceId: string | null; probeScopes: readonly BudgetScope[]; pending: number; handshakeTimer: NodeJS.Timeout | null;
+  challenge: string; capability: CampaignCapability | null;
 }
 
 export class RateLimitCoordinator {
@@ -54,9 +55,11 @@ export class RateLimitCoordinator {
   /** Sends that must follow the durable commit of the step that produced them (probe announcements). */
   #afterCommit: Array<() => void> = [];
   readonly epoch: string;
+  readonly #access: CoordinatorAccessPolicy | undefined;
 
-  private constructor(config: CoordinatorConfig, server: net.Server, store: StateStore, record: DurableRecord, faults: CoordinatorFaults) {
+  private constructor(config: CoordinatorConfig, server: net.Server, store: StateStore, record: DurableRecord, faults: CoordinatorFaults, access?: CoordinatorAccessPolicy) {
     this.#config = config; this.#server = server; this.#store = store; this.#faults = faults;
+    this.#access = access;
     for (const client of record.clients) this.#clients.set(client.clientInstanceId, client.resumeSecretSha256);
     this.epoch = newId('e');
     const now = this.#now();
@@ -70,7 +73,7 @@ export class RateLimitCoordinator {
   }
 
   /** Bind first (single coordinator per pipe, hence per state directory), then open and restore durable state. */
-  static async start(config: CoordinatorConfig, faults: CoordinatorFaults = {}): Promise<CoordinatorStart> {
+  static async start(config: CoordinatorConfig, faults: CoordinatorFaults = {}, access?: CoordinatorAccessPolicy): Promise<CoordinatorStart> {
     const server = net.createServer({ allowHalfOpen: false, pauseOnConnect: true });
     const bound = await new Promise<string | null>((resolve) => {
       server.once('error', (error: NodeJS.ErrnoException) => resolve(error.code ?? 'UNKNOWN'));
@@ -82,7 +85,7 @@ export class RateLimitCoordinator {
     if (opened.kind !== 'OPEN') { await closeServer(); return Object.freeze({ kind: 'FAIL_CLOSED', reason: opened.reason }); }
     let coordinator: RateLimitCoordinator;
     try {
-      coordinator = new RateLimitCoordinator(config, server, opened.store, opened.record, faults);
+      coordinator = new RateLimitCoordinator(config, server, opened.store, opened.record, faults, access);
       // The restored state (new epoch) is made durable before any connection is served.
       if (!coordinator.#commit()) throw new FailClosed('INITIAL_COMMIT_FAILED');
     } catch (error) {
@@ -213,7 +216,7 @@ export class RateLimitCoordinator {
     this.#sockets.add(socket);
     socket.once('close', () => this.#sockets.delete(socket));
     if (this.#closing || this.#sessions.size >= this.#config.maxSessions) { socket.end(encodeFrame({ t: 'ERROR', code: 'TOO_MANY_SESSIONS' }, this.#config.maxFrameBytes)); return; }
-    const session: Session = { id: newId('s'), socket, decoder: new FrameDecoder(this.#config.maxFrameBytes), clientInstanceId: null, probeScopes: [], pending: 0, handshakeTimer: null };
+    const session: Session = { id: newId('s'), socket, decoder: new FrameDecoder(this.#config.maxFrameBytes), clientInstanceId: null, probeScopes: [], pending: 0, handshakeTimer: null, challenge: randomBytes(32).toString('hex'), capability: null };
     this.#sessions.set(session.id, session);
     session.handshakeTimer = setTimeout(() => this.#protocolError(session, 'HANDSHAKE_TIMEOUT'), this.#config.handshakeTimeoutMs);
     socket.on('data', (chunk: Buffer) => {
@@ -234,6 +237,7 @@ export class RateLimitCoordinator {
       // Releases nothing: grants of the closed session stay uncertain until positive evidence arrives.
       if (session.clientInstanceId !== null) this.#dispatch({ type: 'SESSION_CLOSED', sessionId: session.id });
     });
+    if (this.#access !== undefined) this.#send(session, { t: 'CHALLENGE', installationId: this.#access.installationId, nonce: session.challenge });
     socket.resume();
   }
   #protocolError(session: Session, code: string): void {
@@ -252,6 +256,12 @@ export class RateLimitCoordinator {
     switch (message.t) {
       case 'HELLO': case 'RESUME': this.#protocolError(session, 'DUPLICATE_HANDSHAKE'); return;
       case 'REQUEST': {
+        if (this.#access !== undefined && (session.capability !== 'READ' || message.operation !== 'READ' || message.scope !== 'API_AUTH' || message.cls !== 'P1')) {
+          this.#send(session, { t: 'REFUSED', ref: message.ref, code: 'CAMPAIGN_CAPABILITY_FORBIDDEN' }); return;
+        }
+        if (this.#access !== undefined && (this.#state.admission !== 'OPEN' || this.#state.unknown !== null)) {
+          this.#send(session, { t: 'REFUSED', ref: message.ref, code: 'CAMPAIGN_STOPPED_OR_UNKNOWN' }); return;
+        }
         if (session.pending >= this.#config.maxPendingRequestsPerSession) { this.#send(session, { t: 'REFUSED', ref: message.ref, code: 'TOO_MANY_PENDING' }); return; }
         const requestId = newId('r');
         this.#requests.set(requestId, { sessionId: session.id, ref: message.ref });
@@ -289,6 +299,7 @@ export class RateLimitCoordinator {
         return;
       }
       case 'PROBE_RESULT': {
+        if (this.#access !== undefined) { this.#send(session, { t: 'ACK', ackId: message.ackId, result: 'REJECTED', reason: 'CAMPAIGN_CAPABILITY_FORBIDDEN' }); return; }
         const charge = this.#bound(session, message);
         if (typeof charge === 'string' || charge.operation !== 'PROBE' || charge.probeGen === null) { this.#send(session, { t: 'ACK', ackId: message.ackId, result: 'REJECTED', reason: typeof charge === 'string' ? charge : 'NOT_A_PROBE' }); return; }
         const { effects, durable } = this.#dispatch({ type: 'PROBE_RESULT', scope: charge.scope, probeGen: charge.probeGen, outcome: message.outcome });
@@ -297,6 +308,9 @@ export class RateLimitCoordinator {
         return;
       }
       case 'CONTROL': {
+        if (this.#access !== undefined && (session.capability !== 'OPERATOR_STOP' || message.action !== 'STOP')) {
+          this.#send(session, { t: 'ACK', ackId: message.ackId, result: 'REJECTED', reason: 'CAMPAIGN_CONTROL_FORBIDDEN' }); return;
+        }
         // Trusted-host prototype: any connected client may send operator control (no ACL implemented or claimed).
         const ack = this.#control(message.action);
         this.#send(session, { t: 'ACK', ackId: message.ackId, result: ack.result, ...(ack.reason === undefined ? {} : { reason: ack.reason }) });
@@ -322,6 +336,12 @@ export class RateLimitCoordinator {
   }
 
   #handshake(session: Session, message: Extract<ClientMessage, { t: 'HELLO' | 'RESUME' }>): void {
+    if (this.#access !== undefined) {
+      let valid = false;
+      try { valid = message.access?.installationId === this.#access.installationId && message.probeScopes.length === 0 && this.#access.verify(session.challenge, message); } catch { /* refusal */ }
+      if (!valid) { this.#protocolError(session, 'CAMPAIGN_AUTHENTICATION_FAILED'); return; }
+      session.capability = message.access!.capability;
+    } else if (message.access !== undefined) { this.#protocolError(session, 'CAMPAIGN_AUTHENTICATION_NOT_CONFIGURED'); return; }
     if (session.handshakeTimer !== null) { clearTimeout(session.handshakeTimer); session.handshakeTimer = null; }
     let resumeSecret: string | undefined;
     if (message.t === 'HELLO') {
@@ -341,7 +361,9 @@ export class RateLimitCoordinator {
     // The registration (and the open session) are durable before WELCOME is sent.
     const { durable } = this.#dispatch({ type: 'SESSION_OPENED', sessionId: session.id, clientInstanceId: session.clientInstanceId });
     if (!(durable && this.#commit())) { this.#protocolError(session, 'PERSISTENCE_FAILED'); return; }
-    this.#send(session, { t: 'WELCOME', epoch: this.epoch, sessionId: session.id, clientInstanceId: session.clientInstanceId, ...(resumeSecret === undefined ? {} : { resumeSecret }), state: this.#view() });
+    const welcome: Extract<CoordinatorMessage, { t: 'WELCOME' }> = { t: 'WELCOME', epoch: this.epoch, sessionId: session.id, clientInstanceId: session.clientInstanceId, ...(resumeSecret === undefined ? {} : { resumeSecret }), state: this.#view() };
+    if (this.#access !== undefined) welcome.access = { installationId: this.#access.installationId, capability: session.capability!, proof: this.#access.welcomeProof(session.challenge, session.capability!, welcome) };
+    this.#send(session, welcome);
   }
 }
 

@@ -471,17 +471,26 @@ describe('M4 read-only campaign: cancellation, late responses and 429 through th
       const h = await harness();
       let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
       h.venue.respond = (path, body) => path === target ? held.then(() => defaultAnswer(path, body)) : defaultAnswer(path, body);
-      const pending = h.run(campaignConfig(c => { c.campaign.durationMs = 500; c.campaign.maxEvaluations = 3; }));
+      let primitiveCalls = 0;
+      const counted: SyncCampaignReadClient = {
+        getUserInfoSafe: () => { primitiveCalls += 1; return h.client.getUserInfoSafe(); },
+        listInrFuturesOrders: request => { primitiveCalls += 1; return h.client.listInrFuturesOrders(request); },
+        listInrFuturesPositions: request => { primitiveCalls += 1; return h.client.listInrFuturesPositions(request); },
+      };
+      const pending = h.run(campaignConfig(c => { c.campaign.durationMs = 500; c.campaign.maxEvaluations = 3; }), undefined, counted);
       await waitFor(() => h.venue.hits.some(hit => hit.path === target), 5_000, 'held read started');
       h.clock.advance(500);
       const report = (await pending).report;
       expect(report).toMatchObject({ status: 'COMPLETED', stopReason: 'DURATION_REACHED' });
       expect(report.inFlight.unsettled.length).toBeGreaterThan(0);
       if (target === USERS_PATH) expect(accountHits(h.venue)).toBe(0);
-      const hits = h.venue.hits.length;
+      const callsAtStop = primitiveCalls;
+      expect(callsAtStop).toBe(report.inFlight.started);
       const snapshot = JSON.stringify(report);
       release(); await sleep(50);
-      expect(h.venue.hits).toHaveLength(hits);
+      expect(primitiveCalls).toBe(callsAtStop); // no new read invocation after duration expiry
+      // An already-invoked signal-less primitive may reach loopback after the report closes.
+      expect(h.venue.hits.length).toBeLessThanOrEqual(callsAtStop);
       expect(JSON.stringify(report)).toBe(snapshot);
       expect(report.reads.every(read => !read.report.pages.some(page => page.endedAtMs >= 10_500))).toBe(true);
     }

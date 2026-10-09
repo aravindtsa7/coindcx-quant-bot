@@ -58,8 +58,8 @@ describe('one explicit M4 launch proposal: offline preparation only', () => {
     expect(launch.exit, launch.stderr).toBe(2);
     expect(launch.result).toMatchObject({ outcome: 'REAL_LAUNCH_BLOCKED', providerCompositionImplemented: false, readyToContactProvider: false });
     expect(launch.result['blockers']).toEqual(expect.arrayContaining([
-      expect.objectContaining({ kind: 'MISSING_IMPLEMENTATION', code: 'PRODUCTION_LIMITER_STATE_LIFECYCLE_ABSENT' }),
-      expect.objectContaining({ kind: 'MISSING_IMPLEMENTATION', code: 'SUPERVISION_AND_IPC_ACCESS_CONTROL_ABSENT' }),
+      expect.objectContaining({ kind: 'REQUIRED_INPUT', code: 'CAMPAIGN_STATE_LIFECYCLE_REVIEW_REQUIRED' }),
+      expect.objectContaining({ kind: 'REQUIRED_INPUT', code: 'HOST_SECURITY_AND_SUPERVISION_REVIEW_REQUIRED' }),
       expect.objectContaining({ kind: 'AUTHORIZATION', code: 'VALUES_AND_REAL_COLLECTION_NOT_AUTHORIZED' }),
     ]));
   }, 30_000);

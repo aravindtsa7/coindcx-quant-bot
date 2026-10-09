@@ -4,6 +4,9 @@ Proposal `m4-orders-positions-information-collection-20261008` is **PROPOSED_NOT
 The complete proposed field names and values are in
 [`launch/m4-orders-positions-proposal.json`](launch/m4-orders-positions-proposal.json).
 Every numeric value is proposed for this one campaign; none is an approved default or a confirmed provider limit.
+The subsequent [isolated bootstrap specification](M4_READ_ONLY_BOOTSTRAP.md) implements campaign initialization,
+authenticated read/STOP capabilities and supervisor leases for explicit **loopback-only** invocation. Its offline
+evidence now tests this proposed policy through the real M2 coordinator. Real collection remains blocked.
 This follows the [launch checklist](M4_READ_ONLY_CAMPAIGN_LAUNCH_CHECKLIST.md) and uses the checkpointed
 `runSyncReadCampaign`, existing adapter, asynchronous orchestrator and existing M2-budgeted client reads.
 
@@ -89,6 +92,8 @@ policy, and the operator must document aggregate traffic and allocation before l
 not inferred. The campaign stops on refusal or throttle instead of changing policy or waiting through a fallback.
 This validation establishes local consistency only. Loopback uses immediate fixture permits and a virtual clock;
 it **does not test this policy's runtime pacing** or discharge production budget requirements.
+That statement describes the original `--offline-loopback` preparation fixture. The new bootstrap/pacing tests use
+the real M2 coordinator/client and actual request-creation timestamps, separately from approving these values.
 
 ## Identity, lineage and provenance procedure
 
@@ -119,10 +124,13 @@ it **does not test this policy's runtime pacing** or discharge production budget
 ## Operator control, stopping and reports
 
 Before launch, identify an accountable supervising operator, permitted launch/stop operators and approved local-host
-access controls. Restrict named-pipe clients, state/report directories and `STOP`/`RESET_STOP` to authorized principals;
-test that unauthorized clients cannot control the coordinator. The current IPC prototype does not implement or attest
-these ACLs. Approve durable initialization and supervision/restart behavior separately. Test-only installation markers
-are not production installations. STOP is latched; this campaign must never reset STOP or recover UNKNOWN.
+access controls. Restrict named-pipe clients and state/report directories to authorized principals.
+The isolated bootstrap authenticates READ and STOP-only sessions with distinct campaign keys; connected read clients
+cannot obtain operator control. It exposes no RESET_STOP. The legacy trusted-host mode remains unchanged outside
+this bootstrap. Neither mode implements or attests restrictive Windows ACLs, remote exclusion or process identity.
+Review campaign initialization, key custody and supervision/restart behavior separately. The new deliberate
+NEW_READ_ONLY_CAMPAIGN marker is distinct from test initialization and is not a production-readiness approval.
+STOP is latched; this campaign must never reset STOP or recover UNKNOWN.
 
 Operator cancellation, coordinator disconnection/STOP/UNKNOWN, budget refusal, provider throttle, identity mismatch
 or unverified identity, an observed case classified FAIL, two consecutive failed-read evaluations, duration or evaluation
@@ -191,8 +199,8 @@ command plus `--fixture-identity-mismatch` and a separate report path; it makes 
 | Required input | Dated durable lineage export and documented namespace/ownership basis |
 | Required input | Actual client construction, approved credential source reference and matching shared coordinator connection/policy/scope/timing provenance |
 | Missing implementation | Reviewed real read-only CLI bootstrap/composition, including signal, clock and existing dependencies |
-| Missing implementation | Approved production limiter state initialization/lifecycle; accepted marker and initializer are currently `DISPOSABLE_TEST_DIRECTORY` only |
-| Missing implementation | Supervision and IPC/state access controls, with restricted operator STOP/RESET_STOP authority and unauthorized-access checks |
+| Required input/review | Campaign namespace/installation, new initialization and conservative restoration/storage guarantees; no real installation approved or initialized |
+| Required input/review | Actual supervisor/operator key custody, restrictive host pipe/state/report access and aggregate budget allocation; authenticated STOP-only control is implemented, but OS ACL/remote/process assurances remain unproved |
 | Required input | Approved report destination, verified owner/ACL/access/nonexistence and delivery-failure procedure |
 | Authorization | Approval of this campaign's values and separate permission to collect the named account's bounded orders/positions information |
 
