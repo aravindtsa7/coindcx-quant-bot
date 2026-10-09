@@ -1,0 +1,60 @@
+{
+  "proposalId": "m4-orders-positions-information-collection-20261008",
+  "valuesStatus": "PROPOSED_NOT_APPROVED",
+  "purpose": "ORDERS_POSITIONS_ONLY_INFORMATION_COLLECTION",
+  "providerOrigin": "https://api.coindcx.com",
+  "stream": "NOT_CONFIGURED",
+  "configuration": {
+    "account": { "accountId": null, "expectedProviderAccountFingerprint": null },
+    "scope": {
+      "mode": "CUMULATIVE_STATE",
+      "components": ["ORDERS", "POSITIONS"],
+      "requiredAccounting": [],
+      "history": { "kind": "AVAILABLE_HISTORY" },
+      "orderStatuses": ["open", "filled", "partially_filled", "partially_cancelled", "cancelled", "rejected", "untriggered"]
+    },
+    "accountScope": { "assumption": "UNKNOWN", "attestation": "NONE" },
+    "decisions": { "d4c": "PENDING", "as1": "PENDING" },
+    "budget": {
+      "connectionId": null,
+      "kind": "SHARED_COORDINATOR_READ_BUDGET",
+      "scope": "API_AUTH",
+      "priorityClass": "P1",
+      "admissionDeadlineMs": 5000,
+      "transportRequestTimeoutMs": 10000,
+      "limiter": {
+        "windows": [{ "windowMs": 1000, "maxStarts": 2 }, { "windowMs": 60000, "maxStarts": 20 }],
+        "fairnessWindowMs": 60000,
+        "classShares": {
+          "P0": { "minPerWindow": 0, "maxPerWindow": 20 },
+          "P1": { "minPerWindow": 0, "maxPerWindow": 13 },
+          "P2": { "minPerWindow": 0, "maxPerWindow": 20 },
+          "P3": { "minPerWindow": 0, "maxPerWindow": 20 }
+        },
+        "concurrency": 3,
+        "p0ReservedSlots": 1,
+        "grantTtlMs": 1000,
+        "maxRequestDeadlineMs": 5000,
+        "overdueGuardMs": 1000,
+        "uncertainChargeAlertMs": 60000,
+        "retryAfter": {
+          "noHeaderDefaultMs": 60000,
+          "providerStatedBlockMs": 60000,
+          "localBackoffBaseMs": 60000,
+          "localBackoffMaxMs": 300000,
+          "operationalCapMs": 900000,
+          "clockUncertaintyMs": 2000
+        }
+      },
+      "campaignShare": { "maxStartsPerFairnessWindow": 13 }
+    },
+    "scanLimits": { "ORDERS": { "pageSize": 25, "maxPages": 2 }, "POSITIONS": { "pageSize": 25, "maxPages": 2 } },
+    "timeouts": { "identityReadTimeoutMs": 20000, "readTimeoutMs": 65000, "streamTimeoutMs": 5000 },
+    "maxCycles": 1,
+    "thresholds": { "maxEvidenceAgeMs": 150000, "maxTotalReadDurationMs": 140000 },
+    "campaign": { "durationMs": 900000, "evaluationIntervalMs": 120000, "maxEvaluations": 3, "maxConsecutiveFailedReadEvaluations": 2 },
+    "lineage": null,
+    "contracts": "ALL_UNCONFIRMED",
+    "reportDestination": { "kind": "LOCAL_FILE", "path": "C:\\TSA\\coindcx-m2-w1\\.local\\m4-orders-positions-proposal-20261008\\campaign-report.json" }
+  }
+}
