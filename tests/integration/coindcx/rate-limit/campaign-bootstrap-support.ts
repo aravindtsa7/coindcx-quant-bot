@@ -10,7 +10,7 @@ import { providerAccountFingerprint } from '../../../../src/execution/live/recon
 import { validateCoordinatorConfig, validateClientConfig } from '../../../../src/integration/coindcx/rate-limit/runtime/config';
 
 export const ROOT = path.resolve(__dirname, '../../../..');
-export const evidence = path.join(ROOT, '.local/m4-bootstrap-evidence-20261009');
+export const evidence = path.join(ROOT, '.local/m4-provider-invocation-evidence-20261009');
 export const proposed = () => inspectLaunchProposal(JSON.parse(fs.readFileSync(path.join(ROOT, 'docs/launch/m4-orders-positions-proposal.json'), 'utf8'))).proposal!;
 let expectedOwner: string | undefined;
 export function hostFixture(initialize = true, supervision: Partial<CampaignHostInput['supervision']> = {}) {

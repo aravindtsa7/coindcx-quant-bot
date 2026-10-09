@@ -7,6 +7,9 @@ Every numeric value is proposed for this one campaign; none is an approved defau
 The subsequent [isolated bootstrap specification](M4_READ_ONLY_BOOTSTRAP.md) implements campaign initialization,
 authenticated read/STOP capabilities and supervisor leases for explicit **loopback-only** invocation. Its offline
 evidence now tests this proposed policy through the real M2 coordinator. Real collection remains blocked.
+The subsequent [provider invocation candidate](M4_PROVIDER_READ_ONLY_INVOCATION.md) adds a separate, authorization-gated
+provider entry. It remains uncommitted/unapproved, preserves this exact numeric proposal and claims no control over
+unknown consumers sharing a public IP. Known managed consumers and unknown external traffic are recorded separately.
 This follows the [launch checklist](M4_READ_ONLY_CAMPAIGN_LAUNCH_CHECKLIST.md) and uses the checkpointed
 `runSyncReadCampaign`, existing adapter, asynchronous orchestrator and existing M2-budgeted client reads.
 

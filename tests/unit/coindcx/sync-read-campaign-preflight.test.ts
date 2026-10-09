@@ -129,7 +129,10 @@ describe('M4 read-only campaign preflight: blockers (no defaults, no approvals f
     c.lineage.ownedOrders.push({ exchangeOrderId: 'invented-after-preflight', intentId: 'invented' });
     expect(result.plan!.synchronization.scope.history).toEqual({ kind: 'AVAILABLE_HISTORY' });
     expect(result.plan!.synchronization.scanLimits.ORDERS!.maxPages).toBe(3);
-    expect(result.plan!.synchronization.lineage.ownedOrders).toEqual([]);
+    const copiedLineage = result.plan!.synchronization.lineage;
+    expect('kind' in copiedLineage).toBe(false);
+    if ('kind' in copiedLineage) throw new Error('Expected supplied durable lineage');
+    expect(copiedLineage.ownedOrders).toEqual([]);
   });
   it('a missing configuration blocks every section; nothing is defaulted', () => {
     const result = preflightSyncReadCampaign(undefined, { authenticatedClient: null, coordinator: null, stream: 'NOT_CONFIGURED', reportSink: false });

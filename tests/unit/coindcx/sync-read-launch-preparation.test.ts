@@ -50,13 +50,13 @@ describe('one explicit M4 launch proposal: offline preparation only', () => {
     expect(inspectLaunchProposal(limiter).errors).toContain('LIMITER_INVALID:CONFIG_SHAPE');
   });
 
-  it('executes the exact validation and default collect commands; provider composition stays absent and blocked', () => {
+  it('executes validation and hard-blocked legacy collect; explicit provider entry still requires review and authorization', () => {
     const validation = command(['validate', '--spec', SPEC]);
     expect(validation.exit, validation.stderr).toBe(0);
     expect(validation.result).toMatchObject({ parametersValid: true, configurationValid: false, readyToContactProvider: false });
     const launch = command(['collect', '--spec', SPEC]);
     expect(launch.exit, launch.stderr).toBe(2);
-    expect(launch.result).toMatchObject({ outcome: 'REAL_LAUNCH_BLOCKED', providerCompositionImplemented: false, readyToContactProvider: false });
+    expect(launch.result).toMatchObject({ outcome: 'REAL_LAUNCH_BLOCKED', providerCompositionImplemented: true, legacyCollectHardBlocked: true, readyToContactProvider: false });
     expect(launch.result['blockers']).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'REQUIRED_INPUT', code: 'CAMPAIGN_STATE_LIFECYCLE_REVIEW_REQUIRED' }),
       expect.objectContaining({ kind: 'REQUIRED_INPUT', code: 'HOST_SECURITY_AND_SUPERVISION_REVIEW_REQUIRED' }),

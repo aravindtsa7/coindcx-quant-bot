@@ -45,7 +45,9 @@ describe('isolated campaign bootstrap capability and invocation boundary', () =>
     expect(host).not.toContain('initializeDisposableStateDirectory');
     expect(host).toContain('opened.recoveredFrom !== \'BOTH\'');
     expect(host).toContain('capacityRefunded: false'); expect(host).toContain('unknownRecoveryAttempted: false');
-    expect(host).toContain("networkAccess: z.literal('LOOPBACK_ONLY')");
+    expect(host).toContain("networkAccess: z.enum(['LOOPBACK_ONLY', 'COINDCX_PROVIDER_AUTHORIZATION_REQUIRED'])");
+    expect(host).toContain('requireRecordedAuthorization(invocation, record, Date.now())');
+    expect(host).toContain('connection.origin !== \'https://api.coindcx.com\'');
     expect(host).toContain('windowsAclEnforced: false'); expect(host).toContain('processIdentityProven: false'); expect(host).toContain('remoteClientsExcluded: false');
   });
 });

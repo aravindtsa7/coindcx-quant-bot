@@ -96,6 +96,8 @@ export interface SyncLineage {
   /** The bot's tag namespace prefix (correlation only). */
   readonly botTagNamespace: string;
 }
+/** Explicit absence of evidence; never an assertion of an empty durable inventory. */
+export type SyncLineageInput = SyncLineage | Readonly<{ kind: 'UNAVAILABLE'; reason: string }>;
 
 /**
  * Provider contracts as explicit inputs. Unconfirmed is the fail-closed state. The order evidence carries the venue's
@@ -128,7 +130,7 @@ export interface SynchronizationConfig {
   readonly scanLimits: Readonly<Partial<Record<ObservationComponent, SyncScanLimits>>>;
   readonly thresholds: PracticalObservationThresholds;
   readonly maxCycles: number;
-  readonly lineage: SyncLineage;
+  readonly lineage: SyncLineageInput;
   readonly contracts: SyncProviderContracts;
 }
 
@@ -145,6 +147,7 @@ export interface SynchronizationSource {
 
 export type SyncOwnershipClass = 'OWNED' | 'UNRESOLVED' | 'FOREIGN_OBSERVED' | 'VENUE_GENERATED';
 export type SyncOwnershipReason =
+  | 'OWNERSHIP_LINEAGE_UNAVAILABLE'
   | 'BOT_CREATE_RESPONSE' | 'RESOLVED_UNDER_CONFIRMED_CONTRACT' | 'DURABLE_OWNERSHIP_RECORD' | 'OWNED_PARENT_ORDER'
   | 'TAG_WITHOUT_DURABLE_INTENT' | 'TAG_CONTRACT_UNCONFIRMED' | 'TAG_CONFLICT' | 'TAG_MALFORMED' | 'TAG_MISSING'
   | 'AMBIGUOUS_MULTIPLE_CANDIDATES' | 'CANDIDATE_FIELD_MISMATCH' | 'TAG_OUTSIDE_NAMESPACE_UNCONFIRMED'
@@ -326,7 +329,8 @@ function confirmedForClientOrderId(contracts: SyncProviderContracts): Readonly<{
   return contract.confirmed && contract.field === 'client_order_id' ? contract : null;
 }
 
-function classifyOrders(orders: readonly Normalized[], accountId: string, lineage: SyncLineage, contracts: SyncProviderContracts): Map<string, Classified> {
+function classifyOrders(orders: readonly Normalized[], accountId: string, lineage: SyncLineageInput, contracts: SyncProviderContracts): Map<string, Classified> {
+  if ('kind' in lineage) return new Map(orders.map(order => [order.key, unresolved('OWNERSHIP_LINEAGE_UNAVAILABLE')]));
   const result = new Map<string, Classified>();
   const ownedIds = new Map(lineage.ownedOrders.map((entry) => [entry.exchangeOrderId, entry.intentId]));
   const tagCounts = new Map<string, number>();
@@ -367,7 +371,8 @@ function classifyOrders(orders: readonly Normalized[], accountId: string, lineag
   return result;
 }
 
-function classifyPositions(positions: readonly Normalized[], lineage: SyncLineage): Map<string, Classified> {
+function classifyPositions(positions: readonly Normalized[], lineage: SyncLineageInput): Map<string, Classified> {
+  if ('kind' in lineage) return new Map(positions.map(position => [position.key, unresolved('OWNERSHIP_LINEAGE_UNAVAILABLE')]));
   const ownedIds = new Set(lineage.ownedPositions);
   return new Map(positions.map((position) => [position.key,
     ownedIds.has((position.raw as unknown as LiveVenuePositionEvidence).venuePositionId) ? owned('DURABLE_OWNERSHIP_RECORD')
@@ -549,7 +554,10 @@ function validConfig(value: unknown): value is SynchronizationConfig {
     return isRecord(entry) && isPositive(entry['pageSize']) && isPositive(entry['maxPages']);
   })) return false;
   const lineage = value['lineage'];
-  if (!isRecord(lineage) || !Array.isArray(lineage['ownedOrders']) || !Array.isArray(lineage['ambiguousCreates']) || !Array.isArray(lineage['closedIntentTags'])
+  if (!isRecord(lineage)) return false;
+  if ('kind' in lineage) {
+    if (lineage['kind'] !== 'UNAVAILABLE' || !isNonEmpty(lineage['reason']) || !Object.keys(lineage).every(key => ['kind', 'reason'].includes(key))) return false;
+  } else if (!Array.isArray(lineage['ownedOrders']) || !Array.isArray(lineage['ambiguousCreates']) || !Array.isArray(lineage['closedIntentTags'])
     || !Array.isArray(lineage['ownedPositions']) || !isNonEmpty(lineage['botTagNamespace'])) return false;
   const contracts = value['contracts'];
   if (!isRecord(contracts) || !isRecord(contracts['tagContract']) || typeof contracts['tagContract']['confirmed'] !== 'boolean') return false;
@@ -642,7 +650,8 @@ export function evaluateCollectedCycle(config: SynchronizationConfig, cycle: num
     thresholds: config.thresholds, passes, stream, evaluatedAtMs,
   });
   const findings = outcomes.flat().flatMap((outcome) => outcome.findings);
-  const reasons = [...new Set([...assessment.reasons, ...findings.filter((entry) => entry.blocking).map((entry) => entry.finding)])].sort();
+  const reasons = [...new Set([...assessment.reasons, ...findings.filter((entry) => entry.blocking).map((entry) => entry.finding),
+    ...('kind' in config.lineage ? ['OWNERSHIP_LINEAGE_UNAVAILABLE'] : [])])].sort();
   const revoked = assessment.reasons.some((reason) => REVOCATIONS.has(reason));
   const status = revoked ? 'REVOKED' as const : reasons.length === 0 && assessment.kind === 'OBSERVED_CONVERGENCE' ? 'OBSERVED_CONVERGENCE' as const : 'UNRESOLVED' as const;
   return Object.freeze({

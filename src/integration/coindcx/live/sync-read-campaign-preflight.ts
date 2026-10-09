@@ -26,7 +26,7 @@ import {
   type ObservationComponent,
   type SynchronizationConfig,
   type SyncHistoryScope,
-  type SyncLineage,
+  type SyncLineageInput,
   type SyncScanLimits,
 } from '../../../execution/live/practical-synchronization/engine';
 
@@ -71,7 +71,7 @@ export interface SyncReadCampaignConfig {
   readonly thresholds: Readonly<{ maxEvidenceAgeMs: number; maxTotalReadDurationMs: number }>;
   readonly campaign: Readonly<{ durationMs: number; evaluationIntervalMs: number; maxEvaluations: number; maxConsecutiveFailedReadEvaluations: number }>;
   /** Durable lineage, supplied explicitly (this candidate reads no repository). */
-  readonly lineage: SyncLineage;
+  readonly lineage: SyncLineageInput;
   /** Provider contracts: only the fail-closed state is accepted; no recorded provider answer confirms any of them. */
   readonly contracts: 'ALL_UNCONFIRMED';
   readonly reportDestination: Readonly<{ kind: 'LOCAL_FILE'; path: string }>;
@@ -292,6 +292,10 @@ function checkBounds(config: Record<string, unknown>, declared: readonly Observa
 function checkInputsAndDestination(config: Record<string, unknown>, f: Findings): void {
   const lineage = config['lineage'];
   if (!isRecord(lineage)) f.block('CONFIG_MISSING', 'lineage');
+  else if ('kind' in lineage) {
+    if (lineage['kind'] === 'UNAVAILABLE' && isNonEmpty(lineage['reason']) && Object.keys(lineage).every(key => ['kind', 'reason'].includes(key))) f.limit('OWNERSHIP_LINEAGE_UNAVAILABLE', 'PREVENTS_CONVERGENCE');
+    else f.block('LINEAGE_INVALID');
+  }
   else {
     const listOf = (value: unknown, valid: (entry: unknown) => boolean): boolean => Array.isArray(value) && value.every(valid);
     const nullableString = (value: unknown): boolean => value === null || isNonEmpty(value);

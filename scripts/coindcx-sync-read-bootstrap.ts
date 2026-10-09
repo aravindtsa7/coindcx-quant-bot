@@ -5,8 +5,10 @@ import readline from 'node:readline';
 import { initializeCampaignHost, startCampaignHost } from './sync-read-launch/campaign-host';
 import { inspectLaunchProposal } from './sync-read-launch/proposal';
 import type { CampaignKeys } from './sync-read-launch/campaign-access';
+import { campaignEntry } from './sync-read-launch/campaign-entry';
 
 async function main(): Promise<number> {
+  if (['prepare', 'initialize-campaign', 'run-provider', 'run-loopback'].includes(process.argv[2] ?? '')) return campaignEntry(process.argv.slice(2));
   const [action, option, file, ...rest] = process.argv.slice(2);
   if (!['initialize', 'run'].includes(action ?? '') || option !== '--offline-input' || !file) throw new Error('EXPLICIT_OFFLINE_BOOTSTRAP_INVOCATION_REQUIRED');
   const workspace = path.resolve(__dirname, '..'), inputPath = path.resolve(file), relative = path.relative(path.join(workspace, '.local'), inputPath);
@@ -14,6 +16,7 @@ async function main(): Promise<number> {
   const input = JSON.parse(fs.readFileSync(inputPath, 'utf8')) as {
     kind?: string; host: unknown; capabilityKeys: CampaignKeys; proposal: unknown; connection: { origin: string; apiKey: string; apiSecret: string };
   };
+  if ((input.host as { networkAccess?: unknown }).networkAccess !== 'LOOPBACK_ONLY') throw new Error('OFFLINE_HOST_TARGET_REQUIRED');
   if (input.kind !== 'SYNTHETIC_LOOPBACK_BOOTSTRAP_INPUT' || !input.connection.apiKey.startsWith('OFFLINE-') || !input.connection.apiSecret.startsWith('OFFLINE-')) throw new Error('SYNTHETIC_INPUT_REQUIRED');
   const stateDirectory = (input.host as { coordinator?: { stateDirectory?: unknown } }).coordinator?.stateDirectory;
   if (typeof stateDirectory !== 'string' || !path.isAbsolute(stateDirectory)) throw new Error('TASK_OWNED_CAMPAIGN_NAMESPACE_REQUIRED');

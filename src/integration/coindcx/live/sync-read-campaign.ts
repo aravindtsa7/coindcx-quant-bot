@@ -472,6 +472,7 @@ function buildReport(input: Readonly<{
     for (const entry of cycle.engine?.records ?? []) for (const record of entry.records) records[`${entry.component}:${record.ownership}`] = (records[`${entry.component}:${record.ownership}`] ?? 0) + 1;
   }
   const gaps: Array<Readonly<{ evaluation: number | null; gap: string; detail: string }>> = [];
+  if (preflight.limitations.some(entry => entry.code === 'OWNERSHIP_LINEAGE_UNAVAILABLE')) gaps.push(Object.freeze({ evaluation: null, gap: 'OWNERSHIP_LINEAGE_UNAVAILABLE', detail: 'NO_DURABLE_OWNERSHIP_ASSERTIONS_SUPPLIED' }));
   for (const entry of preflight.unsupportedRequiredComponents) gaps.push(Object.freeze({ evaluation: null, gap: 'CLIENT_ADAPTER_UNSUPPORTED_COMPONENT', detail: entry.component }));
   for (const evaluation of evaluations) if (evaluation.stream.observation === 'UNKNOWN') gaps.push(Object.freeze({ evaluation: evaluation.index, gap: 'PRIVATE_STREAM_OBSERVATION_UNKNOWN',
     detail: evaluation.stream.source === 'NOT_CONFIGURED' ? 'NOT_CONFIGURED' : 'UNAVAILABLE' }));

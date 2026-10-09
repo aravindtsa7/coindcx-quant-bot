@@ -1,4 +1,4 @@
-/** One unapproved information-collection proposal; no provider composition or credential loader. */
+/** One unapproved information-collection proposal; pure validation, never contact or credential loading. */
 import { z } from 'zod';
 import { validateRateLimiterConfig } from '../../src/integration/coindcx/rate-limit/config';
 import { ListInrOrdersRequestSchema, ListInrPositionsRequestSchema } from '../../src/integration/coindcx/schemas';
@@ -34,9 +34,9 @@ export type LaunchBlocker = { kind: 'REQUIRED_INPUT' | 'MISSING_IMPLEMENTATION' 
 /** These are real-launch blockers, never discharged by test initialization or a fixture capability declaration. */
 export const REAL_LAUNCH_REQUIREMENTS: readonly LaunchBlocker[] = Object.freeze([
   { kind: 'REQUIRED_INPUT', code: 'ACCOUNT_BINDING_REQUIRED', required: 'account.accountId and independently established expectedProviderAccountFingerprint; no old fingerprint assumed fresh' },
-  { kind: 'REQUIRED_INPUT', code: 'DURABLE_LINEAGE_REQUIRED', required: 'read-only lineage snapshot, provenance and botTagNamespace; empty arrays require an explicit documented basis' },
+  { kind: 'REQUIRED_INPUT', code: 'LINEAGE_AVAILABILITY_REQUIRED', required: 'explicit supplied durable lineage with source/date, or UNAVAILABLE with reason; unavailable ownership stays unresolved and prevents convergence; account identity is not ownership' },
   { kind: 'REQUIRED_INPUT', code: 'CLIENT_AND_COORDINATOR_PROVENANCE_REQUIRED', required: 'actual credential-bound client and shared connectionId, same limiter/policy/transport timeout, authenticated scope, connected not-stopped status' },
-  { kind: 'MISSING_IMPLEMENTATION', code: 'PROVIDER_COMPOSITION_ABSENT', required: 'current isolated bootstrap is LOOPBACK_ONLY; reviewed separately authorized provider entry/composition remains absent; default collect CLI never constructs a provider client' },
+  { kind: 'REQUIRED_INPUT', code: 'PROVIDER_INVOCATION_REVIEW_REQUIRED', required: 'review the explicit run-provider bootstrap entry, closed endpoint boundary and campaign-only environment loader; default collect CLI remains hard-blocked' },
   { kind: 'REQUIRED_INPUT', code: 'CAMPAIGN_STATE_LIFECYCLE_REVIEW_REQUIRED', required: 'review explicit NEW_READ_ONLY_CAMPAIGN namespace/installation, configuration binding, ownership, conservative restore and storage guarantees; no production installation initialized or approved' },
   { kind: 'REQUIRED_INPUT', code: 'HOST_SECURITY_AND_SUPERVISION_REVIEW_REQUIRED', required: 'review actual supervisor/operator key custody, OS ownership, restricted pipe/state/report access and aggregate budget allocation; campaign capabilities authenticate READ versus STOP-only, but no Windows ACL enforcement, remote exclusion or process identity proof is claimed' },
   { kind: 'REQUIRED_INPUT', code: 'REPORT_DESTINATION_ACCESS_REQUIRED', required: 'operator-approved writable destination and verified owner/ACL; sink must refuse overwrite, flush and record delivery failures' },

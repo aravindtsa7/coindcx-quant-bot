@@ -15,16 +15,19 @@ import { providerAccountFingerprint, verifyProviderAccountIdentity } from '../..
 import { coordinatorCampaignAccess, clientCampaignAccess, validateCampaignKeys, type CampaignKeys } from './campaign-access';
 import { inspectLaunchProposal, runPreparedCollection, type LaunchProposal } from './proposal';
 import { localReportSink, writeNewJson } from './report-sink';
+import { validateCampaignInvocation, requireRecordedAuthorization, campaignDigest, type CampaignInvocation } from './campaign-input';
+import { CAMPAIGN_READ_ENDPOINTS, campaignReadBoundary } from './campaign-read-boundary';
+import { redactCampaignOutput } from './campaign-secrets';
 
 const positive = z.number().int().positive().refine(Number.isSafeInteger);
 const hostSchema = z.object({
-  valuesStatus: z.literal('PROPOSED_NOT_APPROVED'), networkAccess: z.literal('LOOPBACK_ONLY'),
+  valuesStatus: z.literal('PROPOSED_NOT_APPROVED'), networkAccess: z.enum(['LOOPBACK_ONLY', 'COINDCX_PROVIDER_AUTHORIZATION_REQUIRED']),
   campaignId: z.string().regex(/^readonly-campaign-[a-zA-Z0-9-]{1,80}$/), installationId: z.string().regex(/^[a-z][0-9a-f]{32}$/),
   coordinator: z.unknown(), client: z.unknown(),
   supervision: z.object({ heartbeatIntervalMs: positive, leaseMs: positive, shutdownWaitMs: positive, pollMs: positive }).strict(),
   expectedWindowsOwner: z.string().min(1), ownershipCheckTimeoutMs: positive, reportDirectory: z.string().min(1),
 }).strict();
-function validated(input: unknown) {
+export function validateCampaignHostInput(input: unknown) {
   const parsed = hostSchema.parse(input);
   const coordinator = validateCoordinatorConfig(parsed.coordinator), client = validateClientConfig(parsed.client);
   if (coordinator.kind !== 'VALID' || client.kind !== 'VALID') throw new Error('CAMPAIGN_RUNTIME_CONFIGURATION_INVALID');
@@ -35,6 +38,7 @@ function validated(input: unknown) {
     || cfg.supervision.leaseMs < 3 * cfg.supervision.heartbeatIntervalMs || cfg.supervision.pollMs > cfg.supervision.heartbeatIntervalMs) throw new Error('CAMPAIGN_NAMESPACE_OR_SUPERVISION_INVALID');
   return cfg;
 }
+const validated = validateCampaignHostInput;
 export type CampaignHostInput = z.infer<typeof hostSchema>;
 const digest = (x: unknown): string => createHash('sha256').update(JSON.stringify(x)).digest('hex');
 function noLinks(target: string): void {
@@ -129,7 +133,12 @@ export async function startCampaignHost(input: unknown, keys: CampaignKeys) {
       ack.kind === 'DURABLE' ? { result: 'APPLIED' } : { result: 'REJECTED', reason: ack.reason }); }
     return stopAck!;
   };
-  const supervised = () => { if (performance.now() - lastHeartbeat >= cfg.supervision.leaseMs) void stop('SUPERVISOR_LEASE_EXPIRED'); return stopped === null; };
+  let authorizationExpiresAt: number | null = null, invocationConsumed = false;
+  let collectionSecrets: readonly string[] = [];
+  const supervised = () => {
+    if (authorizationExpiresAt !== null && Date.now() >= authorizationExpiresAt) void stop('RECORDED_AUTHORIZATION_EXPIRED');
+    if (performance.now() - lastHeartbeat >= cfg.supervision.leaseMs) void stop('SUPERVISOR_LEASE_EXPIRED'); return stopped === null;
+  };
   const watchdog = setInterval(() => {
     if (performance.now() - lastHeartbeat >= cfg.supervision.leaseMs) void stop('SUPERVISOR_LEASE_EXPIRED');
     if (reader.session === null || operator.session === null) void stop('COORDINATOR_CONNECTION_LOST');
@@ -143,21 +152,18 @@ export async function startCampaignHost(input: unknown, keys: CampaignKeys) {
     const permit = result.permit;
     return { kind: 'GRANTED' as const, permit: Object.freeze({
       start<T>(create: () => T) { if (!supervised()) { permit.release(); return { kind: 'NOT_STARTED' as const, reason: 'CAMPAIGN_STOPPED' }; } return permit.start(create); },
-      complete: () => permit.complete(), release: () => permit.release(), throttled: (headers: Parameters<ReadPermit['throttled']>[0]) => permit.throttled(headers),
+      complete: () => permit.complete(), release: () => permit.release(), throttled: (headers: Parameters<ReadPermit['throttled']>[0]) => permit.throttled(redactCampaignOutput(headers, collectionSecrets)),
     }) };
   } });
   const provenance = Object.freeze({ installationId: cfg.installationId, campaignId: cfg.campaignId, epoch: running.epoch,
     clientInstanceId: reader.clientInstanceId!, sessionId: reader.session!.sessionId, capability: 'AUTHENTICATED_READ_P1_API_AUTH',
     connectionId: `${cfg.installationId}:${reader.clientInstanceId}`, windowsAclEnforced: false, processIdentityProven: false, remoteClientsExcluded: false });
-  return Object.freeze({ provenance,
-    heartbeat() { if (!supervised() || closed) throw new Error('CAMPAIGN_SUPERVISION_CLOSED'); lastHeartbeat = performance.now(); },
-    stop: () => stop('SUPERVISED_OPERATOR_STOP'),
-    inspect: () => ({ stopped, charges: running.state.charges.map(charge => ({ grantId: charge.grantId, operation: charge.operation, started: charge.started, slotHeld: charge.slotHeld })), unknown: running.state.unknown,
-      outboxSize: reader.outboxSize, admission: running.state.admission }),
-    async run(proposal: LaunchProposal, connection: { origin: string; apiKey: string; apiSecret: string }) {
+  const collect = async (proposal: LaunchProposal, connection: { origin: string; apiKey: string; apiSecret: string }, invocation?: CampaignInvocation, authorizationSha256: string | null = null) => {
       if (collecting || closed || stopped !== null) throw new Error('CAMPAIGN_NOT_AVAILABLE');
       const origin = new URL(connection.origin);
-      if (origin.protocol !== 'http:' || origin.hostname !== '127.0.0.1' || !origin.port || origin.username || origin.password || origin.pathname !== '/' || origin.search || origin.hash) throw new Error('CAMPAIGN_LOOPBACK_ONLY');
+      if (invocation?.target.kind === 'COINDCX_PROVIDER') {
+        if (cfg.networkAccess !== 'COINDCX_PROVIDER_AUTHORIZATION_REQUIRED' || connection.origin !== 'https://api.coindcx.com') throw new Error('CAMPAIGN_TARGET_MODE_MISMATCH');
+      } else if (cfg.networkAccess !== 'LOOPBACK_ONLY' || origin.protocol !== 'http:' || origin.hostname !== '127.0.0.1' || !origin.port || origin.username || origin.password || origin.pathname !== '/' || origin.search || origin.hash) throw new Error('CAMPAIGN_LOOPBACK_ONLY');
       const inspected = inspectLaunchProposal(proposal), c = proposal.configuration;
       if (!inspected.configurationValid || c.budget.connectionId !== provenance.connectionId || digest(c.budget.limiter) !== digest(cfg.coordinator.limiter)
         || c.budget.admissionDeadlineMs !== cfg.coordinator.limiter.maxRequestDeadlineMs || c.budget.priorityClass !== 'P1' || c.budget.scope !== 'API_AUTH') throw new Error('CAMPAIGN_POLICY_OR_BINDING_MISMATCH');
@@ -167,14 +173,44 @@ export async function startCampaignHost(input: unknown, keys: CampaignKeys) {
       const probe = path.join(cfg.reportDirectory, `access-${randomBytes(16).toString('hex')}.tmp`);
       const access = fs.openSync(probe, 'wx'); try { fs.writeFileSync(access, 'access'); fs.fsyncSync(access); } finally { fs.closeSync(access); fs.unlinkSync(probe); }
       collecting = true;
+      collectionSecrets = [connection.apiKey, connection.apiSecret, keys.read, keys.operatorStop];
       try {
         const client = new CoinDcxClient({ baseUrl: origin.origin, apiKey: connection.apiKey, apiSecret: connection.apiSecret,
-          timeoutMs: c.budget.transportRequestTimeoutMs, readBudget: { budget: guardedBudget, scope: 'API_AUTH' } });
+          timeoutMs: c.budget.transportRequestTimeoutMs, readBudget: { budget: guardedBudget, scope: 'API_AUTH' }, allowedReadEndpoints: CAMPAIGN_READ_ENDPOINTS });
         const narrowed = Object.freeze({ getUserInfoSafe: () => client.getUserInfoSafe(), listInrFuturesOrders: client.listInrFuturesOrders.bind(client), listInrFuturesPositions: client.listInrFuturesPositions.bind(client) });
-        return await runPreparedCollection(proposal, { client: narrowed, authenticatedClient: { kind: 'CREDENTIAL_BOUND', accountId: c.account.accountId!, budgetConnectionId: provenance.connectionId },
+        const boundary = invocation ? campaignReadBoundary(narrowed, proposal, () => { void stop('FIRST_READ_ERROR'); }) : null;
+        const secrets = [connection.apiKey, connection.apiSecret, keys.read, keys.operatorStop];
+        const decorate = <T>(value: T) => redactCampaignOutput(invocation ? { ...value, collectionProvenance: {
+          target: invocation.target.kind, origin: invocation.target.origin, invocationSha256: campaignDigest(invocation), authorizationRecordSha256: authorizationSha256,
+          accountMappingSha256: campaignDigest(invocation.accountMapping), credentialProvenanceSha256: campaignDigest(invocation.credentialProvenance),
+          declaredKnownManagedConsumers: invocation.managedTraffic.knownConsumers, externalTraffic: 'UNKNOWN_NOT_CONTROLLED',
+          limitsApplyTo: 'MANAGED_CAMPAIGN_COORDINATOR_TRAFFIC_ONLY', lineage: invocation.lineageProvenance.kind,
+          ...boundary!.inspect(), windowsAclEnforced: false, remoteClientsExcluded: false, processIdentityProven: false,
+        } } : value, secrets);
+        const result = await runPreparedCollection(proposal, { client: boundary?.client ?? narrowed, authenticatedClient: { kind: 'CREDENTIAL_BOUND', accountId: c.account.accountId!, budgetConnectionId: provenance.connectionId },
           identity: { fingerprint: providerAccountFingerprint, verify: verifyProviderAccountIdentity }, coordinator: { status },
-          stream: null, clock, signal: abort.signal, reportSink: localReportSink });
+          stream: null, clock, signal: abort.signal, reportSink: { write: (destination, value) => localReportSink.write(destination, decorate(value)) } });
+        return { ...result, report: decorate(result.report) };
       } finally { collecting = false; }
+  };
+  return Object.freeze({ provenance,
+    heartbeat() { if (!supervised() || closed) throw new Error('CAMPAIGN_SUPERVISION_CLOSED'); lastHeartbeat = performance.now(); },
+    stop: () => stop('SUPERVISED_OPERATOR_STOP'),
+    inspect: () => ({ stopped, charges: running.state.charges.map(charge => ({ grantId: charge.grantId, operation: charge.operation, started: charge.started, slotHeld: charge.slotHeld })), unknown: running.state.unknown,
+      outboxSize: reader.outboxSize, admission: running.state.admission }),
+    run: (proposal: LaunchProposal, connection: { origin: string; apiKey: string; apiSecret: string }) => collect(proposal, connection),
+    async runCampaign(input: unknown, record: unknown, credentials: { apiKey: string; apiSecret: string }) {
+      const invocation = validateCampaignInvocation(input, Date.now());
+      if (invocationConsumed || campaignDigest(validated(invocation.host)) !== campaignDigest(cfg)
+        || !invocation.managedTraffic.knownConsumers.some(consumer => consumer.consumerId === cfg.campaignId && consumer.coordinatorInstallationId === cfg.installationId)) throw new Error('CAMPAIGN_INVOCATION_BINDING_INVALID_OR_CONSUMED');
+      if (invocation.target.kind === 'COINDCX_PROVIDER') {
+        requireRecordedAuthorization(invocation, record, Date.now());
+        authorizationExpiresAt = Date.parse((record as { expiresAt: string }).expiresAt);
+      } else if (record !== undefined || !credentials.apiKey.startsWith('OFFLINE-') || !credentials.apiSecret.startsWith('OFFLINE-')) throw new Error('LOOPBACK_FIXTURE_INPUTS_REQUIRED');
+      invocationConsumed = true;
+      const p = invocation.proposal;
+      const bound = { ...p, configuration: { ...p.configuration, budget: { ...p.configuration.budget, connectionId: provenance.connectionId } } };
+      return collect(bound, { origin: invocation.target.origin, ...credentials }, invocation, invocation.target.kind === 'COINDCX_PROVIDER' ? campaignDigest(record) : null);
     },
     async close() {
       if (closed) throw new Error('CAMPAIGN_ALREADY_CLOSED');

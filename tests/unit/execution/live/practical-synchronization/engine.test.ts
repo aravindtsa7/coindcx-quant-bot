@@ -91,6 +91,17 @@ const withOrderPages = (orders: readonly unknown[][]) => ({ pages: (_c: number, 
 const withOrders = (orders: readonly unknown[][]) => withOrderPages([...orders, []]);
 
 describe('M4 two-pass observation over a declared scope', () => {
+  it('explicit unavailable lineage cannot establish ownership or convergence, even with empty scans', () => {
+    const c = config({ lineage: { kind: 'UNAVAILABLE', reason: 'No durable evidence supplied' } });
+    const result = run(c);
+    expect(result.status).not.toBe('OBSERVED_CONVERGENCE');
+    for (const cycle of result.cycles) {
+      expect(cycle.reasons).toContain('OWNERSHIP_LINEAGE_UNAVAILABLE');
+      expect(cycle.records.flatMap(entry => entry.records).every(entry => entry.ownership === 'UNRESOLVED' && entry.reason === 'OWNERSHIP_LINEAGE_UNAVAILABLE')).toBe(true);
+    }
+    expect(last(run(c, { pages: () => [[]] })).reasons).toContain('OWNERSHIP_LINEAGE_UNAVAILABLE');
+    expect(result.grants).toBe(GRANTS_NOTHING);
+  });
   it('two agreeing passes of owned records are observed convergence within the declared scan scope only', () => {
     const source = fixtureSource();
     const result = runSynchronizationCandidate(config(), source);

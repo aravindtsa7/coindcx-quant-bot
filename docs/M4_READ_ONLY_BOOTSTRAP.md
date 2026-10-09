@@ -1,6 +1,9 @@
 # Isolated read-only campaign bootstrap — 2026-10-09
 
-Uncommitted review candidate. Preparation checkpoint:
+Checkpointed bootstrap; subsequent provider invocation remains an uncommitted review candidate.
+See [the explicit provider invocation specification](M4_PROVIDER_READ_ONLY_INVOCATION.md) for the extension and
+remaining security/input/authorization prerequisites. The loopback-only statements below describe the checkpoint.
+Preparation checkpoint:
 `942222adbed855457b95b1730304022cf1e3ab44`, following campaign checkpoint
 `a9eecc36e950d0b25eb3cfddbd4565e51906f5cd`.
 Every [campaign proposal](launch/m4-orders-positions-proposal.json) value remains PROPOSED_NOT_APPROVED.

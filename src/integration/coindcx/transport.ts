@@ -135,6 +135,8 @@ export interface TransportOptions {
    * (`createOwnedCoinDcxReadTransport`) ignore this and use the process's set-once production read budget.
    */
   readonly readBudget?: TransportReadBudget | undefined;
+  /** Optional narrower semantic endpoint boundary. Checked before budget acquisition or signing. */
+  readonly allowedReadEndpoints?: readonly CoinDcxReadEndpoint[] | undefined;
 }
 
 export interface ExecuteReadOptions {
@@ -170,6 +172,7 @@ export class CoinDcxTransport {
   readonly #signer: RequestSigner | undefined;
   readonly #apiKey: string | undefined;
   readonly #readBudget: TransportReadBudget | 'PRODUCTION' | null;
+  readonly #allowedReadEndpoints: ReadonlySet<CoinDcxReadEndpoint> | null;
 
   constructor(options: TransportOptions = {}, owned?: unknown) {
     this.#baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
@@ -178,6 +181,9 @@ export class CoinDcxTransport {
     this.#signer = options.signer;
     this.#apiKey = options.apiKey;
     this.#readBudget = owned === OWNED_READ_TRANSPORT ? 'PRODUCTION' : (options.readBudget ?? null);
+    const allowed = options.allowedReadEndpoints;
+    if (allowed !== undefined && (allowed.length === 0 || new Set(allowed).size !== allowed.length || !allowed.every(endpoint => Object.hasOwn(READ_ENDPOINT_DEFINITIONS, endpoint)))) throw new TypeError('READ_ENDPOINT_ALLOWLIST_INVALID');
+    this.#allowedReadEndpoints = allowed === undefined ? null : new Set(allowed);
   }
 
   /** M2 W3: one fresh permit per wire request (every caller retry acquires its own). Refuses before any HTTP. */
@@ -203,6 +209,9 @@ export class CoinDcxTransport {
    * Arbitrary URL paths are structurally unrepresentable in this API.
    */
   public async executeRead<T = unknown>(options: ExecuteReadOptions): Promise<HttpResponse<T>> {
+    if (!Object.hasOwn(READ_ENDPOINT_DEFINITIONS, options.endpoint) || (this.#allowedReadEndpoints !== null && !this.#allowedReadEndpoints.has(options.endpoint))) {
+      throw new CoinDcxProviderError('READ_ENDPOINT_NOT_ALLOWED', 500);
+    }
     const def = READ_ENDPOINT_DEFINITIONS[options.endpoint];
     if (!def) {
       throw new CoinDcxProviderError(

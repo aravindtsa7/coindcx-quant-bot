@@ -26,7 +26,8 @@ async function main(): Promise<number> {
   }
   if (!flags.has('--offline-loopback')) {
     if (flags.size || values.has('--fixture-report')) throw new Error('FIXTURE_FLAGS_REQUIRE_OFFLINE_LOOPBACK');
-    console.log(JSON.stringify({ ...inspection, outcome: 'REAL_LAUNCH_BLOCKED', providerCompositionImplemented: false }, null, 2)); return 2;
+    console.log(JSON.stringify({ ...inspection, outcome: 'REAL_LAUNCH_BLOCKED', providerCompositionImplemented: true, legacyCollectHardBlocked: true,
+      requiredEntry: 'coindcx-sync-read-bootstrap.ts run-provider --input <absolute.json> --authorization <absolute.json>' }, null, 2)); return 2;
   }
   const report = values.get('--fixture-report'); if (!report) throw new Error('EXPLICIT_FIXTURE_REPORT_REQUIRED');
   const reportPath = path.resolve(report);
@@ -45,4 +46,4 @@ async function main(): Promise<number> {
   } finally { process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop); }
 }
 
-main().then(code => { process.exitCode = code; }, error => { console.error(error instanceof Error ? error.message : 'LAUNCH_PREPARATION_FAILED'); process.exitCode = 1; });
+if (require.main === module) main().then(code => { process.exitCode = code; }, () => { console.error('LAUNCH_PREPARATION_FAILED'); process.exitCode = 1; });
