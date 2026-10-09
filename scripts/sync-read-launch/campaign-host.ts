@@ -18,6 +18,7 @@ import { localReportSink, writeNewJson } from './report-sink';
 import { validateCampaignInvocation, requireRecordedAuthorization, campaignDigest, type CampaignInvocation } from './campaign-input';
 import { CAMPAIGN_READ_ENDPOINTS, campaignReadBoundary } from './campaign-read-boundary';
 import { redactCampaignOutput } from './campaign-secrets';
+import { GRANTS_NOTHING } from '../../src/integration/coindcx/live/sync-read-campaign-preflight';
 
 const positive = z.number().int().positive().refine(Number.isSafeInteger);
 const hostSchema = z.object({
@@ -199,6 +200,39 @@ export async function startCampaignHost(input: unknown, keys: CampaignKeys) {
     inspect: () => ({ stopped, charges: running.state.charges.map(charge => ({ grantId: charge.grantId, operation: charge.operation, started: charge.started, slotHeld: charge.slotHeld })), unknown: running.state.unknown,
       outboxSize: reader.outboxSize, admission: running.state.admission }),
     run: (proposal: LaunchProposal, connection: { origin: string; apiKey: string; apiSecret: string }) => collect(proposal, connection),
+    /** A separate one-shot identity diagnostic. Never invokes the account-scan campaign. */
+    async runIdentityDiagnostic(input: { target: 'COINDCX_PROVIDER' | 'LOOPBACK_FIXTURE'; origin: string; expectedFingerprint: string;
+      transportTimeoutMs: number; reportPath: string; authorizationScope: 'SINGLE_PROVIDER_IDENTITY_READ_DIAGNOSTIC_ONLY' | 'SYNTHETIC_LOOPBACK_ONLY' }, credentials: { apiKey: string; apiSecret: string }) {
+      if (invocationConsumed || collecting || closed || !supervised()) throw new Error('IDENTITY_DIAGNOSTIC_UNAVAILABLE');
+      const provider = input.target === 'COINDCX_PROVIDER', url = new URL(input.origin);
+      if (provider ? cfg.networkAccess !== 'COINDCX_PROVIDER_AUTHORIZATION_REQUIRED' || input.origin !== 'https://api.coindcx.com'
+        || input.authorizationScope !== 'SINGLE_PROVIDER_IDENTITY_READ_DIAGNOSTIC_ONLY'
+        : cfg.networkAccess !== 'LOOPBACK_ONLY' || url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.origin !== input.origin
+          || input.authorizationScope !== 'SYNTHETIC_LOOPBACK_ONLY' || !credentials.apiKey.startsWith('OFFLINE-') || !credentials.apiSecret.startsWith('OFFLINE-')) throw new Error('IDENTITY_DIAGNOSTIC_TARGET_OR_AUTHORIZATION_INVALID');
+      if (!/^[0-9a-f]{64}$/.test(input.expectedFingerprint) || !Number.isSafeInteger(input.transportTimeoutMs) || input.transportTimeoutMs <= 0
+        || !path.isAbsolute(input.reportPath) || path.dirname(input.reportPath) !== cfg.reportDirectory || path.basename(input.reportPath) !== 'identity.json'
+        || fs.existsSync(input.reportPath)) throw new Error('IDENTITY_DIAGNOSTIC_INPUT_OR_REPORT_INVALID');
+      owners([cfg.reportDirectory], cfg.expectedWindowsOwner, cfg.ownershipCheckTimeoutMs);
+      invocationConsumed = true; collecting = true;
+      collectionSecrets = [credentials.apiKey, credentials.apiSecret, keys.read, keys.operatorStop];
+      let observation: { observedAt: string; fingerprint: string } | null = null;
+      let failure: string | null = null;
+      try {
+        const client = new CoinDcxClient({ baseUrl: input.origin, ...credentials, timeoutMs: input.transportTimeoutMs,
+          readBudget: { budget: guardedBudget, scope: 'API_AUTH' }, allowedReadEndpoints: ['USER_INFO'] });
+        const identityOnly = Object.freeze({ getUserInfoSafe: () => client.getUserInfoSafe() });
+        const response = await identityOnly.getUserInfoSafe();
+        if (!supervised() || stopped !== null) failure = 'LATE_RESULT_DISCARDED';
+        else if (typeof response.coindcxId !== 'string' || response.coindcxId.length === 0) failure = 'IDENTITY_UNAVAILABLE';
+        else observation = { observedAt: new Date().toISOString(), fingerprint: providerAccountFingerprint(response.coindcxId) };
+      } catch { failure = 'IDENTITY_READ_FAILED_NO_RETRY'; }
+      finally { collecting = false; await stop('IDENTITY_DIAGNOSTIC_FINISHED'); }
+      const report = redactCampaignOutput({ kind: 'SINGLE_IDENTITY_DIAGNOSTIC', target: input.target, source: `${input.origin}/exchange/v1/users/info`,
+        observation, comparison: observation === null ? 'NOT_OBSERVED' : observation.fingerprint === input.expectedFingerprint ? 'MATCH' : 'MISMATCH',
+        failure, provenance, grants: GRANTS_NOTHING, independentlyEstablishedAsserted: false, fullCampaignRun: false }, collectionSecrets);
+      writeNewJson(input.reportPath, report);
+      return report;
+    },
     async runCampaign(input: unknown, record: unknown, credentials: { apiKey: string; apiSecret: string }) {
       const invocation = validateCampaignInvocation(input, Date.now());
       if (invocationConsumed || campaignDigest(validated(invocation.host)) !== campaignDigest(cfg)
