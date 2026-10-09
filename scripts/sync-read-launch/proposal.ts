@@ -15,7 +15,7 @@ export const LaunchProposalSchema = z.object({
     account: z.object({ accountId: z.string().min(1).nullable(), expectedProviderAccountFingerprint: z.string().regex(/^[0-9a-f]{64}$/).nullable() }).strict(),
     scope: z.object({ mode: z.literal('CUMULATIVE_STATE'), components: z.tuple([z.literal('ORDERS'), z.literal('POSITIONS')]),
       requiredAccounting: z.tuple([]), history: z.object({ kind: z.literal('AVAILABLE_HISTORY') }).strict(), orderStatuses: z.array(z.string()).nonempty() }).strict(),
-    accountScope: z.object({ assumption: z.literal('UNKNOWN'), attestation: z.literal('NONE') }).strict(),
+    accountScope: z.object({ assumption: z.enum(['UNKNOWN', 'SHARED_USE_POSSIBLE']), attestation: z.literal('NONE') }).strict(),
     decisions: z.object({ d4c: z.literal('PENDING'), as1: z.literal('PENDING') }).strict(),
     budget: z.object({ connectionId: z.string().min(1).nullable(), kind: z.literal('SHARED_COORDINATOR_READ_BUDGET'), scope: z.literal('API_AUTH'),
       priorityClass: z.literal('P1'), admissionDeadlineMs: positive, transportRequestTimeoutMs: positive, limiter: z.unknown(),

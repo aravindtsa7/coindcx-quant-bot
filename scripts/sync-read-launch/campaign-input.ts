@@ -36,13 +36,15 @@ export function campaignParameters(input: z.infer<typeof LaunchProposalSchema>):
   return { ...input, configuration: { ...configuration, budget: policy } };
 }
 export const PROPOSED_PARAMETERS_SHA256 = '61c257519c8aadbf5354a094e6f86f458ffc5eca08bff3912a5e4987b561d9c5';
+/** Same numeric/filter proposal, with the operator's known manual/shared account use recorded. Neither variant is approved. */
+export const SHARED_USE_PARAMETERS_SHA256 = 'e1e3b79858ab32fc512fa4a322f668d829f3ed806eb4b132ede19a5cec225244';
 
 export function validateCampaignInvocation(input: unknown, nowMs: number): CampaignInvocation {
   const parsed = CampaignInvocationSchema.safeParse(input);
   if (!parsed.success) throw new Error('CAMPAIGN_INPUT_INVALID'); // Never echo operator input or validation payloads.
   const value = parsed.data, p = value.proposal, c = p.configuration, mapping = value.accountMapping;
   const inspection = inspectLaunchProposal(p);
-  if (!inspection.parametersValid || inspection.requestBounds?.maximumRequests !== 39 || campaignDigest(campaignParameters(p)) !== PROPOSED_PARAMETERS_SHA256) throw new Error('EXACT_39_REQUEST_PROPOSAL_REQUIRED');
+  if (!inspection.parametersValid || inspection.requestBounds?.maximumRequests !== 39 || campaignDigest(campaignParameters(p)) !== (c.accountScope.assumption === 'SHARED_USE_POSSIBLE' ? SHARED_USE_PARAMETERS_SHA256 : PROPOSED_PARAMETERS_SHA256)) throw new Error('EXACT_39_REQUEST_PROPOSAL_REQUIRED');
   if (c.budget.connectionId !== null || value.connectionBinding !== 'AUTHENTICATED_CAMPAIGN_SESSION_AT_START') throw new Error('EXPLICIT_RUNTIME_SESSION_BINDING_REQUIRED');
   if (mapping.accountId !== c.account.accountId || mapping.expectedProviderAccountFingerprint !== c.account.expectedProviderAccountFingerprint
     || value.credentialProvenance.accountId !== mapping.accountId || Date.parse(mapping.verifiedAt) > nowMs || Date.parse(value.credentialProvenance.establishedAt) > nowMs) throw new Error('INDEPENDENT_ACCOUNT_MAPPING_REQUIRED');
@@ -69,6 +71,6 @@ export function requireRecordedAuthorization(input: CampaignInvocation, record: 
   const a = parsed.data;
   if (a.invocationSha256 !== campaignDigest(input) || a.accountId !== input.accountMapping.accountId
     || a.expectedProviderAccountFingerprint !== input.accountMapping.expectedProviderAccountFingerprint
-    || a.approvedProposalParametersSha256 !== PROPOSED_PARAMETERS_SHA256 || Date.parse(a.authorizedAt) > nowMs
+    || a.approvedProposalParametersSha256 !== campaignDigest(campaignParameters(input.proposal)) || Date.parse(a.authorizedAt) > nowMs
     || Date.parse(a.expiresAt) <= nowMs || Date.parse(a.expiresAt) <= Date.parse(a.authorizedAt)) throw new Error('RECORDED_PROVIDER_AUTHORIZATION_MISMATCH_OR_EXPIRED');
 }

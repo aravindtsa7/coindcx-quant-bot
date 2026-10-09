@@ -38,6 +38,12 @@ describe('campaign inputs, semantic allowlist and request ceiling without provid
     expect(() => validateCampaignInvocation({ ...input(), lineageProvenance: { kind: 'UNAVAILABLE', reason: 'different' } }, now)).toThrow('LINEAGE_INPUT');
     const noLineage = input(); Reflect.set(noLineage.proposal.configuration, 'lineage', null); expect(() => validateCampaignInvocation(noLineage, now)).toThrow('LINEAGE_INPUT');
   });
+  it('accepts the separately pinned shared-use proposal without relaxing numeric bounds or authority', () => {
+    const shared = input(); shared.proposal.configuration.accountScope.assumption = 'SHARED_USE_POSSIBLE';
+    expect(validateCampaignInvocation(shared, now).proposal.configuration.accountScope).toEqual({ assumption: 'SHARED_USE_POSSIBLE', attestation: 'NONE' });
+    shared.proposal.configuration.budget.admissionDeadlineMs = 4000;
+    expect(() => validateCampaignInvocation(shared, now)).toThrow('EXACT_39_REQUEST');
+  });
   it('separates real and loopback targets without arbitrary hosts, credentials in URLs or provider relabelling', () => {
     for (const target of [{ kind: 'LOOPBACK_FIXTURE', origin: 'https://api.coindcx.com' }, { kind: 'COINDCX_PROVIDER', origin: 'http://127.0.0.1:1234' },
       { kind: 'COINDCX_PROVIDER', origin: 'https://api.coindcx.com.evil.example' }, { kind: 'LOOPBACK_FIXTURE', origin: 'http://secret@127.0.0.1:1234' }]) expect(CampaignInvocationSchema.safeParse({ ...input(), target }).success).toBe(false);
@@ -65,6 +71,10 @@ describe('campaign inputs, semantic allowlist and request ceiling without provid
       approvedProposalParametersSha256: PROPOSED_PARAMETERS_SHA256, reviews: { hostSecurity: 'SYNTHETIC', credentialCustody: 'SYNTHETIC', supervisorAndStop: 'SYNTHETIC', reportAccess: 'SYNTHETIC', stateLifecycle: 'SYNTHETIC', aggregateManagedBudget: 'SYNTHETIC' },
       residualHostAssumptions: 'EXPLICITLY_REVIEWED_NO_ACL_REMOTE_OR_PROCESS_IDENTITY_PROOF' };
     expect(() => requireRecordedAuthorization(provider, fixture, now)).not.toThrow();
+    const shared = structuredClone(provider); shared.proposal.configuration.accountScope.assumption = 'SHARED_USE_POSSIBLE';
+    const sharedFixture = { ...fixture, invocationSha256: campaignDigest(shared), approvedProposalParametersSha256: campaignDigest(campaignParameters(shared.proposal)) };
+    expect(() => requireRecordedAuthorization(shared, sharedFixture, now)).not.toThrow();
+    expect(() => requireRecordedAuthorization(shared, { ...sharedFixture, approvedProposalParametersSha256: PROPOSED_PARAMETERS_SHA256 }, now)).toThrow('MISMATCH_OR_EXPIRED');
     for (const change of [{ invocationSha256: '0'.repeat(64) }, { accountId: 'OTHER' }, { expectedProviderAccountFingerprint: '0'.repeat(64) },
       { expiresAt: '2026-10-08T00:00:00Z' }, { approvedProposalParametersSha256: '0'.repeat(64) }]) expect(() => requireRecordedAuthorization(provider, { ...fixture, ...change }, now)).toThrow('MISMATCH_OR_EXPIRED');
     expect(() => requireRecordedAuthorization({ ...provider, target: { kind: 'LOOPBACK_FIXTURE', origin: 'http://127.0.0.1:1' } }, fixture, now)).toThrow('AUTHORIZATION_REQUIRED');

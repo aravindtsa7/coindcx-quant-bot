@@ -6,7 +6,7 @@ import { validateCampaignInvocation, requireRecordedAuthorization, campaignDiges
 import { loadCampaignSecrets, redactCampaignOutput } from './campaign-secrets';
 import { initializeCampaignHost, startCampaignHost, validateCampaignHostInput } from './campaign-host';
 
-export async function campaignEntry(args: readonly string[]): Promise<number> {
+export async function campaignEntry(args: readonly string[], environment: () => Readonly<Record<string, string | undefined>> | Promise<Readonly<Record<string, string | undefined>>> = () => process.env, requiredTarget?: 'COINDCX_PROVIDER'): Promise<number> {
   const [action, ...options] = args;
   if (!['prepare', 'initialize-campaign', 'run-provider', 'run-loopback'].includes(action ?? '')) throw new Error('EXPLICIT_CAMPAIGN_COMMAND_REQUIRED');
   const fields = new Map<string, string>();
@@ -22,6 +22,7 @@ export async function campaignEntry(args: readonly string[]): Promise<number> {
   const input = validateCampaignInvocation(read(fields.get('--input')), Date.now());
   const cfg = validateCampaignHostInput(input.host);
   const provider = input.target.kind === 'COINDCX_PROVIDER';
+  if (requiredTarget && input.target.kind !== requiredTarget) throw new Error('CAMPAIGN_TARGET_MODE_MISMATCH');
   if (cfg.networkAccess !== (provider ? 'COINDCX_PROVIDER_AUTHORIZATION_REQUIRED' : 'LOOPBACK_ONLY')) throw new Error('CAMPAIGN_TARGET_MODE_MISMATCH');
   if (action === 'prepare') {
     if (fields.size !== 1) throw new Error('PREPARE_READS_NO_AUTHORIZATION_OR_ENVIRONMENT');
@@ -36,7 +37,7 @@ export async function campaignEntry(args: readonly string[]): Promise<number> {
   else if (fields.has('--authorization')) throw new Error('LOOPBACK_CANNOT_USE_PROVIDER_AUTHORIZATION');
   if (action === 'initialize-campaign' ? fields.get('--confirm') !== 'NEW_READ_ONLY_CAMPAIGN' : fields.has('--confirm')) throw new Error('CAMPAIGN_INITIALIZATION_CONFIRMATION_INVALID');
   if (action !== 'initialize-campaign' && (!process.stdin.readable || process.stdin.isTTY)) throw new Error('EXPLICIT_SUPERVISOR_STDIN_REQUIRED');
-  const secrets = loadCampaignSecrets(process.env);
+  const secrets = loadCampaignSecrets(await environment());
   if (!provider && (!secrets.credentials.apiKey.startsWith('OFFLINE-') || !secrets.credentials.apiSecret.startsWith('OFFLINE-'))) throw new Error('SYNTHETIC_LOOPBACK_CREDENTIALS_REQUIRED');
   if (action === 'initialize-campaign') {
     initializeCampaignHost(cfg, secrets.keys, 'NEW_READ_ONLY_CAMPAIGN');

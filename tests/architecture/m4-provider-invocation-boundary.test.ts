@@ -4,7 +4,7 @@ import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import { buildImportGraph } from './support/import-graph';
 const ROOT = path.resolve(__dirname, '../..');
-const files = ['campaign-input', 'campaign-entry', 'campaign-read-boundary', 'campaign-secrets'].map(name => `scripts/sync-read-launch/${name}.ts`);
+const files = ['campaign-input', 'campaign-entry', 'campaign-read-boundary', 'campaign-secrets', 'operator-local-secrets'].map(name => `scripts/sync-read-launch/${name}.ts`);
 const text = (file: string) => fs.readFileSync(path.join(ROOT, file), 'utf8');
 describe('provider invocation stays explicit, read-only and outside production startup', () => {
   it('is unreachable from src and has no import-time I/O, timers, credentials or client construction', () => {
@@ -23,11 +23,12 @@ describe('provider invocation stays explicit, read-only and outside production s
     }
     expect(text('scripts/coindcx-sync-read-bootstrap.ts')).toContain('if (require.main === module)');
     expect(text('scripts/coindcx-sync-read-launch.ts')).toContain('if (require.main === module)');
+    expect(text('scripts/coindcx-sync-read-operator.ts')).toContain('if (require.main === module)');
   });
   it('loads no dotenv/live aliases and checks provider authorization before environment lookup and host startup', () => {
     const entry = text(files[1]!);
-    expect(entry.indexOf('requireRecordedAuthorization(input, authorization')).toBeLessThan(entry.indexOf('loadCampaignSecrets(process.env)'));
-    expect(entry.indexOf('loadCampaignSecrets(process.env)')).toBeLessThan(entry.indexOf('startCampaignHost(cfg'));
+    expect(entry.indexOf('requireRecordedAuthorization(input, authorization')).toBeLessThan(entry.indexOf('loadCampaignSecrets(await environment())'));
+    expect(entry.indexOf('loadCampaignSecrets(await environment())')).toBeLessThan(entry.indexOf('startCampaignHost(cfg'));
     for (const file of files) expect(text(file).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')).not.toMatch(/dotenv|process\.env\.(COINDCX_API|LIVE)|bindProduction|MutationBudget|ExecutionGateway|register\w*Hook|RESET_STOP|recoverUnknown/);
   });
   it('uses only fixed semantic endpoints; budget and transport construction remain in the reviewed host', () => {
