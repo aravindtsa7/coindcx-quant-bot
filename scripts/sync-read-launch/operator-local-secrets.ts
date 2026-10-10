@@ -38,12 +38,12 @@ export async function loadAuthorizedCredentialSource() {
   } catch { throw new Error('CAMPAIGN_AUTHORIZED_SOURCE_UNAVAILABLE_OR_INVALID'); }
   finally { lines.close(); stream.destroy(); selected.clear(); }
 }
-/** CurrentUser DPAPI protects only campaign IPC keys at rest; it is not pipe ACL or process identity enforcement. */
+/** CurrentUser DPAPI for IPC keys and explicit protected credentials; no pipe/process identity claim. */
 export function protectIpcKeys(input: string, decrypt = false): string {
   if (process.platform !== 'win32') throw new Error('WINDOWS_DPAPI_REQUIRED');
   const method = decrypt ? 'Unprotect' : 'Protect';
   const script = `$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Security; $v=[Convert]::FromBase64String([Console]::In.ReadToEnd()); $r=[Security.Cryptography.ProtectedData]::${method}($v,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Write([Convert]::ToBase64String($r))`;
-  try { return execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
+  try { return execFileSync('C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
     { input, encoding: 'utf8', windowsHide: true, timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'] }).trim(); }
   catch { throw new Error('CAMPAIGN_IPC_DPAPI_FAILED'); }
 }

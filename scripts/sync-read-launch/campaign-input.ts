@@ -14,7 +14,8 @@ export const CampaignInvocationSchema = z.object({
   kind: z.literal('COINDCX_READ_ONLY_CAMPAIGN_INPUT'), target, valuesStatus: z.literal('PROPOSED_NOT_APPROVED'), host: z.unknown(), proposal: LaunchProposalSchema,
   accountMapping: z.object({ accountId: text, expectedProviderAccountFingerprint: hash, sourceReference: text, verifiedAt: date,
     independentlyEstablished: z.literal(true) }).strict(),
-  credentialProvenance: z.object({ accountId: text, sourceReference: text, establishedAt: date }).strict(),
+  credentialProvenance: z.object({ accountId: text, sourceReference: text, establishedAt: date,
+    sourceBinding: z.object({ kind: z.literal('protected-dpapi'), path: text, ciphertextSha256: hash }).strict().optional() }).strict(),
   lineageProvenance: z.discriminatedUnion('kind', [z.object({ kind: z.literal('UNAVAILABLE'), reason: text }).strict(),
     z.object({ kind: z.literal('SUPPLIED'), sourceReference: text, exportedAt: date }).strict()]),
   connectionBinding: z.literal('AUTHENTICATED_CAMPAIGN_SESSION_AT_START'),
@@ -36,8 +37,8 @@ export function campaignParameters(input: z.infer<typeof LaunchProposalSchema>):
   return { ...input, configuration: { ...configuration, budget: policy } };
 }
 export const PROPOSED_PARAMETERS_SHA256 = '61c257519c8aadbf5354a094e6f86f458ffc5eca08bff3912a5e4987b561d9c5';
-/** Same numeric/filter proposal, with the operator's known manual/shared account use recorded. Neither variant is approved. */
-export const SHARED_USE_PARAMETERS_SHA256 = 'e1e3b79858ab32fc512fa4a322f668d829f3ed806eb4b132ede19a5cec225244';
+/** Shared-use collection pin with corrected provider-stated block; client waits retained. Not a production default. */
+export const SHARED_USE_PARAMETERS_SHA256 = 'c5274306c77b6336bc102a491e0de6c3bad74903211f57f2f4aa31616d808da5';
 
 export function validateCampaignInvocation(input: unknown, nowMs: number): CampaignInvocation {
   const parsed = CampaignInvocationSchema.safeParse(input);

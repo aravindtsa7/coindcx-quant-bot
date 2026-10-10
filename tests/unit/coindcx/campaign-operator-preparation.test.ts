@@ -38,11 +38,12 @@ describe('explicit local preparation with synthetic credentials only', () => {
     fs.writeFileSync(file, '{}'); const credentials = vi.fn();
     await expect(campaignEntry(['run-provider', '--input', file], credentials)).rejects.toThrow('CAMPAIGN_INPUT_INVALID');
     expect(credentials).not.toHaveBeenCalled();
-    await expect(operatorEntry(['run-provider', '--ipc-key-file', path.join(parent, 'absent.dpapi'), '--input', file])).rejects.toThrow('CAMPAIGN_INPUT_INVALID');
+    await expect(operatorEntry(['run-provider', '--ipc-key-file', path.join(parent, 'absent.dpapi'), '--credential-source', 'protected-dpapi', '--input', file])).rejects.toThrow('CAMPAIGN_INPUT_INVALID');
   });
-  it('pins manual/shared use without changing the numeric proposal or attesting exclusivity', () => {
+  it('pins the corrected shared-use collection without attesting exclusivity', () => {
     const p = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../../../docs/launch/m4-orders-positions-proposal.json'), 'utf8'));
     p.configuration.accountScope = { assumption: 'SHARED_USE_POSSIBLE', attestation: 'NONE' };
+    p.configuration.budget.limiter.retryAfter.providerStatedBlockMs = 10000;
     const inspection = inspectLaunchProposal(p); expect(inspection.parametersValid).toBe(true);
     expect(inspection.requestBounds?.maximumRequests).toBe(39);
     expect(campaignDigest(campaignParameters(p))).toBe(SHARED_USE_PARAMETERS_SHA256);
@@ -55,6 +56,7 @@ describe('explicit local preparation with synthetic credentials only', () => {
     p.configuration.account = { accountId: 'OFFLINE-ACCOUNT', expectedProviderAccountFingerprint: 'f'.repeat(64) };
     p.configuration.lineage = { kind: 'UNAVAILABLE', reason: 'OFFLINE-NO-LINEAGE' };
     p.configuration.accountScope.assumption = 'SHARED_USE_POSSIBLE';
+    p.configuration.budget.limiter.retryAfter.providerStatedBlockMs = 10000;
     p.configuration.reportDestination.path = path.join(stateDirectory, 'reports', 'report.json');
     const input = { kind: 'COINDCX_READ_ONLY_CAMPAIGN_INPUT', target: { kind: 'COINDCX_PROVIDER', origin: 'https://api.coindcx.com' }, valuesStatus: 'PROPOSED_NOT_APPROVED', proposal: p,
       host: { valuesStatus: 'PROPOSED_NOT_APPROVED', networkAccess: 'COINDCX_PROVIDER_AUTHORIZATION_REQUIRED', campaignId, installationId,
@@ -70,10 +72,10 @@ describe('explicit local preparation with synthetic credentials only', () => {
     try {
       await expect(campaignEntry(['prepare', '--input', file], credentials)).resolves.toBe(0);
       await expect(campaignEntry(['initialize-campaign', '--input', file, '--confirm', 'NEW_READ_ONLY_CAMPAIGN'], credentials)).rejects.toThrow('ABSOLUTE_CAMPAIGN_JSON_INPUT_REQUIRED');
-      await expect(operatorEntry(['initialize-campaign', '--ipc-key-file', path.join(parent, 'absent.dpapi'), '--input', file, '--confirm', 'NEW_READ_ONLY_CAMPAIGN'])).rejects.toThrow('ABSOLUTE_CAMPAIGN_JSON_INPUT_REQUIRED');
+      await expect(operatorEntry(['initialize-campaign', '--ipc-key-file', path.join(parent, 'absent.dpapi'), '--credential-source', 'protected-dpapi', '--input', file, '--confirm', 'NEW_READ_ONLY_CAMPAIGN'])).rejects.toThrow('ABSOLUTE_CAMPAIGN_JSON_INPUT_REQUIRED');
       expect(credentials).not.toHaveBeenCalled(); expect(fs.existsSync(stateDirectory)).toBe(false);
       fs.writeFileSync(file, JSON.stringify({ ...input, target: { kind: 'LOOPBACK_FIXTURE', origin: 'http://127.0.0.1:1234' }, host: { ...input.host, networkAccess: 'LOOPBACK_ONLY' } }));
-      await expect(operatorEntry(['initialize-campaign', '--ipc-key-file', path.join(parent, 'absent.dpapi'), '--input', file, '--confirm', 'NEW_READ_ONLY_CAMPAIGN'])).rejects.toThrow('CAMPAIGN_TARGET_MODE_MISMATCH');
+      await expect(operatorEntry(['initialize-campaign', '--ipc-key-file', path.join(parent, 'absent.dpapi'), '--credential-source', 'protected-dpapi', '--input', file, '--confirm', 'NEW_READ_ONLY_CAMPAIGN'])).rejects.toThrow('CAMPAIGN_TARGET_MODE_MISMATCH');
     } finally { print.mockRestore(); }
   });
 });

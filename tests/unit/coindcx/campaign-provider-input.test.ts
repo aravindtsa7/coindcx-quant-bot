@@ -8,6 +8,7 @@ import { inspectLaunchProposal } from '../../../scripts/sync-read-launch/proposa
 import { providerAccountFingerprint } from '../../../src/execution/live/reconciliation/account-identity';
 import { CoinDcxTransport, type CoinDcxReadEndpoint } from '../../../src/integration/coindcx/transport';
 import type { SyncCampaignReadClient } from '../../../src/integration/coindcx/live/sync-read-campaign';
+import type { RateLimiterConfig } from '../../../src/integration/coindcx/rate-limit/config';
 
 const original = () => inspectLaunchProposal(JSON.parse(fs.readFileSync(path.resolve(__dirname, '../../../docs/launch/m4-orders-positions-proposal.json'), 'utf8'))).proposal!;
 const ID = 'OFFLINE-INDEPENDENT-ACCOUNT';
@@ -40,6 +41,8 @@ describe('campaign inputs, semantic allowlist and request ceiling without provid
   });
   it('accepts the separately pinned shared-use proposal without relaxing numeric bounds or authority', () => {
     const shared = input(); shared.proposal.configuration.accountScope.assumption = 'SHARED_USE_POSSIBLE';
+    const limiter = shared.proposal.configuration.budget.limiter as RateLimiterConfig;
+    shared.proposal.configuration.budget.limiter = { ...limiter, retryAfter: { ...limiter.retryAfter, providerStatedBlockMs: 10000 } };
     expect(validateCampaignInvocation(shared, now).proposal.configuration.accountScope).toEqual({ assumption: 'SHARED_USE_POSSIBLE', attestation: 'NONE' });
     shared.proposal.configuration.budget.admissionDeadlineMs = 4000;
     expect(() => validateCampaignInvocation(shared, now)).toThrow('EXACT_39_REQUEST');
@@ -72,6 +75,8 @@ describe('campaign inputs, semantic allowlist and request ceiling without provid
       residualHostAssumptions: 'EXPLICITLY_REVIEWED_NO_ACL_REMOTE_OR_PROCESS_IDENTITY_PROOF' };
     expect(() => requireRecordedAuthorization(provider, fixture, now)).not.toThrow();
     const shared = structuredClone(provider); shared.proposal.configuration.accountScope.assumption = 'SHARED_USE_POSSIBLE';
+    const limiter = shared.proposal.configuration.budget.limiter as RateLimiterConfig;
+    shared.proposal.configuration.budget.limiter = { ...limiter, retryAfter: { ...limiter.retryAfter, providerStatedBlockMs: 10000 } };
     const sharedFixture = { ...fixture, invocationSha256: campaignDigest(shared), approvedProposalParametersSha256: campaignDigest(campaignParameters(shared.proposal)) };
     expect(() => requireRecordedAuthorization(shared, sharedFixture, now)).not.toThrow();
     expect(() => requireRecordedAuthorization(shared, { ...sharedFixture, approvedProposalParametersSha256: PROPOSED_PARAMETERS_SHA256 }, now)).toThrow('MISMATCH_OR_EXPIRED');

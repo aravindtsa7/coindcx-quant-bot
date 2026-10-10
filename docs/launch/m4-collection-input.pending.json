@@ -1,0 +1,245 @@
+{
+  "kind": "COINDCX_READ_ONLY_CAMPAIGN_INPUT",
+  "target": {
+    "kind": "COINDCX_PROVIDER",
+    "origin": "https://api.coindcx.com"
+  },
+  "valuesStatus": "PROPOSED_NOT_APPROVED",
+  "host": {
+    "valuesStatus": "PROPOSED_NOT_APPROVED",
+    "networkAccess": "COINDCX_PROVIDER_AUTHORIZATION_REQUIRED",
+    "campaignId": "readonly-campaign-collection-6ee22446e815b391",
+    "installationId": "c91b6c7f3c47be206408919a49d9b8562",
+    "coordinator": {
+      "limiter": {
+        "windows": [
+          {
+            "windowMs": 1000,
+            "maxStarts": 2
+          },
+          {
+            "windowMs": 60000,
+            "maxStarts": 20
+          }
+        ],
+        "fairnessWindowMs": 60000,
+        "classShares": {
+          "P0": {
+            "minPerWindow": 0,
+            "maxPerWindow": 20
+          },
+          "P1": {
+            "minPerWindow": 0,
+            "maxPerWindow": 13
+          },
+          "P2": {
+            "minPerWindow": 0,
+            "maxPerWindow": 20
+          },
+          "P3": {
+            "minPerWindow": 0,
+            "maxPerWindow": 20
+          }
+        },
+        "concurrency": 3,
+        "p0ReservedSlots": 1,
+        "grantTtlMs": 1000,
+        "maxRequestDeadlineMs": 5000,
+        "overdueGuardMs": 1000,
+        "uncertainChargeAlertMs": 60000,
+        "retryAfter": {
+          "noHeaderDefaultMs": 60000,
+          "providerStatedBlockMs": 10000,
+          "localBackoffBaseMs": 60000,
+          "localBackoffMaxMs": 300000,
+          "operationalCapMs": 900000,
+          "clockUncertaintyMs": 2000
+        }
+      },
+      "stateDirectory": "C:\\Users\\kani1\\CoinDcxCollectionRuntime-48a225657b6047c7ba1a5f114f7d5d07\\campaign\\readonly-campaign-collection-6ee22446e815b391",
+      "pipePath": "\\\\.\\pipe\\coindcx-readonly-campaign-c91b6c7f3c47be206408919a49d9b8562",
+      "maxFrameBytes": 65536,
+      "maxStateBytes": 1048576,
+      "tickMs": 10,
+      "handshakeTimeoutMs": 2000,
+      "maxSessions": 16,
+      "maxRegisteredClients": 32,
+      "maxPendingRequestsPerSession": 16
+    },
+    "client": {
+      "pipePath": "\\\\.\\pipe\\coindcx-readonly-campaign-c91b6c7f3c47be206408919a49d9b8562",
+      "maxFrameBytes": 65536,
+      "connectTimeoutMs": 2000,
+      "probeScopes": [],
+      "maxOutbox": 256
+    },
+    "supervision": {
+      "heartbeatIntervalMs": 1000,
+      "leaseMs": 15000,
+      "shutdownWaitMs": 15000,
+      "pollMs": 100
+    },
+    "expectedWindowsOwner": "KANI\\kani1",
+    "ownershipCheckTimeoutMs": 10000,
+    "reportDirectory": "C:\\Users\\kani1\\CoinDcxCollectionRuntime-48a225657b6047c7ba1a5f114f7d5d07\\campaign\\readonly-campaign-collection-6ee22446e815b391\\reports"
+  },
+  "proposal": {
+    "proposalId": "m4-orders-positions-information-collection-20261008",
+    "valuesStatus": "PROPOSED_NOT_APPROVED",
+    "purpose": "ORDERS_POSITIONS_ONLY_INFORMATION_COLLECTION",
+    "providerOrigin": "https://api.coindcx.com",
+    "stream": "NOT_CONFIGURED",
+    "configuration": {
+      "account": {
+        "accountId": "coindcx-primary-manual-shared",
+        "expectedProviderAccountFingerprint": "25ccf725943efd0c94d04b09eeff0d8aa9d542a28d749a1e4229277dffe706b4"
+      },
+      "scope": {
+        "mode": "CUMULATIVE_STATE",
+        "components": [
+          "ORDERS",
+          "POSITIONS"
+        ],
+        "requiredAccounting": [],
+        "history": {
+          "kind": "AVAILABLE_HISTORY"
+        },
+        "orderStatuses": [
+          "open",
+          "filled",
+          "partially_filled",
+          "partially_cancelled",
+          "cancelled",
+          "rejected",
+          "untriggered"
+        ]
+      },
+      "accountScope": {
+        "assumption": "SHARED_USE_POSSIBLE",
+        "attestation": "NONE"
+      },
+      "decisions": {
+        "d4c": "PENDING",
+        "as1": "PENDING"
+      },
+      "budget": {
+        "connectionId": null,
+        "kind": "SHARED_COORDINATOR_READ_BUDGET",
+        "scope": "API_AUTH",
+        "priorityClass": "P1",
+        "admissionDeadlineMs": 5000,
+        "transportRequestTimeoutMs": 10000,
+        "limiter": {
+          "windows": [
+            {
+              "windowMs": 1000,
+              "maxStarts": 2
+            },
+            {
+              "windowMs": 60000,
+              "maxStarts": 20
+            }
+          ],
+          "fairnessWindowMs": 60000,
+          "classShares": {
+            "P0": {
+              "minPerWindow": 0,
+              "maxPerWindow": 20
+            },
+            "P1": {
+              "minPerWindow": 0,
+              "maxPerWindow": 13
+            },
+            "P2": {
+              "minPerWindow": 0,
+              "maxPerWindow": 20
+            },
+            "P3": {
+              "minPerWindow": 0,
+              "maxPerWindow": 20
+            }
+          },
+          "concurrency": 3,
+          "p0ReservedSlots": 1,
+          "grantTtlMs": 1000,
+          "maxRequestDeadlineMs": 5000,
+          "overdueGuardMs": 1000,
+          "uncertainChargeAlertMs": 60000,
+          "retryAfter": {
+            "noHeaderDefaultMs": 60000,
+            "providerStatedBlockMs": 10000,
+            "localBackoffBaseMs": 60000,
+            "localBackoffMaxMs": 300000,
+            "operationalCapMs": 900000,
+            "clockUncertaintyMs": 2000
+          }
+        },
+        "campaignShare": {
+          "maxStartsPerFairnessWindow": 13
+        }
+      },
+      "scanLimits": {
+        "ORDERS": {
+          "pageSize": 25,
+          "maxPages": 2
+        },
+        "POSITIONS": {
+          "pageSize": 25,
+          "maxPages": 2
+        }
+      },
+      "timeouts": {
+        "identityReadTimeoutMs": 20000,
+        "readTimeoutMs": 65000,
+        "streamTimeoutMs": 5000
+      },
+      "maxCycles": 1,
+      "thresholds": {
+        "maxEvidenceAgeMs": 150000,
+        "maxTotalReadDurationMs": 140000
+      },
+      "campaign": {
+        "durationMs": 900000,
+        "evaluationIntervalMs": 120000,
+        "maxEvaluations": 3,
+        "maxConsecutiveFailedReadEvaluations": 2
+      },
+      "lineage": {
+        "kind": "UNAVAILABLE",
+        "reason": "No independently supplied durable bot-order ownership lineage; operator manually trades on a non-exclusive account."
+      },
+      "contracts": "ALL_UNCONFIRMED",
+      "reportDestination": {
+        "kind": "LOCAL_FILE",
+        "path": "C:\\Users\\kani1\\CoinDcxCollectionRuntime-48a225657b6047c7ba1a5f114f7d5d07\\campaign\\readonly-campaign-collection-6ee22446e815b391\\reports\\campaign-report.json"
+      }
+    }
+  },
+  "accountMapping": {
+    "accountId": "coindcx-primary-manual-shared",
+    "expectedProviderAccountFingerprint": "25ccf725943efd0c94d04b09eeff0d8aa9d542a28d749a1e4229277dffe706b4",
+    "sourceReference": "Fresh protected identity report .local/m4-protected-identity-evidence-20261009/provider-identity-report.json (SUCCESS/MATCH); operator statement 2026-10-09, exact time unknown: key created for the only personal CoinDCX account; operator authorization 2026-10-10 to read that account. Association reviewed independently of this new campaign; no historical-report attestation.",
+    "verifiedAt": "2026-10-09T09:06:07.287Z",
+    "independentlyEstablished": true
+  },
+  "credentialProvenance": {
+    "accountId": "coindcx-primary-manual-shared",
+    "sourceReference": "Operator instruction received 2026-10-11 Asia/Calcutta: concealed local CurrentUser DPAPI provisioning reported successful; explicit protected-dpapi source only. Exact provisioning time unknown. Private runtime input binds the provisioned ciphertext digest and fixed protected store path; identity must match the independently established account reference before scans. Earlier 2026-10-09 key/account statement remains date-only, exact time unknown; earlier original-source provenance remains separately in protected evidence. No original .env read or fallback authorized.",
+    "establishedAt": "2026-10-10T18:36:34.7811616Z"
+  },
+  "lineageProvenance": {
+    "kind": "UNAVAILABLE",
+    "reason": "No independently supplied durable bot-order ownership lineage; operator manually trades on a non-exclusive account."
+  },
+  "connectionBinding": "AUTHENTICATED_CAMPAIGN_SESSION_AT_START",
+  "managedTraffic": {
+    "knownConsumers": [
+      {
+        "consumerId": "readonly-campaign-collection-6ee22446e815b391",
+        "coordinatorInstallationId": "c91b6c7f3c47be206408919a49d9b8562",
+        "operations": "READ_P1_API_AUTH"
+      }
+    ],
+    "externalTraffic": "UNKNOWN_NOT_CONTROLLED"
+  }
+}
