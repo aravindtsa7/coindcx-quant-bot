@@ -6,6 +6,7 @@ import { ZodError } from 'zod';
 import { validateCampaignInvocation, requireRecordedAuthorization, campaignDigest } from './campaign-input';
 import { loadCampaignSecrets, redactCampaignOutput } from './campaign-secrets';
 import { initializeCampaignHost, startCampaignHost, validateCampaignHostInput } from './campaign-host';
+import { validateCampaignKeys } from './campaign-access';
 
 export async function campaignEntry(args: readonly string[], environment: () => Readonly<Record<string, string | undefined>> | Promise<Readonly<Record<string, string | undefined>>> = () => process.env, requiredTarget?: 'COINDCX_PROVIDER'): Promise<number> {
   const [action, ...options] = args;
@@ -52,6 +53,14 @@ export async function campaignEntry(args: readonly string[], environment: () => 
   else if (fields.has('--authorization')) throw new Error('LOOPBACK_CANNOT_USE_PROVIDER_AUTHORIZATION');
   if (action === 'initialize-campaign' ? fields.get('--confirm') !== 'NEW_READ_ONLY_CAMPAIGN' : fields.has('--confirm')) throw new Error('CAMPAIGN_INITIALIZATION_CONFIRMATION_INVALID');
   if (action !== 'initialize-campaign' && (!process.stdin.readable || process.stdin.isTTY)) throw new Error('EXPLICIT_SUPERVISOR_STDIN_REQUIRED');
+  if (action === 'initialize-campaign' && provider) {
+    // Independent authorization above still precedes all key access. Initialization needs IPC capabilities only.
+    const local = await environment();
+    const keys = { read: local.COINDCX_CAMPAIGN_IPC_READ_KEY ?? '', operatorStop: local.COINDCX_CAMPAIGN_IPC_STOP_KEY ?? '' };
+    validateCampaignKeys(keys);
+    initializeCampaignHost(cfg, keys, 'NEW_READ_ONLY_CAMPAIGN');
+    console.log(JSON.stringify({ outcome: 'CAMPAIGN_NAMESPACE_INITIALIZED', target: input.target.kind, readyToContactProvider: false })); return 0;
+  }
   const secrets = loadCampaignSecrets(await environment());
   if (!provider && (!secrets.credentials.apiKey.startsWith('OFFLINE-') || !secrets.credentials.apiSecret.startsWith('OFFLINE-'))) throw new Error('SYNTHETIC_LOOPBACK_CREDENTIALS_REQUIRED');
   if (action === 'initialize-campaign') {

@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { campaignEntry } from './sync-read-launch/campaign-entry';
 import { loadCampaignSecrets } from './sync-read-launch/campaign-secrets';
 import { createIpcKeyFile, loadIpcKeyFile, AUTHORIZED_CREDENTIAL_SOURCE } from './sync-read-launch/operator-local-secrets';
-import { credentialStorePath, loadSelectedCredentialSource, parseCredentialSource } from './sync-read-launch/credential-store';
+import { assertCredentialCustody, credentialStorePath, loadSelectedCredentialSource, parseCredentialSource } from './sync-read-launch/credential-store';
 import { validateCampaignInvocation } from './sync-read-launch/campaign-input';
 
 export async function operatorEntry(args: readonly string[]): Promise<number> {
@@ -40,6 +40,16 @@ export async function operatorEntry(args: readonly string[]): Promise<number> {
     const binding = invocation.credentialProvenance.sourceBinding;
     if (sourceSelection === 'protected-dpapi' ? !binding || path.resolve(binding.path) !== credentialStorePath() : binding !== undefined) {
       throw new Error('CREDENTIAL_SOURCE_INVOCATION_BINDING_REQUIRED');
+    }
+    if (action === 'initialize-campaign' && sourceSelection === 'protected-dpapi') {
+      // Preserve full selected-source custody/hash validation without opening or decrypting API ciphertext here.
+      assertCredentialCustody(credentialStorePath());
+      const root = path.resolve(__dirname, '..');
+      const inventory = JSON.parse(fs.readFileSync(path.join(root, 'runtime-inventory.json'), 'utf8')) as { files: { path: string; sha256: string }[] };
+      if (!inventory.files.some(entry => path.resolve(root, entry.path) === credentialStorePath() && entry.sha256 === binding!.ciphertextSha256)) {
+        throw new Error('CREDENTIAL_SOURCE_INVOCATION_BINDING_REQUIRED');
+      }
+      return loadIpcKeyFile(keyFile);
     }
     return { ...(await loadSelectedCredentialSource(sourceSelection, binding?.ciphertextSha256)).environment, ...loadIpcKeyFile(keyFile) };
   }, 'COINDCX_PROVIDER');
