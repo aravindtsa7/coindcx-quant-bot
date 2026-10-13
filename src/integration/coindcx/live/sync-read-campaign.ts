@@ -104,6 +104,17 @@ export type SyncCampaignIdentityCheck = Readonly<{
   observedFingerprintPrefix: string | null;
 }>;
 export type SyncCampaignAdapterRead = Readonly<{ evaluation: number; binding: AsyncReadBinding; report: SyncReadAdapterReport }>;
+/** Response receipt, scan validity and assessment are separate; accepted does not mean complete or converged. */
+export type SyncCampaignReadAssessment = Readonly<{
+  evaluation: number; cycle: number; pass: 0 | 1; component: string;
+  responseOutcome: AsyncCycleRecord['reads'][number]['outcome'] | null;
+  adapterSupport: SyncReadAdapterReport['support']; adapterFailure: SyncReadAdapterReport['failure'];
+  responsePages: number; receivedRowOccurrences: number;
+  scanValidity: 'ACCEPTED' | 'REJECTED' | 'MALFORMED_RECORDS' | 'NOT_ASSESSED';
+  termination: string | null; scanFindings: readonly string[];
+  retainedRecordObservations: number; retainedRowOccurrences: number;
+  assessmentReasons: readonly string[];
+}>;
 export type SyncCampaignEvaluation = Readonly<{
   index: number;
   startedAtMs: number;
@@ -133,9 +144,11 @@ export type SyncReadCampaignReport = Readonly<{
   correlation: Readonly<{ kind: 'ADAPTER_LOCAL_ECHO'; providerReturnedIdentity: 'NONE'; isProviderProof: false }>;
   evaluations: readonly SyncCampaignEvaluation[];
   reads: readonly SyncCampaignAdapterRead[];
+  readAssessments: readonly SyncCampaignReadAssessment[];
   /** Adapter results that arrived after their evaluation ended: abandoned, never attributed as observations. */
   lateReads: readonly SyncCampaignAdapterRead[];
   observations: Readonly<{ evaluations: number; convergedEvaluations: number; cycles: number; records: Readonly<Record<string, number>> }>;
+  recordCountSemantics: 'PER_SCAN_RECORD_OBSERVATIONS_NOT_UNIQUE_TRADES_FILLS_OR_CURRENT_POSITIONS';
   gaps: readonly Readonly<{ evaluation: number | null; gap: string; detail: string }>[];
   revocations: readonly Readonly<{ evaluation: number; cycle: number; reasons: readonly string[] }>[];
   scanBounds: readonly Readonly<{ evaluation: number; cycle: number; pass: 0 | 1; component: string; segment: string; stop: string; pages: number }>[];
@@ -471,6 +484,23 @@ function buildReport(input: Readonly<{
   for (const { cycle } of cycles) {
     for (const entry of cycle.engine?.records ?? []) for (const record of entry.records) records[`${entry.component}:${record.ownership}`] = (records[`${entry.component}:${record.ownership}`] ?? 0) + 1;
   }
+  const readAssessments: SyncCampaignReadAssessment[] = reads.map((read) => {
+    const cycle = cycleOf(input, read.evaluation, read.binding.cycle);
+    const matches = (entry: { pass: number; component: string }) => entry.pass === read.binding.pass && entry.component === read.binding.component;
+    const termination = cycle?.engine?.terminations.find(matches)?.termination ?? null;
+    const findings = cycle?.engine?.scanFindings.filter(matches).map(entry => entry.finding) ?? [];
+    const retained = cycle?.engine?.records.find(matches)?.records ?? [];
+    return Object.freeze({ evaluation: read.evaluation, cycle: read.binding.cycle, pass: read.binding.pass, component: read.binding.component,
+      responseOutcome: cycle?.reads.find(matches)?.outcome ?? null,
+      adapterSupport: read.report.support, adapterFailure: read.report.failure,
+      responsePages: read.report.pages.length, receivedRowOccurrences: read.report.pages.reduce((total, page) => total + page.records, 0),
+      scanValidity: termination === null ? 'NOT_ASSESSED' as const : termination === 'FAILED' || findings.includes('IRREGULAR_PAGE') ? 'REJECTED' as const
+        : findings.includes('RECORD_MALFORMED') ? 'MALFORMED_RECORDS' as const : 'ACCEPTED' as const,
+      termination, scanFindings: Object.freeze(findings), retainedRecordObservations: retained.length,
+      retainedRowOccurrences: retained.reduce((total, record) => total + record.occurrences.length, 0),
+      assessmentReasons: cycle?.reasons ?? Object.freeze([]),
+    });
+  });
   const gaps: Array<Readonly<{ evaluation: number | null; gap: string; detail: string }>> = [];
   if (preflight.limitations.some(entry => entry.code === 'OWNERSHIP_LINEAGE_UNAVAILABLE')) gaps.push(Object.freeze({ evaluation: null, gap: 'OWNERSHIP_LINEAGE_UNAVAILABLE', detail: 'NO_DURABLE_OWNERSHIP_ASSERTIONS_SUPPLIED' }));
   for (const entry of preflight.unsupportedRequiredComponents) gaps.push(Object.freeze({ evaluation: null, gap: 'CLIENT_ADAPTER_UNSUPPORTED_COMPONENT', detail: entry.component }));
@@ -495,6 +525,7 @@ function buildReport(input: Readonly<{
     correlation: Object.freeze({ kind: 'ADAPTER_LOCAL_ECHO' as const, providerReturnedIdentity: 'NONE' as const, isProviderProof: false as const }),
     evaluations: Object.freeze([...evaluations]),
     reads: Object.freeze([...reads]),
+    readAssessments: Object.freeze(readAssessments),
     lateReads: Object.freeze([...input.lateReads]),
     observations: Object.freeze({
       evaluations: evaluations.length,
@@ -502,6 +533,7 @@ function buildReport(input: Readonly<{
       cycles: cycles.length,
       records: Object.freeze(records),
     }),
+    recordCountSemantics: 'PER_SCAN_RECORD_OBSERVATIONS_NOT_UNIQUE_TRADES_FILLS_OR_CURRENT_POSITIONS' as const,
     gaps: Object.freeze(gaps),
     revocations: Object.freeze(cycles.filter(({ cycle }) => cycle.status === 'REVOKED').map(({ evaluation, cycle }) => Object.freeze({ evaluation, cycle: cycle.cycle, reasons: cycle.reasons }))),
     scanBounds: Object.freeze(reads.flatMap((read) => read.report.stops.map((stop) => Object.freeze({

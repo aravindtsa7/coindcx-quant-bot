@@ -92,14 +92,16 @@ function validateInstallation(cfg: ReturnType<typeof validated>, keys: CampaignK
   if (opened.kind !== 'OPEN' || opened.recoveredFrom !== 'BOTH') throw new Error('CAMPAIGN_STATE_CORRUPT_MISSING_OR_INCOMPATIBLE');
 }
 const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
-const clock = { now: () => performance.now(), delay(ms: number, signal: AbortSignal) {
+// Engine/assessment observation times are non-negative safe-integer milliseconds.
+// Keep the monotonic clock domain; truncate only this local producer, never provider data or engine inputs.
+export const campaignObservationClock = Object.freeze({ now: () => Math.floor(performance.now()), delay(ms: number, signal: AbortSignal) {
   return new Promise<void>((resolve, reject) => {
     if (signal.aborted) { reject(new Error('CANCELLED')); return; }
     const onAbort = () => { clearTimeout(timer); signal.removeEventListener('abort', onAbort); reject(new Error('CANCELLED')); };
     const timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve(); }, ms);
     signal.addEventListener('abort', onAbort, { once: true });
   });
-} };
+} });
 
 /** Explicit start requires external heartbeats. Losing the lease latches STOP and aborts collection, never RESET. */
 export async function startCampaignHost(input: unknown, keys: CampaignKeys) {
@@ -190,7 +192,7 @@ export async function startCampaignHost(input: unknown, keys: CampaignKeys) {
         } } : value, secrets);
         const result = await runPreparedCollection(proposal, { client: boundary?.client ?? narrowed, authenticatedClient: { kind: 'CREDENTIAL_BOUND', accountId: c.account.accountId!, budgetConnectionId: provenance.connectionId },
           identity: { fingerprint: providerAccountFingerprint, verify: verifyProviderAccountIdentity }, coordinator: { status },
-          stream: null, clock, signal: abort.signal, reportSink: { write: (destination, value) => localReportSink.write(destination, decorate(value)) } });
+          stream: null, clock: campaignObservationClock, signal: abort.signal, reportSink: { write: (destination, value) => localReportSink.write(destination, decorate(value)) } });
         return { ...result, report: decorate(result.report) };
       } finally { collecting = false; }
   };
