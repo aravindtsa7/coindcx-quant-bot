@@ -3,6 +3,8 @@
 const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
 const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const read = file => JSON.parse(fs.readFileSync(file, 'utf8'));
+// Separate attempt-2 record; the expired pending authorization is retained unchanged.
+const authorizationRelativePath = 'operator/collection-authorization.attempt-2.json';
 function durableNew(file, value) {
   const fd = fs.openSync(file, 'wx');
   try { fs.writeFileSync(fd, JSON.stringify(value, null, 2) + '\n'); fs.fsyncSync(fd); }
@@ -50,7 +52,7 @@ async function runOnce(files, hooks) {
 }
 function validateHandoff(root) {
   const inputFile = path.join(root, 'operator/campaign-input.pending.json');
-  const authorization = path.join(root, 'operator/collection-authorization.pending.json');
+  const authorization = path.join(root, authorizationRelativePath);
   const { validateCampaignInvocation, requireRecordedAuthorization, campaignDigest } = require('./campaign-input.ts');
   const input = validateCampaignInvocation(read(inputFile), Date.now());
   requireRecordedAuthorization(input, read(authorization), Date.now()); // Before any credential loading or supervisor launch.
@@ -82,7 +84,7 @@ function validateHandoff(root) {
 }
 function production(root) {
   const inputFile = path.join(root, 'operator/campaign-input.pending.json');
-  const authorization = path.join(root, 'operator/collection-authorization.pending.json');
+  const authorization = path.join(root, authorizationRelativePath);
   const evidence = path.join(root, 'offline/interactive-collection-attempt-2');
   const files = { claim: path.join(root, 'operator/collection-attempt-2.claim.json'),
     supervisor: path.join(evidence, 'supervisor-result.json'), exit: path.join(evidence, 'collection-exit.json') };
@@ -93,7 +95,7 @@ function production(root) {
       action: 'run-provider', authorization, keyFile: path.join(root, 'operator/ipc-keys.dpapi'), credentialSource: 'protected-dpapi' } }),
   });
 }
-module.exports = { runOnce, durableNew, validateHandoff };
+module.exports = { runOnce, durableNew, validateHandoff, authorizationRelativePath };
 if (require.main === module) void production(path.resolve(__dirname, '../..'))
   .then(result => { process.exitCode = result.code; })
   .catch(() => { console.error('COLLECTION_HANDOFF_REFUSED'); process.exitCode = 1; });

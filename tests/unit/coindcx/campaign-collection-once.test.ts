@@ -10,8 +10,9 @@ const requireLocal = createRequire(__filename);
 type Result = { code: number; outcome: string; taskChildExited?: boolean };
 type Hooks = { interactive: boolean; signals: EventEmitter; emit: (value: unknown) => void; validate: () => void | Promise<void>;
   supervise: (options: { onChild: () => void }) => Promise<Record<string, unknown>> };
-const { runOnce } = requireLocal('../../../scripts/sync-read-launch/collection-once.cjs') as {
+const { runOnce, authorizationRelativePath } = requireLocal('../../../scripts/sync-read-launch/collection-once.cjs') as {
   runOnce: (files: Record<string, string>, hooks: Hooks) => Promise<Result>;
+  authorizationRelativePath: string;
 };
 const { superviseChild } = requireLocal('../../../scripts/sync-read-launch/identity-supervisor.cjs') as {
   superviseChild: (spawnChild: () => ReturnType<typeof spawn>, supervision: Record<string, number>, deadline: number,
@@ -28,6 +29,11 @@ function fixture() {
 }
 afterEach(() => { for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true }); });
 describe('one further collection admission, synthetic and offline only', () => {
+  it('pins a separate attempt-2 authorization without selecting or overwriting the expired record', () => {
+    expect(authorizationRelativePath).toBe('operator/collection-authorization.attempt-2.json');
+    const source = fs.readFileSync(path.resolve(__dirname, '../../../scripts/sync-read-launch/collection-once.cjs'), 'utf8');
+    expect(source).not.toContain("path.join(root, 'operator/collection-authorization.pending.json')");
+  });
   it('admits exactly once, retaining the claim after success and refusing concurrent/repeated invocations', async () => {
     const f = fixture();
     const results = await Promise.all([runOnce(f.files, f.hooks), runOnce(f.files, f.hooks)]);
@@ -68,6 +74,22 @@ describe('one further collection admission, synthetic and offline only', () => {
     expect(await runOnce(f.files, f.hooks)).toMatchObject({ code: 1, outcome: 'SUPERVISOR_CHILD_STARTUP_FAILED' });
     expect(JSON.parse(fs.readFileSync(f.files.supervisor, 'utf8')).spawnErrorCode).toBe('EPERM');
     expect((await runOnce(f.files, f.hooks)).code).toBe(4); expect(calls).toBe(1);
+  });
+  it('enforces the two-hour synthetic authorization window and exact digest binding', () => {
+    const now = Date.parse('2026-10-13T12:00:00Z');
+    const input = validateCampaignInvocation(JSON.parse(fs.readFileSync(path.resolve(__dirname, '../../../docs/launch/m4-collection-input.pending.json'), 'utf8')), now);
+    const authorization = { kind: 'RECORDED_READ_ONLY_COLLECTION_AUTHORIZATION', target: 'COINDCX_PROVIDER',
+      authorizationId: 'OFFLINE-TWO-HOUR-TEST', authorizedBy: 'SYNTHETIC TEST ONLY', authorizedAt: new Date(now).toISOString(),
+      expiresAt: new Date(now + 7200000).toISOString(), invocationSha256: campaignDigest(input), accountId: input.accountMapping.accountId,
+      expectedProviderAccountFingerprint: input.accountMapping.expectedProviderAccountFingerprint, scope: 'ORDERS_POSITIONS_ONLY_INFORMATION_COLLECTION',
+      maximumRequests: 39, approvedProposalParametersSha256: campaignDigest(campaignParameters(input.proposal)),
+      reviews: Object.fromEntries(['hostSecurity','credentialCustody','supervisorAndStop','reportAccess','stateLifecycle','aggregateManagedBudget'].map(key => [key, 'OFFLINE SYNTHETIC'])),
+      residualHostAssumptions: 'EXPLICITLY_REVIEWED_NO_ACL_REMOTE_OR_PROCESS_IDENTITY_PROOF' };
+    expect(() => requireRecordedAuthorization(input, authorization, now - 1)).toThrow(/MISMATCH_OR_EXPIRED/);
+    expect(() => requireRecordedAuthorization(input, authorization, now)).not.toThrow();
+    expect(() => requireRecordedAuthorization(input, authorization, now + 7199999)).not.toThrow();
+    expect(() => requireRecordedAuthorization(input, authorization, now + 7200000)).toThrow(/MISMATCH_OR_EXPIRED/);
+    expect(() => requireRecordedAuthorization(input, { ...authorization, invocationSha256: '0'.repeat(64) }, now)).toThrow(/MISMATCH_OR_EXPIRED/);
   });
   it('cancels before supervision and retains admission', async () => {
     const f = fixture(); f.hooks.validate = () => { f.hooks.signals.emit('SIGINT'); };

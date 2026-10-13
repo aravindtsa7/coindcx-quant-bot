@@ -1,26 +1,32 @@
 # One further local interactive collection attempt
 
-Prepared 13 October 2026, Asia/Calcutta. **Do not launch yet: the recorded authorization has expired.**
+Prepared 13 October 2026, Asia/Calcutta. The original expired authorization is preserved unchanged.
+The operator subsequently authorized ONE additional attempt with a two-hour launch-validity window.
+The selected fresh private record is `operator/collection-authorization.attempt-2.json`.
+Run only after current preparation reports READY and before that record's expiry; all existing
+expiry checks remain enforced before credential loading and during collection.
 This handoff was prepared without collection, provider requests, real credential decryption/loading,
 or campaign initialization. Native Windows spawn EPERM remains intermittent and unexplained.
 The five passing offline comparisons do not establish a fix or reliable startup.
 
 HEAD: `6619c66bd9dcf16049e8fdb2e96145a2b2324575`.
-Branch: `feature/m2-w1-limiter-scheduler`. Worktree was clean at entry; this handoff is uncommitted.
+Branch: `feature/m2-w1-limiter-scheduler`. The five original handoff files were reviewed and
+committed locally as `fba3dafc734e90186e7c8faa55d8ab04a09fb6ff`. A follow-up changes only the
+fresh-record binding, its offline checks and these preparation records. No private record enters Git.
 
-## Enforced prerequisite
+## Separate authorization and enforced expiry
 
 The existing `operator/collection-authorization.pending.json` expires at
 `2026-10-10T19:42:53.595Z` (**11 October 2026, 01:12:53.595 IST**).
 Its schema and exact bindings match, and it was valid at its recorded time; it is invalid now.
-The actual wrapper's read-only validation returns
-`RECORDED_PROVIDER_AUTHORIZATION_MISMATCH_OR_EXPIRED` before invoking the supervisor or loading credentials.
-No authorization record, expiry, operator statement, signature or attestation was changed or invented.
+The previous preparation verified its expiry refusal before invoking the supervisor or loading credentials.
+That file and its expiry are not edited, replaced or backdated. No issuer signature is claimed.
 
-A separately recorded, reviewed current authorization with actual recording time and explicit expiry
-is required before launch, followed by resealing its inventory entry and repeating the existing full
-custody/binding checks. It must retain the same account, scope and digests below. Do not merely edit
-the old expiry or bypass validation. The review file created here is explicitly **not** authorization.
+The fresh record uses the actual recording time with +05:30 offset and expiry exactly two hours later,
+the same account, scope and digests below, and current review references. Its inventory entry and
+the committed snapshot are resealed and full custody/binding checks repeated before READY is reported.
+The namespace review file is explicitly **not** authorization; its expired-status field describes
+the original preparation checkpoint. The fresh authorization is a separate strict-schema record.
 The earlier statement that no other API script was running remains historical; it is not a fresh
 process/IP inventory. No new attestation about external/manual/shared traffic is made.
 
@@ -47,7 +53,7 @@ The wrapper calls the existing `identity-supervisor.cjs` exported `supervise` ex
 ```text
 action: run-provider
 input: C:\Users\kani1\CoinDcxCollectionRuntime-48a225657b6047c7ba1a5f114f7d5d07\operator\campaign-input.pending.json
-authorization: C:\Users\kani1\CoinDcxCollectionRuntime-48a225657b6047c7ba1a5f114f7d5d07\operator\collection-authorization.pending.json
+authorization: C:\Users\kani1\CoinDcxCollectionRuntime-48a225657b6047c7ba1a5f114f7d5d07\operator\collection-authorization.attempt-2.json
 IPC key file: C:\Users\kani1\CoinDcxCollectionRuntime-48a225657b6047c7ba1a5f114f7d5d07\operator\ipc-keys.dpapi
 credential-source: protected-dpapi
 ```
@@ -86,7 +92,7 @@ absence of continuous console events is expected. No raw child stderr is forward
 |---|---|
 | 0 | Supervisor returned 0 and task-child exit was confirmed. Review reports for actual collection status/coverage; this is no acceptance or trading grant. |
 | 1 | Child startup/run/cleanup failed, exit unresolved or evidence write failed. EPERM appears as `SUPERVISOR_CHILD_STARTUP_FAILED`, `spawnErrorCode: EPERM`. |
-| 3 | Interactive/admission/prerequisite/preflight refusal. Current expiry produces `RECORDED_PROVIDER_AUTHORIZATION_MISMATCH_OR_EXPIRED`. |
+| 3 | Interactive/admission/prerequisite/preflight refusal. Expiry produces `RECORDED_PROVIDER_AUTHORIZATION_MISMATCH_OR_EXPIRED`. |
 | 4 | `COLLECTION_CONSOLE_ADMISSION_REFUSED` or `COLLECTION_ATTEMPT_ALREADY_CONSUMED`; supervisor is not called and existing evidence is retained. |
 | 130 | Operator stop with confirmed task-child exit, or cancellation before supervision. Exact underlying supervisor code/signal remain in evidence. |
 
@@ -125,18 +131,19 @@ Missing child reports after startup failure do not authorize a second invocation
 ## Verified preparation and retained limits
 
 Evidence: `C:\Users\kani1\CoinDcxCollectionRuntime-48a225657b6047c7ba1a5f114f7d5d07\offline\interactive-handoff-20261013`.
-Final inventory: 1,870 entries, including the two uncommitted wrapper files and private non-authorizing review.
-354 Git-blob and 1,507 dependency provenance bindings verified; new wrappers match the worktree bytes.
+The original handoff inventory contained 1,870 entries. Current preparation adds the separate
+authorization and committed handoff files, then verifies each source/inventory binding again.
 The selected ciphertext, IPC ciphertext, private input/expired authorization and all namespace files
 retain their bytes, owners and DACLs. Both state slots remain journalSeq 0, scheduler null, zero clients;
 no owner lock, collection report, shutdown report or unresolved charge exists. No namespace reset,
 repair, reinitialization or IPC-key decryption was performed.
 
-Ten affected offline admission/lifecycle tests, typecheck, affected lint, PowerShell parse checks
+The original ten affected offline admission/lifecycle tests, typecheck, affected lint, PowerShell parse checks
 and extracted-function synthetic console-admission checks pass. The latter invoke only the
 admission function on disposable evidence fixtures, never the operator script or launch command.
 Tests use synthetic credentials, denied network transports and disposable fixture files.
 The unchanged five-comparison, 35-test and 12-check evidence is reused; 644 prior sealed files verified.
+Fresh-record binding and two-hour expiry boundary tests are included in the follow-up checks.
 The original worktree state, 50 dirty fingerprints and 14 frozen migrations remain preserved.
 Earlier deeper-descendant ACL-restoration uncertainty remains; complete restoration is not claimed.
 

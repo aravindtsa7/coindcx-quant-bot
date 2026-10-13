@@ -191,3 +191,10 @@ Its durable admission remains unconsumed; failed attempts cannot automatically
 become reusable. The initialized unused namespace and ciphertext remain unchanged.
 Preparation made zero provider requests, real credential loads or initializations.
 Native EPERM and prior deeper-descendant ACL-restoration uncertainty remain unresolved.
+
+The subsequent operator instruction authorizes ONE additional attempt with a
+two-hour launch-validity window. The expired pending authorization remains unchanged;
+the fresh private strict-schema record is `operator/collection-authorization.attempt-2.json`.
+The wrapper selects that separate record explicitly. Current preparation must
+revalidate the resealed snapshot, namespace, admission absence and all expiry/binding
+gates before reporting READY. No collection is launched by this preparation.
