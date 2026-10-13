@@ -181,3 +181,13 @@ Further workspace ACL repairs remain prohibited, with deeper-descendant rollback
 uncertainty retained. The existing 39-request authorization is unchanged in scope;
 a new private record binds actual review results and recording time, without
 an issuer-signature or new operator attestation claim.
+
+2026-10-13 interactive handoff preparation: see
+[M4_INTERACTIVE_COLLECTION_HANDOFF.md](M4_INTERACTIVE_COLLECTION_HANDOFF.md).
+The existing authorization expired at 2026-10-10T19:42:53.595Z and is an enforced
+launch blocker; it was not renewed or edited. A small uncommitted one-use wrapper
+retains the existing supervisor, protected-dpapi selection and full preflight.
+Its durable admission remains unconsumed; failed attempts cannot automatically
+become reusable. The initialized unused namespace and ciphertext remain unchanged.
+Preparation made zero provider requests, real credential loads or initializations.
+Native EPERM and prior deeper-descendant ACL-restoration uncertainty remain unresolved.
