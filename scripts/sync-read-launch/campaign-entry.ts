@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
+import { ZodError } from 'zod';
 import { validateCampaignInvocation, requireRecordedAuthorization, campaignDigest } from './campaign-input';
 import { loadCampaignSecrets, redactCampaignOutput } from './campaign-secrets';
 import { initializeCampaignHost, startCampaignHost, validateCampaignHostInput } from './campaign-host';
@@ -20,7 +21,21 @@ export async function campaignEntry(args: readonly string[], environment: () => 
     return JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
   };
   const input = validateCampaignInvocation(read(fields.get('--input')), Date.now());
-  const cfg = validateCampaignHostInput(input.host);
+  let cfg: ReturnType<typeof validateCampaignHostInput>;
+  try { cfg = validateCampaignHostInput(input.host); }
+  catch (error) {
+    // Fixed codes only, for visibly synthetic prepare inputs. No paths, values, issues, stacks or raw errors.
+    if (action === 'prepare' && input.accountMapping.accountId.startsWith('OFFLINE-')
+      && input.accountMapping.sourceReference === 'SYNTHETIC_ONLY_NOT_ACCOUNT_EVIDENCE'
+      && input.credentialProvenance.sourceReference === 'SYNTHETIC_ONLY_NO_CREDENTIALS'
+      && input.credentialProvenance.sourceBinding === undefined) {
+      const code = error instanceof ZodError ? 'CAMPAIGN_HOST_SCHEMA_INVALID'
+        : error instanceof Error && ['CAMPAIGN_RUNTIME_CONFIGURATION_INVALID', 'CAMPAIGN_NAMESPACE_OR_SUPERVISION_INVALID'].includes(error.message)
+          ? error.message : 'CAMPAIGN_HOST_VALIDATION_FAILED';
+      console.error(JSON.stringify({ kind: 'SYNTHETIC_OFFLINE_PREPARE_REFUSAL', stage: 'HOST_VALIDATION', code }));
+    }
+    throw error;
+  }
   const provider = input.target.kind === 'COINDCX_PROVIDER';
   if (requiredTarget && input.target.kind !== requiredTarget) throw new Error('CAMPAIGN_TARGET_MODE_MISMATCH');
   if (cfg.networkAccess !== (provider ? 'COINDCX_PROVIDER_AUTHORIZATION_REQUIRED' : 'LOOPBACK_ONLY')) throw new Error('CAMPAIGN_TARGET_MODE_MISMATCH');
