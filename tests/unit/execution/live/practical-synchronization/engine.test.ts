@@ -202,6 +202,34 @@ describe('M4 ownership: the seven register §5 scenarios', () => {
     expect(record(run(config(), withOrders([[order({ exchangeOrderId: 'ex-f', clientOrderId: 'web-1' })]])), 'order:ex-f')).toMatchObject({ reason: 'TAG_OUTSIDE_NAMESPACE_UNCONFIRMED' });
   });
 
+  it('7. a tag outside the namespace is FOREIGN_OBSERVED only under the same SYNTHETIC confirmed always-tagged contract, and still blocks convergence', () => {
+    const alwaysTagged = { ...config().contracts, tagContract: { confirmed: true as const, field: 'client_order_id' as const, botCreatesAlwaysTagged: true } };
+    const result = run(config({ contracts: alwaysTagged }), withOrders([[order({ exchangeOrderId: 'ex-f', clientOrderId: 'web-1' })]]));
+    expect(record(result, 'order:ex-f')).toMatchObject({ ownership: 'FOREIGN_OBSERVED', reason: 'FOREIGN_TAG_UNDER_CONFIRMED_CONTRACT' });
+    expect(result.status).toBe('UNRESOLVED');
+  });
+
+  it.each([
+    ['account', { accountId: 'other-account' }],
+    ['pair', { pair: 'B-ETH_USDT' }],
+    ['side', { side: 'SELL' as const }],
+    ['order type', { wireOrderType: 'market_order' }],
+    ['price', { price: '64001' }],
+    ['price null versus a venue price', { price: null }],
+    ['leverage', { leverage: '10' }],
+    ['leverage null versus a venue leverage', { leverage: null }],
+  ])('2. a single candidate differing only in %s stays UNRESOLVED under a SYNTHETIC confirmed tag contract', (_label, difference) => {
+    const venueOrder = order({ exchangeOrderId: 'ex-7', clientOrderId: 'bot-0007' });
+    const candidate = { intentId: 'intent-7', accountId: ACCOUNT, tag: 'bot-0007', pair: 'B-BTC_USDT', side: 'BUY' as 'BUY' | 'SELL', orderedQuantity: '0.5', price: '64000.5' as string | null, wireOrderType: 'limit_order', leverage: '5' as string | null };
+    const confirmed = { tagContract: { confirmed: true as const, field: 'client_order_id' as const, botCreatesAlwaysTagged: false }, venueGeneratedOrderTypes: null, venueGeneratedWalletStages: null, terminalShortPage: {} };
+    const withCandidate = (entry: typeof candidate) => config({ lineage: { ...lineage, ambiguousCreates: [entry] }, contracts: confirmed });
+    // The unmodified candidate resolves, so each mismatch below is caused only by its one differing field.
+    expect(record(run(withCandidate(candidate), withOrders([[venueOrder]])), 'order:ex-7')).toMatchObject({ ownership: 'OWNED', reason: 'RESOLVED_UNDER_CONFIRMED_CONTRACT' });
+    const result = run(withCandidate({ ...candidate, ...difference }), withOrders([[venueOrder]]));
+    expect(record(result, 'order:ex-7')).toMatchObject({ ownership: 'UNRESOLVED', reason: 'CANDIDATE_FIELD_MISMATCH' });
+    expect(result.status).toBe('UNRESOLVED');
+  });
+
   it('a matching tag alone never establishes ownership, and a fill inherits only an OWNED parent', () => {
     // The owned order's own tag on a different exchange order id is still not lineage.
     expect(record(run(config(), withOrders([[order({ exchangeOrderId: 'ex-2', clientOrderId: 'bot-0001' })]])), 'order:ex-2')).toMatchObject({ ownership: 'UNRESOLVED' });
@@ -430,6 +458,42 @@ describe('M4 closeout counterexamples: pagination terminality', () => {
     expect(runSynchronizationCandidate({ ...config(), contracts: { ...config().contracts, terminalShortPage: { TRADES: 'CONFIRMED' } } }, fixtureSource()).status).toBe('INVALID_CONFIGURATION');
     const { terminalShortPage: _omitted, ...withoutTerminal } = config().contracts;
     expect(runSynchronizationCandidate({ ...config(), contracts: withoutTerminal }, fixtureSource()).status).toBe('INVALID_CONFIGURATION');
+  });
+});
+
+describe('M4 contract inputs: a SYNTHETIC confirmed terminal-page contract is per component and clears no other blocker', () => {
+  // SYNTHETIC ONLY: no provider has confirmed any terminal-page contract; these values never reach actual provider settings.
+  const syntheticConfirmed = (components: ObservationComponent[], base: SynchronizationConfig = config()) => config({ ...base,
+    contracts: { ...base.contracts, terminalShortPage: Object.fromEntries(components.map((component) => [component, 'CONFIRMED' as const])) } });
+  const shortPages = { pages: (_c: number, _p: 0 | 1, component: ObservationComponent) => [[component === 'ORDERS' ? order() : position()]] };
+  const terminationsOf = (result: SynchronizationResult, component: ObservationComponent) =>
+    last(result).terminations.filter((t) => t.component === component).map((t) => t.termination);
+
+  it.each([['ORDERS', 'POSITIONS'], ['POSITIONS', 'ORDERS']] as const)('confirming %s only leaves a lone short %s page unresolved', (confirmedFor, other) => {
+    const result = run(syntheticConfirmed([confirmedFor]), shortPages);
+    expect(terminationsOf(result, confirmedFor)).toEqual(['CONFIRMED_TERMINAL_SHORT_PAGE', 'CONFIRMED_TERMINAL_SHORT_PAGE']);
+    expect(terminationsOf(result, other)).toEqual(['SHORT_PAGE_TERMINALITY_UNCONFIRMED', 'SHORT_PAGE_TERMINALITY_UNCONFIRMED']);
+    expect(last(result).scanFindings.filter((f) => f.finding === 'SHORT_PAGE_TERMINALITY_UNCONFIRMED').map((f) => `${f.pass}:${f.component}`)).toEqual([`0:${other}`, `1:${other}`]);
+    expect(result.status).toBe('UNRESOLVED');
+    expect(result.historyCompleteness.status).toBe('UNPROVEN');
+  });
+
+  it('with clean confirmed-short-page termination, unavailable lineage and stream revocation still block on their own', () => {
+    const both = syntheticConfirmed(['ORDERS', 'POSITIONS']);
+    const clean = run(both, shortPages);
+    expect([...terminationsOf(clean, 'ORDERS'), ...terminationsOf(clean, 'POSITIONS')]).toEqual(Array(4).fill('CONFIRMED_TERMINAL_SHORT_PAGE'));
+    expect(clean.status).toBe('OBSERVED_CONVERGENCE');
+    expect(clean.historyCompleteness.status).toBe('UNPROVEN');
+
+    const noLineage = run(syntheticConfirmed(['ORDERS', 'POSITIONS'], config({ lineage: { kind: 'UNAVAILABLE', reason: 'SYNTHETIC no durable evidence' } })), shortPages);
+    expect(noLineage.status).toBe('UNRESOLVED');
+    expect(last(noLineage).reasons).toContain('OWNERSHIP_LINEAGE_UNAVAILABLE');
+    expect(last(noLineage).reasons).not.toContain('PAGINATION_UNKNOWN');
+
+    const unknownEpoch = run(syntheticConfirmed(['ORDERS', 'POSITIONS'], config({ maxCycles: 1 })), { ...shortPages, stream: () => stream({ epoch: null, epochAtWindowStart: null }) });
+    expect(unknownEpoch.status).toBe('REVOKED_CYCLE_LIMIT_REACHED');
+    expect(unknownEpoch.cycles[0]!.reasons).toContain('EPOCH_UNKNOWN');
+    for (const result of [clean, noLineage, unknownEpoch]) expect(result.grants).toBe(GRANTS_NOTHING);
   });
 });
 
