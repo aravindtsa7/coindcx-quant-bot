@@ -106,6 +106,9 @@ async function replay(variant: Variant = 'baseline') {
   });
   const serialized = fs.readFileSync(proposal.configuration.reportDestination.path, 'utf8');
   const saved = JSON.parse(serialized) as SyncReadCampaignReport;
+  // Explicit synthetic-only export for before/after legacy compatibility verification; never reads protected evidence.
+  const evidenceDirectory = process.env['COINDCX_SYNTHETIC_REPLAY_DIRECTORY'];
+  if (evidenceDirectory) fs.writeFileSync(path.join(evidenceDirectory, `${variant}.json`), serialized, { flag: 'wx' });
   expect(outcome.delivery).toBe('WRITTEN'); expect(saved).toEqual(delivered);
   expect(saved).toEqual(redactCampaignOutput(outcome.report, [SECRET_CANARY]));
   expect(serialized).not.toContain(SECRET_CANARY); expect(serialized).not.toContain(PERSONAL_CANARY);
@@ -161,10 +164,25 @@ describe('SYNTHETIC attempt-3 shape replay through adapter, orchestration, engin
           const rows = records(saved, e, pass, component);
           expect(rows).toHaveLength(component === 'ORDERS' ? 100 : 34);
           expect(rows.every(r => r.occurrences.length === 1)).toBe(true);
+          expect(rows.every(r => r.observationVariants?.length === 1)).toBe(true);
+          for (const row of rows) {
+            const variant = row.observationVariants![0]!;
+            expect(variant.fingerprint).toBe(row.fingerprint); expect(variant.occurrences).toEqual(row.occurrences);
+            expect(variant.normalized).toMatchObject({ format: 'M4_NORMALIZED_OBSERVATION_V1', component,
+              provenance: { source: 'ENGINE_NORMALIZED_INPUT', providerSemantics: 'UNCONFIRMED', rawProviderPayload: 'NOT_RETAINED', rawNumericLexemes: 'NOT_RETAINED' } });
+            expect(`${component}|${Object.entries(variant.normalized.fields).map(([name, value]) => `${name}=${JSON.stringify(value)}`).join('|')}`).toBe(row.fingerprint);
+            expect(variant.normalized.fields.providerEventTimeMs).toBe(component === 'ORDERS' ? 1500 : e === 0 ? 1600 : 1700);
+            if (variant.normalized.component === 'ORDERS') {
+              expect(variant.normalized.fields).toMatchObject({ pair: 'B-SYNTH_USDT', orderedQuantity: '0.5', filledQuantity: '0', remainingQuantity: '0.5', cancelledQuantity: '0', price: '100' });
+            }
+          }
           (component === 'ORDERS' ? allOrders : allPositions).push(...rows);
         }
       }
       expect(gtc(saved, e, 0).fingerprint).toContain(`signedQuantity="${e === 0 ? '-447.2' : '-557.6'}"`);
+      const gtcObservation = gtc(saved, e, 0).observationVariants![0]!.normalized;
+      expect(gtcObservation.component).toBe('POSITIONS');
+      if (gtcObservation.component === 'POSITIONS') expect(gtcObservation.fields).toMatchObject({ pair: 'B-GTC_USDT', signedQuantity: e === 0 ? '-447.2' : '-557.6' });
       expect(saved.evaluations[e]!.result!.cycles[0]!.reasons).not.toContain('RECORDS_DISAGREE');
     }
     expect(new Set(allOrders.map(r => r.key)).size).toBe(101);
@@ -176,6 +194,8 @@ describe('SYNTHETIC attempt-3 shape replay through adapter, orchestration, engin
     for (const read of saved.reads) {
       expect(read.report.pages.map(p => p.records)).toEqual(read.binding.component === 'ORDERS' ? [25, 25, 25, 25] : [25, 9]);
       expect(read.report.fieldProvenance.every(p => p.providerSemantics === 'NOT_CONFIRMED')).toBe(true);
+      if (read.binding.component === 'ORDERS') expect(read.report.fieldProvenance.find(p => p.providerField === 'client_id'))
+        .toMatchObject({ basis: 'NOT_EXPOSED_BY_COMMITTED_READ_PATH' });
       expect(read.report.correlation.kind).toBe('ADAPTER_LOCAL_ECHO');
     }
     expect(saved.recordCountSemantics).toBe('PER_SCAN_RECORD_OBSERVATIONS_NOT_UNIQUE_TRADES_FILLS_OR_CURRENT_POSITIONS');
@@ -190,6 +210,8 @@ describe('SYNTHETIC attempt-3 shape replay through adapter, orchestration, engin
     const repeated = records(saved, 0, 0, 'ORDERS').find(r => r.key === 'order:SYNTHETIC-REPLAY-buy-0')!;
     expect(repeated.occurrences).toEqual([{ segment: 'side=buy', page: 0, position: 0 }, { segment: 'side=buy', page: 0, position: 24 }]);
     expect(repeated.anomalies).toEqual(['IDENTICAL_DUPLICATE_DEDUPED']);
+    expect(repeated.observationVariants).toHaveLength(1);
+    expect(repeated.observationVariants![0]!.occurrences).toEqual(repeated.occurrences);
   });
 
   it('preserves a deliberate within-pass conflicting duplicate and both locations without last-write-wins', async () => {
@@ -206,8 +228,12 @@ describe('SYNTHETIC attempt-3 shape replay through adapter, orchestration, engin
     expect(gtc(saved, 0, 0).fingerprint).toContain('signedQuantity="-447.2"');
     expect(gtc(saved, 0, 0).fingerprint).not.toContain('-999');
     expect(saved.readAssessments.filter(r => r.component === 'POSITIONS').every(r => r.retainedRecordObservations === 33 && r.retainedRowOccurrences === 34)).toBe(true);
-    // The existing report retains the conflict finding/locations and first fingerprint, not the discarded variant's content.
-    expect(JSON.stringify(saved)).not.toContain('signedQuantity=\\"-999\\"');
+    // The legacy comparison keeps the first fingerprint; additive evidence keeps both variants and their locations.
+    expect(gtc(saved, 0, 0).observationVariants).toHaveLength(2);
+    expect(gtc(saved, 0, 0).observationVariants!.map(v => ({ fields: v.normalized.fields, occurrences: v.occurrences }))).toEqual([
+      { fields: expect.objectContaining({ signedQuantity: '-447.2' }), occurrences: [{ page: 0, position: 1 }] },
+      { fields: expect.objectContaining({ signedQuantity: '-999' }), occurrences: [{ page: 0, position: 24 }] },
+    ]);
   });
 
   it('keeps a separate between-pass content difference visible as RECORDS_DISAGREE despite other blockers', async () => {
@@ -215,6 +241,7 @@ describe('SYNTHETIC attempt-3 shape replay through adapter, orchestration, engin
     for (let e = 0; e < 3; e++) {
       expect(gtc(saved, e, 0).fingerprint).not.toBe(gtc(saved, e, 1).fingerprint);
       expect(gtc(saved, e, 1).fingerprint).toContain('signedQuantity="-999"');
+      expect(gtc(saved, e, 0).observationVariants![0]!.normalized.fields).not.toEqual(gtc(saved, e, 1).observationVariants![0]!.normalized.fields);
       expect(saved.evaluations[e]!.result!.cycles[0]!.reasons).toContain('RECORDS_DISAGREE');
     }
   });

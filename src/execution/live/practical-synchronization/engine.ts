@@ -158,6 +158,43 @@ export type SyncOwnershipReason =
 /** Where a record occurred in one scan: zero-based page and position within the page. */
 export type SyncOccurrence = Readonly<{ segment?: string; page: number; position: number }>;
 
+/** Input availability, not wire-field presence or a provider semantic claim. Invalid values are never echoed. */
+export type SyncFieldPresence = 'PRESENT' | 'NULL' | 'MISSING' | 'INVALID';
+export type SyncInputTimestamp = Readonly<{ presence: 'PRESENT'; value: number } | { presence: Exclude<SyncFieldPresence, 'PRESENT'> }>;
+export type SyncObservationFields = {
+  ORDERS: Readonly<{
+    exchangeOrderId: string; pair: string; side: 'BUY' | 'SELL'; venueStatus: string;
+    orderedQuantity: string; filledQuantity: string; remainingQuantity: string; cancelledQuantity: string;
+    averageFillPrice: string | null; price: string | null; wireOrderType: string; leverage: string | null;
+    providerCreatedAtMs: number | null; providerEventTimeMs: number | null; client_order_id: string | null;
+  }>;
+  POSITIONS: Readonly<{
+    venuePositionId: string; pair: string; signedQuantity: string; averageEntryPrice: string | null;
+    leverage: string | null; providerEventTimeMs: number | null;
+  }>;
+  TRANSACTIONS: Readonly<{
+    category: 'FILL' | 'WALLET'; fill_id_field: string | null; fill_id_value: string | null;
+    parentExchangeOrderId: string | null; stage: string | null; amount: string; currency: string | null;
+    providerEventTimeMs: number | null;
+  }>;
+};
+type StructuredObservation<C extends ObservationComponent> = Readonly<{
+  format: 'M4_NORMALIZED_OBSERVATION_V1'; component: C;
+  /** Canonical compared values, in fingerprint order. Order timestamps retain their legacy both-valid rule. */
+  fields: Readonly<SyncObservationFields[C]>;
+  fieldPresence: Readonly<Record<keyof SyncObservationFields[C], SyncFieldPresence>>;
+  /** Individual available timestamps, including a valid order time suppressed by the legacy comparison rule. */
+  inputTimestamps: Readonly<{ providerEventTimeMs: SyncInputTimestamp; providerCreatedAtMs?: SyncInputTimestamp }>;
+  provenance: Readonly<{ source: 'ENGINE_NORMALIZED_INPUT'; providerSemantics: 'UNCONFIRMED';
+    retainedFields: 'COMPARISON_FIELDS_ONLY'; rawProviderPayload: 'NOT_RETAINED'; rawNumericLexemes: 'NOT_RETAINED' }>;
+}>;
+export type SyncStructuredObservation = { [C in ObservationComponent]: StructuredObservation<C> }[ObservationComponent];
+export type SyncObservationVariant = Readonly<{
+  fingerprint: string;
+  normalized: SyncStructuredObservation;
+  occurrences: readonly SyncOccurrence[];
+}>;
+
 export type SyncRecordView = Readonly<{
   key: string;
   identity: 'EXCHANGE_ORDER_ID' | 'VENUE_POSITION_ID' | 'PROVIDER_FILL_ID' | 'CONTENT_ONLY';
@@ -168,6 +205,8 @@ export type SyncRecordView = Readonly<{
   /** Every occurrence in the scan (more than one only for deduplicated or unresolved duplicates). */
   occurrences: readonly SyncOccurrence[];
   anomalies: readonly ('IDENTICAL_DUPLICATE_DEDUPED' | 'CONTENT_ONLY_TWIN_UNRESOLVED')[];
+  /** Additive evidence only. Absent in legacy reports; new valid records retain every normalized variant. */
+  observationVariants?: readonly SyncObservationVariant[];
   /** Raw stage of a wallet record; never interpreted unless a contract confirms it. */
   stageInterpretation?: 'UNCONFIRMED' | 'CONFIRMED_VENUE_GENERATED';
 }>;
@@ -252,7 +291,29 @@ const decimal = (value: unknown): string | undefined => (isString(value) ? (cano
 const isWellFormedTag = (tag: string): boolean => tag.length >= 1 && tag.length <= 36 && /^[\x21-\x7e]+$/.test(tag);
 
 /** One normalized record. `times` are its provider timestamps (null when absent or invalid), used only to flag window membership. */
-type Normalized = Readonly<{ key: string; identity: SyncRecordView['identity']; fingerprint: string; timestamps: boolean; times: readonly (number | null)[]; raw: Record<string, unknown> }>;
+type Normalized = Readonly<{ key: string; identity: SyncRecordView['identity']; fingerprint: string; observation: SyncStructuredObservation;
+  timestamps: boolean; times: readonly (number | null)[]; raw: Record<string, unknown> }>;
+
+const OBSERVATION_PROVENANCE = Object.freeze({ source: 'ENGINE_NORMALIZED_INPUT' as const, providerSemantics: 'UNCONFIRMED' as const,
+  retainedFields: 'COMPARISON_FIELDS_ONLY' as const, rawProviderPayload: 'NOT_RETAINED' as const, rawNumericLexemes: 'NOT_RETAINED' as const });
+function inputPresence(input: Record<string, unknown>, key: string, timestamp = false): SyncFieldPresence {
+  if (!(key in input)) return 'MISSING';
+  if (input[key] === null) return 'NULL';
+  if (input[key] === undefined || (timestamp && !isTime(input[key]))) return 'INVALID';
+  return 'PRESENT';
+}
+function inputTimestamp(input: Record<string, unknown>, key: string): SyncInputTimestamp {
+  const presence = inputPresence(input, key, true);
+  return Object.freeze(presence === 'PRESENT' ? { presence, value: input[key] as number } : { presence });
+}
+function structuredObservation<C extends ObservationComponent>(component: C, fields: SyncObservationFields[C], input: Record<string, unknown>,
+  aliases: Readonly<Record<string, string>> = {}): StructuredObservation<C> {
+  const fieldPresence = Object.fromEntries((Object.keys(fields) as Array<keyof SyncObservationFields[C]>).map(key => [key,
+    inputPresence(input, aliases[String(key)] ?? String(key), key === 'providerCreatedAtMs' || key === 'providerEventTimeMs')])) as Record<keyof SyncObservationFields[C], SyncFieldPresence>;
+  return Object.freeze({ format: 'M4_NORMALIZED_OBSERVATION_V1' as const, component, fields: Object.freeze(fields), fieldPresence: Object.freeze(fieldPresence),
+    inputTimestamps: Object.freeze({ providerEventTimeMs: inputTimestamp(input, 'providerEventTimeMs'),
+      ...(component === 'ORDERS' ? { providerCreatedAtMs: inputTimestamp(input, 'providerCreatedAtMs') } : {}) }), provenance: OBSERVATION_PROVENANCE });
+}
 
 function normalizeOrder(value: unknown): Normalized | null {
   if (!isRecord(value) || !isNonEmpty(value['exchangeOrderId']) || !isNonEmpty(value['pair']) || (value['side'] !== 'BUY' && value['side'] !== 'SELL')) return null;
@@ -261,15 +322,16 @@ function normalizeOrder(value: unknown): Normalized | null {
   const [averageFillPrice, price, leverage] = ['averageFillPrice', 'price', 'leverage'].map((name) => decimalOrNull(value[name]));
   if (quantities.some((q) => q === undefined) || averageFillPrice === undefined || price === undefined || leverage === undefined) return null;
   const timestamps = isTime(value['providerCreatedAtMs']) && isTime(value['providerEventTimeMs']);
-  const fields: (readonly [string, string | number | null])[] = [
-    ['exchangeOrderId', value['exchangeOrderId']], ['pair', value['pair']], ['side', value['side']], ['venueStatus', value['venueStatus']],
-    ['orderedQuantity', quantities[0]!], ['filledQuantity', quantities[1]!], ['remainingQuantity', quantities[2]!], ['cancelledQuantity', quantities[3]!],
-    ['averageFillPrice', averageFillPrice], ['price', price], ['wireOrderType', value['wireOrderType']], ['leverage', leverage],
-    ['providerCreatedAtMs', timestamps ? value['providerCreatedAtMs'] as number : null], ['providerEventTimeMs', timestamps ? value['providerEventTimeMs'] as number : null],
+  const fields: SyncObservationFields['ORDERS'] = {
+    exchangeOrderId: value['exchangeOrderId'], pair: value['pair'], side: value['side'], venueStatus: value['venueStatus'],
+    orderedQuantity: quantities[0]!, filledQuantity: quantities[1]!, remainingQuantity: quantities[2]!, cancelledQuantity: quantities[3]!,
+    averageFillPrice, price, wireOrderType: value['wireOrderType'], leverage,
+    providerCreatedAtMs: timestamps ? value['providerCreatedAtMs'] as number : null, providerEventTimeMs: timestamps ? value['providerEventTimeMs'] as number : null,
     // The venue's `client_order_id`, exactly as returned; never renamed to or merged with `client_id`.
-    ['client_order_id', value['clientOrderId']],
-  ];
-  return Object.freeze({ key: `order:${value['exchangeOrderId']}`, identity: 'EXCHANGE_ORDER_ID' as const, fingerprint: fingerprintOf('ORDERS', fields), timestamps, times: [isTime(value['providerCreatedAtMs']) ? value['providerCreatedAtMs'] as number : null, isTime(value['providerEventTimeMs']) ? value['providerEventTimeMs'] as number : null], raw: value });
+    client_order_id: value['clientOrderId'],
+  };
+  return Object.freeze({ key: `order:${value['exchangeOrderId']}`, identity: 'EXCHANGE_ORDER_ID' as const, fingerprint: fingerprintOf('ORDERS', Object.entries(fields)),
+    observation: structuredObservation('ORDERS', fields, value, { client_order_id: 'clientOrderId' }), timestamps, times: [isTime(value['providerCreatedAtMs']) ? value['providerCreatedAtMs'] as number : null, isTime(value['providerEventTimeMs']) ? value['providerEventTimeMs'] as number : null], raw: value });
 }
 
 function normalizePosition(value: unknown): Normalized | null {
@@ -279,11 +341,12 @@ function normalizePosition(value: unknown): Normalized | null {
   const leverage = decimalOrNull(value['leverage']);
   if (signedQuantity === undefined || averageEntryPrice === undefined || leverage === undefined) return null;
   const timestamps = isTime(value['providerEventTimeMs']);
-  const fields: (readonly [string, string | number | null])[] = [
-    ['venuePositionId', value['venuePositionId']], ['pair', value['pair']], ['signedQuantity', signedQuantity],
-    ['averageEntryPrice', averageEntryPrice], ['leverage', leverage], ['providerEventTimeMs', timestamps ? value['providerEventTimeMs'] as number : null],
-  ];
-  return Object.freeze({ key: `position:${value['venuePositionId']}`, identity: 'VENUE_POSITION_ID' as const, fingerprint: fingerprintOf('POSITIONS', fields), timestamps, times: [isTime(value['providerEventTimeMs']) ? value['providerEventTimeMs'] as number : null], raw: value });
+  const fields: SyncObservationFields['POSITIONS'] = {
+    venuePositionId: value['venuePositionId'], pair: value['pair'], signedQuantity,
+    averageEntryPrice, leverage, providerEventTimeMs: timestamps ? value['providerEventTimeMs'] as number : null,
+  };
+  return Object.freeze({ key: `position:${value['venuePositionId']}`, identity: 'VENUE_POSITION_ID' as const, fingerprint: fingerprintOf('POSITIONS', Object.entries(fields)),
+    observation: structuredObservation('POSITIONS', fields, value), timestamps, times: [isTime(value['providerEventTimeMs']) ? value['providerEventTimeMs'] as number : null], raw: value });
 }
 
 function normalizeTransaction(value: unknown): Normalized | null {
@@ -296,15 +359,16 @@ function normalizeTransaction(value: unknown): Normalized | null {
   const id = fillId as Readonly<{ field: string; value: string }> | null;
   const timestamps = isTime(value['providerEventTimeMs']);
   const eventTime = timestamps ? value['providerEventTimeMs'] as number : null;
-  const fields: (readonly [string, string | number | null])[] = [
-    ['category', value['category']], ['fill_id_field', id?.field ?? null], ['fill_id_value', id?.value ?? null],
-    ['parentExchangeOrderId', value['parentExchangeOrderId']], ['stage', value['stage']], ['amount', amount],
-    ['currency', value['currency']], ['providerEventTimeMs', timestamps ? value['providerEventTimeMs'] as number : null],
-  ];
-  const fingerprint = fingerprintOf('TRANSACTIONS', fields);
+  const fields: SyncObservationFields['TRANSACTIONS'] = {
+    category: value['category'], fill_id_field: id?.field ?? null, fill_id_value: id?.value ?? null,
+    parentExchangeOrderId: value['parentExchangeOrderId'], stage: value['stage'], amount,
+    currency: value['currency'], providerEventTimeMs: timestamps ? value['providerEventTimeMs'] as number : null,
+  };
+  const fingerprint = fingerprintOf('TRANSACTIONS', Object.entries(fields));
+  const observation = structuredObservation('TRANSACTIONS', fields, value, { fill_id_field: 'fillId', fill_id_value: 'fillId' });
   return Object.freeze(id === null
-    ? { key: `txn:content:${fingerprint}`, identity: 'CONTENT_ONLY' as const, fingerprint, timestamps, times: [eventTime], raw: value }
-    : { key: `txn:fill:${id.field}:${id.value}`, identity: 'PROVIDER_FILL_ID' as const, fingerprint, timestamps, times: [eventTime], raw: value });
+    ? { key: `txn:content:${fingerprint}`, identity: 'CONTENT_ONLY' as const, fingerprint, observation, timestamps, times: [eventTime], raw: value }
+    : { key: `txn:fill:${id.field}:${id.value}`, identity: 'PROVIDER_FILL_ID' as const, fingerprint, observation, timestamps, times: [eventTime], raw: value });
 }
 
 const NORMALIZERS: Readonly<Record<ObservationComponent, (value: unknown) => Normalized | null>> = Object.freeze({
@@ -408,6 +472,7 @@ function classifyTransactions(transactions: readonly Normalized[], orders: Reado
 /** A record kept from one scan, with every occurrence and any duplicate anomaly. */
 type ScannedRecord = Normalized & Readonly<{
   occurrences: readonly SyncOccurrence[];
+  observationVariants: readonly SyncObservationVariant[];
   anomalies: readonly ('IDENTICAL_DUPLICATE_DEDUPED' | 'CONTENT_ONLY_TWIN_UNRESOLVED')[];
   /** What the M3 comparison sees: the content fingerprint, plus the occurrence count for content-only twins. */
   comparisonFingerprint: string;
@@ -473,7 +538,8 @@ function evaluateScan(pass: 0 | 1, component: ObservationComponent, limits: Sync
     ?? (segmentTerminations.every((value) => value === 'OBSERVED_EMPTY_PAGE') ? 'OBSERVED_EMPTY_PAGE' : 'CONFIRMED_TERMINAL_SHORT_PAGE');
 
   // Identity and duplicates within one scan (across all its segments), with every occurrence retained.
-  const entries = new Map<string, { record: Normalized; occurrences: SyncOccurrence[]; anomalies: Set<ScannedRecord['anomalies'][number]> }>();
+  type Variant = { fingerprint: string; normalized: SyncStructuredObservation; occurrences: SyncOccurrence[] };
+  const entries = new Map<string, { record: Normalized; occurrences: SyncOccurrence[]; anomalies: Set<ScannedRecord['anomalies'][number]>; variants: Map<string, Variant> }>();
   const order: string[] = [];
   let malformed = false;
   let timestamps = true;
@@ -485,8 +551,17 @@ function evaluateScan(pass: 0 | 1, component: ObservationComponent, limits: Sync
         if (!record.timestamps) timestamps = false;
         const occurrence: SyncOccurrence = Object.freeze({ ...(segment.segment === null ? {} : { segment: segment.segment }), page: pageIndex, position });
         const previous = entries.get(record.key);
-        if (previous === undefined) { entries.set(record.key, { record, occurrences: [occurrence], anomalies: new Set() }); order.push(record.key); return; }
+        // Evidence groups by normalized content AND availability, never raw payload/lexemes or fingerprint alone.
+        const variantKey = JSON.stringify(record.observation);
+        if (previous === undefined) {
+          entries.set(record.key, { record, occurrences: [occurrence], anomalies: new Set(),
+            variants: new Map([[variantKey, { fingerprint: record.fingerprint, normalized: record.observation, occurrences: [occurrence] }]]) });
+          order.push(record.key); return;
+        }
         previous.occurrences.push(occurrence);
+        const variant = previous.variants.get(variantKey);
+        if (variant) variant.occurrences.push(occurrence);
+        else previous.variants.set(variantKey, { fingerprint: record.fingerprint, normalized: record.observation, occurrences: [occurrence] });
         if (record.identity === 'CONTENT_ONLY') {
           // Identical content without a provider fill id: a duplicate or a genuine twin. Undecidable, never collapsed.
           previous.anomalies.add('CONTENT_ONLY_TWIN_UNRESOLVED');
@@ -504,6 +579,7 @@ function evaluateScan(pass: 0 | 1, component: ObservationComponent, limits: Sync
     const entry = entries.get(key)!;
     const twins = entry.record.identity === 'CONTENT_ONLY' && entry.occurrences.length > 1;
     return Object.freeze({ ...entry.record, occurrences: Object.freeze([...entry.occurrences]), anomalies: Object.freeze([...entry.anomalies]),
+      observationVariants: Object.freeze([...entry.variants.values()].map(variant => Object.freeze({ ...variant, occurrences: Object.freeze([...variant.occurrences]) }))),
       comparisonFingerprint: twins ? `${entry.record.fingerprint}|occurrences=${entry.occurrences.length}` : entry.record.fingerprint });
   });
 
@@ -627,7 +703,7 @@ export function evaluateCollectedCycle(config: SynchronizationConfig, cycle: num
         const views = outcome.records.map((record): SyncRecordView => {
           const classified = classes.get(record.key)!;
           return Object.freeze({ key: record.key, identity: record.identity, fingerprint: record.fingerprint, ownership: classified.ownership, reason: classified.reason,
-            occurrences: record.occurrences, anomalies: record.anomalies,
+            occurrences: record.occurrences, anomalies: record.anomalies, observationVariants: record.observationVariants,
             ...(classified.stageInterpretation === undefined ? {} : { stageInterpretation: classified.stageInterpretation }) });
         });
         recordViews.push(Object.freeze({ pass, component: outcome.read.component, records: Object.freeze(views) }));
