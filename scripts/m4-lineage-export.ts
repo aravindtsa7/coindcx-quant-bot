@@ -14,6 +14,20 @@ const identity = z.object({
   serverUuid: z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/),
   databaseName: z.string().regex(/^[A-Za-z0-9_]{1,64}$/),
 }).strict();
+// Kept independently of operator inventory completeness. Pinned to the existing operational-store guard by tests.
+const KNOWN_PROTECTED_SCHEMA_NAMES = Object.freeze(['coindcx_shadow', 'coindcx_quant']);
+const protectedIdentities = z.array(identity).min(1).refine(entries =>
+  new Set(entries.map(entry => `${entry.serverUuid}/${entry.databaseName.toLowerCase()}`)).size === entries.length);
+const protectedInventoryFields = {
+  version: z.literal(2),
+  identities: protectedIdentities,
+  review: z.literal('OPERATOR_VERIFIED_ORIGINAL_STORE_IDENTITIES'),
+};
+const protectedInventorySchema = z.object({
+  kind: z.literal('M4_PROTECTED_ORIGINAL_STORE_INVENTORY'), ...protectedInventoryFields,
+}).strict();
+const INVENTORY_FORMAT_ERROR = Object.freeze(new Error('PROTECTED_INVENTORY_INVALID'));
+const INVENTORY_FORMAT_MESSAGE = 'Supply protectedStore version 2 with a nonempty identities array and the plural review statement in both input and inventory file; review every entry and recompute inventorySha256. Legacy single-entry format is unsupported; validation does not establish historical completeness.';
 const account = z.string().regex(/^[A-Za-z0-9_.:-]{1,128}$/);
 const outputName = z.string().regex(/^[a-z0-9][a-z0-9-]{0,79}$/)
   .refine(name => !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/.test(name));
@@ -22,9 +36,8 @@ const inputSchema = z.object({
   target: identity,
   // This is a REQUIRED operator-reviewed inventory, not a discovery of the original store or issuer proof.
   protectedStore: z.object({
-    identity,
+    ...protectedInventoryFields,
     inventorySha256: hash,
-    review: z.literal('OPERATOR_VERIFIED_ORIGINAL_STORE_IDENTITY'),
   }).strict(),
   databaseUrlEnvironmentVariable: z.literal('M4_LINEAGE_DATABASE_URL'),
   accountId: account,
@@ -59,12 +72,13 @@ export interface LineageInvocationDependencies {
   createOwnedDatabase(url: string): OwnedLineageDatabase | Promise<OwnedLineageDatabase>;
   readonly packageFileSystem?: LineagePackageFileSystem;
 }
-type Failure = 'INPUT_INVALID' | 'PROTECTED_STORE_NOT_EXCLUDED' | 'CHECKOUT_INVALID' | 'OUTPUT_INVALID'
+type Failure = 'INPUT_INVALID' | 'PROTECTED_INVENTORY_INVALID' | 'PROTECTED_STORE_NOT_EXCLUDED' | 'CHECKOUT_INVALID' | 'OUTPUT_INVALID'
   | 'DATABASE_URL_INVALID' | 'DATABASE_CREATE_FAILED' | 'IDENTITY_PREFLIGHT_FAILED' | 'MIGRATION_PREFLIGHT_FAILED'
   | 'PIPELINE_FAILED' | 'CLEANUP_FAILED';
 export interface LineageInvocationResult {
   readonly kind: 'COMPLETED' | 'FAILED';
   readonly failure: Failure | null;
+  readonly message?: string;
   readonly preflight: 'NOT_PASSED' | 'MATCHED_TARGET_AND_MIGRATIONS_EXCLUDED_OPERATOR_INVENTORY';
   readonly cleanup: 'NOT_CREATED' | 'CLOSED' | 'FAILED';
   readonly export: OfflineLineageExportResult | null;
@@ -73,8 +87,10 @@ const digest = (bytes: string | Buffer): string => createHash('sha256').update(b
 const sameIdentity = (a: Identity, b: Identity): boolean => a.serverUuid === b.serverUuid && a.databaseName === b.databaseName;
 
 /** Reject aliases to a protected schema conservatively, even if the operator names a different server. */
-function excludesProtected(target: Identity, protectedIdentity: Identity): boolean {
-  return target.databaseName.toLowerCase() !== protectedIdentity.databaseName.toLowerCase();
+function excludesProtected(target: Identity, identities: readonly Identity[]): boolean {
+  const name = target.databaseName.toLowerCase();
+  return !KNOWN_PROTECTED_SCHEMA_NAMES.includes(name)
+    && identities.every(entry => name !== entry.databaseName.toLowerCase());
 }
 function validUrl(value: string | undefined, target: Identity): value is string {
   if (!value) return false;
@@ -111,11 +127,16 @@ export async function runLineageInvocation(raw: unknown, deps: LineageInvocation
   let owned: OwnedLineageDatabase | undefined;
   try {
     // Zod returns a private copy; mutation by the caller across awaits cannot change the checked inputs.
-    const input = inputSchema.parse(raw);
+    const parsed = inputSchema.safeParse(raw);
+    if (!parsed.success) {
+      if (parsed.error.issues.every(issue => issue.path[0] === 'protectedStore')) failure = 'PROTECTED_INVENTORY_INVALID';
+      throw new Error();
+    }
+    const input = parsed.data;
     if (input.accountId !== input.campaignAccountId
       || input.expectedProviderAccountFingerprint !== input.campaignExpectedProviderAccountFingerprint) throw new Error();
     failure = 'PROTECTED_STORE_NOT_EXCLUDED';
-    if (!excludesProtected(input.target, input.protectedStore.identity)) throw new Error();
+    if (!excludesProtected(input.target, input.protectedStore.identities)) throw new Error();
     if (!await deps.verifyProtectedStoreInventory(input.protectedStore)) throw new Error();
     failure = 'CHECKOUT_INVALID';
     const checkout = await deps.readCheckout();
@@ -129,7 +150,7 @@ export async function runLineageInvocation(raw: unknown, deps: LineageInvocation
     owned = await deps.createOwnedDatabase(url);
     failure = 'IDENTITY_PREFLIGHT_FAILED';
     const observed = z.array(identity).length(1).parse(await owned.readIdentity())[0]!;
-    if (!sameIdentity(observed, input.target) || !excludesProtected(observed, input.protectedStore.identity)) throw new Error();
+    if (!sameIdentity(observed, input.target) || !excludesProtected(observed, input.protectedStore.identities)) throw new Error();
     failure = 'MIGRATION_PREFLIGHT_FAILED';
     if (!migrationsMatch(await owned.readAppliedMigrations(), checkout.migrations)) throw new Error();
     preflight = 'MATCHED_TARGET_AND_MIGRATIONS_EXCLUDED_OPERATOR_INVENTORY';
@@ -151,14 +172,18 @@ export async function runLineageInvocation(raw: unknown, deps: LineageInvocation
       statements, directory, fileSystem: guardedFileSystem });
     if (exported.kind !== 'EXPORTED') throw new Error();
     failure = null;
-  } catch { /* Fixed stage only. Never propagate dependency errors, URLs or account rows. */ }
+  } catch (error) {
+    if (error === INVENTORY_FORMAT_ERROR) failure = 'PROTECTED_INVENTORY_INVALID';
+    // Fixed stages/messages only. Never propagate dependency errors, URLs or account rows.
+  }
   finally {
     if (owned) {
       try { await owned.close(); cleanup = 'CLOSED'; }
       catch { cleanup = 'FAILED'; if (failure === null) failure = 'CLEANUP_FAILED'; }
     }
   }
-  return Object.freeze({ kind: failure === null ? 'COMPLETED' : 'FAILED', failure, preflight, cleanup, export: exported });
+  return Object.freeze({ kind: failure === null ? 'COMPLETED' : 'FAILED', failure, preflight, cleanup, export: exported,
+    ...(failure === 'PROTECTED_INVENTORY_INVALID' ? { message: INVENTORY_FORMAT_MESSAGE } : {}) });
 }
 
 /** Generated Prisma clients can discover env files even on import. Refuse that configuration before importing one. */
@@ -243,13 +268,14 @@ export function nodeLineageDependencies(root: string): LineageEntryDependencies 
     async verifyProtectedStoreInventory(statement) {
       const file = path.join(await localRoot(root), 'protected-store-inventory.json');
       await regular(file, false);
-      if ((await lstat(file)).size > 65536) return false;
+      if ((await lstat(file)).size > 65536) throw INVENTORY_FORMAT_ERROR;
       const bytes = await readFile(file);
+      let inventory: z.infer<typeof protectedInventorySchema>;
+      try { inventory = protectedInventorySchema.parse(JSON.parse(bytes.toString('utf8'))); }
+      catch { throw INVENTORY_FORMAT_ERROR; }
       if (digest(bytes) !== statement.inventorySha256) return false;
-      const schema = z.object({ kind: z.literal('M4_PROTECTED_ORIGINAL_STORE_INVENTORY'), identity,
-        review: z.literal('OPERATOR_VERIFIED_ORIGINAL_STORE_IDENTITY') }).strict();
-      const inventory = schema.parse(JSON.parse(bytes.toString('utf8')));
-      return sameIdentity(inventory.identity, statement.identity) && inventory.review === statement.review;
+      return inventory.identities.length === statement.identities.length
+        && statement.identities.every(expected => inventory.identities.some(entry => sameIdentity(entry, expected)));
     },
     readCheckout: () => readLineageCheckout(root),
     validateOutput: name => validateLineageOutput(root, name),

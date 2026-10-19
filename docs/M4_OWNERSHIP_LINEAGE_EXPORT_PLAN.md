@@ -337,8 +337,9 @@ All these inputs are required; there are no supplied real values or defaults:
 
 - `kind`: `M4_OFFLINE_LINEAGE_EXPORT`.
 - `target`: independently reviewed `serverUuid` (lowercase MySQL UUID) and `databaseName` (ASCII letters/digits/underscore).
-- `protectedStore`: the reviewed original store's `identity` in the same shape, `inventorySha256` (SHA-256 of the
-  exact inventory file bytes), and `review: OPERATOR_VERIFIED_ORIGINAL_STORE_IDENTITY`.
+- `protectedStore`: `version: 2`, a nonempty `identities` array in the target identity shape, `inventorySha256`
+  (SHA-256 of the exact inventory file bytes), and `review: OPERATOR_VERIFIED_ORIGINAL_STORE_IDENTITIES`.
+  Every entry must validate; duplicate UUID/schema pairs (schema compared case-insensitively) are refused.
 - `databaseUrlEnvironmentVariable`: exactly `M4_LINEAGE_DATABASE_URL`. The operator must supply this variable
   securely to the process; no URL or credential belongs in JSON, command arguments or retained stdout.
 - `accountId`, `campaignAccountId`: matching explicit local labels.
@@ -363,19 +364,31 @@ The same parent must contain `protected-store-inventory.json` with exactly:
 ```json
 {
   "kind": "M4_PROTECTED_ORIGINAL_STORE_INVENTORY",
-  "identity": { "serverUuid": "<verified original server UUID>", "databaseName": "<verified original schema>" },
-  "review": "OPERATOR_VERIFIED_ORIGINAL_STORE_IDENTITY"
+  "version": 2,
+  "identities": [
+    { "serverUuid": "<reviewed protected server UUID>", "databaseName": "<reviewed protected schema>" }
+  ],
+  "review": "OPERATOR_VERIFIED_ORIGINAL_STORE_IDENTITIES"
 }
 ```
 
 Placeholders above are intentionally invalid. No inventory was created during this task. Missing inventory, missing
-review, bad digest or disagreeing identity refuses **before URL lookup/client construction**. A target schema with
-the same name as the protected schema (case-insensitive) is refused on every server; aliases to that schema cannot
-bypass the comparison by changing host or UUID. `DATABASE()` and `@@server_uuid` must then match the supplied target.
+review, bad digest or a different identity collection refuses **before URL lookup/client construction**. File and
+invocation must contain exactly the same UUID/schema pairs; list order does not matter, exact entry values do.
+Legacy single-entry, absent/unsupported version, empty, duplicate, malformed and extra-field formats are refused;
+`PROTECTED_INVENTORY_INVALID` includes a fixed message directing the operator to review a version-2 list in both
+files and recompute the digest. There is no automatic conversion or completeness claim for old input.
+
+Both `coindcx_shadow` and `coindcx_quant` are unconditionally excluded as known protected operational schema names,
+pinned to `tests/helpers/p18b-disposable-mysql.ts`; neither exclusion depends on the operator listing either name.
+Every operator-listed protected schema is also excluded case-insensitively on every server. Changing host or UUID
+cannot bypass a schema-name exclusion. A server hosting protected schemas is not rejected wholesale: an unrelated
+schema on that same UUID may pass, provided `DATABASE()` and `@@server_uuid` together match its explicit target.
 This is exclusion against a required **operator-verified inventory**, not automatic discovery of the original store,
-authentication of the inventory issuer, or proof against a false inventory. If the operator cannot establish the
-original identity from previously authorized non-secret evidence, execution must stay blocked; do not inspect its
-credentials/store to manufacture the missing input.
+authentication of the inventory issuer, historical exhaustiveness, or proof against a false/incomplete inventory.
+The two built-in names are a minimum denylist, not a claim that all historical stores are known. If the operator
+cannot establish the required protected identities from authorized non-secret evidence, execution must stay blocked;
+do not inspect their credentials/store to manufacture the missing input.
 
 The explicit MySQL URL must select the exact target schema. Its only query parameters are `connection_limit=1`,
 `connect_timeout` and `pool_timeout`; both timeout values must be operator-chosen integer seconds from 1 to 99.
@@ -385,7 +398,10 @@ ordinary Prisma logging. Use an operator-controlled process environment without 
 One connection reduces pool ambiguity; it is not a proof against failover, a misrouting proxy or concurrent DDL.
 
 Applied migration metadata must have exactly one completed, non-rolled-back row per checkout migration, no extra
-rows, and matching `migration.sql` SHA-256 checksums. The lock-file hash remains separate checkout provenance.
+rows, and matching `migration.sql` SHA-256 checksums over **working-copy bytes**, without newline normalization.
+Git blob and reviewed LF freeze hashes are separate bases; see [target readiness](M4_LINEAGE_TARGET_READINESS.md).
+An LF-only match is not automatically accepted, and neither migrations nor DB records are repaired.
+The lock-file hash remains separate checkout provenance.
 No migration runs. Matching migration history is not an independent schema-drift audit. The existing snapshot's
 single RepeatableRead transaction, integrity checks, timeout and classification rules are unchanged.
 
@@ -403,7 +419,20 @@ Exact future invocation from this worktree (documented only, **NOT EXECUTED**):
 node .\node_modules\tsx\dist\cli.mjs .\scripts\m4-lineage-export.ts --input C:\TSA\coindcx-m2-w1\.local\m4-lineage-exports\invocation.json
 ```
 
-### Bounded real-DB proposal — NOT EXECUTED
+### Two future activities — neither executed or authorized here
+
+**A. Controlled synthetic MySQL validation.** Reviewed synthetic account identities and fingerprints are legitimate
+for a genuinely synthetic fixture database. Label the fixture account, input, retained verification record and package
+context explicitly `SYNTHETIC`; they are not historical or real-account evidence. Synthetic fingerprints are not
+globally banned. Existing fake tests remain synthetic. Fresh MySQL setup and validation require separate authorization;
+the minimum setup and boundaries are recorded in [target readiness](M4_LINEAGE_TARGET_READINESS.md).
+
+**B. Historical-candidate diagnostic export.** `p18b_practical_test_50272508801d` remains a candidate only. Its name
+matches a test generator, but reviewed instance-specific provenance has not been established. Do not substitute
+synthetic fixture labels/fingerprints for its actual account/provenance inputs. Metadata results and the actual
+reviewed account inputs remain outstanding; do not execute the launcher merely because the inventory format is fixed.
+
+### Bounded diagnostic execution proposal — NOT EXECUTED
 
 After separate explicit authorization: use one already provisioned, independently identified **non-original**
 database with an existing SELECT-only principal. Do not create a database/user, apply migrations, alter ACLs or copy
@@ -420,9 +449,10 @@ migration failure stops before any account read. No provider requests, stream, c
 path is composed. Unexpected failure/deadline/cleanup leaves any output untouched and requires review before a new
 invocation/name; a forced process termination cannot promise successful resource cleanup or a complete package.
 
-Current real-execution blockers: no reviewed real protected-store inventory, target identity/authorization,
-SELECT-only connection or concrete account/operator statements were supplied or read. Offline tests establish
-routing/failure/privacy behavior only; they do not establish real MySQL behavior, inventory authenticity, source
+For activity B, current blockers include candidate-instance provenance, metadata compatibility, a reviewed protected
+identity inventory, export authorization, a SELECT-only connection and actual account/operator statements. For
+activity A, independently reviewed synthetic fixture statements are appropriate after authorized fresh setup.
+Offline tests establish routing/failure/privacy behavior only; they do not establish real MySQL behavior, inventory authenticity, source
 coverage or ownership. The known parallel architecture timeout remains unresolved; no timeout setting was changed.
 
 D1–D4, actual M4 lineage `UNAVAILABLE`, false authority grants, gates, `authorityEligible`, Invariant 28, AS1/D4c and

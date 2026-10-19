@@ -30,8 +30,9 @@ const MIGRATION = '20260920000000_phase17_live_execution';
 const FP = 'ab'.repeat(32);
 const INPUT: LineageInvocation = {
   kind: 'M4_OFFLINE_LINEAGE_EXPORT', target: { serverUuid: UUID, databaseName: 'export_copy' },
-  protectedStore: { identity: { serverUuid: UUID, databaseName: 'original_store' }, inventorySha256: 'cd'.repeat(32),
-    review: 'OPERATOR_VERIFIED_ORIGINAL_STORE_IDENTITY' },
+  protectedStore: { version: 2, identities: [{ serverUuid: UUID, databaseName: 'original_store' },
+    { serverUuid: UUID, databaseName: 'another_original' }], inventorySha256: 'cd'.repeat(32),
+    review: 'OPERATOR_VERIFIED_ORIGINAL_STORE_IDENTITIES' },
   databaseUrlEnvironmentVariable: 'M4_LINEAGE_DATABASE_URL', accountId: 'synthetic-account', campaignAccountId: 'synthetic-account',
   expectedProviderAccountFingerprint: FP, campaignExpectedProviderAccountFingerprint: FP, sourceCoverage: 'NOT_ATTESTED',
   sourceCommit: 'a1'.repeat(20), outputName: 'synthetic-package',
@@ -87,8 +88,7 @@ describe('explicit controlled lineage invocation', () => {
   it.each([
     null, {}, { ...INPUT, accountId: '' }, { ...INPUT, accountId: 'bad account' },
     { ...INPUT, campaignAccountId: 'different' }, { ...INPUT, campaignExpectedProviderAccountFingerprint: '00'.repeat(32) },
-    { ...INPUT, sourceCoverage: undefined }, { ...INPUT, protectedStore: undefined },
-    { ...INPUT, protectedStore: { ...INPUT.protectedStore, review: 'NOT_VERIFIED' } },
+    { ...INPUT, sourceCoverage: undefined },
     { ...INPUT, target: { ...INPUT.target, serverUuid: 'unknown' } },
     { ...INPUT, outputName: '../escape' }, { ...INPUT, databaseUrlEnvironmentVariable: 'DATABASE_URL' }, { ...INPUT, unexpected: SECRET },
     { ...INPUT, outputName: 'con' }, { ...INPUT, outputName: 'nul' },
@@ -101,6 +101,57 @@ describe('explicit controlled lineage invocation', () => {
     const raw = structuredClone(INPUT); raw.target.databaseName = 'ORIGINAL_STORE'; raw.target.serverUuid = '22222222-2222-2222-2222-222222222222';
     expect((await runLineageInvocation(raw, f.deps)).failure).toBe('PROTECTED_STORE_NOT_EXCLUDED');
     expect(f.calls).toEqual([]);
+  });
+  it.each(['coindcx_shadow', 'COINDCX_SHADOW', 'CoInDcX_ShAdOw', 'coindcx_quant', 'COINDCX_QUANT', 'CoInDcX_QuAnT'])(
+    'always excludes known protected schema %s even when the operator list omits both known names', async databaseName => {
+      for (const serverUuid of [UUID, '22222222-2222-2222-2222-222222222222']) {
+        const f = fixture();
+        const result = await runLineageInvocation({ ...INPUT, target: { serverUuid, databaseName } }, f.deps);
+        expect(result).toMatchObject({ failure: 'PROTECTED_STORE_NOT_EXCLUDED', cleanup: 'NOT_CREATED', export: null });
+        expect(f.calls).toEqual([]); expect(fs.readdirSync(approved)).toEqual([]);
+      }
+    });
+  it.each([0, 1, 2])('checks a protected identity at list position %s across servers and cases', async position => {
+    const raw = structuredClone(INPUT);
+    raw.protectedStore.identities = [0, 1, 2].map(n => ({ serverUuid: UUID, databaseName: `original_${n}` }));
+    raw.protectedStore.identities[position] = { serverUuid: '22222222-2222-2222-2222-222222222222', databaseName: 'EXPORT_COPY' };
+    const f = fixture();
+    expect((await runLineageInvocation(raw, f.deps)).failure).toBe('PROTECTED_STORE_NOT_EXCLUDED');
+    expect(f.calls).toEqual([]); expect(fs.readdirSync(approved)).toEqual([]);
+  });
+  it.each([
+    undefined, {}, { identity: INPUT.protectedStore.identities[0], inventorySha256: 'cd'.repeat(32), review: 'OPERATOR_VERIFIED_ORIGINAL_STORE_IDENTITY' },
+    { ...INPUT.protectedStore, version: undefined }, { ...INPUT.protectedStore, version: 1 },
+    { ...INPUT.protectedStore, version: 3 }, { ...INPUT.protectedStore, identities: [] },
+    { ...INPUT.protectedStore, identities: undefined }, { ...INPUT.protectedStore, review: 'NOT_VERIFIED' },
+    { ...INPUT.protectedStore, inventorySha256: 'bad' }, { ...INPUT.protectedStore, identities: 'not-an-array' },
+    { ...INPUT.protectedStore, identities: [INPUT.protectedStore.identities[0], { serverUuid: UUID }] },
+    { ...INPUT.protectedStore, identities: [null] },
+    { ...INPUT.protectedStore, identities: [{ serverUuid: 'unknown', databaseName: 'old' }] },
+    { ...INPUT.protectedStore, identities: [{ serverUuid: UUID, databaseName: '../old' }] },
+    { ...INPUT.protectedStore, identities: [{ serverUuid: UUID, databaseName: 'old', unsupported: true }] },
+    { ...INPUT.protectedStore, identities: [{ serverUuid: UUID, databaseName: 'old' }, { serverUuid: UUID, databaseName: 'OLD' }] },
+  ])('refuses invalid/legacy/incomplete inventories with a fixed actionable message (%#)', async protectedStore => {
+    const f = fixture();
+    const result = await runLineageInvocation({ ...INPUT, protectedStore }, f.deps);
+    expect(result).toMatchObject({ kind: 'FAILED', failure: 'PROTECTED_INVENTORY_INVALID', cleanup: 'NOT_CREATED', export: null });
+    expect(result.message).toContain('version 2'); expect(result.message).toContain('recompute inventorySha256');
+    expect(f.calls).toEqual([]); expect(fs.readdirSync(approved)).toEqual([]);
+  });
+  it.each([0, 1, 2])('validates a malformed inventory entry at list position %s before any dependency call', async position => {
+    const identities: unknown[] = [0, 1, 2].map(n => ({ serverUuid: UUID, databaseName: `original_${n}` }));
+    identities[position] = { serverUuid: UUID, databaseName: '' };
+    const f = fixture();
+    expect((await runLineageInvocation({ ...INPUT, protectedStore: { ...INPUT.protectedStore, identities } }, f.deps)).failure)
+      .toBe('PROTECTED_INVENTORY_INVALID');
+    expect(f.calls).toEqual([]);
+  });
+  it('allows an unrelated synthetic candidate on the same UUID as multiple protected identities', async () => {
+    const f = fixture(), raw = structuredClone(INPUT);
+    raw.protectedStore.identities = ['coindcx_shadow', 'coindcx_quant', 'custom_original'].map(databaseName => ({ serverUuid: UUID, databaseName }));
+    const result = await runLineageInvocation(raw, f.deps);
+    expect(result).toMatchObject({ kind: 'COMPLETED', cleanup: 'CLOSED', export: { kind: 'EXPORTED' } });
+    expect(f.snapshot).toHaveBeenCalledWith('synthetic-account'); expect(f.close).toHaveBeenCalledTimes(1);
   });
   it('refuses unverifiable protected-store evidence before checkout, URL or database access', async () => {
     const f = fixture(); f.deps.verifyProtectedStoreInventory = vi.fn(async () => false);
@@ -128,6 +179,8 @@ describe('explicit controlled lineage invocation', () => {
     expect(f.create).not.toHaveBeenCalled(); expect(f.close).not.toHaveBeenCalled();
   });
   it.each([[], [INPUT.target, INPUT.target], [{ ...INPUT.target, databaseName: 'original_store' }],
+    [{ ...INPUT.target, databaseName: 'coindcx_shadow' }], [{ ...INPUT.target, databaseName: 'COINDCX_QUANT' }],
+    [{ ...INPUT.target, databaseName: 'foreign_candidate' }],
     [{ ...INPUT.target, serverUuid: '22222222-2222-2222-2222-222222222222' }], [{ databaseName: 'export_copy' }]].map(observed => ({ observed })))(
     'identity preflight failure cannot construct repository or read account rows (%#)', async ({ observed }) => {
     const f = fixture(); f.identity.mockResolvedValue(observed);
@@ -148,6 +201,15 @@ describe('explicit controlled lineage invocation', () => {
     f.migrations.mockResolvedValue(observed);
     expect((await runLineageInvocation(INPUT, f.deps)).failure).toBe('MIGRATION_PREFLIGHT_FAILED');
     expect(f.snapshots).not.toHaveBeenCalled(); expect(f.snapshot).not.toHaveBeenCalled(); expect(f.close).toHaveBeenCalledTimes(1);
+  });
+  it('does not silently accept an LF-normalized checksum instead of the checkout working-copy byte checksum', async () => {
+    const f = fixture(), sha = (text: string) => createHash('sha256').update(text).digest('hex');
+    const workingCopy = sha('-- SYNTHETIC\r\n'), lfBaseline = sha('-- SYNTHETIC\n');
+    expect(workingCopy).not.toBe(lfBaseline);
+    f.deps.readCheckout = async () => ({ ...CHECKOUT, migrations: [{ name: MIGRATION, checksum: workingCopy }] });
+    f.migrations.mockResolvedValue([{ ...applied()[0], checksum: lfBaseline }]);
+    expect(await runLineageInvocation(INPUT, f.deps)).toMatchObject({ failure: 'MIGRATION_PREFLIGHT_FAILED', cleanup: 'CLOSED' });
+    expect(f.snapshot).not.toHaveBeenCalled(); expect(fs.readdirSync(approved)).toEqual([]);
   });
   it('composes the existing export and readback, keeps binding statements distinct, and closes only its own resource', async () => {
     const f = fixture();
@@ -267,16 +329,42 @@ describe('synthetic filesystem and checkout validation', () => {
       vi.stubEnv(name, 'synthetic-debug'); expect(deps.readDatabaseUrl('M4_LINEAGE_DATABASE_URL')).toBeUndefined(); vi.stubEnv(name, '');
     }
   });
-  it('requires inventory bytes matching the reviewed digest and protected identity, with no credential discovery', async () => {
+  it('requires inventory bytes matching the reviewed digest and all protected identities, with no credential discovery', async () => {
     const deps = nodeLineageDependencies(root), statement = structuredClone(INPUT.protectedStore);
     await expect(deps.verifyProtectedStoreInventory(statement)).rejects.toThrow();
-    const bytes = JSON.stringify({ kind: 'M4_PROTECTED_ORIGINAL_STORE_INVENTORY', identity: statement.identity, review: statement.review });
+    const bytes = JSON.stringify({ kind: 'M4_PROTECTED_ORIGINAL_STORE_INVENTORY', version: 2,
+      identities: [...statement.identities].reverse(), review: statement.review });
     fs.writeFileSync(path.join(approved, 'protected-store-inventory.json'), bytes);
     expect(await deps.verifyProtectedStoreInventory(statement)).toBe(false);
     statement.inventorySha256 = createHash('sha256').update(bytes).digest('hex');
     expect(await deps.verifyProtectedStoreInventory(statement)).toBe(true);
-    statement.identity.databaseName = 'different'; expect(await deps.verifyProtectedStoreInventory(statement)).toBe(false);
+    statement.identities[1]!.databaseName = 'different'; expect(await deps.verifyProtectedStoreInventory(statement)).toBe(false);
   });
+  it.each(['legacy', 'version', 'kind', 'empty', 'duplicate', 'malformed-first', 'malformed-middle', 'malformed-last',
+    'missing-entry', 'foreign-uuid', 'foreign-schema', 'bad-json'])(
+    'rejects inventory-file %s before connection or account reads even when its byte digest matches', async kind => {
+      const f = fixture(), input = structuredClone(INPUT);
+      const identities = structuredClone(input.protectedStore.identities);
+      if (kind === 'foreign-uuid') identities[1]!.serverUuid = '22222222-2222-2222-2222-222222222222';
+      if (kind === 'foreign-schema') identities[1]!.databaseName = 'different';
+      const inventory = kind === 'legacy' ? { kind: 'M4_PROTECTED_ORIGINAL_STORE_INVENTORY', identity: identities[0], review: 'OPERATOR_VERIFIED_ORIGINAL_STORE_IDENTITY' }
+        : { kind: kind === 'kind' ? 'UNSUPPORTED' : 'M4_PROTECTED_ORIGINAL_STORE_INVENTORY', version: kind === 'version' ? 3 : 2,
+          identities: kind === 'empty' ? [] : kind === 'duplicate' ? [...identities, identities[0]]
+            : kind === 'malformed-first' ? [{}, ...identities] : kind === 'malformed-middle' ? [identities[0], {}, identities[1]]
+              : kind === 'malformed-last' ? [...identities, {}]
+            : kind === 'missing-entry' ? identities.slice(0, 1) : identities,
+          review: input.protectedStore.review };
+      const bytes = kind === 'bad-json' ? '{invalid' : JSON.stringify(inventory);
+      fs.writeFileSync(path.join(approved, 'protected-store-inventory.json'), bytes);
+      input.protectedStore.inventorySha256 = createHash('sha256').update(bytes).digest('hex');
+      f.deps.verifyProtectedStoreInventory = nodeLineageDependencies(root).verifyProtectedStoreInventory;
+      const result = await runLineageInvocation(input, f.deps);
+      expect(result).toMatchObject({ kind: 'FAILED', cleanup: 'NOT_CREATED', export: null,
+        failure: ['missing-entry', 'foreign-uuid', 'foreign-schema'].includes(kind) ? 'PROTECTED_STORE_NOT_EXCLUDED' : 'PROTECTED_INVENTORY_INVALID' });
+      if (result.failure === 'PROTECTED_INVENTORY_INVALID') expect(result.message).toContain('version 2');
+      expect(f.calls).toEqual([]); expect(f.create).not.toHaveBeenCalled(); expect(f.snapshot).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(approved, INPUT.outputName))).toBe(false);
+    });
   it('reads source-bound migration file checksums and clean Git identity, and validates fresh ignored output', async () => {
     syntheticGit();
     const facts = await readLineageCheckout(root);

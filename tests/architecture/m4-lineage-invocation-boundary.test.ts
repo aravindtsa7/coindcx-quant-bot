@@ -18,6 +18,14 @@ function scriptImporters(target: string): string[] {
 }
 
 describe('explicit M4 offline diagnostic composition boundary', () => {
+  it('pins both known operational schema exclusions without importing test tooling or changing importer allowlists', () => {
+    const helper = readFileSync(path.join(ROOT, 'tests/helpers/p18b-disposable-mysql.ts'), 'utf8');
+    const known = /Object\.freeze\(\['coindcx_shadow', 'coindcx_quant'\]\)/;
+    expect(helper).toMatch(known); expect(code).toMatch(known);
+    expect(code).toContain('!KNOWN_PROTECTED_SCHEMA_NAMES.includes(name)');
+    expect(code).toContain('identities.every(entry => name !== entry.databaseName.toLowerCase())');
+    expect(code).not.toContain('tests/helpers');
+  });
   it('adds exactly one reviewed scripts importer of repository and exporter; no script imports the root', () => {
     expect(scriptImporters(REPOSITORY)).toEqual([SCRIPT]);
     expect(scriptImporters(EXPORT)).toEqual([SCRIPT]);
