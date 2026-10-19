@@ -78,8 +78,20 @@ The existing public calls do not form one snapshot:
 - `PrismaLiveReconciliationRepository.loadState` is a standalone read outside it.
 
 A consistent export therefore needs **one new reviewed read-only method** that runs every read in a single explicit
-REPEATABLE READ transaction, applying the same integrity checks as the listing. Proposed read-only SQL (text only;
-MySQL `?` placeholders; account-scoped):
+REPEATABLE READ transaction, applying the same integrity checks as the listing.
+
+**Implemented as `PrismaLiveExecutionRepository.readLineageDiagnosticSnapshot(accountId)`:**
+- one Prisma interactive transaction with `isolationLevel: RepeatableRead`;
+- the orders go through the private verified listing `#listAccountOrderViewsWithin`;
+- the other four reads are Prisma delegate reads on the same transaction client, with explicit `select` and
+  `accountId` filters, equivalent to the SQL below;
+- certificate rows are made distinct by exact value in code.
+
+It is read-only by construction (no write delegate, no locking read), not a database-enforced READ ONLY
+transaction. Prisma's interactive transactions expose no access-mode option, and a `SET TRANSACTION` issued inside
+one would not apply. A read, integrity or commit failure rejects the call, so no partial snapshot is returned.
+
+Equivalent read-only SQL (text only; MySQL `?` placeholders; account-scoped):
 
 ```sql
 SELECT account_id, intent_id, exchange_order_id, code
@@ -220,10 +232,32 @@ Provenance separates three kinds:
 
 The checkout's migration identity describes the code, not which migrations the database has applied.
 
-Storage:
-- The record is written once (no overwrite) to an ignored `.local/` package with `SHA256SUMS`.
-- The full fingerprint stays inside that package.
-- Shareable summaries use the 12-character prefix, as the M4 campaign reports do (`observedFingerprintPrefix`).
+Storage, implemented by `src/execution/live/ownership-lineage-export.ts`:
+- **The flow.** Snapshot port, then the diagnostic, then a package write, then a readback.
+  - The snapshot comes through an injected structural port; the module imports no repository or Prisma.
+  - Filesystem work starts only after the snapshot call has returned, i.e. after its transaction committed.
+  - A read failure, a malformed or foreign snapshot, or a diagnostic refusal writes nothing.
+- **The package.** A new directory, created exclusively (an existing one, even empty, is refused). It holds exactly:
+  - `lineage-diagnostic.json`, the allowlisted diagnostic only, never snapshot rows;
+  - `SHA256SUMS`, written last as the completion marker.
+
+  Files are opened with `wx` and flushed. The intended location is under the ignored `.local/`; the caller supplies
+  the path.
+- **Readback** rejects:
+  - a missing manifest (incomplete), and missing or extra files;
+  - non-regular or oversized files;
+  - a malformed manifest or a digest mismatch;
+  - a malformed or lineage-shaped diagnostic;
+  - a `recordSha256` mismatch.
+
+  The digests detect corruption and incomplete writes. They do not authenticate the package against a writer able
+  to recompute both.
+- **A failed write** leaves the directory in place, reported as `INCOMPLETE_OR_UNVERIFIED`. Readback never accepts
+  it, and a retry needs a new path.
+- **Limits:** directory sync and OS ownership/ACL are not established. The requested modes (0700 and 0600) are not
+  enforced on Windows.
+- **Fingerprint:** the package holds only the expected fingerprint's 12-character prefix, as the M4 campaign
+  reports do (`observedFingerprintPrefix`).
 
 | Binding check | Kind | What it does not prove |
 | --- | --- | --- |
@@ -259,13 +293,19 @@ Sensitive fields excluded:
 
 ## 7. Prerequisites, by activity (none satisfied by this document)
 
-- **Writing offline code:** no further input. The pure transformer over injected rows exists as an uncommitted
-  review candidate, with synthetic fixture and boundary tests. A read-only snapshot port (the database adapter) is
-  separate later work and is not written.
+- **Writing offline code:** done.
+  - The diagnostic, the repository snapshot method and the export/package module exist.
+  - They are verified with synthetic rows: the real repository method over a fake transaction client, and a real
+    filesystem in isolated temporary directories.
+  - Fake tests verify routing and failure handling only. They prove nothing about MySQL isolation, locking or
+    deployment suitability.
 - **Executing DB reads:**
   - separate authorization for read-only access to the identified database;
   - confirmation that its applied migrations match the checkout;
   - no execution against the original worktree's store.
+  - A composition root, which does not exist, would have to construct a Prisma client and
+    `PrismaLiveExecutionRepository` and call the export. It would be a new importer of `live/repository.ts`, so it
+    needs a reviewed addition to that file's pinned importer guard and to this module's no-importer guard.
 - **Using the output as account evidence:**
   - the operator-supplied expected fingerprint and source-coverage attestation;
   - the certificate check;

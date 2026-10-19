@@ -8,6 +8,8 @@ import { analyzeModuleReferences, buildImportGraph } from './support/import-grap
 // and reads no database, clock, environment or credential of its own.
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const MODULE = 'src/execution/live/ownership-lineage-diagnostic.ts';
+/** The single reviewed importer (offline export; itself composed by nothing, see its own boundary test). */
+const EXPORT = 'src/execution/live/ownership-lineage-export.ts';
 const { graph, files } = buildImportGraph(path.join(REPO_ROOT, 'src'), REPO_ROOT);
 const raw = readFileSync(path.join(REPO_ROOT, MODULE), 'utf8');
 const code = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\s\/\/.*$/gm, '');
@@ -36,9 +38,9 @@ describe('M4 offline ownership-lineage diagnostic boundary', () => {
     expect(graph.get(MODULE)?.filter((edge) => /practical-synchronization|practical-observation|reconciliation|integration\//.test(edge)) ?? []).toEqual([]);
   });
 
-  it('is imported and named by nothing in src or scripts (no engine, orchestrator or campaign composition)', () => {
-    expect([...graph].filter(([, edges]) => edges.includes(MODULE)).map(([file]) => file)).toEqual([]);
-    for (const file of files.filter((candidate) => candidate !== MODULE)) {
+  it('is imported only by the one offline export adapter, and named by nothing else in src or scripts', () => {
+    expect([...graph].filter(([, edges]) => edges.includes(MODULE)).map(([file]) => file)).toEqual([EXPORT]);
+    for (const file of files.filter((candidate) => candidate !== MODULE && candidate !== EXPORT)) {
       const text = readFileSync(path.join(REPO_ROOT, file), 'utf8');
       expect(/ownership-lineage-diagnostic|buildOfflineLineageDiagnostic|OFFLINE_LINEAGE_DIAGNOSTIC/.test(text), file).toBe(false);
     }
