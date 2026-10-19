@@ -46,8 +46,10 @@ removes the cycle reason `OWNERSHIP_LINEAGE_UNAVAILABLE`. That reason is added o
 and the campaign preflight records it as `PREVENTS_CONVERGENCE`. Feeding this record to the engine would therefore
 assert an empty durable inventory that it does not prove.
 
-The record carries `use: OFFLINE_DIAGNOSTIC_ONLY`, and **M4 runs keep `{ kind: 'UNAVAILABLE' }`**. Converting the
-record into an engine input is outside this candidate.
+A label alone is not a boundary. The record is therefore a distinct result type (`kind: 'OFFLINE_LINEAGE_DIAGNOSTIC'`)
+that contains no `SyncLineage`-shaped object, and no conversion helper exists. The engine's own config validation
+rejects the record, and every part of it, as a lineage input. **M4 runs keep `{ kind: 'UNAVAILABLE' }`.** Converting
+the record into an engine input is outside this candidate.
 
 ## 2. Durable sources (actual tables and columns)
 
@@ -56,7 +58,7 @@ record into an engine input is outside this candidate.
 | `live_execution_intent` | `intent_id` (PK, identity hash), `client_order_id` (unique), `account_id`, `pair`, `side`, `quantity`, `price`, `leverage`, `wire_order_type`, `content_sha256` | Immutable bot intent. Integrity is re-verified by the repository on read |
 | `live_order` | `intent_id` (PK, FK to intent), `client_order_id` (unique), `account_id`, `state`, `exchange_order_id` (nullable, indexed, **not unique**), `dispatch_wire_armed` | One order per intent. `exchange_order_id` is "present only once CoinDCX genuinely supplied one" |
 | `live_order_event` | (not read) | Append-only applied observations. **No column records whether a row came from a create response or from reconciliation** |
-| `live_reconciliation_finding` | `account_id`, `category`, `code`, `intent_id`, `exchange_order_id`, `blocking`, `last_seen_generation`, `resolved_at_ms` | Durable, never deleted. Codes `RECON_AMBIGUOUS_CREATE_RESOLVED_BY_CLIENT_ORDER_ID` and `RECON_AMBIGUOUS_CREATE_RESOLVED` record reconciliation-assigned exchange ids |
+| `live_reconciliation_finding` | `account_id`, `code`, `intent_id`, `exchange_order_id` | Durable, never deleted. Codes `RECON_AMBIGUOUS_CREATE_RESOLVED_BY_CLIENT_ORDER_ID` and `RECON_AMBIGUOUS_CREATE_RESOLVED` record reconciliation-assigned exchange ids |
 | `live_reconciliation_state` | `account_id`, `current_generation`, `healthy_generation`, `status` | Current reconciliation generation |
 | `live_position_ownership_share` | row count only | Reported as a count, never as ids or quantities (D3) |
 | `live_practical_certificate` | `account_id`, `provider_account_fingerprint` | 64-hex digest of the provider account identity (`coindcx_id`), recorded at each certificate's issuance (Phase 18B) |
@@ -80,20 +82,21 @@ REPEATABLE READ transaction, applying the same integrity checks as the listing. 
 MySQL `?` placeholders; account-scoped):
 
 ```sql
-SELECT intent_id, exchange_order_id, category, code, blocking, last_seen_generation, resolved_at_ms
+SELECT account_id, intent_id, exchange_order_id, code
 FROM live_reconciliation_finding
 WHERE account_id = ? AND (intent_id IS NOT NULL OR exchange_order_id IS NOT NULL);
 
-SELECT DISTINCT provider_account_fingerprint FROM live_practical_certificate WHERE account_id = ?;
+SELECT DISTINCT account_id, provider_account_fingerprint FROM live_practical_certificate WHERE account_id = ?;
 
 SELECT COUNT(*) AS share_count FROM live_position_ownership_share WHERE account_id = ?;
 ```
 
 Limits of the SQL as written:
+- `account_id` is selected so the diagnostic can re-check each row's scope.
 - `evidence_json`, `resolved_by` and strategy or position columns are never selected.
 - Findings that name only a pair, a position or a strategy are not read.
-- A finding is "current" exactly as `completeRun` counts it: `last_seen_generation = current_generation` and
-  `resolved_at_ms IS NULL`. The exporter applies that rule to the raw columns.
+- Under D4 only finding codes are used. The `category`, `blocking`, `last_seen_generation` and `resolved_at_ms`
+  columns are not needed and are not selected.
 
 | Durable row | Candidate output | Diagnostic entry (kept, never discarded) |
 | --- | --- | --- |
@@ -150,29 +153,70 @@ Never used for ownership:
 
 ## 5. Export record, provenance and binding checks
 
-Record shape:
-- `use: OFFLINE_DIAGNOSTIC_ONLY`;
-- `candidateLineage`: the five `SyncLineage` fields;
-- `fieldStatus` per field:
-  - `EMPTY_BY_POLICY` with its decision (D2, D3, D4); or
-  - for `ambiguousCreates`, `ENTRIES_FOUND` or `NONE_FOUND_IN_SNAPSHOT`. "None found" covers this snapshot of
-    this database only, never the account (§4.5).
-- `diagnostics`: `excluded`, `omitted` and `conflicts`. Each entry is an intent id with reason and finding codes
-  only.
-- `header`.
+Record shape, as implemented by the offline transformer `src/execution/live/ownership-lineage-diagnostic.ts`:
+- `kind: 'OFFLINE_LINEAGE_DIAGNOSTIC'`, `use: 'OFFLINE_DIAGNOSTIC_ONLY'`, `engineInput: 'NOT_PERMITTED'`,
+  `ownershipProof: 'NONE'`;
+- `policyEmpty`: a status per disabled output, each `EMPTY_BY_POLICY` with its decision (D4, D2, D3). These are
+  statuses, never arrays;
+- `ambiguousCreateCandidates`:
+  - `ENTRIES_FOUND` or `NONE_FOUND_IN_SNAPSHOT`, always with `scope: SUPPLIED_SNAPSHOT_ONLY` and
+    `accountWideAbsence: NOT_ESTABLISHED` (§4.5);
+  - entries carry the plan §1 fields and their finding codes, as diagnostic evidence only;
+- `diagnostics`:
+  - `excluded`, `omitted` and `conflicts`: each entry is intent ids with a reason and finding codes only;
+  - `excluded` entries also carry `exchangeIdCorrelatedFindingCodes`. These come from findings that name only the
+    order's exchange id. They are correlation only and never classify an order (for example, never
+    `RECONCILIATION_RESOLVED`);
+  - unlinked finding codes with counts (no exchange ids);
+  - the share count.
+- `provenance` and `recordSha256`.
 
-The header labels every item as one of two kinds:
-- **VERIFIED_BY_EXPORT**, read from the snapshot:
-  - row counts per table;
-  - `current_generation` and `healthy_generation`;
-  - the distinct certificate fingerprints for the `account_id`;
-  - the snapshot's isolation level and local time;
-  - the source commit and the checkout's migration directory names plus the `migration_lock.toml` hash;
-  - a SHA-256 over the canonical record.
-- **OPERATOR_STATEMENT**:
-  - the expected provider-account fingerprint (never the raw `coindcx_id`);
-  - that this is the identified database;
-  - the source-coverage attestation.
+Reported finding codes are those of the persisted Phase 18 taxonomy (`LiveReconciliationFindingCode`, pinned by a
+compile-time test). A well-formed code outside the taxonomy is reported as `UNRECOGNIZED_FINDING_CODE` and never
+echoed.
+
+Order rows must match the repository's persisted shapes:
+- the Phase 17 `client_order_id` format;
+- positive `DECIMAL(36,18)` ordered quantity, price and leverage.
+
+Every supplied field is read once before it is validated and used.
+
+A refusal is `kind: 'OFFLINE_LINEAGE_DIAGNOSTIC_REFUSED'` with a fixed reason code and nothing else. It covers:
+- malformed rows;
+- a row of another account;
+- duplicate intent or client order ids;
+- a wire arm outside `DISPATCH_RESERVED`;
+- disagreeing fingerprint statements;
+- a certificate mismatch.
+
+No partial diagnostic is returned.
+
+Provenance separates three kinds:
+- **Checked on the supplied rows:**
+  - row formats and account scope;
+  - uniqueness;
+  - wire-arm consistency;
+  - finding associations;
+  - the account label against the campaign statement;
+  - the certificate fingerprints against the statement;
+  - row counts and the supplied generations.
+
+  These checks cover rows as supplied. Synthetic rows prove nothing about a database.
+- **Caller statements:**
+  - the source commit;
+  - the checkout's migration directory names and `migration_lock.toml` hash;
+  - the expected fingerprint (12-character prefix only);
+  - the agreement of the two fingerprint statements, labelled as binding nothing;
+  - the coverage attestation, labelled unverified.
+- **Not established without a real database read:**
+  - transaction consistency;
+  - snapshot isolation and time;
+  - intent content-hash integrity (verified by the repository on a real read);
+  - database identity and applied migrations;
+  - source coverage;
+  - order-time account identity;
+  - create-response provenance;
+  - account-wide absence.
 
 The checkout's migration identity describes the code, not which migrations the database has applied.
 
@@ -215,9 +259,9 @@ Sensitive fields excluded:
 
 ## 7. Prerequisites, by activity (none satisfied by this document)
 
-- **Writing offline code:** no further input. This means a pure derivation from injected snapshot rows, a
-  read-only snapshot port, and fixture tests with synthetic rows. The code itself still needs review before
-  commit.
+- **Writing offline code:** no further input. The pure transformer over injected rows exists as an uncommitted
+  review candidate, with synthetic fixture and boundary tests. A read-only snapshot port (the database adapter) is
+  separate later work and is not written.
 - **Executing DB reads:**
   - separate authorization for read-only access to the identified database;
   - confirmation that its applied migrations match the checkout;
