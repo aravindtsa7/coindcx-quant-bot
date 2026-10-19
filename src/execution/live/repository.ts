@@ -985,6 +985,50 @@ interface ConsistentListingClient {
 }
 
 /**
+ * [M4 offline lineage diagnostic] The listing's reads plus the four plain, account-scoped reads of the lineage
+ * snapshot, all through ONE interactive transaction client. It has no write delegate: nothing here can mutate.
+ */
+interface LineageSnapshotClient extends ConsistentListingClient {
+  readonly liveReconciliationFinding: {
+    findMany(args: {
+      where: { accountId: string; OR: [{ intentId: { not: null } }, { exchangeOrderId: { not: null } }] };
+      select: { accountId: true; intentId: true; exchangeOrderId: true; code: true };
+      orderBy: { findingId: 'asc' };
+    }): Promise<unknown>;
+  };
+  readonly livePracticalCertificate: {
+    findMany(args: { where: { accountId: string }; select: { accountId: true; providerAccountFingerprint: true }; orderBy: { certificateId: 'asc' } }): Promise<unknown>;
+  };
+  readonly livePositionOwnershipShare: { count(args: { where: { accountId: string } }): Promise<unknown> };
+  readonly liveReconciliationState: {
+    findUnique(args: { where: { accountId: string }; select: { accountId: true; currentGeneration: true; healthyGeneration: true } }): Promise<unknown>;
+  };
+}
+
+/**
+ * [M4 offline lineage diagnostic] One account's lineage snapshot, as read. Values are returned exactly as the
+ * transaction client produced them (strings and integers; no conversion). Rows other than the verified order views
+ * are NOT validated here: the offline diagnostic validates every field and refuses on any anomaly.
+ */
+export interface LiveLineageDiagnosticSnapshot {
+  readonly accountId: string;
+  readonly orders: readonly LiveDurableOrderRow[];
+  readonly findings: readonly Readonly<{ accountId: unknown; intentId: unknown; exchangeOrderId: unknown; code: unknown }>[];
+  readonly certificates: readonly Readonly<{ accountId: unknown; providerAccountFingerprint: unknown }>[];
+  readonly reconciliationState: Readonly<{ accountId: unknown; currentGeneration: unknown; healthyGeneration: unknown }> | null;
+  readonly ownershipShareCount: number;
+  /** Requested through the Prisma interactive-transaction option. Not a database-enforced READ ONLY transaction. */
+  readonly isolationRequested: 'REPEATABLE_READ';
+}
+
+function snapshotRows(value: unknown): readonly Record<string, unknown>[] {
+  if (!Array.isArray(value) || !value.every((row) => typeof row === 'object' && row !== null && !Array.isArray(row))) {
+    throw new LiveExecutionError('LIVE_DURABLE_INTEGRITY_VIOLATION', 'Lineage snapshot read did not return rows');
+  }
+  return value as readonly Record<string, unknown>[];
+}
+
+/**
  * [P18B Stage 1B2 Wave 2B2a/2B2b] The practical lease naming each order's
  * EXACT CURRENT cancel generation, read through the listing's OWN consistent
  * snapshot `tx` (never a separate statement outside it). ADVISORY and
@@ -1669,6 +1713,64 @@ export class PrismaLiveExecutionRepository implements LiveExecutionRepository {
       (tx) => this.#listAccountOrderViewsWithin(tx as unknown as ConsistentListingClient, accountId),
       { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead, timeout: 30_000 },
     );
+  }
+
+  /**
+   * [M4 offline lineage diagnostic] One account's lineage snapshot in ONE explicit REPEATABLE READ interactive
+   * transaction. The orders go through the same verified listing as `listAccountOrderViews` (sealed-digest and
+   * projection checks, practical bindings); findings, certificate fingerprints, the share count and the reconciliation
+   * state are plain, non-locking, account-filtered reads with explicit field selection on the SAME transaction client.
+   *
+   * Read-only by construction (no write delegate is used), not a database-enforced READ ONLY transaction: Prisma's
+   * interactive transactions expose no access-mode option, and a SET TRANSACTION statement issued inside one would not
+   * apply. Any read, integrity or commit failure rejects; no partial snapshot is returned. MySQL equality is
+   * case-insensitive and pad-space, so returned rows keep their own `accountId` for an exact re-check downstream.
+   */
+  public async readLineageDiagnosticSnapshot(accountId: string): Promise<LiveLineageDiagnosticSnapshot> {
+    return this.#prisma.$transaction(
+      (tx) => this.#readLineageDiagnosticSnapshotWithin(tx as unknown as LineageSnapshotClient, accountId),
+      { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead, timeout: 30_000 },
+    );
+  }
+
+  async #readLineageDiagnosticSnapshotWithin(tx: LineageSnapshotClient, accountId: string): Promise<LiveLineageDiagnosticSnapshot> {
+    const orders = await this.#listAccountOrderViewsWithin(tx, accountId);
+    const findings = snapshotRows(await tx.liveReconciliationFinding.findMany({
+      where: { accountId, OR: [{ intentId: { not: null } }, { exchangeOrderId: { not: null } }] },
+      select: { accountId: true, intentId: true, exchangeOrderId: true, code: true },
+      orderBy: { findingId: 'asc' },
+    })).map((row) => Object.freeze({ accountId: row['accountId'], intentId: row['intentId'], exchangeOrderId: row['exchangeOrderId'], code: row['code'] }));
+    const distinct = new Map<string, Readonly<{ accountId: unknown; providerAccountFingerprint: unknown }>>();
+    for (const row of snapshotRows(await tx.livePracticalCertificate.findMany({
+      where: { accountId },
+      select: { accountId: true, providerAccountFingerprint: true },
+      orderBy: { certificateId: 'asc' },
+    }))) {
+      const entry = Object.freeze({ accountId: row['accountId'], providerAccountFingerprint: row['providerAccountFingerprint'] });
+      distinct.set(JSON.stringify([entry.accountId, entry.providerAccountFingerprint]), entry);
+    }
+    const shareCount = await tx.livePositionOwnershipShare.count({ where: { accountId } });
+    if (typeof shareCount !== 'number' || !Number.isSafeInteger(shareCount) || shareCount < 0) {
+      throw new LiveExecutionError('LIVE_DURABLE_INTEGRITY_VIOLATION', 'Lineage snapshot share count is not a count');
+    }
+    const state = await tx.liveReconciliationState.findUnique({
+      where: { accountId },
+      select: { accountId: true, currentGeneration: true, healthyGeneration: true },
+    });
+    if (state !== null && (typeof state !== 'object' || Array.isArray(state))) {
+      throw new LiveExecutionError('LIVE_DURABLE_INTEGRITY_VIOLATION', 'Lineage snapshot reconciliation state is malformed');
+    }
+    const stateRow = state as Record<string, unknown> | null;
+    return Object.freeze({
+      accountId,
+      orders,
+      findings: Object.freeze(findings),
+      certificates: Object.freeze([...distinct.values()]),
+      reconciliationState: stateRow === null ? null
+        : Object.freeze({ accountId: stateRow['accountId'], currentGeneration: stateRow['currentGeneration'], healthyGeneration: stateRow['healthyGeneration'] }),
+      ownershipShareCount: shareCount,
+      isolationRequested: 'REPEATABLE_READ' as const,
+    });
   }
 
   async #listAccountOrderViewsWithin(tx: ConsistentListingClient, accountId: string): Promise<readonly LiveDurableOrderRow[]> {

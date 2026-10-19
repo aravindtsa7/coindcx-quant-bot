@@ -656,6 +656,8 @@ describe('F17-R03 no authoritative path accepts durable state without verificati
       dispatchWireArmed: false, cancelWireArmed: false, revision: 3,
     }, 2, null) },
     { name: 'listAccountOrderViews', kind: 'verified-read', call: (r) => r.listAccountOrderViews(ACCOUNT) },
+    // [M4 offline lineage diagnostic] Its orders come from the same verified listing, so a poisoned intent fails it too.
+    { name: 'readLineageDiagnosticSnapshot', kind: 'verified-read', call: (r) => r.readLineageDiagnosticSnapshot(ACCOUNT) },
     { name: 'loadPositionOwnership', kind: 'undigested-read', call: (r) => r.loadPositionOwnership(ACCOUNT, PAIR) },
   ];
 
