@@ -1,7 +1,8 @@
 # M4 ownership-lineage export plan (restricted offline candidate; nothing executed)
 
-**Status: plan only.** No database, credential, provider or runtime was accessed. No query was run and no exporter
-exists. The record this plan describes is an **offline diagnostic, not ownership proof**. It sets no lineage input
+**Status: offline implementation, no real execution.** The diagnostic, snapshot, package and explicit operator
+composition exist. No database, credential, provider or runtime was accessed for this implementation. The record
+is an **offline diagnostic, not ownership proof**. It sets no lineage input
 and changes no gate, grant, AS1, D4c or formal M3/M4 decision. The candidate scope in §0 is recorded; the
 underlying contracts stay unresolved (§6). References re-checked against
 `2414417333dc0586ee49e7c198506544db2d0d2d` (source inspection only).
@@ -303,9 +304,9 @@ Sensitive fields excluded:
   - separate authorization for read-only access to the identified database;
   - confirmation that its applied migrations match the checkout;
   - no execution against the original worktree's store.
-  - A composition root, which does not exist, would have to construct a Prisma client and
-    `PrismaLiveExecutionRepository` and call the export. It would be a new importer of `live/repository.ts`, so it
-    needs a reviewed addition to that file's pinned importer guard and to this module's no-importer guard.
+  - The explicit composition root `scripts/m4-lineage-export.ts` constructs its own Prisma client after local
+    validation, and its repository after metadata preflight. Its one scripts importer of the repository and exporter
+    is pinned separately; existing src importer allowlists remain unchanged. See §8.
 - **Using the output as account evidence:**
   - the operator-supplied expected fingerprint and source-coverage attestation;
   - the certificate check;
@@ -317,3 +318,140 @@ No ownership is inferred meanwhile:
 - lineage stays `UNAVAILABLE`;
 - the account remains manually and shared used;
 - no exclusivity is claimed.
+
+## 8. Explicit operator composition (offline verified; real execution NOT authorized or performed)
+
+`scripts/m4-lineage-export.ts` composes only:
+
+explicit `--input` → strict operator input validation → protected-store inventory verification → clean source and
+fresh ignored output checks → explicit URL validation → owned DB client → DB identity → applied migrations →
+existing repository snapshot/export/package/readback → owned client disconnect.
+
+No account-data read or repository construction is reachable on failed preflight. Importing the root performs no
+I/O, client construction, environment lookup, startup or invocation. Prisma and the repository are loaded only
+inside the owned factory. Before loading them, the factory checks generated Prisma source `relativeEnvPaths`;
+configured env-file discovery or an unrecognized format refuses. There is no `.env` loader or `DATABASE_URL`
+fallback. The root's explicit URL override and disabled Prisma logging keep dependency errors out of its output.
+
+All these inputs are required; there are no supplied real values or defaults:
+
+- `kind`: `M4_OFFLINE_LINEAGE_EXPORT`.
+- `target`: independently reviewed `serverUuid` (lowercase MySQL UUID) and `databaseName` (ASCII letters/digits/underscore).
+- `protectedStore`: the reviewed original store's `identity` in the same shape, `inventorySha256` (SHA-256 of the
+  exact inventory file bytes), and `review: OPERATOR_VERIFIED_ORIGINAL_STORE_IDENTITY`.
+- `databaseUrlEnvironmentVariable`: exactly `M4_LINEAGE_DATABASE_URL`. The operator must supply this variable
+  securely to the process; no URL or credential belongs in JSON, command arguments or retained stdout.
+- `accountId`, `campaignAccountId`: matching explicit local labels.
+- `expectedProviderAccountFingerprint`, `campaignExpectedProviderAccountFingerprint`: matching lowercase 64-hex
+  operator/campaign statements. They are not a DB identity or a fresh provider identity observation.
+- `sourceCoverage`: explicitly `ATTESTED` or `NOT_ATTESTED`; either remains an unverified operator statement.
+- `sourceCommit`: exact clean checkout HEAD, including the reviewed composition changes.
+- `outputName`: a fresh lowercase ASCII alphanumeric/hyphen basename, at most 80 characters, beginning alphanumeric.
+  Windows reserved device names are refused as well.
+
+The non-secret input JSON must be directly under the **already existing**
+`C:\TSA\coindcx-m2-w1\.local\m4-lineage-exports`. That directory and `.local` must be real directories, without
+symlinks/junctions. The checkout must have a canonical path. The output is precisely this parent plus `outputName`;
+it must be absent, ignored by the effective Git rules and untracked. Existing paths, including incomplete packages,
+are never reused or deleted. The package writer still creates the directory exclusively and verifies its readback.
+The root rechecks the approved parent and fresh output at the writer's first filesystem action, after the snapshot.
+These path checks do not establish OS custody against an adversarial concurrent rename between checking and opening;
+the already approved local directory must remain under the operator's control throughout the invocation.
+
+The same parent must contain `protected-store-inventory.json` with exactly:
+
+```json
+{
+  "kind": "M4_PROTECTED_ORIGINAL_STORE_INVENTORY",
+  "identity": { "serverUuid": "<verified original server UUID>", "databaseName": "<verified original schema>" },
+  "review": "OPERATOR_VERIFIED_ORIGINAL_STORE_IDENTITY"
+}
+```
+
+Placeholders above are intentionally invalid. No inventory was created during this task. Missing inventory, missing
+review, bad digest or disagreeing identity refuses **before URL lookup/client construction**. A target schema with
+the same name as the protected schema (case-insensitive) is refused on every server; aliases to that schema cannot
+bypass the comparison by changing host or UUID. `DATABASE()` and `@@server_uuid` must then match the supplied target.
+This is exclusion against a required **operator-verified inventory**, not automatic discovery of the original store,
+authentication of the inventory issuer, or proof against a false inventory. If the operator cannot establish the
+original identity from previously authorized non-secret evidence, execution must stay blocked; do not inspect its
+credentials/store to manufacture the missing input.
+
+The explicit MySQL URL must select the exact target schema. Its only query parameters are `connection_limit=1`,
+`connect_timeout` and `pool_timeout`; both timeout values must be operator-chosen integer seconds from 1 to 99.
+Duplicate parameters, alternate socket/schema selectors and additional parameters refuse. No URL is printed.
+Nonempty `DEBUG`, `RUST_LOG` or `PRISMA_LOG_LEVEL` refuses before client loading, because dependency traces can bypass
+ordinary Prisma logging. Use an operator-controlled process environment without tracing or injected preload hooks.
+One connection reduces pool ambiguity; it is not a proof against failover, a misrouting proxy or concurrent DDL.
+
+Applied migration metadata must have exactly one completed, non-rolled-back row per checkout migration, no extra
+rows, and matching `migration.sql` SHA-256 checksums. The lock-file hash remains separate checkout provenance.
+No migration runs. Matching migration history is not an independent schema-drift audit. The existing snapshot's
+single RepeatableRead transaction, integrity checks, timeout and classification rules are unchanged.
+
+The launcher result separates its metadata-preflight status from the existing diagnostic's conservative
+`notEstablished` list. In particular the diagnostic is not rewritten to claim DB identity, provider account identity
+or source coverage. The package still contains only the existing diagnostic and manifest, with the fingerprint prefix.
+The caller retains the non-secret reviewed invocation, inventory and safe launcher result separately if needed.
+Failures report fixed stages; no dependency message, URL, full fingerprint or raw account row is echoed.
+Cleanup always attempts to disconnect exactly the created client, including preflight/snapshot/write/readback
+failures. A cleanup failure makes the invocation fail even if a package was written; no automatic retry or deletion.
+
+Exact future invocation from this worktree (documented only, **NOT EXECUTED**):
+
+```powershell
+node .\node_modules\tsx\dist\cli.mjs .\scripts\m4-lineage-export.ts --input C:\TSA\coindcx-m2-w1\.local\m4-lineage-exports\invocation.json
+```
+
+### Bounded real-DB proposal — NOT EXECUTED
+
+After separate explicit authorization: use one already provisioned, independently identified **non-original**
+database with an existing SELECT-only principal. Do not create a database/user, apply migrations, alter ACLs or copy
+the original store as part of this invocation. Review original-store inventory, target UUID/schema, account/campaign
+fingerprint statements, coverage choice, clean source commit and a new output name before supplying the URL.
+The URL must point directly to the reviewed server, without a load-balancing/failover endpoint. Keep schema/migration
+changes paused by the owner for this read; this launcher does not enforce that host condition.
+
+Run the command once under an external operator-controlled 120-second process deadline, with explicit connection
+and pool timeouts each no more than 10 seconds. Successful execution issues two metadata SELECTs and exactly one
+existing account-scoped RepeatableRead snapshot transaction (existing 30-second transaction timeout), writes one
+fresh diagnostic package, verifies readback, then disconnects. Identity failure stops before migration metadata;
+migration failure stops before any account read. No provider requests, stream, collection, campaign, engine or trading
+path is composed. Unexpected failure/deadline/cleanup leaves any output untouched and requires review before a new
+invocation/name; a forced process termination cannot promise successful resource cleanup or a complete package.
+
+Current real-execution blockers: no reviewed real protected-store inventory, target identity/authorization,
+SELECT-only connection or concrete account/operator statements were supplied or read. Offline tests establish
+routing/failure/privacy behavior only; they do not establish real MySQL behavior, inventory authenticity, source
+coverage or ownership. The known parallel architecture timeout remains unresolved; no timeout setting was changed.
+
+D1–D4, actual M4 lineage `UNAVAILABLE`, false authority grants, gates, `authorityEligible`, Invariant 28, AS1/D4c and
+formal M3/M4 acceptance remain unchanged.
+
+## 9. Offline verification record (19 October 2026)
+
+Starting HEAD: `6bc8f3e35366f0585aaf8d7a6360752fafc276bc`, clean index/worktree. The operator confirmed no other
+session was editing this worktree. No completed pipeline source, frozen migration or producing launcher was changed.
+
+- Final affected run: **91/91 passed** — 74 synthetic invocation tests; the invocation/export/diagnostic architecture
+  boundaries (10 tests); and the unchanged cancel-transport provenance boundary (7 tests). Command:
+  `node node_modules/vitest/vitest.mjs run tests/unit/scripts/m4-lineage-export.test.ts tests/architecture/m4-lineage-invocation-boundary.test.ts tests/architecture/m4-ownership-lineage-export-boundary.test.ts tests/architecture/m4-ownership-lineage-diagnostic-boundary.test.ts tests/architecture/phase18b-practical-cancel-transport-provenance-boundary.test.ts --maxWorkers=1 --no-file-parallelism`.
+- Wider offline run: **988 passed, 1 timeout**, across 39 files, using the same single-worker flags with
+  `tests/architecture` and invocation/export/diagnostic/durable-integrity unit suites. The unchanged timeout was
+  `phase18b-practical-cancel-transport-provenance-boundary.test.ts`, test
+  `pins neutral importers and privileged operations to exact modules`, at the existing 5000 ms limit. It passed
+  subsequently at 4920 ms in the final affected run. This is timing-sensitive evidence, not closure of the known
+  parallel architecture timeout. No timeout setting changed. The final output-parent recheck was added after the
+  wider run and covered by the final affected run; unchanged source-bound checks were reused.
+- Existing export (16), diagnostic (40), and durable-integrity (75) tests all passed in that wider run; their pipeline
+  source remains identical to the starting HEAD. No classification or integrity implementation was duplicated.
+- Final `npm.cmd run typecheck`: passed. Final `npm.cmd run lint`: passed with 10 existing `no-explicit-any` warnings
+  in unchanged `session-fault-recovery.test.ts`. Explicit ESLint on the new launcher and affected tests: no warnings/errors.
+- Focused final source/importer review and `git diff --check`: passed. The sole new script importer is pinned by exact
+  filename; no src importer list, engine/campaign/startup boundary, gate or authority rule was relaxed.
+
+Tests used injected factories/DB ports, mocked Prisma construction, synthetic filesystem/Git data and the unchanged
+fake-transaction pipeline suites. They covered import behavior, input/identity/migration refusals before account reads,
+existing export/readback, malformed/foreign/certificate failures, safe errors, tracing refusal, write/readback failure,
+fresh ignored storage/junction checks, caller mutation, and cleanup including double failures. No real credential,
+env-file contents, DB connection (including disposable DBs), provider call or runtime startup was used.
