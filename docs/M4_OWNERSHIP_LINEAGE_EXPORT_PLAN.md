@@ -305,8 +305,9 @@ Sensitive fields excluded:
   - confirmation that its applied migrations match the checkout;
   - no execution against the original worktree's store.
   - The explicit composition root `scripts/m4-lineage-export.ts` constructs its own Prisma client after local
-    validation, and its repository after metadata preflight. Its one scripts importer of the repository and exporter
-    is pinned separately; existing src importer allowlists remain unchanged. See §8.
+    validation, and its repository after metadata preflight. The operator root and the explicit synthetic acceptance
+    adapter are the two pinned scripts importers; existing src importer allowlists remain unchanged. See §8 and
+    [the prepared synthetic harness](M4_SYNTHETIC_MYSQL_ACCEPTANCE.md). No MySQL acceptance has been executed.
 - **Using the output as account evidence:**
   - the operator-supplied expected fingerprint and source-coverage attestation;
   - the certificate check;

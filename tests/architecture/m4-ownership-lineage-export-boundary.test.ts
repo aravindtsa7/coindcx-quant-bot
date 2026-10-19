@@ -5,11 +5,12 @@ import { analyzeModuleReferences, buildImportGraph } from './support/import-grap
 
 // M4 offline ownership-lineage export (unwired): it receives its snapshot through an injected structural port, so it
 // imports neither the repository nor Prisma, constructs no client, reads no environment or credential, is composed by
-// one explicit operator script (no campaign, engine or orchestrator), and persists only the diagnostic.
+// the explicit operator script and synthetic acceptance adapter (no campaign, engine or orchestrator), and persists only the diagnostic.
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const MODULE = 'src/execution/live/ownership-lineage-export.ts';
 const REPOSITORY = 'src/execution/live/repository.ts';
 const OPERATOR_SCRIPT = 'scripts/m4-lineage-export.ts';
+const SYNTHETIC_ADAPTER = 'scripts/m4-synthetic-mysql.ts';
 const { graph, files } = buildImportGraph(path.join(REPO_ROOT, 'src'), REPO_ROOT);
 const raw = readFileSync(path.join(REPO_ROOT, MODULE), 'utf8');
 const code = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\s\/\/.*$/gm, '');
@@ -38,14 +39,14 @@ describe('M4 offline ownership-lineage export boundary', () => {
     expect(code).not.toMatch(/PrismaClient|@prisma|PrismaLiveExecutionRepository|\$transaction|\$queryRaw/);
   });
 
-  it('has no src importers and only the reviewed explicit operator script under scripts', () => {
+  it('has no src importers and only the reviewed operator script and synthetic readback adapter under scripts', () => {
     expect(graph.has(MODULE)).toBe(true);
     expect([...graph].filter(([, edges]) => edges.includes(MODULE)).map(([file]) => file)).toEqual([]);
     for (const file of files.filter((candidate) => candidate !== MODULE)) {
       expect(/ownership-lineage-export|exportOfflineLineageDiagnostic|LineageSnapshotPort/.test(readFileSync(path.join(REPO_ROOT, file), 'utf8')), file).toBe(false);
     }
     for (const file of scriptFiles(path.join(REPO_ROOT, 'scripts'))) {
-      if (path.relative(REPO_ROOT, file).split(path.sep).join('/') === OPERATOR_SCRIPT) continue;
+      if ([OPERATOR_SCRIPT, SYNTHETIC_ADAPTER].includes(path.relative(REPO_ROOT, file).split(path.sep).join('/'))) continue;
       expect(/ownership-lineage|readLineageDiagnosticSnapshot/.test(readFileSync(file, 'utf8')), file).toBe(false);
     }
     const script = readFileSync(path.join(REPO_ROOT, OPERATOR_SCRIPT), 'utf8');

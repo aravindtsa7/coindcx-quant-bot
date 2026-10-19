@@ -49,6 +49,8 @@ const inputSchema = z.object({
   outputName,
 }).strict();
 export type LineageInvocation = z.infer<typeof inputSchema>;
+/** Pure validation shared with the explicit synthetic acceptance harness; no inventory discovery or I/O. */
+export function validateLineageInvocation(raw: unknown) { return inputSchema.safeParse(raw); }
 type Identity = z.infer<typeof identity>;
 export interface CheckoutFacts {
   readonly sourceCommit: string;
@@ -127,7 +129,7 @@ export async function runLineageInvocation(raw: unknown, deps: LineageInvocation
   let owned: OwnedLineageDatabase | undefined;
   try {
     // Zod returns a private copy; mutation by the caller across awaits cannot change the checked inputs.
-    const parsed = inputSchema.safeParse(raw);
+    const parsed = validateLineageInvocation(raw);
     if (!parsed.success) {
       if (parsed.error.issues.every(issue => issue.path[0] === 'protectedStore')) failure = 'PROTECTED_INVENTORY_INVALID';
       throw new Error();

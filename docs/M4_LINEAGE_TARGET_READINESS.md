@@ -1,5 +1,11 @@
 # M4 lineage target readiness and checksum bases
 
+Update after operator metadata was supplied: the completed offline comparison and the prepared executable
+synthetic harness are recorded in [M4_SYNTHETIC_MYSQL_ACCEPTANCE.md](M4_SYNTHETIC_MYSQL_ACCEPTANCE.md).
+The original readiness/verification record below is retained as its earlier source-bound checkpoint. Its
+"no candidate migration results" and unprepared synthetic-execution status are superseded by that update;
+its raw-byte comparison policy and hash bases remain unchanged. No real DB action has been performed.
+
 Offline source inspection only, 19 October 2026. Starting source: `8a353c260737ff5ce50ac22f1e3cc3f7b47b216b`.
 No real inventory or operator review statement has been created. No DB connection/query, credential/env-file read,
 provider call, launcher execution or producing-runtime operation occurred. Frozen migrations and old evidence are unchanged.
