@@ -4,6 +4,8 @@
   "description": "CoinDCX INR-Margined Crypto Perpetual Futures Quantitative Trading Bot",
   "main": "dist/index.js",
   "scripts": {
+    "backtest:run": "tsx scripts/run-backtest.ts",
+    "dashboard": "tsx scripts/run-dashboard.ts",
     "dev": "tsx watch src/index.ts",
     "build": "rimraf dist && tsc",
     "start": "node dist/index.js",

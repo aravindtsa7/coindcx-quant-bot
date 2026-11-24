@@ -34,6 +34,14 @@ export interface FetchCandlesQuery {
   readonly toMs: number;
 }
 
+export type HistoricalResolution = '1' | '5' | '15' | '60';
+export interface HistoricalCandleQuery {
+  readonly pair: string;
+  readonly from: number;
+  readonly to: number;
+  readonly resolution: HistoricalResolution;
+}
+
 export interface FuturesCandleRestReaderConfig {
   readonly baseUrl?: string | undefined;
   readonly timeoutMs?: number | undefined;
@@ -65,13 +73,14 @@ const RawRestCandlesResponseSchema = z.object({
 /**
  * Fixed, read-only CoinDCX Futures candlestick REST reader.
  * Invariants:
- * - Query format: GET /market_data/candlesticks?pair=<pair>&from=<sec>&to=<sec>&resolution=1&pcode=f
+ * - One-minute recovery keeps resolution=1; historical reads accept only 1, 5, 15 and 60.
+ * - Query format: GET /market_data/candlesticks?pair=<pair>&from=<sec>&to=<sec>&resolution=<minutes>&pcode=f
  * - Strictly read-only; no mutations.
  * - Sorts records ascending by openTimeMs.
  * - Deduplicates identical records; rejects conflicting duplicates for the same minute.
- * - Enforces structural OHLC validation and exact UTC minute alignment.
+ * - Enforces structural OHLC validation and exact UTC interval alignment.
  * - Filters strictly to the requested [fromMs, toMs] range.
- * - Rejects forming/current minute candles (only closed truth is accepted).
+ * - Rejects forming/current interval candles (only closed truth is accepted).
  * - Provider errors are sanitized and never reflected unsafely.
  */
 export class CoinDcxFuturesCandleRestReader {
@@ -89,11 +98,18 @@ export class CoinDcxFuturesCandleRestReader {
   }
 
   public async fetchClosedCandles(query: FetchCandlesQuery): Promise<readonly RestCandleRecord[]> {
+    return this.getCandles({ pair: query.pair, from: query.fromMs, to: query.toMs, resolution: '1' });
+  }
+
+  /** Historical research shares the same permit discipline and parser as one-minute recovery. */
+  public async getCandles(query: HistoricalCandleQuery): Promise<readonly RestCandleRecord[]> {
     const started = performance.now();
     const assertDeadline = () => {
       if (performance.now() - started >= this.#timeoutMs) throw new CanonicalRecoveryError('REST candle operation deadline exceeded');
     };
-    const { pair, fromMs, toMs } = query;
+    const { pair, from: fromMs, to: toMs, resolution } = query;
+    if (!['1', '5', '15', '60'].includes(resolution)) throw new CanonicalRecoveryError('Invalid candle resolution');
+    const intervalMs = Number(resolution) * 60_000;
 
     if (!pair || pair.trim() === '') {
       throw new CanonicalRecoveryError('Pair is required for REST candle recovery');
@@ -108,7 +124,7 @@ export class CoinDcxFuturesCandleRestReader {
 
     const endpointUrl = `${this.#baseUrl}/market_data/candlesticks?pair=${encodeURIComponent(
       pair
-    )}&from=${fromSec}&to=${toSec}&resolution=1&pcode=f`;
+    )}&from=${fromSec}&to=${toSec}&resolution=${resolution}&pcode=f`;
 
     let rawBody: string;
     try {
@@ -137,7 +153,7 @@ export class CoinDcxFuturesCandleRestReader {
     }
 
     const nowMs = this.#clock.nowMs();
-    const currentMinuteStartMs = Math.floor(nowMs / 60_000) * 60_000;
+    const currentMinuteStartMs = Math.floor(nowMs / intervalMs) * intervalMs;
 
     const dedupeMap = new Map<number, RestCandleRecord>();
 
@@ -146,7 +162,7 @@ export class CoinDcxFuturesCandleRestReader {
       const timestamp = toSafeIntegerTimestamp(item.time, 'time');
       const timeMs = timestamp < 100_000_000_000 ? timestamp * 1000 : timestamp;
 
-      if (!Number.isSafeInteger(timeMs) || timeMs < MIN_CANONICAL_OPEN_TIME_MS || timeMs % 60_000 !== 0) {
+      if (!Number.isSafeInteger(timeMs) || timeMs < MIN_CANONICAL_OPEN_TIME_MS || timeMs % intervalMs !== 0) {
         throw new CanonicalRecoveryError(`REST candle time must align to exact UTC minute: ${timeMs}`);
       }
 

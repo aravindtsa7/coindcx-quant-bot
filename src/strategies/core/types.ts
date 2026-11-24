@@ -1,6 +1,6 @@
 import type { IndicatorKernel, IndicatorPoint, PriceSource } from '../../indicators/types';
 
-export type StrategyIndicatorType = 'EMA' | 'ATR' | 'RSI' | 'SMA' | 'MACD' | 'BOLLINGER' | 'SUPERTREND';
+export type StrategyIndicatorType = 'EMA' | 'ATR' | 'RSI' | 'SMA' | 'MACD' | 'BOLLINGER' | 'SUPERTREND' | 'ROLLING_VWAP';
 export type StrategyDecisionStatus = 'WARMING' | 'READY';
 export type StrategyTargetExposure = 'LONG' | 'SHORT' | 'FLAT';
 

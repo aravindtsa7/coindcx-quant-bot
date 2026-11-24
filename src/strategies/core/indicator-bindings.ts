@@ -2,6 +2,7 @@ import { AtrKernel } from '../../indicators/atr';
 import { strategyCanonicalJson } from './canonical';
 import { EmaKernel } from '../../indicators/ema';
 import { RsiKernel } from '../../indicators/rsi';
+import { RollingVwapKernel } from '../../indicators/rolling-vwap';
 import type { IndicatorKernel, PriceSource } from '../../indicators/types';
 import { StrategyError } from './errors';
 import type { StrategyIndicatorBinding, StrategyIndicatorRequirement, StrategyKernel } from './types';
@@ -21,6 +22,7 @@ function constructKernel(strategy: StrategyKernel, requirement: StrategyIndicato
     switch (requirement.indicatorType) {
       case 'EMA': return new EmaKernel({ ...base, priceSource: requirement.priceSource as PriceSource });
       case 'ATR': return new AtrKernel(base);
+      case 'ROLLING_VWAP': return new RollingVwapKernel(base);
       case 'RSI': return new RsiKernel({ ...base, priceSource: requirement.priceSource as PriceSource });
       default: throw new StrategyError('STRATEGY_INPUT_INVALID', `Unsupported Phase 10 indicator type: ${requirement.indicatorType}`);
     }

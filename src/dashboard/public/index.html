@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#0b1018"><title>CoinDCX Quant · Personal INR Futures</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231a3b36'/%3E%3Ctext x='8' y='24' fill='%234bd6b7' font-size='24' font-family='sans-serif'%3EQ%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css"><script defer src="/ui-core.js"></script><script defer src="/execution.js"></script><script defer src="/system.js"></script><script defer src="/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <aside class="sidebar" id="sidebar" aria-label="Workspace navigation">
+    <a class="brand" href="#overview"><span class="brand-mark">Q</span><span>COINDCX QUANT<small>PERSONAL INR FUTURES</small></span></a>
+    <nav id="navigation" aria-label="Workspace sections"></nav>
+    <div class="sidebar-foot"><span class="connection-dot" id="connection-dot"></span><b id="connection-label">Connecting to workspace</b><small>Local research · Virtual execution</small><a href="#unlock">Workspace home ↗</a></div>
+  </aside>
+  <div class="workspace-shell">
+    <header class="topbar">
+      <button class="icon-button mobile-menu" data-action="menu" aria-controls="sidebar" aria-expanded="false" aria-label="Toggle navigation">☰</button>
+      <div class="breadcrumb">Personal workspace <span>/ INR Futures</span></div><span class="pill blue" id="source-badge">CONNECTING</span>
+      <div class="topbar-right"><span class="pill" id="admission-badge" role="status">PAPER ADMISSION</span><span class="pill amber">▣ LIVE LOCKED</span><label class="sr-only" for="screen-jumper">Jump to screen</label><select id="screen-jumper" aria-label="Jump to any of the 42 screens"></select><span class="avatar" aria-label="Personal workspace">P</span></div>
+    </header>
+    <main id="main" tabindex="-1">
+      <div class="page-heading"><div><p class="eyebrow" id="screen-label">WORKSPACE / SCREEN 02 OF 42</p><h1 id="page-title">Overview</h1><p class="subtitle" id="page-description">Loading your local workspace…</p></div><div class="heading-actions"><button data-action="refresh" class="quiet" id="refresh-workspace">↻ Refresh</button><button data-action="screen-index">Open screen index</button></div></div>
+      <nav class="subtabs" id="subtabs" aria-label="Related screens"></nav>
+      <div id="connection-notice" role="status" hidden></div><div id="notice" role="status" hidden></div>
+      <section id="view" aria-label="Current screen" aria-busy="true"><div class="empty"><span class="spinner"></span><h2>Connecting your workspace</h2><p>Loading retained research and paper state.</p></div></section>
+      <footer><span>CoinDCX INR futures · Research &amp; paper only · Explicit funding assumptions</span><span id="footer-screen">Screen 02 / 42</span></footer>
+    </main>
+  </div>
+  <dialog id="screen-index" aria-labelledby="index-title"><div class="dialog-head"><div><p class="eyebrow">THE COMPLETE WORKSPACE</p><h2 id="index-title">All 42 screens</h2></div><button data-action="close-dialog" aria-label="Close screen index">✕</button></div><div class="dialog-body"><label class="search-field">Find a screen<input id="index-search" type="search" placeholder="Search name, group or screen number…"></label><div id="screen-index-list" class="screen-index-list"></div></div></dialog>
+  <dialog id="evidence-dialog" aria-labelledby="evidence-title"><div class="dialog-head"><h2 id="evidence-title">JSON evidence</h2><button data-action="close-dialog" aria-label="Close evidence">✕</button></div><pre id="evidence-content"></pre></dialog>
+  <dialog class="stop-dialog" id="stop-dialog" aria-labelledby="stop-title" aria-describedby="stop-description"><div class="dialog-head"><div><span class="stop-symbol" aria-hidden="true">!</span><h2 id="stop-title">Stop new admissions?</h2></div><button type="button" data-system="cancel-stop" aria-label="Close stop confirmation">✕</button></div><div class="dialog-body"><p id="stop-description">This stops new workspace admissions and virtual OPEN orders. Existing exposure is not guaranteed to close automatically.</p><ul class="stop-boundaries"><li>Retain pending evidence and uncertain outcomes.</li><li>No automatic venue cancellation or flattening is composed.</li><li>Live trading stays locked. Resume affects paper admission only.</li></ul><label class="field">Operator reason<input id="stop-reason" maxlength="500" placeholder="Optional reason retained in the audit"></label><p class="stop-dialog-status" id="stop-dialog-status" role="status" aria-live="polite"></p><div class="form-actions"><button type="button" id="stop-cancel" data-system="cancel-stop" autofocus>Keep viewing</button><button type="button" class="danger" id="confirm-stop" data-system="confirm-stop">Confirm admission stop</button></div></div></dialog>
+  <dialog id="catalog-dialog" aria-labelledby="catalog-title"><div class="dialog-head"><h2 id="catalog-title">CoinDCX INR Perpetual Catalog</h2><button type="button" data-action="close-dialog" aria-label="Close catalog">&times;</button></div><div class="dialog-body"><form id="catalog-search-form"><label>Search any coin<input id="catalog-query" name="query" type="search" placeholder="XRP, DOGE, SUI, ADA, BNB..." autocomplete="off"></label><button type="submit">Search</button></form><div id="catalog-results" aria-live="polite"></div></div></dialog>
+  <dialog id="history-dialog" aria-labelledby="history-title"><div class="dialog-head"><h2 id="history-title">Backfill historical 1m candles</h2><button type="button" data-action="close-dialog" aria-label="Close backfill">&times;</button></div><div class="dialog-body"><form id="history-form"><div id="history-fields" class="form-grid two"></div><p>Maximum 365 days per request. UTC [From, To), excluding To Date. Downloads run in the background. Every chunk is saved; you can cancel and resume missing minutes later.</p><div class="form-actions"><button type="submit" class="primary">Download &amp; merge archive</button></div></form><div data-sync-progress></div></div></dialog>
+  <div id="toast" role="status" hidden></div><noscript><div class="noscript">Enable JavaScript to connect the workspace. Live execution is locked.</div></noscript>
+</body>
+</html>

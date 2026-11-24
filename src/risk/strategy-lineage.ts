@@ -1,7 +1,7 @@
 import { strategySha256CanonicalJson } from '../strategies/core/canonical';
 import { StrategyError } from '../strategies/core/errors';
 import { computeStrategyInstanceId, computeStrategyParameterHash, normalizeIndicatorBootstrapIdentity } from '../strategies/core/identity';
-import { PHASE10_STRATEGY_DEFINITIONS } from '../strategies/implementations';
+import { RESEARCH_STRATEGY_DEFINITIONS } from '../strategies/implementations';
 import { BaseStrategyKernel, StrategyDecisionOrigin } from '../strategies/core/kernel';
 import type { StrategyDecision, StrategyKernel } from '../strategies/core/types';
 import { riskSourceInvalid } from './errors';
@@ -52,7 +52,7 @@ export function strategyLineageReasons(candidate: StrategyRiskCandidate, origin:
       decision.triggerTimeframeMinutes !== expected.triggerTimeframeMinutes ||
       strategySha256CanonicalJson(candidate.strategyLineage.normalizedParameters) !== strategySha256CanonicalJson(expected.normalizedParameters) ||
       strategySha256CanonicalJson(candidate.strategyLineage.indicatorBootstrapIdentity) !== strategySha256CanonicalJson(expected.indicatorBootstrapIdentity)) return ['DECISION_IDENTITY_MISMATCH'];
-  const definition = PHASE10_STRATEGY_DEFINITIONS.find((entry) =>
+  const definition = RESEARCH_STRATEGY_DEFINITIONS.find((entry) =>
     entry.strategyId === decision.strategyId && entry.strategyVersion === decision.strategyVersion);
   if (definition === undefined) return ['DECISION_IDENTITY_MISMATCH'];
   try {
